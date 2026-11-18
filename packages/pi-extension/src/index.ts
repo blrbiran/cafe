@@ -31,13 +31,29 @@ export async function ensureDaemon(addr = daemonAddr(), timeoutMs = 5000): Promi
   const host = addr.split(":")[0];
   if (host !== "127.0.0.1" && host !== "localhost") return false;
   const cli = fileURLToPath(new URL("../../cli/src/main.ts", import.meta.url));
-  const child = spawn(process.execPath, [cli, "daemon", "run"], { detached: true, stdio: "ignore", env: process.env });
+  // Under oh-my-pi (Bun) process.execPath is the omp binary itself: start the daemon with Node.
+  const node = process.versions.bun ? (process.env.CAFE_NODE ?? "node") : process.execPath;
+  const child = spawn(node, [cli, "daemon", "run"], { detached: true, stdio: "ignore", env: process.env });
   child.on("error", () => {});
   child.unref();
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     await new Promise((r) => setTimeout(r, 200));
     if (await healthy(addr)) return true;
+  }
+  return false;
+}
+
+/** Running inside oh-my-pi (a Bun build of pi) rather than pi on Node. Override with CAFE_HOST_AGENT=pi|omp. */
+export function isOmp(): boolean {
+  return process.env.CAFE_HOST_AGENT ? process.env.CAFE_HOST_AGENT === "omp" : !!process.versions.bun;
+}
+
+/** oh-my-pi's agent_end has no `aborted` flag: the last assistant message says how it stopped. */
+export function runAborted(messages: readonly unknown[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string; stopReason?: string };
+    if (m?.role === "assistant") return m.stopReason === "aborted";
   }
   return false;
 }
@@ -386,12 +402,22 @@ export default function cafe(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", async (event, ctx) => {
+  async function onRunEnd(aborted: boolean, ctx: ExtensionContext): Promise<void> {
     ctxRef = ctx;
-    if (current?.seen) await finish(event.aborted);
+    if (current?.seen) await finish(aborted);
     if (queue.length) await drain();
     else if (client && !current) void client.setStatus("idle").catch(() => {});
-  });
+  }
+
+  if (isOmp()) {
+    // oh-my-pi has no agent_settled: a run is over at the agent_end that will not continue.
+    (pi as any).on("agent_end", async (event: { messages?: unknown[]; willContinue?: boolean }, ctx: ExtensionContext) => {
+      if (event.willContinue) return;
+      await onRunEnd(runAborted(event.messages ?? []), ctx);
+    });
+  } else {
+    pi.on("agent_settled", async (event, ctx) => onRunEnd(event.aborted, ctx));
+  }
 
   pi.on("before_agent_start", async (event) => {
     const rec = client?.record;
@@ -400,7 +426,10 @@ export default function cafe(pi: ExtensionAPI) {
       "Other agents on the network may know things you don't. Use cafe_agents to see who is registered and cafe_ask to send them a question (non-blocking by default; replies arrive as cafe-reply messages; pass threadId to follow up with whoever answered).",
     ];
     if (role === "barista") lines.push("Messages of type cafe-order are questions from other agents: answer them, or call cafe_decline if they are not your responsibility.");
-    event.systemPromptOptions.sections.cafe = lines.join("\n");
+    // pi exposes named sections; oh-my-pi passes the prompt as a string[] to extend.
+    const ev = event as unknown as { systemPromptOptions?: { sections: Record<string, string> }; systemPrompt?: string[] };
+    if (ev.systemPromptOptions?.sections) ev.systemPromptOptions.sections.cafe = lines.join("\n");
+    else if (Array.isArray(ev.systemPrompt)) return { systemPrompt: [...ev.systemPrompt, lines.join("\n")] } as never;
   });
 
   // ---------------------------------------------------------------------------

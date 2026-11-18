@@ -169,8 +169,9 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
     if (m === "GET") return send(res, 200, sup.list());
     if (m === "POST") {
-      const { dir, args } = await readJson(req);
-      return send(res, 200, sup.start({ dir, args }));
+      const { dir, args, bin } = await readJson(req);
+      if (bin !== undefined && (typeof bin !== "string" || !/^[\w./-]+$/.test(bin))) throw new RpcError("bad_request", "bin must be an executable name or path");
+      return send(res, 200, sup.start({ dir, args, ...(bin ? { bin } : {}) }));
     }
     if (m === "DELETE") return send(res, 200, { stopped: sup.stop(url.searchParams.get("dir") ?? "") });
   }

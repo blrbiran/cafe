@@ -409,9 +409,10 @@ const barista = program.command("barista").description("headless Baristas (pi --
 barista
   .command("start")
   .option("--dir <dir>", "directory to run in (its .cafe defines identity)", process.cwd())
+  .option("--agent <bin>", "agent executable: pi (default) or omp (oh-my-pi)")
   .action(async (o) => {
     await ensureDaemon();
-    const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir) }) });
+    const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir), ...(o.agent ? { bin: o.agent } : {}) }) });
     out(`started ${ws.length} worker(s) in ${resolve(o.dir)}`, ws);
   });
 barista

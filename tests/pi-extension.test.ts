@@ -46,8 +46,11 @@ function fakePi() {
     aborts: () => aborts,
     setIdle: (v: boolean) => (idle = v),
     async fire(event: string, payload: any, cwd: string) {
-      for (const h of handlers.get(event) ?? []) await h(payload, ctx(cwd));
+      let last: unknown;
+      for (const h of handlers.get(event) ?? []) last = await h(payload, ctx(cwd));
+      return last;
     },
+    has: (event: string) => (handlers.get(event)?.length ?? 0) > 0,
   };
 }
 
@@ -72,6 +75,7 @@ afterEach(async () => {
   delete process.env.CAFE_DAEMON;
   delete process.env.CAFE_INJECT_TIMEOUT_MS;
   delete process.env.CAFE_HEARTBEAT_MS;
+  delete process.env.CAFE_HOST_AGENT;
 });
 
 async function setup() {
@@ -347,5 +351,44 @@ describe("pi extension", () => {
     expect((await bClosed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "B done" });
     expect(aEvents).not.toContain("order.replied");
     expect(aEvents).not.toContain("order.declined");
+  });
+});
+
+describe("pi extension under oh-my-pi", () => {
+  it("ends a run on the agent_end that will not continue, and extends a string[] system prompt", async () => {
+    process.env.CAFE_HOST_AGENT = "omp";
+    const { pi, c } = await setup();
+    expect(pi.has("agent_settled")).toBe(false);
+    expect(pi.has("agent_end")).toBe(true);
+
+    const sys = (await pi.fire("before_agent_start", { type: "before_agent_start", prompt: "hi", systemPrompt: ["base"] }, dir)) as { systemPrompt: string[] };
+    expect(sys.systemPrompt[0]).toBe("base");
+    expect(sys.systemPrompt[1]).toContain("cafe agent network");
+
+    const res = await c.ask({ body: "how many widgets?" });
+    await waitFor(() => orders(pi).length === 1);
+    const closed = untilClosed(c, res.threadId);
+    const messages = [asCustom(orders(pi)[0]!), assistant("12 widgets")];
+    await pi.fire("agent_start", { type: "agent_start" }, dir);
+    for (const message of messages) await pi.fire("message_end", { type: "message_end", message }, dir);
+    await pi.fire("agent_end", { type: "agent_end", messages, willContinue: true }, dir);
+    await pi.fire("agent_end", { type: "agent_end", messages }, dir);
+    const events = await closed;
+    expect(events.filter((e) => e.event.type === "order.replied")).toHaveLength(1);
+    expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "12 widgets", final: true });
+  });
+
+  it("declines as unavailable when the run was aborted before any answer", async () => {
+    process.env.CAFE_HOST_AGENT = "omp";
+    const { pi, c } = await setup();
+    const res = await c.ask({ body: "long job" });
+    await waitFor(() => orders(pi).length === 1);
+    const closed = untilClosed(c, res.threadId);
+    const messages = [asCustom(orders(pi)[0]!), { role: "assistant", content: [], stopReason: "aborted" }];
+    await pi.fire("agent_start", { type: "agent_start" }, dir);
+    for (const message of messages) await pi.fire("message_end", { type: "message_end", message }, dir);
+    await pi.fire("agent_end", { type: "agent_end", messages }, dir);
+    const events = await closed;
+    expect(events.find((e) => e.event.type === "order.declined")?.event).toMatchObject({ reason: "aborted by the operator", unavailable: true });
   });
 });

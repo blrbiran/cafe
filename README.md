@@ -89,6 +89,10 @@ retention:
 
 同一局域网内，没配 `root` 的 Daemon 会通过 mDNS 自动找到 Root（只找到一个时才会自动连），`cafe root discover` 可手动查看；token 仍需手动设置。`cafe daemon install` 让 Daemon 开机自启、崩溃后自动重启（macOS launchd / Linux systemd --user），`cafe daemon uninstall` 撤销。详见 [`docs/specs/v2-3-discovery-autostart.md`](docs/specs/v2-3-discovery-autostart.md)。Root 换了 IP 后，启动时会主动回连 `knownDaemons` 中记录的各 Daemon，把新地址告诉它们。
 
+## oh-my-pi
+
+同一个 pi 扩展也能在 oh-my-pi（omp）里用：`omp -e packages/pi-extension/src/index.ts`，headless 用 `cafe barista start --dir <dir> --agent omp`。差异处理见 [`docs/specs/v2-6-oh-my-pi.md`](docs/specs/v2-6-oh-my-pi.md)。
+
 ## v1 范围外（已预留接口）
 
 - Daemon 之间直连（P2P）、三级及以上层级、mDNS 自动发现

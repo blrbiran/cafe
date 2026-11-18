@@ -11,6 +11,8 @@ export interface BaristaSpec {
   dir: string;
   /** Extra args for pi. */
   args?: string[];
+  /** Agent executable for this Barista (`pi` by default; `omp` for oh-my-pi). */
+  bin?: string;
 }
 
 interface Worker {
@@ -182,7 +184,8 @@ export class Supervisor {
         log = undefined;
       }
     };
-    const args = [GUARD, this.piBin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
+    const bin = w.spec.bin ?? this.piBin;
+    const args = [GUARD, bin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.
     const child = spawn(process.execPath, args, { cwd: w.spec.dir, env: this.env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
     // Attach 'error' first: an unhandled spawn error would crash the daemon.
@@ -214,7 +217,7 @@ export class Supervisor {
       });
     }
     child.on("exit", (code, signal) => {
-      note(code === EXIT_NOT_FOUND ? `pi executable not found: ${this.piBin} (set CAFE_PI_BIN)` : `exited code=${code} signal=${signal}`);
+      note(code === EXIT_NOT_FOUND ? `agent executable not found: ${bin} (set CAFE_PI_BIN or --agent)` : `exited code=${code} signal=${signal}`);
       const pgid = child.pid;
       // Grandchildren may still hold the group's pipes: give them a moment, then SIGKILL the group.
       if (pgid) setTimeout(() => signalGroup(pgid, "SIGKILL"), EXIT_DRAIN_MS).unref?.();
