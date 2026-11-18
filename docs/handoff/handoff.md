@@ -37,13 +37,15 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `packages/daemon/src/server.ts` | One port (4777): HTTP API, `/ws`, static web UI. New: `/api/routing/hints`, `/api/search`, `/api/prune`, `/api/threads?before=` |
 | `packages/daemon/src/supervisor.ts`, `proc/` | Headless workers under a guard that dies with the Daemon; per-Barista `bin` (pi / omp) |
 | `packages/daemon/src/index.ts` | `runDaemon()`, lock, discovery start/stop |
-| `packages/cli/src/main.ts` | The `cafe` command. New: `stats`, `search`, `prune`, `root discover`, `daemon install/uninstall`, `barista start --agent` |
-| `packages/cli/src/service.ts` | launchd plist / systemd unit generation and (un)install |
+| `packages/cli/src/main.ts` | The `cafe` command. New: `stats`, `search`, `prune`, `root discover`, `daemon install/uninstall`, `barista start --agent`, `pi-extension-path`, `--version`. `daemon start` (and the pi extension's auto-start) goes through launchd/systemd when autostart is installed for this `CAFE_HOME` |
+| `packages/cli/src/service.ts` | launchd plist / systemd unit generation and (un)install; `servicePath()` drops temp and per-terminal shim dirs (cmux) from the service PATH; `startInstalledService()` |
+| `scripts/build-release.mjs` | esbuild → `release/` (publishable package `@blrbiran/cafe`), see `docs/specs/v2-7-publishing.md` |
+| `scripts/sim-hosts.sh` | Three local Daemons (Root + 2 children) running the section 6 failure cases without a model; run before a real multi-machine test |
 | `packages/cli/src/serve.ts` | `cafe serve` |
 | `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below |
 | `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore` |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
-| `tests/` | vitest, **66 tests**: e2e, follow-up/recovery, pi extension (incl. omp mode) against a fake pi, serve, supervisor, routing hints, routing eval, direct links, discovery (real multicast), service files, retention/search |
+| `tests/` | vitest, **69 tests**: e2e, follow-up/recovery, pi extension (incl. omp mode) against a fake pi, serve, supervisor, routing hints, routing eval, direct links, discovery (real multicast), service files, retention/search, client reconnect while the daemon stays down |
 
 **pi extension behaviour**
 - Orders queue (FIFO), are acked and heartbeated on arrival, and are injected only when idle with `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
@@ -58,7 +60,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 66 must pass (run twice: earlier flakes were unhandled rejections)
+npm test                   # vitest; all 69 must pass (run twice: earlier flakes were unhandled rejections)
 npm run check --workspace @cafe/web && npm run build:web
 node packages/cli/bin/cafe.js daemon start --root     # or `npm link --workspace @cafe/cli` then `cafe ...`
 open http://127.0.0.1:4777/
@@ -72,7 +74,7 @@ export CAFE_HOME=$(mktemp -d); printf 'port: 47821\nhost: test\nmode: root\ndisc
 
 Tests run with `CAFE_DISCOVERY=0` (vitest.config.ts); `tests/discovery.test.ts` opts back in on a private service name.
 
-Real checks done so far: pi TUI (tmux) and headless; `claude -p` via `cafe serve --preset claude`; **omp 18.17.0 loads the extension and registers as a Barista** (no model call); web UI for the routing-hint display checked in a browser against a scripted scenario. The user allows real-model tests with their pi model (`magpie/group/smart`), a few prompts each, but **every new paid run needs its own approval**.
+Real checks done so far: pi TUI (tmux) and headless; `claude -p` via `cafe serve --preset claude`; **omp 18.17.0 real Q&A** (headless answer, follow-up to the same Barista, Order shown in omp's TUI as `☕ Order from …`; ~$0.11); **`cafe daemon install` on the user's Mac** (launchd runs the Root now; `kill -9` → relaunched, `cafe daemon stop` → stays stopped, `cafe daemon start` → kickstarts the service, the pi TUI Barista reconnects); `scripts/sim-hosts.sh` all six steps pass; the packed `@blrbiran/cafe` tarball installed into a temp prefix passes a smoke test (web, serve, headless pi with the bundled extension, skill install, LLM router from the optional dependency); web UI for the routing-hint display checked in a browser against a scripted scenario. The user allows real-model tests with their pi model (`magpie/group/smart`), a few prompts each, but **every new paid run needs its own approval**.
 
 ## 4. Decisions you must not silently undo
 
@@ -87,15 +89,14 @@ Real checks done so far: pi TUI (tmux) and headless; `claude -p` via `cafe serve
 
 ## 5. Waiting on the user (start the next session here)
 
-Everything below was done with the recommended defaults while the user was away; ask the user to review:
+Done on 2026-11-19 with the user's approval: v2 defaults accepted; Q60–Q64 as recommended, package name `@blrbiran/cafe` (user is logged in to npm as blrbiran); omp real Q&A; `cafe daemon install` on the Mac. Open:
 
-1. **Review the v2 defaults** in `docs/specs/v2-3-discovery-autostart.md` (discovery on by default; several Roots → not auto-picked; user-level services only) and `docs/specs/v2-5-retention-search.md` (no automatic pruning by default).
-2. **Publishing (Q60–Q64)** in `docs/specs/v2-7-publishing.md`: package name/scope, one package vs several, esbuild build, where `skills/` lives, release flow. Sibling-package lookups were already switched to `import.meta.resolve` with a repo-path fallback.
-3. **Real omp Q&A** (needs a model call): `cafe barista start --dir <dir> --agent omp`, then `cafe ask --to <name> "..."`; also look at an injected Order in omp's TUI.
-4. **`cafe daemon install` on the real Mac**: never executed here (it writes `~/Library/LaunchAgents/dev.cafe.daemon.plist` and takes over the running daemon). `--dry-run` output passed `plutil -lint`. Reinstall after changing Node version (nvm path is pinned in the plist) or moving the repo.
-5. **Two-machine test** (section 6), now also covering direct links, discovery and autostart.
-6. Web "load older threads": backend `?before=` exists; the UI needs a prototype first.
-7. Suggest `pi update` (local pi 1.5.0, extension targets 1.5.2).
+1. **Web: load older threads + search** — approved as recommended (Q67 A: "加载更早的会话" button at the bottom of 最近, 50 per click, then "没有更早的会话了"; Q68 A: search box in the filter row, results list matching sentences with the keyword highlighted, cleared box returns to the list). Prototype: https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ. **Not implemented yet — next task.** Backend: `/api/threads?before=&limit=`, `/api/search?q=`.
+2. Q69 (MIT license) and Q70 (keep `@earendil-works/pi-coding-agent` as optionalDependency) are done.
+3. **Publish** (the user does it): `npm version <x.y.z>` → `npm run release:pack` → check `release-out/*.tgz` → `npm publish ./release`.
+4. **Real two-machine test** (section 6). The local simulation passes; B needs `npm i -g @blrbiran/cafe` (after publishing) or the repo.
+5. Suggest `pi update` (local pi 1.5.0, extension targets 1.5.2).
+6. Reinstall autostart (`cafe daemon install`) after changing Node version or moving the repo — the plist pins both.
 
 ## 6. Two-machine test (the user runs this)
 
@@ -114,14 +115,17 @@ Everything below was done with the recommended defaults while the user was away;
 ## 7. Backlog after v2
 
 - Multi-level Daemon hierarchy (codex `parent`/AgentPath idea) — not started; only two levels exist.
-- Publishing (section 5 item 2).
+- Publishing: built and verified, not yet published (section 5).
 - SQLite FTS if `cafe search` gets slow (it scans JSONL files).
 - Web: "load older", maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
 
 ## 8. Traps already found
 
 - **`npx tsc` is rewritten by the user's rtk hook** to an old global tsc. Use `npm run typecheck` or `node_modules/.bin/tsc`.
-- `rm` is aliased to interactive and hangs; use `/bin/rm -f` for files you created.
+- `rm` and `cp` are aliased to interactive and hang or silently skip; use `/bin/rm -f`, `/bin/cp -f` for files you created.
+- **Node 22's built-in WebSocket fires only `error` (no `close`) when a connection attempt fails**, and leaves no handle: a reconnect loop driven by `close` stops after one failure and a process with nothing else alive exits with code 0 (`cafe serve` did). `CafeClient` now handles `error` and `close` once each. The daemon uses the `ws` package, which always emits `close`.
+- The shell's PATH contains per-terminal shims (`~/.cmuxterm/cmux-cli-shims/<id>/pi`); never bake those into a service file (`servicePath()` filters them).
+- The user's Root daemon is now owned by launchd (`dev.cafe.daemon`): stop it with `cafe daemon stop`, not `kill` (launchd restarts it).
 - User rules: never delete or overwrite user data without asking, show the diff/stat before committing, never force-push. Use a scratch `CAFE_HOME`.
 - pnpm is not installed (npm workspaces). Never run two `npm install` at once (ENOTEMPTY).
 - zsh does not word-split `$VAR` commands: wrap smoke tests in `bash -c` with `cafe(){ node packages/cli/bin/cafe.js "$@"; }`.
@@ -138,7 +142,7 @@ Everything below was done with the recommended defaults while the user was away;
 
 ## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q64**).
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q70**).
 - New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
 - Commit when asked, with a stat or diff shown first; messages end with the Co-Authored-By line.
-- UI prototypes are Claude artifacts: v1 https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK, routing-history display https://claude.ai/artifact/JJit3GCxiQZUypYVWZFxFg (approved: Q51–Q53 as recommended).
+- UI prototypes are Claude artifacts: v1 https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK, routing-history display https://claude.ai/artifact/JJit3GCxiQZUypYVWZFxFg (approved: Q51–Q53 as recommended), older threads + search https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ (approved: Q67–Q68 as recommended).

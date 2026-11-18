@@ -1,6 +1,6 @@
 # v2-6 oh-my-pi（omp）作为 Barista
 
-状态：已实现（2026-11-19），**待用户审核**。真实 omp 18.17.0 已验证能加载扩展并注册为 Barista；**完整问答（需调用模型）尚未在真实 omp 上跑过**。
+状态：已实现并经用户同意（2026-11-19）。真实 omp 18.17.0 已验证：加载扩展并注册为 Barista；headless 问答、追问回到同一个 Barista、TUI 中注入的 Order 显示为 `☕ Order from …` 并在原处作答（模型 magpie/group/never-stuck，约 $0.11）。
 
 ## 结论
 
@@ -21,8 +21,3 @@
 
 - 交互：`omp -e <cafe>/packages/pi-extension/src/index.ts`，或在 omp 配置的 `extensions` 列表里加入该路径。
 - headless：`cafe barista start --dir <dir> --agent omp`（守护进程用 `omp --mode rpc --no-session -e <ext>` 启动；每个 Barista 可以单独指定，持久化在 baristas.json）。全局默认仍是 `CAFE_PI_BIN`，未设为 `pi`。
-
-## 待用户验证
-
-- 在 omp 里真实问答一次（会调用模型）：`cafe barista start --dir <dir> --agent omp` 后 `cafe ask --to <name> "..."`。
-- omp 的 TUI 里注入 Order 时的显示（`registerMessageRenderer`）。
