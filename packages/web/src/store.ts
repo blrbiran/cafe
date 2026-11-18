@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { AgentRecord, DaemonRecord, RegistryDelta, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
-import { api, token, wsUrl, type Snapshot, type ThreadDetail } from "./api.ts";
+import { api, token, wsUrl, type SearchHit, type Snapshot, type ThreadDetail } from "./api.ts";
 
 export interface State {
   loaded: boolean;
@@ -20,7 +20,21 @@ export interface State {
   live: Record<string, LiveTurn>;
   /** The "Ask" composer on the feed; `to` prefilled by "Ask it". */
   composer?: { to?: string };
+  /** Older threads fetched with "Load older" (beyond the snapshot's newest SNAPSHOT_LIMIT). */
+  older: { loading: boolean; loaded: boolean; done: boolean };
+  /** Feed search; results replace the list while `q` is non-empty. */
+  search: { q: string; loading: boolean; results?: SearchResult[]; error?: string };
 }
+
+export interface SearchResult {
+  meta: ThreadMeta;
+  hits: SearchHit[];
+}
+
+/** The daemon's snapshot carries this many newest threads (server.ts / daemon.snapshot()). */
+const SNAPSHOT_LIMIT = 200;
+const OLDER_PAGE = 50;
+export const SEARCH_LIMIT = 20;
 
 export interface LiveTurn {
   orderId: string;
@@ -46,6 +60,8 @@ let state: State = {
   daemons: [],
   threads: [],
   live: {},
+  older: { loading: false, loaded: false, done: false },
+  search: { q: "", loading: false },
 };
 
 const listeners = new Set<() => void>();
@@ -74,6 +90,12 @@ function norm(m: ThreadMeta): ThreadMeta {
 }
 
 function applySnapshot(s: Snapshot): void {
+  const fresh = s.threads.map(norm);
+  // A re-snapshot (reconnect) must not drop older threads the user already loaded.
+  const ids = new Set(fresh.map((t) => t.threadId));
+  const oldest = fresh.reduce((m, t) => Math.min(m, t.createdAt), Number.POSITIVE_INFINITY);
+  const kept = state.threads.filter((t) => !ids.has(t.threadId) && t.createdAt < oldest);
+  const done = kept.length > 0 ? state.older.done : fresh.length < SNAPSHOT_LIMIT;
   set({
     loaded: true,
     error: undefined,
@@ -84,8 +106,51 @@ function applySnapshot(s: Snapshot): void {
     registryVersion: s.registryVersion,
     agents: Object.fromEntries(s.agents.map((a) => [a.agentId, a])),
     daemons: s.daemons,
-    threads: s.threads.map(norm),
+    threads: [...fresh, ...kept],
+    older: { ...state.older, done },
   });
+}
+
+/** Fetch the next page of threads older than everything loaded. */
+export async function loadOlder(): Promise<void> {
+  if (state.older.loading || state.older.done) return;
+  const before = state.threads.reduce((m, t) => Math.min(m, t.createdAt), Number.MAX_SAFE_INTEGER);
+  set((s) => ({ older: { ...s.older, loading: true } }));
+  try {
+    const page = (await api.threads(before, OLDER_PAGE)).map(norm);
+    set((s) => {
+      const ids = new Set(s.threads.map((t) => t.threadId));
+      return { threads: [...s.threads, ...page.filter((t) => !ids.has(t.threadId))], older: { loading: false, loaded: true, done: page.length < OLDER_PAGE } };
+    });
+  } catch (err) {
+    set((s) => ({ error: (err as Error).message, older: { ...s.older, loading: false } }));
+  }
+}
+
+let searchSeq = 0;
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Update the feed search; queries the daemon after a short pause in typing. */
+export function setSearch(q: string): void {
+  const seq = ++searchSeq;
+  if (searchTimer) clearTimeout(searchTimer);
+  if (!q.trim()) {
+    set({ search: { q, loading: false } });
+    return;
+  }
+  set((s) => ({ search: { ...s.search, q, loading: true, error: undefined } }));
+  searchTimer = setTimeout(() => {
+    api
+      .search(q.trim(), SEARCH_LIMIT)
+      .then((rows) => {
+        if (seq !== searchSeq) return;
+        set({ search: { q, loading: false, results: rows.map((r) => ({ meta: norm(r.meta), hits: r.hits })) } });
+      })
+      .catch((err) => {
+        if (seq !== searchSeq) return;
+        set({ search: { q, loading: false, error: (err as Error).message } });
+      });
+  }, 250);
 }
 
 function upsertThread(raw: ThreadMeta): void {

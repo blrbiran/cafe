@@ -1,17 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { ThreadMeta } from "@cafe/protocol";
 import { api } from "../api.ts";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
 import { bucketOf, outcome, whoAddress, whyText } from "../outcome.ts";
 import { navigate, type Filter } from "../route.ts";
-import { closeComposer, ensureLive, openComposer, useStore } from "../store.ts";
+import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setSearch, useStore, type SearchResult } from "../store.ts";
 import { Empty, PageHeader, Pill } from "../ui/bits.tsx";
 
 export function FeedPage({ filter }: { filter: Filter }) {
   const t = useT();
   const threads = useStore((s) => s.threads);
   const composer = useStore((s) => s.composer);
+  const older = useStore((s) => s.older);
+  const search = useStore((s) => s.search);
+  const searching = search.q.trim() !== "";
 
   const active = threads.filter((x) => bucketOf(x) === "active");
   const rest = threads
@@ -40,13 +43,29 @@ export function FeedPage({ filter }: { filter: Filter }) {
         }
       />
       {composer && <Composer initialTo={composer.to} />}
-      <div role="group" aria-label="filter" className="flex flex-wrap gap-2">
-        {filters.map(([k, label]) => (
-          <button key={k} type="button" className="chip" aria-pressed={filter === k} onClick={() => navigate({ page: "feed", filter: k })}>
-            {label}
-          </button>
-        ))}
+      <div className="flex flex-wrap items-center gap-2">
+        <div role="group" aria-label="filter" className="flex flex-wrap gap-2">
+          {filters.map(([k, label]) => (
+            <button key={k} type="button" className="chip" aria-pressed={filter === k} onClick={() => navigate({ page: "feed", filter: k })}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <input
+          id="cafe-search"
+          type="search"
+          className="field min-h-8 min-w-0 flex-[1_1_180px] py-1"
+          style={{ width: "auto" }}
+          aria-label={t.searchLabel}
+          placeholder={t.searchPlaceholder}
+          value={search.q}
+          onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setSearch("");
+          }}
+        />
       </div>
+      {searching ? <SearchResults filter={filter} /> : <>
       {threads.length === 0 && <Empty>{t.emptyFeed}</Empty>}
       {showActive && (
         <section className="flex flex-col gap-2.5">
@@ -60,11 +79,94 @@ export function FeedPage({ filter }: { filter: Filter }) {
         <section className="flex flex-col gap-2.5">
           <h2 className="section-cap">{t.recent}</h2>
           {done.length === 0 ? <Empty>{t.emptyFilter}</Empty> : done.map((m) => <ThreadCard key={m.threadId} meta={m} />)}
+          {!older.done ? (
+            <div className="flex justify-center pt-1">
+              <button type="button" onClick={() => void loadOlder()} disabled={older.loading} aria-busy={older.loading}>
+                {older.loading ? t.loadingOlder : t.loadOlder}
+              </button>
+            </div>
+          ) : (
+            older.loaded && <div className="hint text-center">{t.noOlder}</div>
+          )}
         </section>
       )}
       {filter === "active" && active.length === 0 && threads.length > 0 && <Empty>{t.emptyFilter}</Empty>}
+      </>}
     </>
   );
+}
+
+function SearchResults({ filter }: { filter: Filter }) {
+  const t = useT();
+  const now = useNow();
+  const agents = useStore((s) => s.agents);
+  const search = useStore((s) => s.search);
+  const q = search.q.trim();
+  if (search.error) return <div role="alert" className="well text-sm" data-tone="danger">{search.error}</div>;
+  if (!search.results) return <div className="hint">{t.searching}</div>;
+  const rows = search.results.filter((r: SearchResult) => filter === "all" || bucketOf(r.meta) === filter);
+  if (rows.length === 0) return <Empty>{t.searchNone(q)}</Empty>;
+  return (
+    <section className="flex flex-col gap-2.5" aria-busy={search.loading}>
+      <h2 className="section-cap">{t.searchFound(rows.length)}</h2>
+      {rows.map(({ meta, hits }) => {
+        const o = outcome(t, meta, agents, undefined, now);
+        const open = () => navigate({ page: "thread", threadId: meta.threadId });
+        return (
+          <article key={meta.threadId} className="card flex flex-col gap-2.5 px-4.5 py-4">
+            <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
+              <span className="mono text-fg">{meta.from.address}</span>
+              <span>{t.askedVerb}</span>
+              <span>· {ago(t, meta.createdAt, now)}</span>
+            </div>
+            <button type="button" className="qbtn" onClick={open}>
+              <Highlight text={meta.summary || "—"} q={q} />
+            </button>
+            <div>
+              <Pill tone={o.tone}>{o.text}</Pill>
+            </div>
+            {hits.filter((h) => !sameAsTitle(h.text, meta.summary)).map((h) => (
+              <div key={`${h.orderId}-${h.at}-${h.who}`} className="well flex flex-col gap-1 px-3.5 py-2.5">
+                <div className="mono text-xs text-muted">{h.who}</div>
+                <div className="answer clamp3">
+                  <Highlight text={plain(h.text)} q={q} />
+                </div>
+              </div>
+            ))}
+            <div>
+              <button type="button" className="linkbtn" onClick={open}>
+                {t.openConv}
+              </button>
+            </div>
+          </article>
+        );
+      })}
+      {search.results.length >= SEARCH_LIMIT && <div className="hint">{t.searchCapped(SEARCH_LIMIT)}</div>}
+    </section>
+  );
+}
+
+/** A hit on the question itself repeats the card title; the title already shows the highlight. */
+function sameAsTitle(hit: string, summary: string): boolean {
+  const a = hit.replace(/^…/, "").replace(/\s+/g, " ").trim();
+  const b = summary.replace(/…$/, "").replace(/\s+/g, " ").trim();
+  return !!a && !!b && (a.startsWith(b) || b.startsWith(a));
+}
+
+/** Mark every case-insensitive occurrence of `q` in `text`. */
+function Highlight({ text, q }: { text: string; q: string }) {
+  if (!q) return <>{text}</>;
+  const lower = text.toLowerCase();
+  const needle = q.toLowerCase();
+  const parts: ReactNode[] = [];
+  let at = 0;
+  for (let i = lower.indexOf(needle); i >= 0; i = lower.indexOf(needle, at)) {
+    if (i > at) parts.push(text.slice(at, i));
+    parts.push(<mark key={i}>{text.slice(i, i + q.length)}</mark>);
+    at = i + q.length;
+  }
+  parts.push(text.slice(at));
+  return <>{parts}</>;
 }
 
 function ThreadCard({ meta }: { meta: ThreadMeta }) {

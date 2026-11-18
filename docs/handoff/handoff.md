@@ -43,7 +43,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `scripts/sim-hosts.sh` | Three local Daemons (Root + 2 children) running the section 6 failure cases without a model; run before a real multi-machine test |
 | `packages/cli/src/serve.ts` | `cafe serve` |
 | `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below |
-| `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore` |
+| `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore`; feed has "load older" and full-text search |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
 | `tests/` | vitest, **69 tests**: e2e, follow-up/recovery, pi extension (incl. omp mode) against a fake pi, serve, supervisor, routing hints, routing eval, direct links, discovery (real multicast), service files, retention/search, client reconnect while the daemon stays down |
 
@@ -91,7 +91,7 @@ Real checks done so far: pi TUI (tmux) and headless; `claude -p` via `cafe serve
 
 Done on 2026-11-19 with the user's approval: v2 defaults accepted; Q60–Q64 as recommended, package name `@blrbiran/cafe` (user is logged in to npm as blrbiran); omp real Q&A; `cafe daemon install` on the Mac. Open:
 
-1. **Web: load older threads + search** — approved as recommended (Q67 A: "加载更早的会话" button at the bottom of 最近, 50 per click, then "没有更早的会话了"; Q68 A: search box in the filter row, results list matching sentences with the keyword highlighted, cleared box returns to the list). Prototype: https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ. **Not implemented yet — next task.** Backend: `/api/threads?before=&limit=`, `/api/search?q=`.
+1. **Web: load older threads + search** — done (Q67 A, Q68 A; prototype https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ). "加载更早的会话" fetches 50 at a time from `/api/threads?before=` and becomes "没有更早的会话了" when exhausted; a reconnect snapshot keeps already-loaded older threads (`applySnapshot` merge in `web/src/store.ts`). The search box queries `/api/search` (debounced, max 20 threads), highlights matches, hides a hit that only repeats the question title, and the status filter still applies. Checked in a browser against 230 seeded threads. The user's running daemon serves the web build it read at startup: restart it (`cafe daemon stop && cafe daemon start`) to see the new UI.
 2. Q69 (MIT license) and Q70 (keep `@earendil-works/pi-coding-agent` as optionalDependency) are done.
 3. **Publish** (the user does it): `npm version <x.y.z>` → `npm run release:pack` → check `release-out/*.tgz` → `npm publish ./release`.
 4. **Real two-machine test** (section 6). The local simulation passes; B needs `npm i -g @blrbiran/cafe` (after publishing) or the repo.
@@ -117,7 +117,7 @@ Done on 2026-11-19 with the user's approval: v2 defaults accepted; Q60–Q64 as 
 - Multi-level Daemon hierarchy (codex `parent`/AgentPath idea) — not started; only two levels exist.
 - Publishing: built and verified, not yet published (section 5).
 - SQLite FTS if `cafe search` gets slow (it scans JSONL files).
-- Web: "load older", maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
+- Web: maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
 
 ## 8. Traps already found
 

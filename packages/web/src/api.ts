@@ -50,8 +50,19 @@ export interface AgentStats {
   lastAnsweredAt?: number;
 }
 
+export interface SearchHit {
+  orderId: string;
+  who: string;
+  text: string;
+  at: number;
+}
+
 export const api = {
   snapshot: () => call<Snapshot>("GET", "/api/snapshot"),
+  /** Threads created before `before` (ms), newest first. */
+  threads: (before: number, limit: number) => call<ThreadMeta[]>("GET", `/api/threads?before=${before}&limit=${limit}`),
+  /** Full-text search over questions and answers (all threads, not only the loaded ones). */
+  search: (q: string, limit: number) => call<{ meta: ThreadMeta; hits: SearchHit[] }[]>("GET", `/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   thread: (id: string) => call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}`),
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
   createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string }) =>

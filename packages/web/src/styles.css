@@ -107,6 +107,7 @@ input, textarea, select {
   min-height: var(--control-h); line-height: 1.4; caret-color: var(--accent);
 }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+mark { background: color-mix(in srgb, var(--warn) 30%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
 input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
 input:disabled, textarea:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
 textarea { min-height: 72px; width: 100%; resize: vertical; padding: 8px 10px; line-height: 1.5; }
