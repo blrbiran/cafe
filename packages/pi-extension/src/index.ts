@@ -22,6 +22,15 @@ async function healthy(addr: string): Promise<boolean> {
   }
 }
 
+/** The `cafe` CLI entry: the installed `@cafe/cli`, else the sibling workspace package. */
+function cafeCliPath(): string {
+  try {
+    return fileURLToPath(import.meta.resolve("@cafe/cli"));
+  } catch {
+    return fileURLToPath(new URL("../../cli/src/main.ts", import.meta.url));
+  }
+}
+
 /**
  * Make sure a local Daemon is running. If `addr` is loopback and nothing answers,
  * start `cafe daemon run` detached and poll /api/health for up to `timeoutMs`.
@@ -30,7 +39,7 @@ export async function ensureDaemon(addr = daemonAddr(), timeoutMs = 5000): Promi
   if (await healthy(addr)) return true;
   const host = addr.split(":")[0];
   if (host !== "127.0.0.1" && host !== "localhost") return false;
-  const cli = fileURLToPath(new URL("../../cli/src/main.ts", import.meta.url));
+  const cli = cafeCliPath();
   // Under oh-my-pi (Bun) process.execPath is the omp binary itself: start the daemon with Node.
   const node = process.versions.bun ? (process.env.CAFE_NODE ?? "node") : process.execPath;
   const child = spawn(node, [cli, "daemon", "run"], { detached: true, stdio: "ignore", env: process.env });

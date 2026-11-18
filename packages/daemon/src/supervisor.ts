@@ -63,8 +63,14 @@ const GUARD = join(here, "proc", "guard.mjs");
 const EXIT_DRAIN_MS = 1000;
 const EXIT_NOT_FOUND = 127;
 
+/** The cafe pi extension: `CAFE_PI_EXTENSION`, else the installed `@cafe/pi-extension`, else the sibling workspace package. */
 export function defaultExtensionPath(): string {
-  return resolve(here, "../../pi-extension/src/index.ts");
+  if (process.env.CAFE_PI_EXTENSION) return process.env.CAFE_PI_EXTENSION;
+  try {
+    return fileURLToPath(import.meta.resolve("@cafe/pi-extension"));
+  } catch {
+    return resolve(here, "../../pi-extension/src/index.ts");
+  }
 }
 
 /**

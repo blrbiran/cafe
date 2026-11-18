@@ -19,8 +19,13 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
+/** The built web UI: from the installed `@cafe/web` package, else the sibling workspace package. */
 export function defaultWebDist(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
+  try {
+    return join(dirname(fileURLToPath(import.meta.resolve("@cafe/web/package.json"))), "dist");
+  } catch {
+    return resolve(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
+  }
 }
 
 /** Read the built web UI into memory once (flat, exact-match lookup; no path traversal). */
