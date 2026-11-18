@@ -198,7 +198,8 @@ export type Response<R = unknown> =
   | { id: number | string; error: { code: string; message: string } };
 export type Frame = Request | Notification | Response;
 
-export const ClientKind = z.enum(["agent", "daemon", "ui"]);
+/** `peer`: another Daemon connecting directly while the Root is offline (ADR-0004). */
+export const ClientKind = z.enum(["agent", "daemon", "ui", "peer"]);
 export type ClientKind = z.infer<typeof ClientKind>;
 
 export const InitializeParams = z.object({
@@ -266,6 +267,8 @@ export const Methods = {
   routeDecide: "route/decide",
   /** Root→Daemon: latest routing hints (not versioned; replaces the previous set). */
   hintsUpdate: "hints/update",
+  /** Daemon→Root after reconnecting: events of Threads that went direct while the Root was offline. */
+  threadBackfill: "thread/backfill",
   rootMoved: "root/moved",
   daemonsChanged: "daemons/changed",
 } as const;

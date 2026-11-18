@@ -18,7 +18,7 @@ cafe 是一个 agent 网络：任意一方发出的一条消息（Order），会
 
 - 每个 Host 一个 **Daemon**，监听单一端口（默认 4777），在该端口上提供 HTTP API、`/ws` WebSocket 与 web UI。
 - 发起方所在的 Daemon 负责做 **Routing Decision**：配置了 `router.model` 时用 LLM（通过 pi SDK）决策，否则按关键词规则。Order 原文透传，不做改写。
-- Root 在线时，所有 Order 都经 Root 中转（ADR-0001）。Root 离线时，同一 Host 内的 Order 仍可投递，跨 Host 的 Order 返回 `root_unreachable`。
+- Root 在线时，所有 Order 都经 Root 中转（ADR-0001）。Root 离线时，同一 Host 内的 Order 照常投递，跨 Host 的 Order 直连目标 Daemon（ADR-0004）；连不上才返回 `root_unreachable`。Root 恢复后，离线期间的会话会补发给它。
 - Registry 由 Root 复制到每个 Daemon（ADR-0002）。Thread 内容存放在 `~/.cafe/sessions/<date>/<threadId>.jsonl`，SQLite 里只存元数据（ADR-0003）。
 
 ## 包结构

@@ -4,6 +4,6 @@
 
 ## Consequences
 
-- Root 离线时退化为：同 Host 内的 Order 由本地 Daemon 直接投递；跨 Host 的 Order 立即返回 `root_unreachable`。
+- Root 离线时退化为：同 Host 内的 Order 由本地 Daemon 直接投递；跨 Host 的 Order ~~立即返回 `root_unreachable`~~ 改为直连目标 Daemon，见 [ADR-0004](0004-direct-links-when-root-offline.md)。
 - 同 Host 消息在 Root 在线时也多一跳延迟，这是为可观测性付出的代价。
-- Daemon 间直连（P2P）留待以后；Registry 中已记录各 Daemon 地址，便于将来切换。
+- Daemon 间直连只作为 Root 离线时的后备（ADR-0004）；Root 在线时仍全部经 Root。

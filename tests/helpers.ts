@@ -14,7 +14,8 @@ export async function startDaemon(host: string, opts: Partial<RunOptions> & { co
   const r = await runDaemon({ home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "no-web"), ...opts });
   const addr = `127.0.0.1:${r.server.port}`;
   const stop = r.stop;
-  return Object.assign(r, { home, addr, stop: async () => { await stop(); rmSync(home, { recursive: true, force: true }); } });
+  let stopped: Promise<void> | undefined;
+  return Object.assign(r, { home, addr, stop: () => (stopped ??= (async () => { await stop(); rmSync(home, { recursive: true, force: true }); })()) });
 }
 
 export function identity(name: string, extra: Partial<AgentIdentity> = {}): AgentIdentity {

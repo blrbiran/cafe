@@ -105,14 +105,16 @@ describe("restart & reconnect", () => {
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
     const b = new CafeClient({ daemon: addr, reconnect: true });
-    b.onOrder(async (h) => {
-      await h.ack();
-      const stop = keepAlive(h, 150);
-      await released;
-      await waitFor(() => b.connected, 5000);
-      await h.reply("answered after restart");
-      stop();
-    });
+    b.onOrder((h) =>
+      void (async () => {
+        await h.ack();
+        const stop = keepAlive(h, 150);
+        await released;
+        await waitFor(() => b.connected, 5000);
+        await h.reply("answered after restart");
+        stop();
+      })().catch(() => {}),
+    );
     const rec = await b.connect(identity("worker"));
     cleanup.push(() => b.close());
 

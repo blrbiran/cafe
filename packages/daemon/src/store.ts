@@ -106,6 +106,20 @@ export class Store {
     return { version: v ? Number(v.value) : 0, records: rows.map((r) => JSON.parse(r.record) as AgentRecord) };
   }
 
+  getKv<T>(key: string): T | undefined {
+    const row = this.db.prepare("SELECT value FROM kv WHERE key=?").get(key) as { value: string } | undefined;
+    if (!row) return undefined;
+    try {
+      return JSON.parse(row.value) as T;
+    } catch {
+      return undefined;
+    }
+  }
+
+  setKv(key: string, value: unknown): void {
+    this.db.prepare("INSERT INTO kv(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(value));
+  }
+
   /** One outcome per Agent per Order (answered / declined / failed), for per-agent stats. */
   recordAgentEvent(
     agentId: string,

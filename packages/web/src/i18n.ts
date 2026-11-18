@@ -93,8 +93,8 @@ const zh = {
   networkTitle: "网络",
   networkSub: "加入网络的机器，以及它们和中心节点的连接情况。",
   networkExplain:
-    "每台机器运行一个 cafe 服务，负责本机 agent 的注册和消息收发。其中一台是「中心节点」：它掌握全网 agent 名单，并转发所有问答，所以在中心节点的页面上能看到全网的对话。中心节点离线时，本机内部仍可问答，跨机器的问题会失败。",
-  hubOfflineWarn: "中心节点现在连不上：本机内部仍可问答，跨机器的问题会失败。恢复后会自动重连。",
+    "每台机器运行一个 cafe 服务，负责本机 agent 的注册和消息收发。其中一台是「中心节点」：它掌握全网 agent 名单，并转发所有问答，所以在中心节点的页面上能看到全网的对话。中心节点离线时，本机内部照常问答，跨机器的问题会直接发到对方机器；对方也连不上才会失败。中心节点恢复后，这期间的对话会补到它那里。",
+  hubOfflineWarn: "中心节点现在连不上：本机内部照常问答，跨机器的问题会直接发到对方机器。恢复后会自动重连，并补上这期间的对话。",
   childView: "这台机器不是中心节点，这里只显示本机和中心节点。打开中心节点的页面可以看到全网。",
   address: "地址",
   since: "连接于",
@@ -150,7 +150,7 @@ const zh = {
     "lost (missed heartbeats)": "长时间没有报平安，视为失联",
     "agent disconnected": "断开了连接",
     deadline: "超过等待时间",
-    root_unreachable: "中心节点不可达",
+    root_unreachable: "中心节点和对方机器都连不上",
     "no barista available": "没有可用的 agent",
   } as Record<string, string>,
 
@@ -260,8 +260,8 @@ const en: Dict = {
   networkTitle: "Network",
   networkSub: "Machines on the network and how they connect to the hub.",
   networkExplain:
-    "Each machine runs one cafe service that registers its local agents and carries their messages. One machine is the hub: it holds the list of every agent and relays every conversation, which is why its page shows the whole network. While the hub is offline, agents on the same machine can still talk; questions across machines fail.",
-  hubOfflineWarn: "The hub is unreachable right now: agents on this machine can still talk, questions across machines fail. It reconnects automatically.",
+    "Each machine runs one cafe service that registers its local agents and carries their messages. One machine is the hub: it holds the list of every agent and relays every conversation, which is why its page shows the whole network. While the hub is offline, agents on the same machine still talk, and questions across machines go straight to the other machine; they fail only if that machine is unreachable too. When the hub is back, it receives the conversations it missed.",
+  hubOfflineWarn: "The hub is unreachable right now: agents on this machine still talk, and questions across machines go straight to the other machine. It reconnects automatically and catches up on what it missed.",
   childView: "This machine is not the hub, so only this machine and the hub are shown. Open the hub's page to see the whole network.",
   address: "Address",
   since: "Connected",
@@ -314,7 +314,7 @@ const en: Dict = {
     "lost (missed heartbeats)": "stopped checking in; treated as lost",
     "agent disconnected": "disconnected",
     deadline: "ran out of time",
-    root_unreachable: "the hub is unreachable",
+    root_unreachable: "neither the hub nor the other machine is reachable",
     "no barista available": "no agent available",
   },
 

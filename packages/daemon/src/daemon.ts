@@ -51,6 +51,10 @@ export interface Timing {
   reconnectMaxMs: number;
   /** Root: how often to recompute and push routing hints when there are new outcomes. */
   hintsIntervalMs: number;
+  /** Direct links (Root offline): give up connecting to another Daemon after this long. */
+  linkConnectTimeoutMs: number;
+  /** Direct links: close an outgoing link after this long without traffic. */
+  linkIdleMs: number;
 }
 
 /** Recompute hints at least this often even without new outcomes, so time decay shows. */
@@ -126,6 +130,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private pushedHints = "";
   private hintsTimer?: ReturnType<typeof setInterval>;
 
+  // Direct links between Daemons, used only while the Root is offline (ADR-0004).
+  /** host → ws URL of other Daemons, learned from the Root and kept across restarts. */
+  private peerUrls = new Map<string, string>();
+  /** Outgoing direct links by host. */
+  private links = new Map<string, { peer: Peer; ws: WebSocket; lastUsed: number }>();
+  private linking = new Map<string, Promise<Peer>>();
+  /** Direct links taking part in each Thread (both directions). */
+  private threadLinks = new Map<string, Set<Peer>>();
+  /** Threads that went direct while the Root was offline; sent to the Root when it is back. */
+  private backfill = new Set<string>();
+  private linkSweep?: ReturnType<typeof setInterval>;
+
   constructor(opts: DaemonOptions) {
     super();
     this.config = opts.config;
@@ -140,6 +156,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       reconnectMinMs: 500,
       reconnectMaxMs: 30_000,
       hintsIntervalMs: 30_000,
+      linkConnectTimeoutMs: 3000,
+      linkIdleMs: 5 * 60_000,
       ...opts.timing,
     };
     this.router = opts.router ?? new RulesRouter();
@@ -155,6 +173,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
       this.hintsTimer.unref?.();
+    } else {
+      for (const [h, u] of Object.entries(this.store.getKv<Record<string, string>>("peerUrls") ?? {})) this.peerUrls.set(h, u);
+      for (const id of this.store.getKv<string[]>("backfill") ?? []) this.backfill.add(id);
+      this.linkSweep = setInterval(() => this.sweepLinks(), Math.min(this.timing.linkIdleMs, 60_000));
+      this.linkSweep.unref?.();
     }
   }
 
@@ -196,6 +219,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (!local && p.token !== this.config.token) throw new RpcError("unauthorized", "bad token");
       peer.meta.kind = p.kind;
       if (p.kind === "daemon") return this.onChildDaemon(peer, p);
+      if (p.kind === "peer") {
+        peer.meta.host = p.host;
+        if (p.host && p.url && !this.isRoot) this.learnPeers([{ host: p.host, url: p.url }]);
+        this.bindLink(peer);
+        return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: this.isRoot };
+      }
       if (p.kind === "ui") this.uis.add(peer);
       return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: this.isRoot };
     });
@@ -204,8 +233,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private onPeerClosed(peer: Peer): void {
     this.uis.delete(peer);
+    if (peer.meta.kind === "peer") this.dropLink(peer);
     for (const subs of this.subscribers.values()) subs.delete(peer);
-    if (peer.meta.kind === "daemon" && peer.meta.host) {
+    // A Root shutting down does not mark its children's Agents offline: they may keep working over direct links.
+    if (peer.meta.kind === "daemon" && peer.meta.host && !this.stopped) {
       const host = peer.meta.host as string;
       if (this.children.get(host) === peer) {
         this.children.delete(host);
@@ -379,7 +410,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return this.registry
       .all()
       .filter((r) => r.role === "barista" && r.status !== "offline" && !excluded.has(r.agentId))
-      .filter((r) => this.rootOnline || r.host === this.host);
+      .filter((r) => this.rootOnline || r.host === this.host || this.peerUrls.has(r.host));
   }
 
   /** Earlier turns of a Thread, oldest first, bounded for prompt size. */
@@ -435,7 +466,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.deliver(t.order, agentId);
   }
 
-  /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally. */
+  /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally or directly (ADR-0004). */
   private deliver(order: Order, agentId: string): void {
     const rec = this.registry.get(agentId);
     if (!rec) return;
@@ -451,7 +482,145 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return;
     }
     if (rec.host === this.host) return this.deliverLocal(order, agentId);
+    if (this.peerUrls.has(rec.host)) return void this.deliverDirect(order, agentId, rec.host);
     this.relayFailure(order, agentId, "root_unreachable");
+  }
+
+  // -------------------------------------------------------------------------
+  // Direct links (Root offline only, ADR-0004)
+  // -------------------------------------------------------------------------
+
+  private async deliverDirect(order: Order, agentId: string, host: string): Promise<void> {
+    try {
+      const link = await this.link(host);
+      this.joinThread(order.threadId, link);
+      this.markBackfill(order.threadId);
+      link.notify(Methods.orderRelay, { order, agentId });
+    } catch (err) {
+      this.log(`direct link to ${host} failed: ${(err as Error).message}`);
+      this.relayFailure(order, agentId, "root_unreachable");
+    }
+  }
+
+  /** An open outgoing link to `host`, connecting on demand. */
+  private link(host: string): Promise<Peer> {
+    const cur = this.links.get(host);
+    if (cur && !cur.peer.isClosed) {
+      cur.lastUsed = Date.now();
+      return Promise.resolve(cur.peer);
+    }
+    const pending = this.linking.get(host);
+    if (pending) return pending;
+    const url = this.peerUrls.get(host);
+    if (!url) return Promise.reject(new Error(`no address for ${host}`));
+    const attempt = new Promise<Peer>((resolve, reject) => {
+      const ws = new WebSocket(`${url}/ws`);
+      const peer = new Peer(ws);
+      peer.meta.kind = "peer";
+      peer.meta.host = host;
+      const timer = setTimeout(() => {
+        ws.terminate();
+        reject(new Error("connect timeout"));
+      }, this.timing.linkConnectTimeoutMs);
+      this.bindLink(peer);
+      ws.on("message", (data) => void peer.receive(data.toString()));
+      ws.on("error", () => {});
+      ws.on("close", () => {
+        clearTimeout(timer);
+        peer.closed();
+        this.dropLink(peer);
+        if (this.links.get(host)?.peer === peer) this.links.delete(host);
+        reject(new Error("connection closed"));
+      });
+      ws.on("open", async () => {
+        try {
+          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, kind: "peer", token: this.config.token, host: this.host, url: this.url() });
+          clearTimeout(timer);
+          this.links.set(host, { peer, ws, lastUsed: Date.now() });
+          this.log(`direct link to ${host} open`);
+          resolve(peer);
+        } catch (err) {
+          clearTimeout(timer);
+          ws.close();
+          reject(err as Error);
+        }
+      });
+    }).finally(() => this.linking.delete(host));
+    this.linking.set(host, attempt);
+    return attempt;
+  }
+
+  /** Handlers shared by both ends of a direct link. */
+  private bindLink(peer: Peer): void {
+    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string }) => {
+      this.joinThread(x.order.threadId, peer);
+      this.adoptOrder(x.order);
+      this.deliverLocal(x.order, x.agentId);
+    });
+    peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
+      this.touchLink(peer);
+      this.recordEvent(env, { from: peer });
+    });
+  }
+
+  private joinThread(threadId: string, peer: Peer): void {
+    let set = this.threadLinks.get(threadId);
+    if (!set) this.threadLinks.set(threadId, (set = new Set()));
+    set.add(peer);
+  }
+
+  private dropLink(peer: Peer): void {
+    for (const [id, set] of this.threadLinks) {
+      set.delete(peer);
+      if (set.size === 0) this.threadLinks.delete(id);
+    }
+  }
+
+  private touchLink(peer: Peer): void {
+    const host = peer.meta.host as string | undefined;
+    const cur = host ? this.links.get(host) : undefined;
+    if (cur?.peer === peer) cur.lastUsed = Date.now();
+  }
+
+  private sweepLinks(): void {
+    const now = Date.now();
+    for (const [host, l] of this.links) {
+      if (now - l.lastUsed < this.timing.linkIdleMs) continue;
+      this.links.delete(host);
+      l.ws.close();
+    }
+  }
+
+  private learnPeers(list: { host: string; url: string }[]): void {
+    let changed = false;
+    for (const d of list) {
+      if (d.host === this.host || !d.url || this.peerUrls.get(d.host) === d.url) continue;
+      this.peerUrls.set(d.host, d.url);
+      changed = true;
+    }
+    if (changed) this.store.setKv("peerUrls", Object.fromEntries(this.peerUrls));
+  }
+
+  private markBackfill(threadId: string): void {
+    if (this.rootOnline || this.backfill.has(threadId)) return;
+    this.backfill.add(threadId);
+    this.store.setKv("backfill", [...this.backfill]);
+  }
+
+  /** After reconnecting: give the Root the Threads it missed while we went direct. */
+  private async flushBackfill(): Promise<void> {
+    for (const id of [...this.backfill]) {
+      if (!this.rootOnline) return;
+      const meta = this.metas.get(id) ?? this.store.getThread(id);
+      try {
+        if (meta) await this.uplink!.request(Methods.threadBackfill, { events: this.store.readEvents(meta.file) }, 30_000);
+        this.backfill.delete(id);
+        this.store.setKv("backfill", [...this.backfill]);
+      } catch (err) {
+        this.log(`backfill of ${id} failed: ${(err as Error).message}`);
+        return;
+      }
+    }
   }
 
   private deliverLocal(order: Order, agentId: string): void {
@@ -603,6 +772,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
     if (this.isRoot) this.fanOutToChildren(env, opts.from);
     else if (this.rootOnline && opts.from !== this.uplink) this.uplink!.notify(Methods.threadEvent, env);
+    for (const l of this.threadLinks.get(env.threadId) ?? []) {
+      if (l === opts.from || l.isClosed) continue;
+      this.touchLink(l);
+      l.notify(Methods.threadEvent, env);
+    }
     this.emit("thread", env, meta);
     if (env.event.type === "order.cancelled") this.notifyCancelled(env);
     if (env.event.type === "order.replied" && env.event.final) this.recordOutcome(env, env.event.agentId, "answered");
@@ -874,6 +1048,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
     peer.on("agent/kick", (x: { agentId: string }) => this.kick(x.agentId));
+    peer.on(Methods.threadBackfill, (x: { events: ThreadEnvelope[] }) => {
+      // Skip events already on file (the Root may have restarted and lost its in-memory dedupe set).
+      const first = x.events[0];
+      const meta = first ? (this.metas.get(first.threadId) ?? this.store.getThread(first.threadId)) : undefined;
+      const known = new Set(meta ? this.store.readEvents(meta.file).map((e) => e.eventId) : []);
+      for (const env of x.events) if (!known.has(env.eventId)) this.recordEvent(env, { from: peer, skipTrack: true });
+      return {};
+    });
     peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[] }) => {
       const cands = x.candidates.map((id) => this.registry.get(id)).filter((r): r is AgentRecord => !!r);
       return this.router.decide({ order: x.order, candidates: cands, hints: this.hintsFor(cands) });
@@ -933,6 +1115,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.reconnectDelay = 0;
         this.setRootOnline(true);
         await peer.request("registry/sync", { records: [...this.local.values()] });
+        void this.flushBackfill();
         this.log(`connected to root ${target}`);
       } catch (err) {
         this.log(`root handshake failed: ${(err as Error).message}`);
@@ -943,6 +1126,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const remote = x.records.filter((r) => r.host !== this.host);
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
+    peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
     peer.on(Methods.hintsUpdate, (x: { hints: Record<string, RoutingHint> }) => {
       this.rootHints = x.hints;
     });
@@ -984,8 +1168,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (online) rec.connectedAt = Date.now();
     this.daemonRecords.set("__root__", rec);
     if (!online) {
-      // Remote agents become unreachable; keep them visible but offline.
-      const remote = this.registry.all().filter((r) => r.host !== this.host && r.status !== "offline");
+      // Remote agents become unreachable unless their Daemon can be reached directly (ADR-0004).
+      const remote = this.registry.all().filter((r) => r.host !== this.host && r.status !== "offline" && !this.peerUrls.has(r.host));
       if (remote.length) this.registry.upsert(remote.map((r) => ({ ...r, status: "offline" as const })));
     }
     this.emitDaemons();
@@ -1016,6 +1200,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // -------------------------------------------------------------------------
 
   daemons(): DaemonRecord[] {
+    // The listening port is only known after the server starts.
+    const self = this.daemonRecords.get(this.host);
+    if (self) self.url = this.url();
     return [...this.daemonRecords.values()];
   }
 
@@ -1023,6 +1210,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const list = this.daemons();
     this.emit("daemons", list);
     for (const ui of this.uis) ui.notify(Methods.daemonsChanged, list);
+    // Children keep every Daemon's address so they can go direct while the Root is offline (ADR-0004).
+    if (this.isRoot) for (const child of this.children.values()) child.notify(Methods.daemonsChanged, list);
   }
 
   snapshot() {
@@ -1061,6 +1250,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.removeAllListeners();
     clearTimeout(this.reconnectTimer);
     clearInterval(this.hintsTimer);
+    clearInterval(this.linkSweep);
+    for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();
     for (const t of this.tracking.values()) {
       for (const timer of t.timers.values()) clearTimeout(timer);
