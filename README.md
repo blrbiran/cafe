@@ -77,7 +77,10 @@ root: 192.168.1.10:4777    # mode=daemon 时填写
 router:
   model: anthropic/claude-haiku-4-5   # 走 pi 的 auth.json；不填则用规则路由
   fallback: rules          # rules | root（本地没有 LLM 时请 Root 代为路由）
+  learn: true              # 参考最近 7 天的婉拒记录，在描述同样匹配的 Barista 之间排先后
 ```
+
+路由主要看 Barista 的描述；`router.learn` 只是辅助：最近在类似问题上婉拒过的 Barista 会排到后面，但不会被排除，也不会盖过描述更匹配的 Barista。`cafe stats` 查看每个 Barista 最近 7 天回答、婉拒的次数和常婉拒的话题。详见 [`docs/specs/v2-1-routing-hints.md`](docs/specs/v2-1-routing-hints.md)。
 
 `cafe root set <addr>` 和 `cafe config set <k> <v>` 会同时更新文件和正在运行的 Daemon。Root 换了 IP 后，启动时会主动回连 `knownDaemons` 中记录的各 Daemon，把新地址告诉它们。
 

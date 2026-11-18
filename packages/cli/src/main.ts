@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import type { AgentRecord, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import { cafeHome, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
 
@@ -242,6 +242,21 @@ const printThreads = (list: ThreadMeta[], agents: Map<string, AgentRecord>) =>
   list
     .map((t) => `${t.status.padEnd(9)} ${t.threadId}  ${time(t.createdAt)}  ${t.from.address} → ${t.targets.map((id) => agents.get(id)?.address ?? id).join(",") || "-"}  ${t.summary.replace(/\s+/g, " ").slice(0, 60)}`)
     .join("\n") || "(no threads)";
+
+program
+  .command("stats")
+  .description("how each barista did in the last 7 days (used as a weak routing hint)")
+  .action(async () => {
+    await ensureDaemon();
+    const { learn, hints } = await api<{ learn: boolean; hints: Record<string, RoutingHint> }>("/api/routing/hints");
+    const rows = Object.values(hints).sort((a, b) => b.answered + b.declined - (a.answered + a.declined) || a.identity.localeCompare(b.identity));
+    const lines = rows.map((h) => {
+      const topics = Object.keys(h.declinedTopics).slice(0, 6).join(", ");
+      return `${h.identity.padEnd(28)} answered ${String(h.answered).padStart(3)}  declined ${String(h.declined).padStart(3)}  failed ${String(h.failed).padStart(3)}${topics ? `  declined topics: ${topics}` : ""}`;
+    });
+    const footer = learn ? "" : "\n(router.learn is off: routing ignores this history)";
+    out((lines.join("\n") || "(no answers or declines in the last 7 days)") + footer, { learn, hints });
+  });
 
 program
   .command("threads")

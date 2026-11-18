@@ -21,12 +21,14 @@ import {
   type Order,
   type Party,
   type RoutingDecision,
+  type RoutingHint,
   type ThreadEnvelope,
   type ThreadEventBody,
   type ThreadMeta,
 } from "@cafe/protocol";
 import { Peer, RpcError } from "@cafe/protocol/peer";
 import { type CafeConfig, saveConfig } from "./config.ts";
+import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints.ts";
 import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
 import { Store } from "./store.ts";
@@ -47,7 +49,12 @@ export interface Timing {
   broadcastDeadlineMs: number;
   reconnectMinMs: number;
   reconnectMaxMs: number;
+  /** Root: how often to recompute and push routing hints when there are new outcomes. */
+  hintsIntervalMs: number;
 }
+
+/** Recompute hints at least this often even without new outcomes, so time decay shows. */
+const HINTS_MAX_AGE_MS = 3600_000;
 
 /** Live delivery state of one Order on its origin Daemon. */
 interface Tracking {
@@ -110,6 +117,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private stopped = false;
   private rootHost?: string;
 
+  /** Routing hints computed from this Daemon's own outcomes (agent_events). */
+  private localHints: Record<string, RoutingHint> = {};
+  private localHintsAt = 0;
+  private hintsDirty = true;
+  /** Child side: the network-wide hints last pushed by the Root. */
+  private rootHints?: Record<string, RoutingHint>;
+  private pushedHints = "";
+  private hintsTimer?: ReturnType<typeof setInterval>;
+
   constructor(opts: DaemonOptions) {
     super();
     this.config = opts.config;
@@ -123,6 +139,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       broadcastDeadlineMs: BROADCAST_DEADLINE_MS,
       reconnectMinMs: 500,
       reconnectMaxMs: 30_000,
+      hintsIntervalMs: 30_000,
       ...opts.timing,
     };
     this.router = opts.router ?? new RulesRouter();
@@ -135,6 +152,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
     this.daemonRecords.set(this.host, { host: this.host, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now() });
+    if (this.isRoot) {
+      this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
+      this.hintsTimer.unref?.();
+    }
   }
 
   /** Initialise the LLM router if configured. Separate from the constructor because it is async. */
@@ -252,8 +273,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.orderReply, (p: { orderId: string; threadId: string; text: string; final?: boolean }) =>
       this.agentEvent(peer, p, { type: "order.replied", agentId: peer.meta.agentId, text: p.text, final: p.final ?? true }),
     );
-    peer.on(Methods.orderDecline, (p: { orderId: string; threadId: string; reason: string }) =>
-      this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason }),
+    peer.on(Methods.orderDecline, (p: { orderId: string; threadId: string; reason: string; unavailable?: boolean }) =>
+      this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason, ...(p.unavailable ? { unavailable: true } : {}) }),
     );
     peer.on(Methods.orderCancel, (p: { threadId: string }) => this.cancel(p.threadId, peer.meta.party?.address ?? "customer"));
     peer.on("thread/subscribe", (p: { threadId: string }) => {
@@ -403,7 +424,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.log(`root route/decide failed: ${(err as Error).message}`);
       }
     }
-    return this.router.decide({ order, candidates });
+    return this.router.decide({ order, candidates, hints: this.hintsFor(candidates) });
   }
 
   private dispatch(t: Tracking, agentId: string): void {
@@ -584,10 +605,67 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     else if (this.rootOnline && opts.from !== this.uplink) this.uplink!.notify(Methods.threadEvent, env);
     this.emit("thread", env, meta);
     if (env.event.type === "order.cancelled") this.notifyCancelled(env);
-    if (env.event.type === "order.replied" && env.event.final) this.store.recordAgentEvent(env.event.agentId, "answered", env.at, env.threadId);
-    else if (env.event.type === "order.declined") this.store.recordAgentEvent(env.event.agentId, "declined", env.at, env.threadId);
-    else if (env.event.type === "order.failed" && env.event.agentId) this.store.recordAgentEvent(env.event.agentId, "failed", env.at, env.threadId);
+    if (env.event.type === "order.replied" && env.event.final) this.recordOutcome(env, env.event.agentId, "answered");
+    else if (env.event.type === "order.declined") this.recordOutcome(env, env.event.agentId, "declined", env.event.unavailable);
+    else if (env.event.type === "order.failed" && env.event.agentId) this.recordOutcome(env, env.event.agentId, "failed");
     if (!opts.skipTrack) this.track(env);
+  }
+
+  /** `noTopic`: count the outcome but do not tie it to the Order's keywords (operational declines). */
+  private recordOutcome(env: ThreadEnvelope, agentId: string, kind: "answered" | "declined" | "failed", noTopic?: boolean): void {
+    const rec = this.registry.get(agentId) ?? this.local.get(agentId);
+    const order = this.knownOrders.get(env.orderId);
+    this.store.recordAgentEvent(agentId, kind, env.at, env.threadId, {
+      identity: rec ? identityOf(rec) : undefined,
+      tokens: order && !noTopic ? orderKeywords(order.body) : undefined,
+    });
+    this.hintsDirty = true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Routing hints (docs/specs/v2-1-routing-hints.md)
+  // -------------------------------------------------------------------------
+
+  /** Hints from this Daemon's own outcomes, recomputed lazily. */
+  private ownHints(): Record<string, RoutingHint> {
+    const now = Date.now();
+    if (!this.hintsDirty && now - this.localHintsAt < HINTS_MAX_AGE_MS) return this.localHints;
+    const rows = this.store.outcomes(now - HINT_WINDOW_MS).map((r) => {
+      const rec = r.identity ? undefined : (this.registry.get(r.agentId) ?? this.local.get(r.agentId));
+      return { identity: r.identity ?? (rec ? identityOf(rec) : r.agentId), kind: r.kind, at: r.at, tokens: r.tokens };
+    });
+    this.localHints = computeHints(rows, now);
+    this.localHintsAt = now;
+    this.hintsDirty = false;
+    return this.localHints;
+  }
+
+  /** Hints by identity: the Root's network-wide view while it is online, else our own. */
+  routingHints(): Record<string, RoutingHint> {
+    if (!this.isRoot && this.rootOnline && this.rootHints) return this.rootHints;
+    return this.ownHints();
+  }
+
+  private hintsFor(candidates: AgentRecord[]): Map<string, RoutingHint> | undefined {
+    if (!this.config.router.learn) return undefined;
+    const all = this.routingHints();
+    const out = new Map<string, RoutingHint>();
+    for (const c of candidates) {
+      const h = all[identityOf(c)];
+      if (h) out.set(c.agentId, h);
+    }
+    return out.size ? out : undefined;
+  }
+
+  /** Root: push hints to child Daemons when they changed. */
+  private pushHints(force?: Peer): void {
+    if (!this.isRoot) return;
+    const hints = this.ownHints();
+    const json = JSON.stringify(hints);
+    if (force) return force.notify(Methods.hintsUpdate, { hints });
+    if (json === this.pushedHints) return;
+    this.pushedHints = json;
+    for (const child of this.children.values()) child.notify(Methods.hintsUpdate, { hints });
   }
 
   /** Tell local Agents that were sent this Order that it was cancelled. Every Host in the Thread sees the event. */
@@ -798,12 +876,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on("agent/kick", (x: { agentId: string }) => this.kick(x.agentId));
     peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[] }) => {
       const cands = x.candidates.map((id) => this.registry.get(id)).filter((r): r is AgentRecord => !!r);
-      return this.router.decide({ order: x.order, candidates: cands });
+      return this.router.decide({ order: x.order, candidates: cands, hints: this.hintsFor(cands) });
     });
     this.emitDaemons();
     this.log(`daemon ${host} connected (${p.url})`);
     // Send snapshot after the initialize response.
-    queueMicrotask(() => peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all() }));
+    queueMicrotask(() => {
+      peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all() });
+      this.pushHints(peer);
+    });
     return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: true, registryVersion: this.registry.version };
   }
 
@@ -862,6 +943,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const remote = x.records.filter((r) => r.host !== this.host);
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
+    peer.on(Methods.hintsUpdate, (x: { hints: Record<string, RoutingHint> }) => {
+      this.rootHints = x.hints;
+    });
     peer.on(Methods.registryDelta, (raw) => {
       const d = RegistryDelta.parse(raw);
       if (!this.registry.applyDelta(d)) {
@@ -882,6 +966,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (this.uplinkSocket !== ws) return;
       const wasOnline = this.uplink === peer;
       this.uplink = undefined;
+      this.rootHints = undefined;
       if (wasOnline) {
         this.setRootOnline(false);
         this.log("root connection lost");
@@ -975,6 +1060,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.registry.removeAllListeners();
     this.removeAllListeners();
     clearTimeout(this.reconnectTimer);
+    clearInterval(this.hintsTimer);
     this.uplinkSocket?.close();
     for (const t of this.tracking.values()) {
       for (const timer of t.timers.values()) clearTimeout(timer);

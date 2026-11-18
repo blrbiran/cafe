@@ -1,9 +1,12 @@
-import type { AgentRecord, Order, RoutingDecision } from "@cafe/protocol";
+import type { AgentRecord, Order, RoutingDecision, RoutingHint } from "@cafe/protocol";
+import { historyPenalty, overlappingDeclines, tokenize } from "./hints.ts";
 
 export interface RouteInput {
   order: Order;
   /** Baristas eligible for this Order (already excludes the Customer and the call chain). */
   candidates: AgentRecord[];
+  /** Recent outcomes by agentId (auxiliary; absent when `router.learn` is off or there is no history). */
+  hints?: Map<string, RoutingHint>;
 }
 
 export interface Router {
@@ -11,40 +14,51 @@ export interface Router {
   decide(input: RouteInput): Promise<RoutingDecision>;
 }
 
-const WORD = /[\p{L}\p{N}_-]+/gu;
-
-function tokens(s: string): Set<string> {
-  return new Set((s.toLowerCase().match(WORD) ?? []).filter((t) => t.length > 1));
+/** True if every token of `phrase` is in `body` (a CJK tag like "数据库" becomes the bigrams 数据 + 据库). */
+function mentions(body: Set<string>, phrase: string): boolean {
+  const t = tokenize(phrase);
+  if (t.size === 0) return false;
+  for (const x of t) if (!body.has(x)) return false;
+  return true;
 }
 
 /**
  * Deterministic fallback: keyword overlap between the Order body and each
  * Barista's name/tags/description/scope. No match → broadcast.
+ *
+ * Ranking is (description score, then idle bonus minus history penalty). The
+ * penalty is < 1, so history only reorders Baristas that tie on the description.
  */
 export class RulesRouter implements Router {
   readonly name = "rules" as const;
 
-  async decide({ order, candidates }: RouteInput): Promise<RoutingDecision> {
+  async decide({ order, candidates, hints }: RouteInput): Promise<RoutingDecision> {
     if (candidates.length === 0) return { targets: [], mode: "broadcast", reason: "no eligible baristas", router: "rules", candidates: [] };
-    const body = tokens(order.body);
+    const body = tokenize(order.body);
     const scored = candidates
       .map((c) => {
         let score = 0;
-        if (body.has(c.name.toLowerCase())) score += 5;
-        for (const t of c.tags) if (body.has(t.toLowerCase())) score += 3;
-        for (const t of tokens(`${c.description} ${c.scope.join(" ")}`)) if (body.has(t)) score += 1;
-        if (c.status === "idle") score += 0.5;
-        return { c, score };
+        if (mentions(body, c.name)) score += 5;
+        for (const t of c.tags) if (mentions(body, t)) score += 3;
+        for (const t of tokenize(`${c.description} ${c.scope.join(" ")}`)) if (body.has(t)) score += 1;
+        const penalty = historyPenalty(hints?.get(c.agentId), body);
+        const tiebreak = (c.status === "idle" ? 0.5 : 0) - penalty;
+        return { c, score, penalty, tiebreak };
       })
-      .sort((a, b) => b.score - a.score);
-    const best = scored[0]!;
-    if (best.score >= 1) {
+      .sort((a, b) => b.score - a.score || b.tiebreak - a.tiebreak);
+    const matched = scored.filter((s) => s.score >= 1);
+    const best = matched[0];
+    if (best) {
+      const demoted = matched.filter((s) => s.penalty > 0);
+      const history = demoted.length
+        ? `; history: ${demoted.map((s) => `${s.c.address} declined similar orders`).join(", ")}`
+        : "";
       return {
         targets: [best.c.agentId],
         mode: "unicast",
-        reason: `keyword match (score ${best.score}) on ${best.c.address}`,
+        reason: `keyword match (score ${best.score}) on ${best.c.address}${history}`,
         router: "rules",
-        candidates: scored.slice(1).filter((s) => s.score >= 1).map((s) => s.c.agentId),
+        candidates: matched.slice(1).map((s) => s.c.agentId),
       };
     }
     return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "no barista matched; broadcasting", router: "rules", candidates: [] };
@@ -61,7 +75,9 @@ Respond with ONLY a JSON object:
 - unicast: exactly one clearly responsible Barista.
 - multicast: a few Baristas each own part of the answer.
 - broadcast: you cannot tell; targets = all Baristas.
-- candidates: ordered fallbacks if the unicast target does not acknowledge.`;
+- candidates: ordered fallbacks if the unicast target does not acknowledge.
+Decide mainly from each Barista's description, tags and scope. A "history" line, when present, is only a weak hint:
+use it to choose between Baristas that fit about equally well, never to skip a Barista that clearly fits better.`;
 
 /** LLM-backed router. `complete` is injected so tests can use a fake model. */
 export class LlmRouter implements Router {
@@ -75,10 +91,15 @@ export class LlmRouter implements Router {
   }
 
   async decide(input: RouteInput): Promise<RoutingDecision> {
-    const { order, candidates } = input;
+    const { order, candidates, hints } = input;
     if (candidates.length === 0) return this.fallback.decide(input);
+    const body = tokenize(order.body);
     const list = candidates
-      .map((c) => `- agentId: ${c.agentId}\n  address: ${c.address}\n  status: ${c.status}\n  tags: ${c.tags.join(", ")}\n  scope: ${c.scope.join(", ")}\n  description: ${c.description}`)
+      .map((c) => {
+        const declined = overlappingDeclines(hints?.get(c.agentId), body).slice(0, 5);
+        const history = declined.length ? `\n  history (weak hint): recently declined orders about ${declined.join(", ")}` : "";
+        return `- agentId: ${c.agentId}\n  address: ${c.address}\n  status: ${c.status}\n  tags: ${c.tags.join(", ")}\n  scope: ${c.scope.join(", ")}\n  description: ${c.description}${history}`;
+      })
       .join("\n");
     const prompt = `Order from ${order.from.address}:\n"""\n${order.body}\n"""\n\nBaristas:\n${list}`;
     try {

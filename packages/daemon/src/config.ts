@@ -20,6 +20,8 @@ export const CafeConfig = z.object({
       /** `provider/model`, resolved through pi's ModelRuntime. Unset = rules only. */
       model: z.string().optional(),
       fallback: z.enum(["rules", "root"]).default("rules"),
+      /** Use recent declines as a weak tie-breaker between Baristas (docs/specs/v2-1-routing-hints.md). */
+      learn: z.boolean().default(true),
     })
     .default({}),
   /** Root only: last known URLs of Daemons, for dial-back after the Root moves. */
@@ -59,7 +61,7 @@ export function setConfigValue(key: string, value: string, home = cafeHome()): C
   let obj = cfg;
   for (const p of parts.slice(0, -1)) obj = obj[p] ??= {};
   const last = parts.at(-1)!;
-  obj[last] = /^\d+$/.test(value) ? Number(value) : value === "" ? undefined : value;
+  obj[last] = /^\d+$/.test(value) ? Number(value) : value === "true" ? true : value === "false" ? false : value === "" ? undefined : value;
   const next = CafeConfig.parse(cfg);
   saveConfig(next, home);
   return next;

@@ -27,7 +27,8 @@ export interface OrderHandle {
   ack(): Promise<void>;
   heartbeat(note?: string): Promise<void>;
   reply(text: string, final?: boolean): Promise<void>;
-  decline(reason: string): Promise<void>;
+  /** `unavailable`: declined for an operational reason (timeout, shutdown, crash), not because the topic is not ours. */
+  decline(reason: string, opts?: { unavailable?: boolean }): Promise<void>;
 }
 
 type Listener<T> = (x: T) => void;
@@ -142,7 +143,7 @@ export class CafeClient {
       ack: () => this.req(Methods.orderAck, base),
       heartbeat: (note) => this.req(Methods.orderHeartbeat, { ...base, note }),
       reply: (text, final = true) => this.req(Methods.orderReply, { ...base, text, final }),
-      decline: (reason) => this.req(Methods.orderDecline, { ...base, reason }),
+      decline: (reason, opts) => this.req(Methods.orderDecline, { ...base, reason, ...(opts?.unavailable ? { unavailable: true } : {}) }),
     };
   }
 

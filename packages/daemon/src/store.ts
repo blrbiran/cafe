@@ -37,6 +37,10 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS agent_events_at ON agent_events(at);
     `);
+    // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
+    const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
+    if (!cols.has("identity")) this.db.exec("ALTER TABLE agent_events ADD COLUMN identity TEXT");
+    if (!cols.has("tokens")) this.db.exec("ALTER TABLE agent_events ADD COLUMN tokens TEXT");
   }
 
   threadFile(threadId: string, createdAt: number): string {
@@ -103,8 +107,26 @@ export class Store {
   }
 
   /** One outcome per Agent per Order (answered / declined / failed), for per-agent stats. */
-  recordAgentEvent(agentId: string, kind: "answered" | "declined" | "failed", at: number, threadId: string): void {
-    this.db.prepare("INSERT INTO agent_events(agent_id, kind, at, thread_id) VALUES (?, ?, ?, ?)").run(agentId, kind, at, threadId);
+  recordAgentEvent(
+    agentId: string,
+    kind: "answered" | "declined" | "failed",
+    at: number,
+    threadId: string,
+    extra: { identity?: string; tokens?: string[] } = {},
+  ): void {
+    this.db
+      .prepare("INSERT INTO agent_events(agent_id, kind, at, thread_id, identity, tokens) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(agentId, kind, at, threadId, extra.identity ?? null, extra.tokens?.length ? extra.tokens.join(" ") : null);
+  }
+
+  /** Outcomes since `since`, for routing hints. `identity` is null on rows written before v2. */
+  outcomes(since: number): { agentId: string; identity: string | null; kind: "answered" | "declined" | "failed"; at: number; tokens: string[] }[] {
+    const rows = this.db
+      .prepare("SELECT agent_id, identity, kind, at, tokens FROM agent_events WHERE at >= ?")
+      .all(since) as { agent_id: string; identity: string | null; kind: string; at: number; tokens: string | null }[];
+    return rows
+      .filter((r) => r.kind === "answered" || r.kind === "declined" || r.kind === "failed")
+      .map((r) => ({ agentId: r.agent_id, identity: r.identity, kind: r.kind as "answered", at: r.at, tokens: r.tokens ? r.tokens.split(" ") : [] }));
   }
 
   agentStats(since: number): Record<string, { answered: number; declined: number; failed: number; lastAnsweredAt?: number }> {

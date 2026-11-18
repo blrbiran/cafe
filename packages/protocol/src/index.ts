@@ -114,6 +114,17 @@ export const RoutingDecision = z.object({
 });
 export type RoutingDecision = z.infer<typeof RoutingDecision>;
 
+/** Recent outcomes of one Barista identity (`name@host`), an auxiliary routing signal. */
+export const RoutingHint = z.object({
+  identity: z.string(),
+  answered: z.number(),
+  declined: z.number(),
+  failed: z.number(),
+  /** keyword → time-decayed weight of recent declines mentioning it. */
+  declinedTopics: z.record(z.string(), z.number()),
+});
+export type RoutingHint = z.infer<typeof RoutingHint>;
+
 export const ThreadStatus = z.enum(["routing", "delivering", "working", "done", "failed", "cancelled"]);
 export type ThreadStatus = z.infer<typeof ThreadStatus>;
 
@@ -125,7 +136,8 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.acked"), agentId: z.string() }),
   z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), note: z.string().optional() }),
   z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean() }),
-  z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string() }),
+  /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
+  z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional() }),
   z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string() }),
   z.object({ type: z.literal("order.cancelled"), by: z.string() }),
   /** One Order finished. The Thread stays open for Follow-ups. */
@@ -250,6 +262,8 @@ export const Methods = {
   registryUpsert: "registry/upsert",
   registryRemove: "registry/remove",
   routeDecide: "route/decide",
+  /** Root→Daemon: latest routing hints (not versioned; replaces the previous set). */
+  hintsUpdate: "hints/update",
   rootMoved: "root/moved",
   daemonsChanged: "daemons/changed",
 } as const;

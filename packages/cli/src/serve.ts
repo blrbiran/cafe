@@ -82,17 +82,17 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
       if (result.cancelled) return log(`✗ cancelled ${h.order.orderId}`);
       const text = result.stdout.trim();
       if (result.code !== 0) {
-        await h.decline(`command failed (exit ${result.code}${result.timedOut ? ", timed out" : ""}): ${result.stderr.trim().slice(-300) || "no output"}`);
+        await h.decline(`command failed (exit ${result.code}${result.timedOut ? ", timed out" : ""}): ${result.stderr.trim().slice(-300) || "no output"}`, { unavailable: true });
       } else if (text.startsWith(DECLINE_MARKER)) {
         await h.decline(text.slice(DECLINE_MARKER.length).trim() || "not mine");
       } else if (!text) {
-        await h.decline("command produced no output");
+        await h.decline("command produced no output", { unavailable: true });
       } else {
         await h.reply(text);
       }
       log(`← ${h.order.orderId} (${result.code === 0 ? "ok" : `exit ${result.code}`})`);
     } catch (err) {
-      await h.decline(`could not run command: ${(err as Error).message}`).catch(() => {});
+      await h.decline(`could not run command: ${(err as Error).message}`, { unavailable: true }).catch(() => {});
     } finally {
       stopBeat();
       running.delete(h.order.orderId);

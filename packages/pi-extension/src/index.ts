@@ -265,7 +265,7 @@ export default function cafe(pi: ExtensionAPI) {
       const waited = Date.now() - startedAt;
       if (waited >= ms && isIdle()) {
         release(w);
-        void persist(() => w.handle.decline(`not picked up by the agent within ${Math.round(ms / 1000)}s`), 3).catch(() => {});
+        void persist(() => w.handle.decline(`not picked up by the agent within ${Math.round(ms / 1000)}s`, { unavailable: true }), 3).catch(() => {});
         void drain();
         return;
       }
@@ -302,7 +302,7 @@ export default function cafe(pi: ExtensionAPI) {
     if (!w) return;
     release(w);
     if (w.declined) return;
-    if (!w.lastText && aborted) await persist(() => w.handle.decline("aborted by the operator")).catch(() => {});
+    if (!w.lastText && aborted) await persist(() => w.handle.decline("aborted by the operator", { unavailable: true })).catch(() => {});
     else await persist(() => w.handle.reply(w.lastText ?? "(no answer produced)", true)).catch(() => {});
   }
 
@@ -350,11 +350,11 @@ export default function cafe(pi: ExtensionAPI) {
     if (current) {
       const w = current;
       release(w);
-      await w.handle.decline("agent session shutting down").catch(() => {});
+      await w.handle.decline("agent session shutting down", { unavailable: true }).catch(() => {});
     }
     for (const q of queue.splice(0)) {
       q.stopHeartbeat();
-      await q.handle.decline("agent session shutting down").catch(() => {});
+      await q.handle.decline("agent session shutting down", { unavailable: true }).catch(() => {});
     }
     c?.close();
   });

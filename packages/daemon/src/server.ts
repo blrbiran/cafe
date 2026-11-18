@@ -132,6 +132,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const since = Number(url.searchParams.get("since") ?? Date.now() - 24 * 3600_000);
     return send(res, 200, daemon.store.agentStats(since));
   }
+  if (m === "GET" && path === "/api/routing/hints") return send(res, 200, { learn: daemon.config.router.learn, hints: daemon.routingHints() });
   if (m === "GET" && path === "/api/daemons") return send(res, 200, daemon.daemons());
   if (m === "GET" && path === "/api/threads") {
     return send(res, 200, daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined));
