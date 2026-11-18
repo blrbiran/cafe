@@ -115,6 +115,14 @@ export default function cafe(pi: ExtensionAPI) {
   let registry: AgentRecord[] = [];
 
   const addrOf = (id: string) => registry.find((r) => r.agentId === id)?.address ?? id;
+  /** Refresh the Registry cache used to show Addresses instead of agent ids. */
+  const refreshRegistry = async (c: CafeClient) => {
+    try {
+      registry = await c.agents();
+    } catch {
+      // best effort
+    }
+  };
   const isIdle = () => {
     try {
       return ctxRef?.isIdle() ?? true;
@@ -214,7 +222,10 @@ export default function cafe(pi: ExtensionAPI) {
       void drain();
     });
     c.onThreadEvent(onThreadEvent);
-    c.onConnect((rec) => setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe"));
+    c.onConnect((rec) => {
+      setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");
+      void refreshRegistry(c);
+    });
     try {
       await c.connect({ ...id, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", cwd: ctx.cwd, pid: process.pid });
       client = c;
@@ -321,12 +332,14 @@ export default function cafe(pi: ExtensionAPI) {
       const c = requireClient();
       const parentOrderId = current?.handle.order.orderId;
       if (!params.wait) {
+        await refreshRegistry(c);
         const res = await c.ask({ body: params.body, to: params.to, parentOrderId });
         track(res.threadId, {});
         return text(
           `Order sent (thread ${res.threadId}). Routed ${res.decision.mode} to ${res.decision.targets.map(addrOf).join(", ") || "nobody"}: ${res.decision.reason}. Replies will arrive as cafe-reply messages.`,
         );
       }
+      await refreshRegistry(c);
       const replies: string[] = [];
       let threadId = "";
       const closed = new Promise<string>((resolve, reject) => {
