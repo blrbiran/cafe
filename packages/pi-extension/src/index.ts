@@ -120,6 +120,22 @@ interface Working {
   /** A human message arrived after ours: later assistant text answers the human, not the Order. */
   frozen: boolean;
   lastText?: string;
+  /** Inject watchdog (cleared once the message is seen). */
+  watchdog?: ReturnType<typeof setTimeout>;
+}
+
+const DEFAULT_INJECT_TIMEOUT_MS = 120_000;
+
+/** Heartbeat interval for Orders held by this agent. Env: CAFE_HEARTBEAT_MS (tests). */
+function heartbeatMs(): number | undefined {
+  const v = Number(process.env.CAFE_HEARTBEAT_MS);
+  return Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+/** How long an injected Order may wait unprocessed while pi is idle. Env: CAFE_INJECT_TIMEOUT_MS. */
+export function injectTimeoutMs(): number {
+  const v = Number(process.env.CAFE_INJECT_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_INJECT_TIMEOUT_MS;
 }
 
 /** True if `m` is the injected cafe-order custom message for `orderId` (pi CustomMessage shape). */
@@ -148,7 +164,8 @@ export default function cafe(pi: ExtensionAPI) {
   let client: CafeClient | undefined;
   let ctxRef: ExtensionContext | undefined;
   let role: "barista" | "customer" = "customer";
-  const queue: OrderHandle[] = [];
+  /** Received Orders waiting their turn; acked and heartbeating from arrival. */
+  const queue: Array<{ handle: OrderHandle; stopHeartbeat: () => void }> = [];
   let current: Working | undefined;
   let draining = false;
   /** Open Orders this session asked: threadId → the Order (and its waiter in wait mode). */
@@ -216,11 +233,11 @@ export default function cafe(pi: ExtensionAPI) {
     }
     draining = true;
     try {
-      await next.ack().catch(() => {});
-      current = { handle: next, stopHeartbeat: keepAlive(next), declined: false, seen: false, frozen: false };
+      current = { handle: next.handle, stopHeartbeat: next.stopHeartbeat, declined: false, seen: false, frozen: false };
+      armWatchdog(current, injectTimeoutMs());
       void client.setStatus("busy").catch(() => {});
       pi.sendMessage(
-        { customType: "cafe-order", content: orderPrompt(next.order, client.record), display: true, details: { order: next.order } },
+        { customType: "cafe-order", content: orderPrompt(next.handle.order, client.record), display: true, details: { order: next.handle.order } },
         { triggerTurn: true, deliverAs: "followUp" },
       );
     } finally {
@@ -228,11 +245,62 @@ export default function cafe(pi: ExtensionAPI) {
     }
   }
 
+  /** Drop `w` as the current Order without replying (timeout, cancel, shutdown). */
+  function release(w: Working): void {
+    if (current === w) current = undefined;
+    w.stopHeartbeat();
+    clearTimeout(w.watchdog);
+  }
+
+  /**
+   * Stuck-order watchdog: if pi never processes the injected message (it never reaches
+   * message_end) and pi sits idle past the timeout, decline and move on. While pi is busy
+   * the message may legitimately be queued behind other work, so re-check later. Once the
+   * message is seen the watchdog is off: long work is covered by heartbeats.
+   */
+  function armWatchdog(w: Working, ms: number): void {
+    const startedAt = Date.now();
+    const check = () => {
+      if (current !== w || w.seen) return;
+      const waited = Date.now() - startedAt;
+      if (waited >= ms && isIdle()) {
+        release(w);
+        void persist(() => w.handle.decline(`not picked up by the agent within ${Math.round(ms / 1000)}s`), 3).catch(() => {});
+        void drain();
+        return;
+      }
+      w.watchdog = setTimeout(check, waited >= ms ? Math.max(250, ms / 4) : ms - waited);
+    };
+    w.watchdog = setTimeout(check, ms);
+  }
+
+  function onCancelled(x: { orderId: string; threadId: string; by: string }): void {
+    const i = queue.findIndex((q) => q.handle.order.orderId === x.orderId);
+    if (i >= 0) {
+      // Still queued: the daemon already closed it; drop silently.
+      queue.splice(i, 1)[0]!.stopHeartbeat();
+      return;
+    }
+    const w = current;
+    if (!w || w.handle.order.orderId !== x.orderId) return;
+    w.declined = true; // never reply
+    release(w);
+    if (ctxRef?.hasUI) ctxRef.ui.notify(`☕ cafe Order from ${w.handle.order.from.address} was cancelled by ${x.by}`, "warning");
+    // Abort only the run that is working on this Order; a not-yet-processed message
+    // may still sit behind a human's run, which must not be interrupted.
+    if (w.seen && !isIdle()) {
+      try {
+        ctxRef?.abort();
+      } catch {
+        // stale ctx
+      }
+    } else void drain();
+  }
+
   async function finish(aborted: boolean): Promise<void> {
     const w = current;
     if (!w) return;
-    current = undefined;
-    w.stopHeartbeat();
+    release(w);
     if (w.declined) return;
     if (!w.lastText && aborted) await persist(() => w.handle.decline("aborted by the operator")).catch(() => {});
     else await persist(() => w.handle.reply(w.lastText ?? "(no answer produced)", true)).catch(() => {});
@@ -256,10 +324,14 @@ export default function cafe(pi: ExtensionAPI) {
     c.onOrder((h) => {
       if (known.has(h.order.orderId)) return;
       known.add(h.order.orderId);
-      queue.push(h);
+      // Ack on receipt (delivery confirmation) and heartbeat while queued, so an Order
+      // waiting behind long work is not failed by the daemon's ack/heartbeat timers.
+      void persist(() => h.ack(), 3).catch(() => {});
+      queue.push({ handle: h, stopHeartbeat: keepAlive(h, heartbeatMs()) });
       void drain();
     });
     c.onThreadEvent(onThreadEvent);
+    c.onCancel(onCancelled);
     c.onConnect((rec) => {
       setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");
       void refreshRegistry(c);
@@ -276,11 +348,14 @@ export default function cafe(pi: ExtensionAPI) {
     const c = client;
     client = undefined;
     if (current) {
-      current.stopHeartbeat();
-      await current.handle.decline("agent session shutting down").catch(() => {});
-      current = undefined;
+      const w = current;
+      release(w);
+      await w.handle.decline("agent session shutting down").catch(() => {});
     }
-    for (const h of queue.splice(0)) await h.decline("agent session shutting down").catch(() => {});
+    for (const q of queue.splice(0)) {
+      q.stopHeartbeat();
+      await q.handle.decline("agent session shutting down").catch(() => {});
+    }
     c?.close();
   });
 
@@ -298,6 +373,7 @@ export default function cafe(pi: ExtensionAPI) {
     const m = event.message as { role?: string };
     if (isOrderMessage(m, w.handle.order.orderId)) {
       w.seen = true;
+      clearTimeout(w.watchdog);
       w.frozen = false;
       w.lastText = undefined;
       return;

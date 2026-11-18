@@ -56,6 +56,12 @@ pi -e /path/to/cafe/packages/pi-extension/src/index.ts
 # 或在 ~/.pi/agent/settings.json 的 "extensions" 中加入该路径
 ```
 
+让 Claude Code / Codex / 任意脚本当 Barista（每个问题跑一次命令，prompt 走 stdin，stdout 即回答，输出 `CAFE_DECLINE: 原因` 表示婉拒）：
+
+```bash
+cafe serve --preset claude --dir ~/code/billing    # 或 --preset codex，或 --exec "<任意命令>"
+```
+
 给 Claude Code / Codex 安装 skill：`cafe skill install`。它会创建软链 `~/.claude/skills/cafe` 和 `~/.agents/skills/cafe`。
 
 ## 配置
@@ -79,5 +85,4 @@ router:
 
 - Daemon 之间直连（P2P）、三级及以上层级、mDNS 自动发现
 - oh-my-pi 扩展适配
-- `cafe serve --exec`：让 Claude Code / Codex 以 Barista 身份接单
 - 开机自启（launchd）、Thread 数据清理、全文检索

@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/main.ts"
+    ".": "./src/main.ts",
+    "./serve": "./src/serve.ts"
   },
   "bin": {
     "cafe": "./bin/cafe.js"

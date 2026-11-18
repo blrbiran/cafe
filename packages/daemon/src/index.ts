@@ -11,7 +11,7 @@ export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";
 export { Store } from "./store.ts";
-export { Supervisor, defaultExtensionPath, type BaristaSpec, type WorkerInfo } from "./supervisor.ts";
+export { Supervisor, defaultExtensionPath, type BaristaSpec, type SupervisorOptions, type WorkerInfo } from "./supervisor.ts";
 
 function alive(pid: number): boolean {
   try {
@@ -91,7 +91,9 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   daemon.log(`listening on :${server.port} as ${config.mode} (${daemon.url()})`);
   if (!opts.noSupervisor) {
     daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token });
-    daemon.supervisor.restore();
+    const { reaped, skipped } = await daemon.supervisor.restore();
+    if (reaped) daemon.log(`reaped ${reaped} barista worker group(s) left by a previous daemon`);
+    for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);
   }
   daemon.recover();
   daemon.connectRoot();
@@ -100,7 +102,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
     daemon,
     server,
     async stop() {
-      daemon.supervisor?.shutdown();
+      await daemon.supervisor?.shutdown();
       daemon.stop();
       await server.close();
       release();

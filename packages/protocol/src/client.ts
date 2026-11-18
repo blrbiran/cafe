@@ -44,6 +44,7 @@ export class CafeClient {
   private closedByUser = false;
   private retry = 0;
   private orderListeners = new Set<Listener<OrderHandle>>();
+  private cancelListeners = new Set<Listener<{ orderId: string; threadId: string; by: string }>>();
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
   private connectListeners = new Set<Listener<AgentRecord | undefined>>();
   record?: AgentRecord;
@@ -54,6 +55,12 @@ export class CafeClient {
 
   get connected(): boolean {
     return !!this.peer && !this.peer.isClosed;
+  }
+
+  /** An Order delivered to this Agent was cancelled by its Customer; stop working on it. */
+  onCancel(fn: Listener<{ orderId: string; threadId: string; by: string }>): () => void {
+    this.cancelListeners.add(fn);
+    return () => this.cancelListeners.delete(fn);
   }
 
   onOrder(fn: Listener<OrderHandle>): () => void {
@@ -84,6 +91,9 @@ export class CafeClient {
       this.ws = ws;
       const peer = new Peer(ws);
       let settled = false;
+      peer.on(Methods.orderCancelled, (x: { orderId: string; threadId: string; by: string }) => {
+        for (const fn of this.cancelListeners) fn(x);
+      });
       peer.on(Methods.orderDeliver, ({ order }: { order: Order }) => {
         const h = this.handle(order);
         for (const fn of this.orderListeners) fn(h);

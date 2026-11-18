@@ -43,6 +43,13 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return data as T;
 }
 
+export interface AgentStats {
+  answered: number;
+  declined: number;
+  failed: number;
+  lastAnsweredAt?: number;
+}
+
 export const api = {
   snapshot: () => call<Snapshot>("GET", "/api/snapshot"),
   thread: (id: string) => call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}`),
@@ -51,6 +58,7 @@ export const api = {
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web" }),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),
+  agentStats: (since: number) => call<Record<string, AgentStats>>("GET", `/api/agents/stats?since=${since}`),
 };
 
 export function wsUrl(): string {

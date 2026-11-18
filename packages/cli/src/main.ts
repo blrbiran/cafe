@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import { cafeHome, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
+import { PRESETS, serve } from "./serve.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAIN = fileURLToPath(import.meta.url);
@@ -331,6 +332,26 @@ barista.command("list").action(async () => {
   const ws = await api<any[]>("/api/baristas");
   out(ws.map((w) => `${w.running ? "running" : "waiting"} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n") || "(none)", ws);
 });
+
+program
+  .command("serve")
+  .description("be a Barista by running a command per question (prompt on stdin, answer on stdout)")
+  .option("--exec <cmd>", "shell command; use {prompt_file} to get the prompt as a file instead of stdin")
+  .option("--preset <name>", `ready-made command: ${Object.keys(PRESETS).join(", ")}`)
+  .option("--dir <dir>", "directory whose .cafe gives the identity (and where the command runs)", process.cwd())
+  .option("--timeout <ms>", "kill the command after this long (default: no limit)", Number)
+  .action(async (o) => {
+    const cmd = o.exec ?? (o.preset ? PRESETS[o.preset] : undefined);
+    if (!cmd) throw new Error(`pass --exec "<cmd>" or --preset ${Object.keys(PRESETS).join("|")}`);
+    await ensureDaemon();
+    const { stop } = await serve({ exec: cmd, dir: o.dir, daemon: base().replace(/^http:\/\//, ""), token: process.env.CAFE_TOKEN, timeoutMs: o.timeout });
+    const quit = () => {
+      stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", quit);
+    process.on("SIGTERM", quit);
+  });
 
 program
   .command("skill")

@@ -128,6 +128,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid });
   if (m === "GET" && path === "/api/snapshot") return send(res, 200, daemon.snapshot());
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
+  if (m === "GET" && path === "/api/agents/stats") {
+    const since = Number(url.searchParams.get("since") ?? Date.now() - 24 * 3600_000);
+    return send(res, 200, daemon.store.agentStats(since));
+  }
   if (m === "GET" && path === "/api/daemons") return send(res, 200, daemon.daemons());
   if (m === "GET" && path === "/api/threads") {
     return send(res, 200, daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined));

@@ -236,6 +236,8 @@ export const Methods = {
   agentsList: "agents/list",
   orderCreate: "order/create",
   orderDeliver: "order/deliver",
+  /** D→A: an Order you were working on was cancelled by its Customer. */
+  orderCancelled: "order/cancelled",
   orderAck: "order/ack",
   orderHeartbeat: "order/heartbeat",
   orderReply: "order/reply",

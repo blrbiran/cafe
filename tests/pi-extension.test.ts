@@ -27,18 +27,23 @@ function fakePi() {
   };
   let idle = true;
   const statuses: Array<string | undefined> = [];
+  const notices: string[] = [];
+  let aborts = 0;
   const ctx = (cwd: string) => ({
     cwd,
-    hasUI: false,
-    mode: "print",
+    hasUI: true,
+    mode: "rpc",
     isIdle: () => idle,
-    ui: { setStatus: (_k: string, t: string | undefined) => statuses.push(t), confirm: async () => true },
+    abort: () => void aborts++,
+    ui: { setStatus: (_k: string, t: string | undefined) => statuses.push(t), confirm: async () => true, notify: (m: string) => void notices.push(m) },
   });
   return {
     api,
     tools,
     sent,
     statuses,
+    notices,
+    aborts: () => aborts,
     setIdle: (v: boolean) => (idle = v),
     async fire(event: string, payload: any, cwd: string) {
       for (const h of handlers.get(event) ?? []) await h(payload, ctx(cwd));
@@ -57,6 +62,7 @@ function asCustom(sent: { message: any }) {
 const cleanup: Array<() => unknown> = [];
 let dir: string;
 beforeEach(() => {
+  process.env.CAFE_HEARTBEAT_MS = "100";
   dir = mkdtempSync(join(tmpdir(), "cafe-ext-"));
   writeFileSync(join(dir, ".cafe"), "name: widgets\ndescription: owns the widget service\ntags: [widgets]\n");
 });
@@ -64,6 +70,8 @@ afterEach(async () => {
   while (cleanup.length) await cleanup.pop()!();
   rmSync(dir, { recursive: true, force: true });
   delete process.env.CAFE_DAEMON;
+  delete process.env.CAFE_INJECT_TIMEOUT_MS;
+  delete process.env.CAFE_HEARTBEAT_MS;
 });
 
 async function setup() {
@@ -252,5 +260,92 @@ describe("pi extension", () => {
     expect(orderPrompt(order)).toContain("--- new message ---\nnext?");
     expect(isOrderMessage({ role: "custom", customType: "cafe-order", details: { order } }, "o2")).toBe(true);
     expect(isOrderMessage({ role: "custom", customType: "cafe-order", details: { order } }, "o1")).toBe(false);
+  });
+  it("watchdog: an injected Order pi never processes is declined after the timeout and the next one proceeds", async () => {
+    process.env.CAFE_INJECT_TIMEOUT_MS = "300";
+    const { pi, c } = await setup();
+    const a = await c.ask({ body: "first", to: "widgets@root" });
+    await waitFor(() => orders(pi).length === 1);
+    const aClosed = untilClosed(c, a.threadId);
+    const b = await c.ask({ body: "second", to: "widgets@root" });
+    const aEvents = await aClosed;
+    expect(aEvents.find((e) => e.event.type === "order.declined")?.event).toMatchObject({ reason: expect.stringMatching(/not picked up/) });
+    await waitFor(() => orders(pi).length === 2);
+    expect(orders(pi)[1]!.message.content).toContain("second");
+    const bClosed = untilClosed(c, b.threadId);
+    await runTurn(pi, "second answer");
+    expect((await bClosed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "second answer" });
+  });
+
+  it("watchdog does not fire while pi is busy or once the Order is being worked on", async () => {
+    process.env.CAFE_INJECT_TIMEOUT_MS = "200";
+    const { pi, c } = await setup();
+    const res = await c.ask({ body: "slow one", to: "widgets@root" });
+    await waitFor(() => orders(pi).length === 1);
+    let declined = false;
+    c.onThreadEvent((e) => {
+      if (e.threadId === res.threadId && e.event.type === "order.declined") declined = true;
+    });
+    // pi busy with a human run: our follow-up message is legitimately waiting.
+    pi.setIdle(false);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(declined).toBe(false);
+    // The message is processed; long work after that is not timed out.
+    await pi.fire("agent_start", { type: "agent_start" }, dir);
+    await pi.fire("message_end", { type: "message_end", message: asCustom(orders(pi)[0]!) }, dir);
+    pi.setIdle(true);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(declined).toBe(false);
+    const closed = untilClosed(c, res.threadId);
+    await pi.fire("message_end", { type: "message_end", message: assistant("slow answer") }, dir);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    expect((await closed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "slow answer" });
+  });
+
+  it("cancel while queued: dropped silently, never injected", async () => {
+    const { pi, c } = await setup();
+    pi.setIdle(false);
+    const res = await c.ask({ body: "queued", to: "widgets@root" });
+    await new Promise((r) => setTimeout(r, 100));
+    const events: string[] = [];
+    c.onThreadEvent((e) => {
+      if (e.threadId === res.threadId) events.push(e.event.type);
+    });
+    await c.cancel(res.threadId);
+    await new Promise((r) => setTimeout(r, 100));
+    pi.setIdle(true);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(orders(pi)).toHaveLength(0);
+    expect(events).not.toContain("order.replied");
+    expect(events).not.toContain("order.declined");
+  });
+
+  it("cancel while running: aborts the run, sends no Reply, notifies, and continues with the queue", async () => {
+    const { pi, c } = await setup();
+    const a = await c.ask({ body: "long task", to: "widgets@root" });
+    await waitFor(() => orders(pi).length === 1);
+    const b = await c.ask({ body: "next task", to: "widgets@root" });
+    const aEvents: string[] = [];
+    c.onThreadEvent((e) => {
+      if (e.threadId === a.threadId) aEvents.push(e.event.type);
+    });
+    // pi is working on A.
+    await pi.fire("agent_start", { type: "agent_start" }, dir);
+    await pi.fire("message_end", { type: "message_end", message: asCustom(orders(pi)[0]!) }, dir);
+    await pi.fire("message_end", { type: "message_end", message: assistant("partial work") }, dir);
+    pi.setIdle(false);
+    await c.cancel(a.threadId);
+    await waitFor(() => pi.aborts() === 1);
+    expect(pi.notices.at(-1)).toMatch(/cancelled by/);
+    // The aborted run settles; B is injected next.
+    pi.setIdle(true);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: true }, dir);
+    await waitFor(() => orders(pi).length === 2);
+    const bClosed = untilClosed(c, b.threadId);
+    await runTurn(pi, "B done");
+    expect((await bClosed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "B done" });
+    expect(aEvents).not.toContain("order.replied");
+    expect(aEvents).not.toContain("order.declined");
   });
 });

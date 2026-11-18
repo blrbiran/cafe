@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
-import { api } from "../api.ts";
+import { api, type AgentStats } from "../api.ts";
 import { useT, type Dict } from "../i18n.ts";
 import { hashFor, navigate } from "../route.ts";
 import { openComposer, useStore } from "../store.ts";
@@ -25,7 +25,20 @@ export function AgentsPage() {
   }
   const hosts = [...byHost.keys()].sort((a, b) => (a === host ? -1 : b === host ? 1 : a.localeCompare(b)));
 
-  // 24h activity from the threads this daemon knows (latest turn of each thread; approximate).
+  // Exact 24h per-agent counts from the daemon; refreshed when traffic changes.
+  const [stats, setStats] = useState<Record<string, AgentStats>>();
+  const activity = threads.reduce((n, m) => Math.max(n, m.lastActivityAt ?? m.createdAt), 0);
+  useEffect(() => {
+    let alive = true;
+    api
+      .agentStats(Date.now() - DAY)
+      .then((s) => alive && setStats(s))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [activity]);
+  // Fallback for older daemons without the stats endpoint: approximate from thread records.
   const since = Date.now() - DAY;
   const recent = threads.filter((m) => (m.lastActivityAt ?? m.createdAt) >= since);
 
@@ -47,7 +60,7 @@ export function AgentsPage() {
             </div>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
               {list.map((a) => (
-                <AgentCard key={a.agentId} a={a} threads={threads} recent={recent} t={t} />
+                <AgentCard key={a.agentId} a={a} threads={threads} recent={recent} stats={stats?.[a.agentId] ?? (stats ? { answered: 0, declined: 0, failed: 0 } : undefined)} t={t} />
               ))}
             </div>
           </section>
@@ -58,14 +71,14 @@ export function AgentsPage() {
   );
 }
 
-function AgentCard({ a, threads, recent, t }: { a: AgentRecord; threads: ThreadMeta[]; recent: ThreadMeta[]; t: Dict }) {
+function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: ThreadMeta[]; recent: ThreadMeta[]; stats?: AgentStats; t: Dict }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
   const current = threads.find((m) => (m.status === "working" || m.status === "delivering") && m.targets.includes(a.agentId));
   const status: "idle" | "busy" | "offline" = a.status === "offline" ? "offline" : current || a.status === "busy" ? "busy" : "idle";
   const tone: Tone = status === "busy" ? "info" : status === "idle" ? "ok" : undefined;
-  const answered = recent.reduce((n, m) => n + m.replies.filter((r) => r.agentId === a.agentId).length, 0);
-  const declined = recent.reduce((n, m) => n + m.declines.filter((d) => d.agentId === a.agentId).length, 0);
+  const answered = stats?.answered ?? recent.reduce((n, m) => n + m.replies.filter((r) => r.agentId === a.agentId).length, 0);
+  const declined = stats?.declined ?? recent.reduce((n, m) => n + m.declines.filter((d) => d.agentId === a.agentId).length, 0);
   const runsAs = { tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode];
 
   return (

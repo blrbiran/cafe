@@ -47,6 +47,9 @@ cafe root set 192.168.1.10:4777                       # Root moved; updates conf
 cafe config set router.model anthropic/claude-haiku-4-5  # LLM routing via pi auth; unset = keyword rules
 cafe daemon start --root                              # make this machine the Root
 cafe barista start --dir ~/code/billing               # run a headless pi Barista for that directory
+cafe serve --preset claude --dir ~/code/billing       # answer questions with `claude -p` (or --preset codex)
+cafe serve --exec "./answer.sh" --dir .               # any command: prompt on stdin (or {prompt_file}), answer on stdout;
+                                                      # print `CAFE_DECLINE: <reason>` to decline
 ```
 
 A `.cafe` file in a directory gives agents started there an identity:

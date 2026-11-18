@@ -583,7 +583,20 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) this.fanOutToChildren(env, opts.from);
     else if (this.rootOnline && opts.from !== this.uplink) this.uplink!.notify(Methods.threadEvent, env);
     this.emit("thread", env, meta);
+    if (env.event.type === "order.cancelled") this.notifyCancelled(env);
+    if (env.event.type === "order.replied" && env.event.final) this.store.recordAgentEvent(env.event.agentId, "answered", env.at, env.threadId);
+    else if (env.event.type === "order.declined") this.store.recordAgentEvent(env.event.agentId, "declined", env.at, env.threadId);
+    else if (env.event.type === "order.failed" && env.event.agentId) this.store.recordAgentEvent(env.event.agentId, "failed", env.at, env.threadId);
     if (!opts.skipTrack) this.track(env);
+  }
+
+  /** Tell local Agents that were sent this Order that it was cancelled. Every Host in the Thread sees the event. */
+  private notifyCancelled(env: ThreadEnvelope): void {
+    if (env.event.type !== "order.cancelled") return;
+    const meta = this.metas.get(env.threadId);
+    for (const id of meta?.targets ?? []) {
+      this.agents.get(id)?.notify(Methods.orderCancelled, { orderId: env.orderId, threadId: env.threadId, by: env.event.by });
+    }
   }
 
   /** Root: forward an event to every Host taking part in the Thread, except where it came from. */
