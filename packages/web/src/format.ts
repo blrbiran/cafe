@@ -5,9 +5,9 @@ const ticks = new Set<() => void>();
 setInterval(() => {
   now = Date.now();
   for (const t of ticks) t();
-}, 5_000);
+}, 1_000);
 
-/** A "now" that re-renders every 5s, for relative times. */
+/** A "now" that re-renders every second, for live durations and relative times. */
 export function useNow(): number {
   return useSyncExternalStore(
     (l) => {

@@ -82,17 +82,19 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
       return `! ${e.agentId ? who(e.agentId) : "order"} failed: ${e.reason}`;
     case "order.cancelled":
       return `✗ cancelled by ${e.by}`;
-    case "thread.closed":
-      return `— thread ${e.status}`;
+    case "order.created":
+      return e.order.turn > 1 ? `\n> follow-up from ${e.order.from.address}: ${e.order.body}` : undefined;
+    case "order.closed":
+      return `— ${e.status}`;
     default:
       return undefined;
   }
 }
 
 /** Follow a Thread over SSE until it closes. Returns the final status. */
-async function follow(threadId: string, opts: { quiet?: boolean } = {}): Promise<string> {
+async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string } = {}): Promise<string> {
   const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
-  const res = await fetch(`${base()}/api/threads/${threadId}/stream`, {
+  const res = await fetch(`${base()}/api/threads/${threadId}/stream${opts.orderId ? `?orderId=${opts.orderId}` : ""}`, {
     headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
   });
   if (!res.ok || !res.body) throw new Error(`cannot stream thread ${threadId}: ${res.status}`);
@@ -109,8 +111,10 @@ async function follow(threadId: string, opts: { quiet?: boolean } = {}): Promise
       const data = block.split("\n").find((l) => l.startsWith("data: "));
       if (!data) continue;
       const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
+      // Earlier turns are replayed; only report on the Order being followed.
+      if (opts.orderId && env.orderId !== opts.orderId) continue;
       if (env.event.type === "order.replied") replies.push({ from: agents.get(env.event.agentId)?.address ?? env.event.agentId, text: env.event.text, final: env.event.final });
-      if (env.event.type === "thread.closed") status = env.event.status;
+      if (env.event.type === "order.closed") status = env.event.status;
       if (!JSON_OUT && !opts.quiet) {
         const line = describe(env, agents);
         if (line) console.log(line);
@@ -189,6 +193,7 @@ program
   .description("send an Order and wait for replies")
   .argument("<body...>", "the question or task")
   .option("--to <address>", "explicit Address (name, name@host, name#n@host); skips routing")
+  .option("--thread <threadId>", "follow-up in an existing thread (goes to whoever answered there)")
   .option("--async", "return the thread id immediately")
   .option("--notice", "send a Notice (no reply expected)")
   .option("--deadline <ms>", "broadcast collection deadline", Number)
@@ -197,11 +202,11 @@ program
     await ensureDaemon();
     const res = await api("/api/orders", {
       method: "POST",
-      body: JSON.stringify({ body: words.join(" "), to: o.to, kind: o.notice ? "notice" : "order", deadlineMs: o.deadline, as: o.as }),
+      body: JSON.stringify({ body: words.join(" "), to: o.to, threadId: o.thread, kind: o.notice ? "notice" : "order", deadlineMs: o.deadline, as: o.as }),
     });
     if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision.mode}: ${res.decision.reason}`, res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
-    const status = await follow(res.threadId);
+    const status = await follow(res.threadId, { orderId: res.orderId });
     process.exitCode = status === "done" ? 0 : 1;
   });
 

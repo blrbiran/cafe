@@ -43,8 +43,12 @@ _Avoid_: response, answer
 _Avoid_: event, fire-and-forget message
 
 **Thread**:
-一个 Order 及其全部 Reply 与后续往返构成的会话。
+一次完整对话：首个 Order、其后的 Follow-up，以及它们的全部 Reply。Thread 的状态即其最新一个 Order 的状态。
 _Avoid_: conversation, session, 问答 pair
+
+**Follow-up**:
+在已有 Thread 中继续发出的 Order；默认发给该 Thread 中已经回答过的 Barista，并附带此前的对话记录。
+_Avoid_: reply-to, continuation
 
 **Routing Decision**:
 Daemon 针对一个 Order 给出的去向结论：目标 Barista 列表、投递方式及理由。

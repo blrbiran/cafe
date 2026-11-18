@@ -1,0 +1,70 @@
+import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
+import type { Dict } from "./i18n.ts";
+import { isActive, nameOf, type LiveTurn } from "./store.ts";
+import type { Tone } from "./ui/bits.tsx";
+
+export type Bucket = "active" | "answered" | "unanswered" | "cancelled";
+
+export function bucketOf(t: ThreadMeta): Bucket {
+  if (isActive(t.status)) return "active";
+  if (t.status === "cancelled") return "cancelled";
+  if (t.replies.length > 0) return "answered";
+  return "unanswered";
+}
+
+/** Display name of an agent id, preferring the live registry, then addresses carried in the meta. */
+export function whoName(id: string, agents: Record<string, AgentRecord>, meta?: ThreadMeta): string {
+  const a = agents[id];
+  if (a) return a.name;
+  const fromMeta = meta?.replies.find((r) => r.agentId === id)?.address ?? meta?.declines.find((d) => d.agentId === id)?.address;
+  return fromMeta ? nameOf(fromMeta) : id.slice(-6);
+}
+
+export function whoAddress(id: string, agents: Record<string, AgentRecord>, meta?: ThreadMeta): string {
+  return agents[id]?.address ?? meta?.replies.find((r) => r.agentId === id)?.address ?? meta?.declines.find((d) => d.agentId === id)?.address ?? id.slice(-6);
+}
+
+/**
+ * The one-line outcome of a Thread's latest turn, in plain language.
+ * `live` supplies the turn start (for follow-ups) and the current targets.
+ */
+export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentRecord>, live: LiveTurn | undefined, now: number): { tone: Tone; text: string } {
+  const startedAt = live?.startedAt ?? meta.turnStartedAt ?? (meta.turns <= 1 ? meta.createdAt : undefined);
+  const names = (ids: string[]) => t.list([...new Set(ids.map((id) => whoName(id, agents, meta)))]);
+  switch (bucketOf(meta)) {
+    case "active": {
+      const targets = live?.targets ?? meta.targets;
+      if (meta.status === "routing" || targets.length === 0) return { tone: "info", text: t.routing };
+      if (meta.status === "delivering") return { tone: "info", text: t.delivering(names(targets)) };
+      return { tone: "info", text: t.working(names(targets), startedAt ? t.dur(now - startedAt) : "…") };
+    }
+    case "answered": {
+      const who = names(meta.replies.map((r) => r.agentId));
+      const end = meta.replies[0]?.at ?? meta.closedAt;
+      const took = startedAt && end ? t.dur(end - startedAt) : undefined;
+      return { tone: "ok", text: t.answeredBy(who, took) };
+    }
+    case "cancelled":
+      return { tone: undefined, text: t.cancelled };
+    case "unanswered":
+      return meta.declines.length > 0 ? { tone: "warn", text: t.nobody(meta.declines.length) } : { tone: "danger", text: t.noAnswer };
+  }
+}
+
+/** Plain-language "why this agent" from a routing decision. */
+export function whyText(t: Dict, d: { router?: string; mode?: string; reason?: string } | undefined): string | undefined {
+  if (!d?.router) return undefined;
+  if (d.mode === "broadcast") return t.askEveryone;
+  switch (d.router) {
+    case "llm":
+      return d.reason ? t.whyLlm(d.reason) : t.router.llm;
+    case "rules":
+      return t.whyRules;
+    case "explicit":
+      return t.whyExplicit;
+    case "followup":
+      return t.whyFollowup;
+    default:
+      return d.reason;
+  }
+}

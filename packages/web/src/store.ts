@@ -16,6 +16,20 @@ export interface State {
   threads: ThreadMeta[];
   /** The open Thread detail, kept live while open. */
   detail?: ThreadDetail & { loading?: boolean };
+  /** Per-thread facts about the latest turn that ThreadMeta does not carry. */
+  live: Record<string, LiveTurn>;
+  /** The "Ask" composer on the feed; `to` prefilled by "Ask it". */
+  composer?: { to?: string };
+}
+
+export interface LiveTurn {
+  orderId: string;
+  /** When the latest Order (turn) was created. */
+  startedAt: number;
+  reason?: string;
+  router?: string;
+  mode?: string;
+  targets?: string[];
 }
 
 let state: State = {
@@ -29,6 +43,7 @@ let state: State = {
   agents: {},
   daemons: [],
   threads: [],
+  live: {},
 };
 
 const listeners = new Set<() => void>();
@@ -51,6 +66,11 @@ export function getState(): State {
   return state;
 }
 
+/** Threads written by older daemons lack the newer list fields. */
+function norm(m: ThreadMeta): ThreadMeta {
+  return { ...m, turns: m.turns ?? 1, replies: m.replies ?? [], declines: m.declines ?? [] };
+}
+
 function applySnapshot(s: Snapshot): void {
   set({
     loaded: true,
@@ -62,11 +82,12 @@ function applySnapshot(s: Snapshot): void {
     registryVersion: s.registryVersion,
     agents: Object.fromEntries(s.agents.map((a) => [a.agentId, a])),
     daemons: s.daemons,
-    threads: s.threads,
+    threads: s.threads.map(norm),
   });
 }
 
-function upsertThread(meta: ThreadMeta): void {
+function upsertThread(raw: ThreadMeta): void {
+  const meta = norm(raw);
   set((s) => {
     const i = s.threads.findIndex((t) => t.threadId === meta.threadId);
     const threads = i >= 0 ? s.threads.map((t, j) => (j === i ? meta : t)) : [meta, ...s.threads];
@@ -75,7 +96,28 @@ function upsertThread(meta: ThreadMeta): void {
   });
 }
 
+/** Fold one event into the per-thread latest-turn facts. */
+function foldLive(live: Record<string, LiveTurn>, env: ThreadEnvelope): Record<string, LiveTurn> {
+  const ev = env.event;
+  const cur = live[env.threadId];
+  if (ev.type === "order.created") {
+    if (cur && cur.startedAt > ev.order.createdAt) return live;
+    return { ...live, [env.threadId]: { orderId: ev.order.orderId, startedAt: ev.order.createdAt } };
+  }
+  if (ev.type === "order.routed" && cur && cur.orderId === env.orderId) {
+    return { ...live, [env.threadId]: { ...cur, reason: ev.decision.reason, router: ev.decision.router, mode: ev.decision.mode, targets: ev.decision.targets } };
+  }
+  return live;
+}
+
+function liveFromEvents(events: ThreadEnvelope[], live: Record<string, LiveTurn>): Record<string, LiveTurn> {
+  let next = live;
+  for (const e of events) next = foldLive(next, e);
+  return next;
+}
+
 function appendEvent(env: ThreadEnvelope): void {
+  set((s) => ({ live: foldLive(s.live, env) }));
   set((s) => {
     if (!s.detail || s.detail.meta.threadId !== env.threadId) return {};
     if (s.detail.events.some((e) => e.eventId === env.eventId)) return {};
@@ -178,9 +220,10 @@ export async function openThread(threadId: string): Promise<void> {
     const d = await api.thread(threadId);
     set((s) => {
       // Merge in any live events that arrived while fetching.
-      const live = s.detail?.meta.threadId === threadId ? s.detail.events : [];
+        const pending = s.detail?.meta.threadId === threadId ? s.detail.events : [];
       const ids = new Set(d.events.map((e) => e.eventId));
-      return { detail: { meta: d.meta, events: [...d.events, ...live.filter((e) => !ids.has(e.eventId))].sort((a, b) => a.at - b.at) } };
+      const events = [...d.events, ...pending.filter((e) => !ids.has(e.eventId))].sort((a, b) => a.at - b.at);
+      return { detail: { meta: norm(d.meta), events }, live: liveFromEvents(events, s.live) };
     });
   } catch (err) {
     set({ error: (err as Error).message, detail: undefined });
@@ -194,4 +237,41 @@ export function closeThread(): void {
 /** Address of an agent id, or the id itself if unknown. */
 export function addressOf(agents: Record<string, AgentRecord>, id: string): string {
   return agents[id]?.address ?? id.slice(-8);
+}
+
+const fetching = new Set<string>();
+
+/** Fill `live` for a thread loaded from the snapshot (no events seen yet). Deduplicated, best effort. */
+export function ensureLive(threadId: string): void {
+  if (state.live[threadId] || fetching.has(threadId)) return;
+  // Newer daemons put the latest turn's timing and routing reason on the thread record itself.
+  const meta = state.threads.find((t) => t.threadId === threadId);
+  if (meta?.turnStartedAt !== undefined && meta.reason !== undefined) {
+    const turn: LiveTurn = { orderId: meta.orderId, startedAt: meta.turnStartedAt, reason: meta.reason, router: meta.router, mode: meta.mode, targets: meta.targets };
+    set((s) => ({ live: { ...s.live, [threadId]: turn } }));
+    return;
+  }
+  fetching.add(threadId);
+  api
+    .thread(threadId)
+    .then((d) => set((s) => ({ live: liveFromEvents(d.events, s.live) })))
+    .catch(() => {})
+    .finally(() => fetching.delete(threadId));
+}
+
+export function openComposer(to?: string): void {
+  set({ composer: { to } });
+}
+
+export function closeComposer(): void {
+  set({ composer: undefined });
+}
+
+export function isActive(status: string): boolean {
+  return status === "routing" || status === "delivering" || status === "working";
+}
+
+/** The agent name part of an Address (`billing#1@host` → `billing`). */
+export function nameOf(address: string): string {
+  return address.replace(/[#@].*$/, "");
 }

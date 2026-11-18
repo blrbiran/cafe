@@ -20,9 +20,6 @@ export type AgentRole = z.infer<typeof AgentRole>;
 export const AgentMode = z.enum(["tui", "headless", "cli", "web"]);
 export type AgentMode = z.infer<typeof AgentMode>;
 
-export const AcceptPolicy = z.enum(["auto", "confirm"]);
-export type AcceptPolicy = z.infer<typeof AcceptPolicy>;
-
 /** Contents of a `.cafe` Cafe File. */
 export const CafeFile = z.object({
   name: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/, "name may only contain [a-zA-Z0-9_.-]"),
@@ -30,7 +27,6 @@ export const CafeFile = z.object({
   tags: z.array(z.string()).default([]),
   scope: z.array(z.string()).default([]),
   role: AgentRole.default("barista"),
-  accept: AcceptPolicy.default("auto"),
   concurrency: z.number().int().min(1).default(1),
 });
 export type CafeFile = z.infer<typeof CafeFile>;
@@ -43,6 +39,8 @@ export const AgentIdentity = CafeFile.extend({
   mode: AgentMode,
   cwd: z.string(),
   pid: z.number().int().optional(),
+  /** On reconnect: ask to keep the agentId/Address from the previous connection. */
+  resumeAgentId: z.string().optional(),
 });
 export type AgentIdentity = z.infer<typeof AgentIdentity>;
 
@@ -99,6 +97,10 @@ export const Order = z.object({
   depth: z.number().int().min(0).default(0),
   deadlineMs: z.number().int().optional(),
   createdAt: z.number(),
+  /** 1 for the first Order of a Thread; >1 for Follow-ups. */
+  turn: z.number().int().min(1).default(1),
+  /** Earlier turns of the Thread, oldest first (Follow-ups only). */
+  history: z.array(z.object({ from: z.string(), role: z.enum(["customer", "barista"]), text: z.string() })).default([]),
 });
 export type Order = z.infer<typeof Order>;
 
@@ -106,7 +108,7 @@ export const RoutingDecision = z.object({
   targets: z.array(z.string()),
   mode: DeliveryMode,
   reason: z.string(),
-  router: z.enum(["explicit", "llm", "rules"]),
+  router: z.enum(["explicit", "followup", "llm", "rules"]),
   /** Ordered fallbacks for unicast re-delivery. */
   candidates: z.array(z.string()).default([]),
 });
@@ -126,7 +128,8 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string() }),
   z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string() }),
   z.object({ type: z.literal("order.cancelled"), by: z.string() }),
-  z.object({ type: z.literal("thread.closed"), status: ThreadStatus }),
+  /** One Order finished. The Thread stays open for Follow-ups. */
+  z.object({ type: z.literal("order.closed"), status: ThreadStatus }),
 ]);
 export type ThreadEventBody = z.infer<typeof ThreadEvent>;
 
@@ -154,6 +157,18 @@ export const ThreadMeta = z.object({
   firstReplyAt: z.number().optional(),
   closedAt: z.number().optional(),
   file: z.string(),
+  /** Number of Orders (first + Follow-ups). */
+  turns: z.number().int().default(1),
+  /** When the latest Order (turn) was created. */
+  turnStartedAt: z.number().optional(),
+  /** Routing Decision of the latest Order. */
+  reason: z.string().optional(),
+  router: z.enum(["explicit", "followup", "llm", "rules"]).optional(),
+  lastActivityAt: z.number().optional(),
+  /** Final replies of the latest Order (text truncated), for list views. */
+  replies: z.array(z.object({ agentId: z.string(), address: z.string().optional(), text: z.string(), at: z.number() })).default([]),
+  /** Declines of the latest Order. */
+  declines: z.array(z.object({ agentId: z.string(), address: z.string().optional(), reason: z.string(), at: z.number() })).default([]),
 });
 export type ThreadMeta = z.infer<typeof ThreadMeta>;
 
@@ -188,6 +203,8 @@ export const CreateOrderParams = z.object({
   kind: OrderKind.default("order"),
   to: z.string().optional(),
   parentOrderId: z.string().optional(),
+  /** Follow-up: continue this Thread (default targets: Baristas that replied in it). */
+  threadId: z.string().optional(),
   deadlineMs: z.number().int().optional(),
   /** Customer identity for callers that are not registered Agents (CLI, web). */
   as: z.string().optional(),

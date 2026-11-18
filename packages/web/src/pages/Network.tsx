@@ -1,78 +1,88 @@
+import { useState } from "react";
+import { ago, useT } from "../i18n.ts";
+import { useNow } from "../format.ts";
 import { useStore } from "../store.ts";
-import { relTime, stamp, useNow } from "../format.ts";
-import { Badge, Empty, Led, PageHeader } from "../ui/bits.tsx";
+import { Disclosure, Empty, Facts, PageHeader, Pill } from "../ui/bits.tsx";
 
 export function NetworkPage() {
+  const t = useT();
+  const now = useNow();
   const daemons = useStore((s) => s.daemons);
   const host = useStore((s) => s.host);
   const isRoot = useStore((s) => s.isRoot);
   const router = useStore((s) => s.router);
   const version = useStore((s) => s.registryVersion);
   const rootOnline = useStore((s) => s.rootOnline);
-  const now = useNow();
-  const sorted = [...daemons].sort((a, b) => Number(b.isRoot) - Number(a.isRoot) || a.host.localeCompare(b.host));
+  const agents = useStore((s) => s.agents);
+  const threads = useStore((s) => s.threads);
+  const [debug, setDebug] = useState(false);
+
+  const sorted = [...daemons].sort((a, b) => Number(b.host === host) - Number(a.host === host) || Number(b.isRoot) - Number(a.isRoot) || a.host.localeCompare(b.host));
+  const self = daemons.find((d) => d.host === host);
+  const anyFile = threads.find((m) => m.file)?.file;
+  const dataDir = anyFile ? anyFile.replace(/\/[^/]+\/[^/]+$/, "/") : "~/.cafe/sessions/";
+  const count = (h: string) => Object.values(agents).filter((a) => a.host === h && a.role === "barista" && a.status !== "offline").length;
 
   return (
     <>
-      <PageHeader title="Network" meta={isRoot ? "root daemon: full topology" : "child daemon: this host and its root"} />
-      <div className="mb-4 grid grid-cols-4 gap-3 max-md:grid-cols-2">
-        <Tile label="this host" value={host} />
-        <Tile label="role" value={isRoot ? "root" : "daemon"} />
-        <Tile label="router" value={router} />
-        <Tile label="registry" value={`v${version}`} />
-      </div>
+      <PageHeader title={t.networkTitle} sub={t.networkSub} />
+      <div className="well px-4 py-3 text-sm leading-relaxed text-fg">{t.networkExplain}</div>
       {!isRoot && !rootOnline && (
-        <div role="status" className="well mb-4 text-sm" data-tone="warn">
-          Root unreachable: orders stay on this host; cross-host orders fail with root_unreachable.
+        <div role="status" className="well text-sm" data-tone="warn">
+          {t.hubOfflineWarn}
         </div>
       )}
+      {!isRoot && <div className="hint">{t.childView}</div>}
       {sorted.length === 0 ? (
-        <Empty>No daemons known.</Empty>
+        <Empty>—</Empty>
       ) : (
-        <section className="card table-box">
-          <table>
-            <thead>
-              <tr>
-                <th>Host</th>
-                <th>URL</th>
-                <th>Role</th>
-                <th>Status</th>
-                <th>Connected</th>
-                <th>Last seen</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map((d) => (
-                <tr key={`${d.host}-${d.isRoot}`}>
-                  <td className="whitespace-nowrap text-fg-strong">
-                    {d.host}
-                    {d.host === host && <span className="meta ml-2">(this)</span>}
-                  </td>
-                  <td className="meta">{d.url || "—"}</td>
-                  <td>{d.isRoot ? <Badge tone="info">root</Badge> : <Badge>daemon</Badge>}</td>
-                  <td className="whitespace-nowrap">
-                    <span className="flex items-center gap-2">
-                      <Led status={d.online ? "idle" : "offline"} />
-                      {d.online ? "online" : "offline"}
-                    </span>
-                  </td>
-                  <td className="meta whitespace-nowrap num">{stamp(d.connectedAt)}</td>
-                  <td className="meta whitespace-nowrap num">{relTime(d.lastSeenAt, now)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
+          {sorted.map((d) => {
+            const isThis = d.host === host;
+            // A child daemon only knows the hub as a synthetic "root" record.
+            const name = !isThis && d.isRoot && d.host === "root" ? t.hub : d.host;
+            const badges = [d.isRoot || (isThis && isRoot) ? t.hub : undefined, isThis ? t.thisMachine : undefined].filter(Boolean) as string[];
+            return (
+              <article key={`${d.host}-${d.isRoot}`} className="card flex flex-col gap-2.5 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="mono truncate text-base text-fg-strong">{name}</span>
+                  <Pill tone={d.online ? "ok" : undefined}>{d.online ? t.online : t.mOffline}</Pill>
+                </div>
+                {badges.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {badges.map((b) => (
+                      <Pill key={b} dot={false}>
+                        {b}
+                      </Pill>
+                    ))}
+                  </div>
+                )}
+                <Facts
+                  rows={[
+                    [t.address, <span className="mono">{d.url.replace(/^wss?:\/\//, "") || "—"}</span>],
+                    ["Agents", d.host === "root" && !isThis ? "—" : String(count(d.host))],
+                    [t.since, d.online ? ago(t, d.connectedAt, now) : t.lostAt(ago(t, d.lastSeenAt, now))],
+                  ]}
+                />
+              </article>
+            );
+          })}
+        </div>
       )}
+      <Disclosure show={t.dbgShow} hide={t.dbgHide} open={debug} onToggle={() => setDebug((v) => !v)}>
+        <div className="grid grid-cols-[160px_1fr] gap-x-3 gap-y-1.5 text-xs">
+          <span className="text-muted">{t.dbgRole}</span>
+          <span className="mono">{isRoot ? "root (hub)" : "daemon"}</span>
+          <span className="text-muted">{t.dbgRouter}</span>
+          <span className="mono">{router}</span>
+          <span className="text-muted">{t.dbgRegistry}</span>
+          <span className="mono">v{version}</span>
+          <span className="text-muted">{t.dbgUrl}</span>
+          <span className="mono">{self?.url ?? "—"}</span>
+          <span className="text-muted">{t.dbgData}</span>
+          <span className="mono">{dataDir}</span>
+        </div>
+      </Disclosure>
     </>
-  );
-}
-
-function Tile({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="well">
-      <div className="meta uppercase">{label}</div>
-      <div className="truncate font-data text-base text-fg-strong">{value || "—"}</div>
-    </div>
   );
 }

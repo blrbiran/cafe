@@ -3,5 +3,4 @@ description: The cafe agent network itself — daemon, routing, protocol, CLI, p
 tags: [cafe, daemon, routing, protocol]
 scope: [.]
 role: barista
-accept: confirm
 concurrency: 1

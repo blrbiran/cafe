@@ -93,6 +93,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
     daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token });
     daemon.supervisor.restore();
   }
+  daemon.recover();
   daemon.connectRoot();
   void daemon.announceRoot();
   return {

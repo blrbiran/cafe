@@ -136,7 +136,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const t = daemon.thread(match[1]!);
     return t ? send(res, 200, t) : send(res, 404, { error: "not_found" });
   }
-  if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, req, res);
+  if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
   if (m === "POST" && path === "/api/orders") {
     const p = CreateOrderParams.parse(await readJson(req));
     return send(res, 200, await daemon.createOrder(p));
@@ -180,11 +180,13 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
 }
 
 /** SSE: replay the Thread so far, then follow live events until it closes. */
-function stream(daemon: Daemon, threadId: string, req: IncomingMessage, res: ServerResponse): void {
+function stream(daemon: Daemon, threadId: string, orderId: string | undefined, req: IncomingMessage, res: ServerResponse): void {
+  // Follow one Order (default: the Thread's latest) until it closes; earlier turns are replayed for context.
+  const until = orderId ?? daemon.thread(threadId)?.meta.orderId;
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   const write = (env: ThreadEnvelope) => {
     res.write(`data: ${JSON.stringify(env)}\n\n`);
-    if (env.event.type === "thread.closed") res.end();
+    if (env.event.type === "order.closed" && (!until || env.orderId === until)) res.end();
   };
   const seen = new Set<string>();
   const onEvent = (env: ThreadEnvelope) => {

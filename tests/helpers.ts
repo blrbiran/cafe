@@ -18,7 +18,7 @@ export async function startDaemon(host: string, opts: Partial<RunOptions> & { co
 }
 
 export function identity(name: string, extra: Partial<AgentIdentity> = {}): AgentIdentity {
-  return { name, description: "", tags: [], scope: [], role: "barista", accept: "auto", concurrency: 1, mode: "headless", cwd: "/tmp", ...extra };
+  return { name, description: "", tags: [], scope: [], role: "barista", concurrency: 1, mode: "headless", cwd: "/tmp", ...extra };
 }
 
 /** A scripted Barista. `behave` decides what to do with each Order. */
@@ -42,7 +42,7 @@ export async function customer(addr: string) {
   return c;
 }
 
-/** Collect thread events until `thread.closed`. */
+/** Collect thread events until `order.closed`. */
 export function untilClosed(c: CafeClient, threadId: string, timeoutMs = 5000): Promise<ThreadEnvelope[]> {
   return new Promise((resolve, reject) => {
     const events: ThreadEnvelope[] = [];
@@ -50,7 +50,7 @@ export function untilClosed(c: CafeClient, threadId: string, timeoutMs = 5000): 
     const off = c.onThreadEvent((env) => {
       if (env.threadId !== threadId) return;
       events.push(env);
-      if (env.event.type === "thread.closed") {
+      if (env.event.type === "order.closed") {
         clearTimeout(t);
         off();
         resolve(events);

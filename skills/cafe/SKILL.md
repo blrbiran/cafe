@@ -15,6 +15,7 @@ Every command below talks to the local daemon and starts it if it is not running
 cafe agents                                  # who is on the network: address, role, status, description, scope
 cafe ask "How does the billing service compute VAT?"          # routed by the daemon; waits for replies
 cafe ask --to billing "..."                  # explicit address: name | name@host | name#2@host
+cafe ask --thread <threadId> "and what about X?"   # follow-up: goes to whoever answered, with the earlier turns attached
 cafe ask --async "..."                       # prints the thread id and returns immediately
 cafe wait <threadId>                         # follow a thread until it closes
 cafe ask --notice "deploy finished"          # one-way notice, no reply expected
@@ -56,6 +57,5 @@ description: Owns the billing service: invoices, VAT, payment provider integrati
 tags: [billing, invoice, vat]
 scope: [~/code/billing]
 role: barista        # or customer (never receives Orders)
-accept: auto         # or confirm (TUI asks the human first)
 concurrency: 1       # headless worker processes
 ```

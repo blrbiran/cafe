@@ -24,6 +24,14 @@ function withToken(path: string): string {
   return `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
 }
 
+export class ApiError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(withToken(path), {
     method,
@@ -31,14 +39,15 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message ?? data.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) throw new ApiError(data.error ?? String(res.status), data.message ?? data.error ?? `${res.status} ${res.statusText}`);
   return data as T;
 }
 
 export const api = {
   snapshot: () => call<Snapshot>("GET", "/api/snapshot"),
   thread: (id: string) => call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}`),
-  createOrder: (p: { body: string; to?: string; kind?: "order" | "notice" }) =>
+  /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
+  createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string }) =>
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web" }),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),

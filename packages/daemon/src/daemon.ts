@@ -52,7 +52,9 @@ export interface Timing {
 /** Live delivery state of one Order on its origin Daemon. */
 interface Tracking {
   order: Order;
-  meta: ThreadMeta;
+  status: "open" | "done" | "failed" | "cancelled";
+  /** Any final reply received for this Order. */
+  replied: boolean;
   decision?: RoutingDecision;
   /** per-target state */
   targets: Map<string, "pending" | "acked" | "done" | "failed">;
@@ -210,13 +212,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private bindAgentMethods(peer: Peer): void {
     peer.on(Methods.agentRegister, (raw) => {
-      const identity = AgentIdentity.parse(raw);
-      const n = this.registry.nextInstance(identity.name, this.host);
+      const { resumeAgentId, ...identity } = AgentIdentity.parse(raw);
+      // Resume a previous identity (reconnect, daemon restart) when it is not held by a live connection.
+      const prev = resumeAgentId && !this.agents.has(resumeAgentId) ? (this.local.get(resumeAgentId) ?? this.registry.get(resumeAgentId)) : undefined;
+      const resumable = prev && prev.host === this.host && prev.name === identity.name ? prev : undefined;
       const now = Date.now();
       const record: AgentRecord = {
         ...identity,
-        agentId: ulid(),
-        address: formatAddress(identity.name, n, this.host),
+        agentId: resumable?.agentId ?? resumeAgentId ?? ulid(),
+        address: resumable?.address ?? formatAddress(identity.name, this.registry.nextInstance(identity.name, this.host), this.host),
         host: this.host,
         status: "idle",
         registeredAt: now,
@@ -299,9 +303,19 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const parent = p.parentOrderId ? this.knownOrders.get(p.parentOrderId) : undefined;
     const depth = parent ? parent.depth + 1 : 0;
     if (depth > MAX_ORDER_DEPTH) throw new RpcError("too_deep", `order depth ${depth} exceeds ${MAX_ORDER_DEPTH}`);
+
+    // Follow-up: continue an existing Thread.
+    let prior: ThreadMeta | undefined;
+    if (p.threadId) {
+      prior = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
+      if (!prior) throw new RpcError("not_found", `unknown thread ${p.threadId}`);
+      if ([...this.tracking.values()].some((x) => x.order.threadId === p.threadId && x.status === "open")) {
+        throw new RpcError("thread_busy", "the previous question in this thread is still open; wait or cancel it first");
+      }
+    }
     const order: Order = {
       orderId: ulid(),
-      threadId: ulid(),
+      threadId: prior?.threadId ?? ulid(),
       kind: p.kind,
       from,
       to: p.to,
@@ -311,27 +325,19 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       depth,
       deadlineMs: p.deadlineMs,
       createdAt: Date.now(),
+      turn: prior ? prior.turns + 1 : 1,
+      history: prior ? this.history(prior) : [],
     };
     this.knownOrders.set(order.orderId, order);
     if (peer) this.subscribe(order.threadId, peer);
 
-    const meta: ThreadMeta = {
-      threadId: order.threadId,
-      orderId: order.orderId,
-      kind: order.kind,
-      from,
-      targets: [],
-      status: "routing",
-      summary: order.body.slice(0, 200),
-      createdAt: order.createdAt,
-      file: this.store.threadFile(order.threadId, order.createdAt),
-    };
-    const t: Tracking = { order, meta, targets: new Map(), candidates: [], timers: new Map() };
+    // Capture who answered before the new turn resets the Thread's reply list.
+    const answeredBefore = prior ? [...new Set(prior.replies.map((r) => r.agentId))] : [];
+    const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
     this.tracking.set(order.orderId, t);
-    this.metas.set(order.threadId, meta);
     this.emitEvent(order, { type: "order.created", order });
 
-    const decision = await this.route(order);
+    const decision = await this.route(order, answeredBefore);
     t.decision = decision;
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
@@ -355,8 +361,31 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       .filter((r) => this.rootOnline || r.host === this.host);
   }
 
-  private async route(order: Order): Promise<RoutingDecision> {
+  /** Earlier turns of a Thread, oldest first, bounded for prompt size. */
+  private history(meta: ThreadMeta): Order["history"] {
+    const out: Order["history"] = [];
+    for (const env of this.store.readEvents(meta.file)) {
+      const ev = env.event;
+      if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: ev.order.body.slice(0, 4000) });
+      else if (ev.type === "order.replied" && ev.final) out.push({ from: this.registry.get(ev.agentId)?.address ?? ev.agentId, role: "barista", text: ev.text.slice(0, 4000) });
+    }
+    return out.slice(-12);
+  }
+
+  private async route(order: Order, answeredBefore: string[] = []): Promise<RoutingDecision> {
     const candidates = this.eligible(order);
+    if (answeredBefore.length && !order.to) {
+      const answered = answeredBefore.filter((id) => candidates.some((c) => c.agentId === id));
+      if (answered.length) {
+        return {
+          targets: answered,
+          mode: answered.length === 1 ? "unicast" : "multicast",
+          reason: `follow-up to ${answered.map((id) => this.registry.get(id)?.address ?? id).join(", ")}, who answered earlier in this thread`,
+          router: "followup",
+          candidates: [],
+        };
+      }
+    }
     if (order.to) {
       const ids = this.registry.resolve(order.to).filter((id) => candidates.some((c) => c.agentId === id));
       return {
@@ -379,7 +408,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private dispatch(t: Tracking, agentId: string): void {
     t.targets.set(agentId, "pending");
-    if (!t.meta.targets.includes(agentId)) t.meta.targets.push(agentId);
     const rec = this.registry.get(agentId);
     if (!rec) return this.targetFailed(t, agentId, "unknown agent");
     if (t.order.kind === "order") this.armAck(t, agentId);
@@ -436,7 +464,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private targetFailed(t: Tracking, agentId: string, reason: string, emit = true): void {
-    if (t.meta.status === "done" || t.meta.status === "cancelled" || t.meta.status === "failed") return;
+    if (t.status !== "open") return;
     const state = t.targets.get(agentId);
     if (state === "done" || state === "failed") return;
     this.clearTimer(t, agentId);
@@ -458,15 +486,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     switch (ev.type) {
       case "order.acked":
         if (t.targets.get(ev.agentId) === "pending") t.targets.set(ev.agentId, "acked");
-        t.meta.status = "working";
         this.armHeartbeat(t, ev.agentId);
         break;
       case "order.heartbeat":
         if (t.targets.get(ev.agentId) === "acked") this.armHeartbeat(t, ev.agentId);
         break;
       case "order.replied":
-        t.meta.firstReplyAt ??= env.at;
         if (ev.final) {
+          t.replied = true;
           this.clearTimer(t, ev.agentId);
           t.targets.set(ev.agentId, "done");
           this.maybeClose(t);
@@ -499,27 +526,30 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private hasReply(t: Tracking): boolean {
-    return t.meta.firstReplyAt !== undefined;
+    return t.replied;
   }
 
   private finishOnDeadline(t: Tracking): void {
-    if (t.meta.status === "done" || t.meta.status === "failed" || t.meta.status === "cancelled") return;
+    if (t.status !== "open") return;
     if (t.order.kind === "notice") return this.close(t, "done");
     for (const [id, s] of t.targets) if (s === "pending" || s === "acked") this.targetFailed(t, id, "deadline");
     this.maybeClose(t);
   }
 
   private close(t: Tracking, status: "done" | "failed" | "cancelled"): void {
-    if (t.meta.status === "done" || t.meta.status === "failed" || t.meta.status === "cancelled") return;
+    if (t.status !== "open") return;
+    t.status = status;
     for (const timer of t.timers.values()) clearTimeout(timer);
     t.timers.clear();
     if (t.deadline) clearTimeout(t.deadline);
-    this.emitEvent(t.order, { type: "thread.closed", status });
+    this.emitEvent(t.order, { type: "order.closed", status });
+    // Keep closed Orders briefly for late events, then drop them.
+    setTimeout(() => this.tracking.delete(t.order.orderId), 60_000).unref?.();
   }
 
   cancel(threadId: string, by: string): {} {
-    const t = [...this.tracking.values()].find((x) => x.order.threadId === threadId);
-    if (!t) throw new RpcError("not_found", `no active order on thread ${threadId} at this daemon`);
+    const t = [...this.tracking.values()].find((x) => x.order.threadId === threadId && x.status === "open");
+    if (!t) throw new RpcError("not_found", `no open question on thread ${threadId} at this daemon`);
     this.emitEvent(t.order, { type: "order.cancelled", by });
     this.close(t, "cancelled");
     return {};
@@ -546,7 +576,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.store.appendEvent(meta.file, env);
       this.store.putThread(meta);
     }
-    // Fan out first: tracking may synchronously emit follow-up events (e.g. thread.closed).
+    // Fan out first: tracking may synchronously emit follow-up events (e.g. order.closed).
 
     for (const s of this.subscribers.get(env.threadId) ?? []) if (s !== opts.from) s.notify(Methods.threadEvent, env);
     for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
@@ -604,13 +634,37 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         summary: ev.order.body.slice(0, 200),
         createdAt: ev.order.createdAt,
         file: this.store.threadFile(env.threadId, ev.order.createdAt),
+        turns: 0,
+        replies: [],
+        declines: [],
       };
     }
     this.metas.set(env.threadId, meta);
-    if (ev.type === "order.created") this.knownOrders.set(ev.order.orderId, ev.order);
+    meta.lastActivityAt = env.at;
+    const addr = (id: string) => this.registry.get(id)?.address;
+    if (ev.type === "order.created") {
+      this.knownOrders.set(ev.order.orderId, ev.order);
+      // A new turn: the Thread now reflects this Order.
+      if (ev.order.orderId !== meta.orderId || meta.turns === 0) {
+        meta.orderId = ev.order.orderId;
+        meta.turns = Math.max(meta.turns + 1, ev.order.turn);
+        meta.turnStartedAt = ev.order.createdAt;
+        meta.reason = undefined;
+        meta.router = undefined;
+        meta.status = "routing";
+        meta.replies = [];
+        meta.declines = [];
+        meta.closedAt = undefined;
+      }
+      return meta;
+    }
+    // Late events from an earlier turn are recorded but do not change the Thread's state.
+    if (env.orderId !== meta.orderId) return meta;
     switch (ev.type) {
       case "order.routed":
         meta.mode = ev.decision.mode;
+        meta.reason = ev.decision.reason;
+        meta.router = ev.decision.router;
         for (const id of ev.decision.targets) if (!meta.targets.includes(id)) meta.targets.push(id);
         meta.status = "delivering";
         break;
@@ -618,17 +672,78 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (!meta.targets.includes(ev.agentId)) meta.targets.push(ev.agentId);
         break;
       case "order.acked":
-        meta.status = "working";
+        if (meta.status === "delivering" || meta.status === "routing") meta.status = "working";
         break;
       case "order.replied":
         meta.firstReplyAt ??= env.at;
+        if (ev.final) meta.replies.push({ agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at });
         break;
-      case "thread.closed":
+      case "order.declined":
+        meta.declines.push({ agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at });
+        break;
+      case "order.closed":
         meta.status = ev.status;
         meta.closedAt = env.at;
         break;
     }
     return meta;
+  }
+
+  // -------------------------------------------------------------------------
+  // Recovery after a restart
+  // -------------------------------------------------------------------------
+
+  /**
+   * Re-arm delivery tracking for Orders that originated here and were still open
+   * when the Daemon stopped. Baristas resume their agentId on reconnect, so acks,
+   * heartbeats and replies keep flowing; if they do not, the usual ack/heartbeat
+   * timeouts fail the Order.
+   */
+  recover(): number {
+    let n = 0;
+    for (const meta of this.store.listThreads(1000)) {
+      if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
+      const events = this.store.readEvents(meta.file).filter((e) => e.orderId === meta.orderId);
+      const created = events.find((e) => e.event.type === "order.created")?.event;
+      if (!created || created.type !== "order.created") continue;
+      const order = created.order;
+      if (order.from.host !== this.host) continue;
+      this.metas.set(meta.threadId, meta);
+      this.knownOrders.set(order.orderId, order);
+      for (const e of events) this.seen.add(e.eventId);
+      const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
+      this.tracking.set(order.orderId, t);
+      n++;
+      const routed = events.find((e) => e.event.type === "order.routed")?.event;
+      if (!routed || routed.type !== "order.routed") {
+        this.emitEvent(order, { type: "order.failed", reason: "daemon restarted before routing finished" });
+        this.close(t, "failed");
+        continue;
+      }
+      t.decision = routed.decision;
+      for (const id of routed.decision.targets) t.targets.set(id, "pending");
+      for (const { event: ev } of events) {
+        if (ev.type === "order.delivered" && !t.targets.has(ev.agentId)) t.targets.set(ev.agentId, "pending");
+        else if (ev.type === "order.acked" && t.targets.get(ev.agentId) === "pending") t.targets.set(ev.agentId, "acked");
+        else if (ev.type === "order.replied" && ev.final) {
+          t.targets.set(ev.agentId, "done");
+          t.replied = true;
+        } else if (ev.type === "order.declined") t.targets.set(ev.agentId, "done");
+        else if (ev.type === "order.failed" && ev.agentId) t.targets.set(ev.agentId, "failed");
+      }
+      t.candidates = routed.decision.candidates.filter((id) => !t.targets.has(id));
+      for (const [id, st] of t.targets) {
+        if (st === "pending") this.armAck(t, id);
+        else if (st === "acked") this.armHeartbeat(t, id);
+      }
+      if (routed.decision.mode !== "unicast" || order.kind === "notice") {
+        const remaining = order.createdAt + (order.deadlineMs ?? this.timing.broadcastDeadlineMs) - Date.now();
+        t.deadline = setTimeout(() => this.finishOnDeadline(t), Math.max(0, remaining));
+      }
+      this.maybeClose(t);
+    }
+    if (n) this.log(`recovered ${n} open order(s)`);
+    return n;
   }
 
   // -------------------------------------------------------------------------

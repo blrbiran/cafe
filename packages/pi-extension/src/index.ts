@@ -60,11 +60,35 @@ export function lastAssistantText(messages: readonly unknown[]): string | undefi
   return undefined;
 }
 
-function orderPrompt(order: Order, self?: AgentRecord): string {
+const HISTORY_TURN_CHARS = 1500;
+
+/** Compact transcript of the earlier turns of a Thread, oldest first. */
+export function formatHistory(history: Order["history"]): string {
+  return history
+    .map((h) => {
+      const text = h.text.length > HISTORY_TURN_CHARS ? `${h.text.slice(0, HISTORY_TURN_CHARS)} …[truncated]` : h.text;
+      return `[${h.role} ${h.from}]\n${text}`;
+    })
+    .join("\n\n");
+}
+
+export function orderPrompt(order: Order, self?: AgentRecord): string {
+  const to = self ? ` to you (${self.address})` : "";
+  const head =
+    order.turn > 1
+      ? [
+          `☕ cafe follow-up (turn ${order.turn}) from ${order.from.address}${to}`,
+          `orderId: ${order.orderId} · threadId: ${order.threadId}`,
+          "",
+          "This continues an earlier conversation in this thread. You may have handled other work since then, so rely on this transcript, not your memory:",
+          "",
+          formatHistory(order.history),
+          "",
+          "--- new message ---",
+        ]
+      : [`☕ cafe Order from ${order.from.address}${to}`, `orderId: ${order.orderId} · threadId: ${order.threadId}`, ""];
   return [
-    `☕ cafe Order from ${order.from.address}${self ? ` to you (${self.address})` : ""}`,
-    `orderId: ${order.orderId}`,
-    "",
+    ...head,
     order.body,
     "",
     "Answer this Order directly; your final reply in this turn is sent back to the asker.",
@@ -77,11 +101,11 @@ function describeEvent(env: ThreadEnvelope, addr: (id: string) => string): strin
   const ev = env.event;
   switch (ev.type) {
     case "order.replied":
-      return `☕ ${ev.final ? "Reply" : "Interim reply"} from ${addr(ev.agentId)} (thread ${env.threadId}):\n\n${ev.text}`;
+      return `☕ ${ev.final ? "Reply" : "Interim reply"} from ${addr(ev.agentId)} (threadId ${env.threadId}):\n\n${ev.text}`;
     case "order.declined":
-      return `☕ ${addr(ev.agentId)} declined (thread ${env.threadId}): ${ev.reason}`;
-    case "thread.closed":
-      return `☕ Thread ${env.threadId} closed: ${ev.status}`;
+      return `☕ ${addr(ev.agentId)} declined (threadId ${env.threadId}): ${ev.reason}`;
+    case "order.closed":
+      return `☕ Order ${env.orderId} closed: ${ev.status}. To follow up with whoever answered, call cafe_ask with threadId "${env.threadId}".`;
     default:
       return undefined;
   }
@@ -91,9 +115,29 @@ interface Working {
   handle: OrderHandle;
   stopHeartbeat: () => void;
   declined: boolean;
-  /** Set once the run triggered by the injection has started. */
-  started: boolean;
+  /** pi has processed the injected cafe-order message (seen in message_end). */
+  seen: boolean;
+  /** A human message arrived after ours: later assistant text answers the human, not the Order. */
+  frozen: boolean;
   lastText?: string;
+}
+
+/** True if `m` is the injected cafe-order custom message for `orderId` (pi CustomMessage shape). */
+export function isOrderMessage(m: unknown, orderId: string): boolean {
+  const x = m as { role?: string; customType?: string; details?: { order?: { orderId?: string } } };
+  return x?.role === "custom" && x.customType === "cafe-order" && x.details?.order?.orderId === orderId;
+}
+
+/** Retry a daemon call across a reconnect (the client re-registers with the same agentId). */
+async function persist(fn: () => Promise<void>, tries = 30, delayMs = 1000): Promise<void> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i >= tries - 1) throw err;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
 }
 
 /**
@@ -103,13 +147,14 @@ interface Working {
 export default function cafe(pi: ExtensionAPI) {
   let client: CafeClient | undefined;
   let ctxRef: ExtensionContext | undefined;
-  let accept: "auto" | "confirm" = "auto";
   let role: "barista" | "customer" = "customer";
   const queue: OrderHandle[] = [];
   let current: Working | undefined;
   let draining = false;
-  /** Threads this session asked about: threadId → waiter (wait mode) or undefined (async). */
-  const asked = new Map<string, { onEvent?: (env: ThreadEnvelope) => void }>();
+  /** Open Orders this session asked: threadId → the Order (and its waiter in wait mode). */
+  const asked = new Map<string, { orderId: string; onEvent?: (env: ThreadEnvelope) => void }>();
+  /** orderIds already queued or served, so a redelivery after a reconnect is not run twice. */
+  const known = new Set<string>();
   /** Events that arrive before order/create returns (the daemon fans out during creation). */
   const early = new Map<string, ThreadEnvelope[]>();
   let registry: AgentRecord[] = [];
@@ -143,18 +188,19 @@ export default function cafe(pi: ExtensionAPI) {
       if (early.size > 100) early.delete(early.keys().next().value!);
       return;
     }
+    if (env.orderId !== entry.orderId) return;
     if (entry.onEvent) return entry.onEvent(env);
     const text = describeEvent(env, addrOf);
     if (text) {
       pi.sendMessage(
-        { customType: "cafe-reply", content: text, display: true, details: { threadId: env.threadId, event: env.event.type } },
-        { triggerTurn: env.event.type !== "thread.closed", deliverAs: "followUp" },
+        { customType: "cafe-reply", content: text, display: true, details: { threadId: env.threadId, orderId: env.orderId, event: env.event.type } },
+        { triggerTurn: env.event.type !== "order.closed", deliverAs: "followUp" },
       );
     }
-    if (env.event.type === "thread.closed") asked.delete(env.threadId);
+    if (env.event.type === "order.closed") asked.delete(env.threadId);
   }
 
-  function track(threadId: string, entry: { onEvent?: (env: ThreadEnvelope) => void }): void {
+  function track(threadId: string, entry: { orderId: string; onEvent?: (env: ThreadEnvelope) => void }): void {
     asked.set(threadId, entry);
     const buf = early.get(threadId);
     early.delete(threadId);
@@ -170,16 +216,8 @@ export default function cafe(pi: ExtensionAPI) {
     }
     draining = true;
     try {
-      if (accept === "confirm" && ctxRef?.hasUI) {
-        const ok = await ctxRef.ui.confirm("☕ cafe Order", `From ${next.order.from.address}:\n\n${next.order.body}\n\nWork on it now?`);
-        if (!ok) {
-          await next.decline("declined by the human operator").catch(() => {});
-          draining = false;
-          return void drain();
-        }
-      }
       await next.ack().catch(() => {});
-      current = { handle: next, stopHeartbeat: keepAlive(next), declined: false, started: false };
+      current = { handle: next, stopHeartbeat: keepAlive(next), declined: false, seen: false, frozen: false };
       void client.setStatus("busy").catch(() => {});
       pi.sendMessage(
         { customType: "cafe-order", content: orderPrompt(next.order, client.record), display: true, details: { order: next.order } },
@@ -190,15 +228,14 @@ export default function cafe(pi: ExtensionAPI) {
     }
   }
 
-  async function finish(): Promise<void> {
+  async function finish(aborted: boolean): Promise<void> {
     const w = current;
     if (!w) return;
     current = undefined;
     w.stopHeartbeat();
-    if (!w.declined) {
-      const text = w.lastText ?? "(no answer produced)";
-      await w.handle.reply(text, true).catch(() => {});
-    }
+    if (w.declined) return;
+    if (!w.lastText && aborted) await persist(() => w.handle.decline("aborted by the operator")).catch(() => {});
+    else await persist(() => w.handle.reply(w.lastText ?? "(no answer produced)", true)).catch(() => {});
   }
 
   // ---------------------------------------------------------------------------
@@ -209,7 +246,6 @@ export default function cafe(pi: ExtensionAPI) {
     ctxRef = ctx;
     if (client) return;
     const { cafe: id } = loadIdentity(ctx.cwd);
-    accept = id.accept;
     role = id.role;
     const addr = daemonAddr();
     if (!(await ensureDaemon(addr))) {
@@ -218,6 +254,8 @@ export default function cafe(pi: ExtensionAPI) {
     }
     const c = new CafeClient({ daemon: addr, token: process.env.CAFE_TOKEN, reconnect: true });
     c.onOrder((h) => {
+      if (known.has(h.order.orderId)) return;
+      known.add(h.order.orderId);
       queue.push(h);
       void drain();
     });
@@ -248,19 +286,33 @@ export default function cafe(pi: ExtensionAPI) {
 
   pi.on("agent_start", async (_event, ctx) => {
     ctxRef = ctx;
-    if (current) current.started = true;
     if (client) void client.setStatus("busy").catch(() => {});
   });
 
-  pi.on("agent_end", async (event) => {
-    if (!current?.started) return;
-    const text = lastAssistantText(event.messages);
-    if (text) current.lastText = text;
+  // Correlate by content, not timing: the Order's run is the one whose messages contain
+  // our cafe-order custom message. The Reply is the last assistant text after it and
+  // before any later human (role "user") message. A run without it never replies.
+  pi.on("message_end", async (event) => {
+    const w = current;
+    if (!w) return;
+    const m = event.message as { role?: string };
+    if (isOrderMessage(m, w.handle.order.orderId)) {
+      w.seen = true;
+      w.frozen = false;
+      w.lastText = undefined;
+      return;
+    }
+    if (!w.seen || w.frozen) return;
+    if (m.role === "user") w.frozen = true;
+    else if (m.role === "assistant") {
+      const t = lastAssistantText([m]);
+      if (t) w.lastText = t;
+    }
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     ctxRef = ctx;
-    if (current?.started) await finish();
+    if (current?.seen) await finish(event.aborted);
     if (queue.length) await drain();
     else if (client && !current) void client.setStatus("idle").catch(() => {});
   });
@@ -269,7 +321,7 @@ export default function cafe(pi: ExtensionAPI) {
     const rec = client?.record;
     const lines = [
       rec ? `You are connected to the cafe agent network as ${rec.address} (role: ${role}).` : "You can reach the cafe agent network.",
-      "Other agents on the network may know things you don't. Use cafe_agents to see who is registered and cafe_ask to send them a question (non-blocking by default; replies arrive as cafe-reply messages).",
+      "Other agents on the network may know things you don't. Use cafe_agents to see who is registered and cafe_ask to send them a question (non-blocking by default; replies arrive as cafe-reply messages; pass threadId to follow up with whoever answered).",
     ];
     if (role === "barista") lines.push("Messages of type cafe-order are questions from other agents: answer them, or call cafe_decline if they are not your responsibility.");
     event.systemPromptOptions.sections.cafe = lines.join("\n");
@@ -281,7 +333,8 @@ export default function cafe(pi: ExtensionAPI) {
 
   pi.registerMessageRenderer<{ order: Order }>("cafe-order", (message, options, theme) => {
     const order = message.details?.order;
-    const head = theme.fg("accent", `☕ Order from ${order?.from.address ?? "?"}`);
+    const kind = order && order.turn > 1 ? `Follow-up (turn ${order.turn})` : "Order";
+    const head = theme.fg("accent", `☕ ${kind} from ${order?.from.address ?? "?"}`);
     const body = order?.body ?? (typeof message.content === "string" ? message.content : "");
     return new Text(`${head}\n${options.expanded ? body : body.split("\n").slice(0, 6).join("\n")}`, 1, 0);
   });
@@ -320,28 +373,39 @@ export default function cafe(pi: ExtensionAPI) {
     name: "cafe_ask",
     label: "cafe ask",
     description:
-      "Send an Order (question or task) to other agents on the cafe network. The daemon routes it to the right agent(s) unless `to` names an address (name, name@host or name#n@host). Non-blocking by default: replies arrive later as cafe-reply messages. Set wait=true to block until the thread closes and get all replies.",
+      "Send an Order (question or task) to other agents on the cafe network. The daemon routes it to the right agent(s) unless `to` names an address (name, name@host or name#n@host). Pass threadId to continue a previous conversation with whoever answered in that thread. Non-blocking by default: replies arrive later as cafe-reply messages. Set wait=true to block until the Order closes and get all replies.",
     promptSnippet: "Ask other agents on the cafe network",
     promptGuidelines: ["Use cafe_ask when another agent on the cafe network is likely to know the answer or own the code in question."],
     parameters: Type.Object({
       body: Type.String({ description: "The question or task, self-contained." }),
       to: Type.Optional(Type.String({ description: "Explicit address; omit to let the router decide." })),
+      threadId: Type.Optional(Type.String({ description: "Continue a previous conversation (thread) with whoever answered in it." })),
       wait: Type.Optional(Type.Boolean({ description: "Block until all replies are in." })),
     }),
     async execute(_id, params, signal) {
       const c = requireClient();
       const parentOrderId = current?.handle.order.orderId;
+      const ask = async () => {
+        try {
+          return await c.ask({ body: params.body, to: params.to, threadId: params.threadId, parentOrderId });
+        } catch (err) {
+          if ((err as { code?: string }).code === "thread_busy") {
+            throw new Error(`Thread ${params.threadId} still has an open Order; wait for its replies (cafe-reply messages) before following up.`);
+          }
+          throw err;
+        }
+      };
+      await refreshRegistry(c);
       if (!params.wait) {
-        await refreshRegistry(c);
-        const res = await c.ask({ body: params.body, to: params.to, parentOrderId });
-        track(res.threadId, {});
+        const res = await ask();
+        track(res.threadId, { orderId: res.orderId });
         return text(
-          `Order sent (thread ${res.threadId}). Routed ${res.decision.mode} to ${res.decision.targets.map(addrOf).join(", ") || "nobody"}: ${res.decision.reason}. Replies will arrive as cafe-reply messages.`,
+          `Order ${res.orderId} sent (threadId ${res.threadId}). Routed ${res.decision.mode} to ${res.decision.targets.map(addrOf).join(", ") || "nobody"}: ${res.decision.reason}. Replies will arrive as cafe-reply messages; to follow up later, call cafe_ask with threadId "${res.threadId}".`,
         );
       }
-      await refreshRegistry(c);
       const replies: string[] = [];
       let threadId = "";
+      let orderId = "";
       const closed = new Promise<string>((resolve, reject) => {
         const onAbort = () => {
           if (threadId) void c.cancel(threadId).catch(() => {});
@@ -349,24 +413,27 @@ export default function cafe(pi: ExtensionAPI) {
         };
         signal?.addEventListener("abort", onAbort, { once: true });
         const onEvent = (env: ThreadEnvelope) => {
-          const line = env.event.type === "thread.closed" ? undefined : describeEvent(env, addrOf);
+          const line = env.event.type === "order.closed" ? undefined : describeEvent(env, addrOf);
           if (line) replies.push(line);
-          if (env.event.type === "thread.closed") {
+          if (env.event.type === "order.closed") {
             signal?.removeEventListener("abort", onAbort);
             asked.delete(env.threadId);
             resolve(env.event.status);
           }
         };
-        void c
-          .ask({ body: params.body, to: params.to, parentOrderId })
+        void ask()
           .then((res) => {
             threadId = res.threadId;
-            track(res.threadId, { onEvent });
+            orderId = res.orderId;
+            // Keyed on this Order: track() drops events of other Orders in the thread.
+            track(res.threadId, { orderId: res.orderId, onEvent });
           })
           .catch(reject);
       });
       const status = await closed;
-      return text(`Thread ${threadId} ${status}.\n\n${replies.join("\n\n") || "(no replies)"}`);
+      return text(
+        `Order ${orderId} (threadId ${threadId}) ${status}.\n\n${replies.join("\n\n") || "(no replies)"}\n\nTo follow up with whoever answered, call cafe_ask with threadId "${threadId}".`,
+      );
     },
   });
 

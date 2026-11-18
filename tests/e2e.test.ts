@@ -32,7 +32,7 @@ describe("single root", () => {
     const events = await untilClosed(c, res.threadId);
     const reply = events.find((e) => e.event.type === "order.replied");
     expect(reply?.event).toMatchObject({ agentId: a.rec.agentId, text: "billing says: why is the invoice total wrong?" });
-    expect(events.at(-1)?.event).toEqual({ type: "thread.closed", status: "done" });
+    expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "done" });
     expect(root.daemon.thread(res.threadId)?.meta.status).toBe("done");
   });
 
@@ -53,7 +53,7 @@ describe("single root", () => {
     const types = events.map((e) => e.event.type);
     expect(types).toContain("order.replied");
     expect(types).toContain("order.declined");
-    expect(events.at(-1)?.event).toEqual({ type: "thread.closed", status: "done" });
+    expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "done" });
   });
 
   it("falls back to the next candidate when the target never acks", async () => {

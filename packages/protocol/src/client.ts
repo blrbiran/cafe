@@ -97,7 +97,9 @@ export class CafeClient {
           await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, kind: "agent", token: this.opts.token });
           this.peer = peer;
           this.retry = 0;
-          this.record = this.identity ? await peer.request<AgentRecord>(Methods.agentRegister, this.identity) : undefined;
+          // Keep the same agentId across reconnects so in-flight Orders stay attributable.
+          const identity = this.identity ? { ...this.identity, resumeAgentId: this.record?.agentId ?? this.identity.resumeAgentId } : undefined;
+          this.record = identity ? await peer.request<AgentRecord>(Methods.agentRegister, identity) : undefined;
           for (const fn of this.connectListeners) fn(this.record);
           settled = true;
           resolve(this.record);

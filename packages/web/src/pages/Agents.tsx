@@ -1,118 +1,115 @@
 import { useState } from "react";
-import type { AgentRecord } from "@cafe/protocol";
+import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
 import { api } from "../api.ts";
-import { hashFor } from "../route.ts";
-import { useStore } from "../store.ts";
-import { relTime, useNow } from "../format.ts";
-import { Badge, Empty, Led, PageHeader } from "../ui/bits.tsx";
+import { useT, type Dict } from "../i18n.ts";
+import { hashFor, navigate } from "../route.ts";
+import { openComposer, useStore } from "../store.ts";
+import { Dot, Empty, Facts, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
+
+const DAY = 24 * 3600 * 1000;
 
 export function AgentsPage() {
+  const t = useT();
   const agents = useStore((s) => s.agents);
   const host = useStore((s) => s.host);
-  const version = useStore((s) => s.registryVersion);
-  const [showOffline, setShowOffline] = useState(true);
-  const list = Object.values(agents).filter((a) => showOffline || a.status !== "offline");
+  const isRoot = useStore((s) => s.isRoot);
+  const daemons = useStore((s) => s.daemons);
+  const threads = useStore((s) => s.threads);
+
+  const all = Object.values(agents);
+  const baristas = all.filter((a) => a.role === "barista");
+  const customers = all.filter((a) => a.role !== "barista" && a.status !== "offline").length;
   const byHost = new Map<string, AgentRecord[]>();
-  for (const a of list.sort((x, y) => x.address.localeCompare(y.address))) {
-    const l = byHost.get(a.host) ?? [];
-    l.push(a);
-    byHost.set(a.host, l);
+  for (const a of baristas.sort((x, y) => x.name.localeCompare(y.name) || x.address.localeCompare(y.address))) {
+    byHost.set(a.host, [...(byHost.get(a.host) ?? []), a]);
   }
   const hosts = [...byHost.keys()].sort((a, b) => (a === host ? -1 : b === host ? 1 : a.localeCompare(b)));
 
+  // 24h activity from the threads this daemon knows (latest turn of each thread; approximate).
+  const since = Date.now() - DAY;
+  const recent = threads.filter((m) => (m.lastActivityAt ?? m.createdAt) >= since);
+
   return (
     <>
-      <PageHeader
-        title="Agents"
-        meta={`registry v${version} · ${Object.keys(agents).length} registered`}
-        actions={
-          <label className="flex-row items-center gap-2 text-sm text-fg">
-            <input type="checkbox" checked={showOffline} onChange={(e) => setShowOffline(e.target.checked)} />
-            show offline
-          </label>
-        }
-      />
-      {hosts.length === 0 && <Empty>No agents registered. Start one with `cafe barista start` or open pi with the cafe extension.</Empty>}
-      <div className="flex flex-col gap-4">
-        {hosts.map((h) => (
-          <section key={h} className="card overflow-hidden">
-            <div className="flex items-center gap-2 border-b border-line-strong px-4 py-2">
-              <h2 className="m-0 text-base">{h}</h2>
-              {h === host && <Badge>this host</Badge>}
-              <span className="meta ml-auto">{byHost.get(h)!.length} agents</span>
+      <PageHeader title={t.agentsTitle} sub={t.agentsSub} />
+      {hosts.length === 0 && <Empty>{t.agentsEmpty}</Empty>}
+      {hosts.map((h) => {
+        const list = byHost.get(h)!;
+        const rec = daemons.find((d) => d.host === h);
+        const online = rec ? rec.online : list.some((a) => a.status !== "offline");
+        const note = h === host ? (isRoot ? t.hostHubThis : t.hostThis) : !online ? t.hostOffline : rec?.isRoot ? t.hostHub : "";
+        return (
+          <section key={h} className="flex flex-col gap-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <Dot tone={online ? "ok" : undefined} />
+              <h2 className="mono m-0 text-base text-fg-strong">{h}</h2>
+              {note && <span className="hint">{note}</span>}
             </div>
-            <div className="table-box">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Address</th>
-                    <th>Description</th>
-                    <th>Scope</th>
-                    <th>Mode</th>
-                    <th>Role</th>
-                    <th>Seen</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {byHost.get(h)!.map((a) => (
-                    <AgentRow key={a.agentId} a={a} />
-                  ))}
-                </tbody>
-              </table>
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
+              {list.map((a) => (
+                <AgentCard key={a.agentId} a={a} threads={threads} recent={recent} t={t} />
+              ))}
             </div>
           </section>
-        ))}
-      </div>
+        );
+      })}
+      {customers > 0 && <div className="hint">{t.customersOnly(customers)}</div>}
     </>
   );
 }
 
-function AgentRow({ a }: { a: AgentRecord }) {
-  const now = useNow();
+function AgentCard({ a, threads, recent, t }: { a: AgentRecord; threads: ThreadMeta[]; recent: ThreadMeta[]; t: Dict }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
+  const current = threads.find((m) => (m.status === "working" || m.status === "delivering") && m.targets.includes(a.agentId));
+  const status: "idle" | "busy" | "offline" = a.status === "offline" ? "offline" : current || a.status === "busy" ? "busy" : "idle";
+  const tone: Tone = status === "busy" ? "info" : status === "idle" ? "ok" : undefined;
+  const answered = recent.reduce((n, m) => n + m.replies.filter((r) => r.agentId === a.agentId).length, 0);
+  const declined = recent.reduce((n, m) => n + m.declines.filter((d) => d.agentId === a.agentId).length, 0);
+  const runsAs = { tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode];
+
   return (
-    <tr className={a.status === "offline" ? "opacity-60" : undefined}>
-      <td className="whitespace-nowrap">
-        <div className="flex items-center gap-2">
-          <Led status={a.status} />
-          <a href={hashFor({ page: "threads", agent: a.agentId })} className="font-data text-xs">
-            {a.address}
-          </a>
+    <article className={`card flex flex-col gap-2.5 p-4 ${status === "offline" ? "opacity-70" : ""}`}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-col">
+          <span className="text-lg font-semibold text-fg-strong">{a.name}</span>
+          <span className="mono truncate text-xs text-muted">{a.address}</span>
         </div>
-        <div className="meta pl-4">{a.status}</div>
-      </td>
-      <td className="min-w-48">
-        <div className="text-fg-strong">{a.name}</div>
-        {a.description && <div className="text-xs text-muted">{a.description}</div>}
-        {a.tags.length > 0 && (
-          <div className="mt-1 flex flex-wrap gap-1">
-            {a.tags.map((t) => (
-              <Badge key={t}>{t}</Badge>
-            ))}
-          </div>
-        )}
-      </td>
-      <td className="meta">
-        {a.scope.length ? a.scope.map((s) => <div key={s}>{s}</div>) : <div>{a.cwd}</div>}
-      </td>
-      <td>
-        <Badge>{a.mode}</Badge>
-      </td>
-      <td>
-        <Badge tone={a.role === "barista" ? "info" : undefined}>{a.role}</Badge>
-        {a.role === "barista" && a.accept === "confirm" && <div className="meta mt-1">confirm</div>}
-      </td>
-      <td className="meta whitespace-nowrap num">{relTime(a.lastSeenAt, now)}</td>
-      <td className="text-right">
-        {a.status !== "offline" && (
+        <Pill tone={tone}>{t[status]}</Pill>
+      </div>
+      {current && (
+        <a className="well block text-sm no-underline hover:border-line-strong" href={hashFor({ page: "thread", threadId: current.threadId })}>
+          <span className="text-muted">{t.nowAnswering}</span> <span className="text-fg-strong">“{current.summary.slice(0, 80)}{current.summary.length > 80 ? "…" : ""}”</span>
+        </a>
+      )}
+      {a.description && <div className="text-sm text-fg">{a.description}</div>}
+      <Facts
+        rows={[
+          [t.dir, <span className="mono" title={(a.scope.length ? a.scope : [a.cwd]).join("\n")}>{a.scope[0] ?? a.cwd}</span>],
+          [t.runsAs, runsAs],
+          [t.last24h, t.stats(answered, declined)],
+        ]}
+      />
+      <div className="mt-0.5 flex gap-2">
+        <button
+          type="button"
+          className="btn-sm"
+          disabled={status === "offline"}
+          onClick={() => {
+            openComposer(a.address);
+            navigate({ page: "feed", filter: "all" });
+          }}
+        >
+          {t.askIt}
+        </button>
+        {status !== "offline" && (
           <button
-            className="btn-quiet btn-sm"
+            type="button"
+            className="btn-sm"
+            title={t.disconnectHint}
             aria-busy={busy}
-            title="Disconnect this agent"
             onClick={async () => {
-              if (!confirm(`Disconnect ${a.address}?`)) return;
+              if (!confirm(t.disconnectConfirm(a.address))) return;
               setBusy(true);
               setErr(undefined);
               try {
@@ -124,11 +121,11 @@ function AgentRow({ a }: { a: AgentRecord }) {
               }
             }}
           >
-            kick
+            {t.disconnect}
           </button>
         )}
-        {err && <div className="text-xs text-danger">{err}</div>}
-      </td>
-    </tr>
+      </div>
+      {err && <div className="text-xs text-danger">{err}</div>}
+    </article>
   );
 }

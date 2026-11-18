@@ -2,12 +2,14 @@ import { useEffect } from "react";
 import { Shell } from "./Shell.tsx";
 import { useRoute } from "./route.ts";
 import { closeThread, openThread, useStore } from "./store.ts";
+import { useT } from "./i18n.ts";
+import { FeedPage } from "./pages/Feed.tsx";
+import { ConversationPage } from "./pages/Conversation.tsx";
 import { AgentsPage } from "./pages/Agents.tsx";
-import { ThreadsPage } from "./pages/Threads.tsx";
-import { ThreadPage } from "./pages/Thread.tsx";
 import { NetworkPage } from "./pages/Network.tsx";
 
 export function App() {
+  const t = useT();
   const route = useRoute();
   const error = useStore((s) => s.error);
   const loaded = useStore((s) => s.loaded);
@@ -21,20 +23,20 @@ export function App() {
   return (
     <Shell route={route}>
       {error && (
-        <div role="alert" className="well mb-4 text-sm" data-tone="danger">
+        <div role="alert" className="well text-sm" data-tone="danger">
           {error}
         </div>
       )}
       {!loaded ? (
-        <div className="meta">loading…</div>
+        <div className="hint">{t.loading}</div>
       ) : route.page === "agents" ? (
         <AgentsPage />
       ) : route.page === "network" ? (
         <NetworkPage />
       ) : route.page === "thread" ? (
-        <ThreadPage threadId={route.threadId} />
+        <ConversationPage threadId={route.threadId} />
       ) : (
-        <ThreadsPage status={route.status} agent={route.agent} />
+        <FeedPage filter={route.filter} />
       )}
     </Shell>
   );
