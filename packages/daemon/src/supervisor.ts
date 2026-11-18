@@ -66,6 +66,9 @@ const EXIT_NOT_FOUND = 127;
 /** The cafe pi extension: `CAFE_PI_EXTENSION`, else the installed `@cafe/pi-extension`, else the sibling workspace package. */
 export function defaultExtensionPath(): string {
   if (process.env.CAFE_PI_EXTENSION) return process.env.CAFE_PI_EXTENSION;
+  // Published package: dist/cli.js sits next to dist/pi-extension.js.
+  const bundled = join(here, "pi-extension.js");
+  if (existsSync(bundled)) return bundled;
   try {
     return fileURLToPath(import.meta.resolve("@cafe/pi-extension"));
   } catch {

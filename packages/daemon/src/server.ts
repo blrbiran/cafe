@@ -21,6 +21,9 @@ const MIME: Record<string, string> = {
 
 /** The built web UI: from the installed `@cafe/web` package, else the sibling workspace package. */
 export function defaultWebDist(): string {
+  // Published package: dist/cli.js, with the web build in ../web.
+  const bundled = resolve(dirname(fileURLToPath(import.meta.url)), "../web");
+  if (existsSync(join(bundled, "index.html"))) return bundled;
   try {
     return join(dirname(fileURLToPath(import.meta.resolve("@cafe/web/package.json"))), "dist");
   } catch {

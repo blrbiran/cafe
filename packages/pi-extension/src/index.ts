@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -24,6 +25,9 @@ async function healthy(addr: string): Promise<boolean> {
 
 /** The `cafe` CLI entry: the installed `@cafe/cli`, else the sibling workspace package. */
 function cafeCliPath(): string {
+  // Published package: dist/pi-extension.js, with the CLI entry in ../bin/cafe.js.
+  const bundled = fileURLToPath(new URL("../bin/cafe.js", import.meta.url));
+  if (existsSync(bundled)) return bundled;
   try {
     return fileURLToPath(import.meta.resolve("@cafe/cli"));
   } catch {

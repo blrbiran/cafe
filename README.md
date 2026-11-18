@@ -32,6 +32,19 @@ cafe 是一个 agent 网络：任意一方发出的一条消息（Order），会
 | `packages/web` | web UI（React 19 + Vite + Tailwind v4），构建后由 Daemon 托管 |
 | `skills/cafe` | 给 Claude Code / Codex / pi 用的 skill |
 
+## 安装
+
+需要 Node ≥ 22.18。
+
+```bash
+npm i -g @blrbiran/cafe          # 命令是 cafe
+cafe daemon start --root          # 本机作为 Root（或 cafe daemon install --root：开机自启）
+pi -e "$(cafe pi-extension-path)" # 让 pi / omp 接入
+cafe skill install                # 给 Claude Code / Codex 装 skill
+```
+
+发布（维护者）：`npm version <x.y.z>` → `npm run release:pack`（生成 `release/` 和 `release-out/*.tgz`，先看内容）→ `npm publish ./release`。见 [`docs/specs/v2-7-publishing.md`](docs/specs/v2-7-publishing.md)。
+
 ## 开发
 
 需要 Node ≥ 22.18。源码是 TS，直接靠 Node 的 type stripping 运行，无需编译。
@@ -52,7 +65,7 @@ open http://127.0.0.1:4777/
 在 pi 里接入（TUI Barista）：
 
 ```bash
-pi -e /path/to/cafe/packages/pi-extension/src/index.ts
+pi -e "$(cafe pi-extension-path)"     # 仓库里即 packages/pi-extension/src/index.ts
 # 或在 ~/.pi/agent/settings.json 的 "extensions" 中加入该路径
 ```
 

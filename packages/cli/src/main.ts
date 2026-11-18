@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, openSync, readlinkSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import type { AgentRecord, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
-import { cafeHome, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
+import { cafeHome, defaultExtensionPath, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
 
@@ -138,8 +138,20 @@ async function follow(threadId: string, opts: { quiet?: boolean; orderId?: strin
 // Commands
 // ---------------------------------------------------------------------------
 
+/** Published package: release/package.json next to dist/; repo: the root package.json. */
+function cafeVersion(): string {
+  for (const f of [resolve(here, "../package.json"), resolve(here, "../../../package.json")]) {
+    try {
+      const pkg = JSON.parse(readFileSync(f, "utf8"));
+      if (pkg.name !== "@cafe/cli" && pkg.version) return pkg.version;
+    } catch {}
+  }
+  return "0.0.0";
+}
+
 const program = new Command("cafe")
   .description("cafe: route a message to the agent(s) on the network that can answer it")
+  .version(cafeVersion(), "-V, --version")
   .option("--json", "machine-readable output")
   .hook("preAction", (cmd) => {
     JSON_OUT = !!cmd.opts().json;
@@ -451,11 +463,17 @@ program
   });
 
 program
+  .command("pi-extension-path")
+  .description("print the path of the cafe pi extension (for `pi -e` / `omp -e` or the extensions list)")
+  .action(() => out(defaultExtensionPath(), { path: defaultExtensionPath() }));
+
+program
   .command("skill")
   .description("install the cafe skill for Claude Code / Codex / pi")
   .command("install")
   .action(() => {
-    const src = resolve(here, "../../../skills/cafe");
+    // Published package: dist/cli.js with ../skills/cafe; repo: packages/cli/src → ../../../skills/cafe.
+    const src = [resolve(here, "../skills/cafe"), resolve(here, "../../../skills/cafe")].find((d) => existsSync(join(d, "SKILL.md")))!;
     const targets = [join(homedir(), ".claude/skills/cafe"), join(homedir(), ".agents/skills/cafe")];
     const done: string[] = [];
     for (const t of targets) {
