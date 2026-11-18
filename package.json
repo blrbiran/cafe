@@ -17,7 +17,8 @@
     "cafe": "node packages/cli/src/main.ts",
     "build:web": "npm run build --workspace @cafe/web",
     "release:build": "node scripts/build-release.mjs",
-    "release:pack": "node scripts/build-release.mjs && node -e \"require('fs').mkdirSync('release-out',{recursive:true})\" && npm pack ./release --pack-destination release-out"
+    "release:pack": "node scripts/build-release.mjs && node -e \"require('fs').mkdirSync('release-out',{recursive:true})\" && npm pack ./release --pack-destination release-out",
+    "test:release": "node scripts/test-release.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
