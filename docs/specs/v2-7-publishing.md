@@ -1,6 +1,6 @@
 # v2-7 可发布的 npm 包
 
-状态：**已实现，未发布**（2026-11-19）。Q60–Q64 按推荐执行，包名按用户决定为 `@blrbiran/cafe`（Q65 先选了 `agent-cafe`，后改为用户自己的 scope）。发布本身由用户执行。
+状态：**已实现并已发布**（2026-11-19，npm 上有 0.1.0 / 0.1.1）。Q60–Q64 按推荐执行，包名按用户决定为 `@blrbiran/cafe`（Q65 先选了 `agent-cafe`，后改为用户自己的 scope）。发布本身由用户执行。
 
 ## 决定
 
@@ -44,11 +44,12 @@
 ## 发布流程
 
 ```bash
-npm version 0.1.1           # 改根 package.json 并打 tag
-npm run release:pack        # 构建 web + 打包 → release/，tarball → release-out/
-tar tzf release-out/*.tgz   # 看内容
+npm version 0.1.2           # 改根 package.json 并打 tag
+npm run test:release        # 构建 + 打包 + 装到临时 prefix 冒烟测试（v2-8）
 npm publish ./release       # 需要已 npm login
 ```
+
+已发布：0.1.0、0.1.1（用户自己发布，2026-11-19）。
 
 ## 已验证（2026-11-19）
 

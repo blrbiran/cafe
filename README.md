@@ -43,7 +43,9 @@ pi -e "$(cafe pi-extension-path)" # 让 pi / omp 接入
 cafe skill install                # 给 Claude Code / Codex 装 skill
 ```
 
-发布（维护者）：`npm version <x.y.z>` → `npm run release:pack`（生成 `release/` 和 `release-out/*.tgz`，先看内容）→ `npm publish ./release`。见 [`docs/specs/v2-7-publishing.md`](docs/specs/v2-7-publishing.md)。
+发布（维护者）：`npm version <x.y.z>` → `npm run test:release`（打包、装到临时目录并冒烟测试，不调用模型）→ `npm publish ./release`。见 [`docs/specs/v2-7-publishing.md`](docs/specs/v2-7-publishing.md) 和 [`docs/specs/v2-8-versions-reconnect-release-test.md`](docs/specs/v2-8-versions-reconnect-release-test.md)。
+
+多台机器请装同一个版本：协议不兼容的版本会被拒绝连接，版本不同但兼容时 `cafe daemon status` 和网络页会提示。
 
 ## 开发
 
