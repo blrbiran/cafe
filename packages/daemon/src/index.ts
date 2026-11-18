@@ -4,6 +4,8 @@ import { Daemon, type DaemonOptions } from "./daemon.ts";
 import { cafeHome, loadConfig } from "./config.ts";
 import { startServer, type ServerHandle } from "./server.ts";
 import { Supervisor } from "./supervisor.ts";
+import { advertiseRoot, discoverRoots } from "./discovery.ts";
+import { lanAddress } from "./daemon.ts";
 
 export { Daemon, lanAddress, type DaemonOptions, type Timing } from "./daemon.ts";
 export { CafeConfig, cafeHome, configPath, loadConfig, saveConfig, setConfigValue } from "./config.ts";
@@ -11,6 +13,7 @@ export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";
 export { Store } from "./store.ts";
+export { discoverRoots, type FoundRoot } from "./discovery.ts";
 export { Supervisor, defaultExtensionPath, type BaristaSpec, type SupervisorOptions, type WorkerInfo } from "./supervisor.ts";
 
 function alive(pid: number): boolean {
@@ -98,10 +101,35 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   daemon.recover();
   daemon.connectRoot();
   void daemon.announceRoot();
+  const discovery = config.discovery && process.env.CAFE_DISCOVERY !== "0";
+  let stopAdvert: (() => void) | undefined;
+  let searching: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  if (discovery && config.mode === "root") {
+    stopAdvert = advertiseRoot({ host: config.host, addr: () => `${config.advertise ?? lanAddress()}:${config.port}` });
+  } else if (discovery && !config.root) {
+    // No Root configured: look for exactly one on the LAN, retrying until found.
+    const search = async () => {
+      const roots = (await discoverRoots(2000)).filter((r) => r.host !== config.host);
+      if (stopped || config.root || daemon.isRoot) return;
+      if (roots.length === 1) {
+        daemon.log(`discovered root ${roots[0]!.host} at ${roots[0]!.addr}`);
+        daemon.setRoot(roots[0]!.addr);
+        return;
+      }
+      if (roots.length > 1) daemon.log(`several roots on the LAN (${roots.map((r) => `${r.host} ${r.addr}`).join(", ")}); pick one with \`cafe root set\``);
+      searching = setTimeout(() => void search(), 15_000);
+      searching.unref?.();
+    };
+    void search();
+  }
   return {
     daemon,
     server,
     async stop() {
+      stopped = true;
+      clearTimeout(searching);
+      stopAdvert?.();
       await daemon.supervisor?.shutdown();
       daemon.stop();
       await server.close();

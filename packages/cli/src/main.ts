@@ -6,8 +6,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import type { AgentRecord, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
-import { cafeHome, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
+import { cafeHome, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
+import { installService, serviceFile, uninstallService } from "./service.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAIN = fileURLToPath(import.meta.url);
@@ -171,6 +172,38 @@ daemon
     out("cafe daemon stopping", { stopping: true });
   });
 daemon
+  .command("install")
+  .description("start the daemon at login and restart it if it crashes (launchd on macOS, systemd --user on Linux)")
+  .option("--root", "run as the Root Daemon (persisted to config)")
+  .option("--dry-run", "print the service file and commands without installing")
+  .action(async (o) => {
+    const f = serviceFile({
+      platform: process.platform,
+      node: process.execPath,
+      bin: join(here, "..", "bin", "cafe.js"),
+      cafeHome: cafeHome(),
+      // Keep existing, unique entries only: the service outlives this shell's temporary PATH additions.
+      path: [...new Set((process.env.PATH ?? "/usr/bin:/bin").split(":"))].filter((d) => d && existsSync(d)).join(":"),
+    });
+    if (o.dryRun) return out(`# ${f.file}\n${f.content}\n# then: ${f.load.map((c) => c.join(" ")).join(" && ")}`, f);
+    if (o.root) setConfigValue("mode", "root");
+    // A daemon started by hand would hold the lock; hand over to the service.
+    if (await healthy()) {
+      await api("/api/shutdown", { method: "POST" });
+      for (let i = 0; i < 50 && (await healthy()); i++) await new Promise((r) => setTimeout(r, 100));
+    }
+    installService(f);
+    for (let i = 0; i < 50 && !(await healthy()); i++) await new Promise((r) => setTimeout(r, 100));
+    out(`installed ${f.file}; daemon ${(await healthy()) ? "running" : "not answering yet, see ~/.cafe/daemon.log"}`, { file: f.file });
+  });
+daemon
+  .command("uninstall")
+  .description("stop starting the daemon at login (also stops it)")
+  .action(() => {
+    const f = serviceFile({ platform: process.platform, node: process.execPath, bin: "", cafeHome: cafeHome(), path: "" });
+    out(uninstallService(f) ? `removed ${f.file}` : "autostart was not installed", { file: f.file });
+  });
+daemon
   .command("status")
   .description("show daemon status")
   .action(async () => {
@@ -302,6 +335,17 @@ root
     setConfigValue("root", addr);
     if (await healthy()) await api("/api/root", { method: "POST", body: JSON.stringify({ root: addr }) });
     out(`root set to ${addr}`, { root: addr });
+  });
+root
+  .command("discover")
+  .description("look for Root Daemons on the local network (mDNS)")
+  .option("--timeout <ms>", "how long to listen", Number, 2000)
+  .action(async (o) => {
+    const found = await discoverRoots(o.timeout);
+    out(
+      found.length ? found.map((r) => `${r.host.padEnd(20)} ${r.addr}    cafe root set ${r.addr}`).join("\n") : "(no root found on the local network)",
+      found,
+    );
   });
 root
   .command("show")

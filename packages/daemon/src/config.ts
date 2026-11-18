@@ -24,6 +24,8 @@ export const CafeConfig = z.object({
       learn: z.boolean().default(true),
     })
     .default({}),
+  /** LAN discovery over mDNS: the Root answers, a Daemon without `root` looks for one. */
+  discovery: z.boolean().default(true),
   /** Root only: last known URLs of Daemons, for dial-back after the Root moves. */
   knownDaemons: z.record(z.string(), z.string()).default({}),
 });
