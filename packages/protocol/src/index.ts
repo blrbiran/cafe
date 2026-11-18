@@ -111,6 +111,8 @@ export const RoutingDecision = z.object({
   router: z.enum(["explicit", "followup", "llm", "rules"]),
   /** Ordered fallbacks for unicast re-delivery. */
   candidates: z.array(z.string()).default([]),
+  /** Baristas that matched as well as the target but were ranked after it because they recently declined similar Orders. */
+  demoted: z.array(z.string()).optional(),
 });
 export type RoutingDecision = z.infer<typeof RoutingDecision>;
 

@@ -1,4 +1,4 @@
-import type { AgentRecord, DaemonRecord, RoutingDecision, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import type { AgentRecord, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 
 export interface Snapshot {
   host: string;
@@ -59,6 +59,8 @@ export const api = {
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),
   agentStats: (since: number) => call<Record<string, AgentStats>>("GET", `/api/agents/stats?since=${since}`),
+  /** Last 7 days per Barista identity (`name@host`); survives Barista restarts. */
+  routingHints: () => call<{ learn: boolean; hints: Record<string, RoutingHint> }>("GET", "/api/routing/hints"),
 };
 
 export function wsUrl(): string {

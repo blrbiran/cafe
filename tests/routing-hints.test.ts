@@ -81,6 +81,8 @@ describe("rules router with hints", () => {
     expect(d.targets).toEqual([b.agentId]);
     expect(d.candidates).toEqual([a.agentId]);
     expect(d.reason).toContain("declined similar orders");
+    expect(d.demoted).toEqual([a.agentId]);
+    expect(plain.demoted).toBeUndefined();
   });
 
   it("never lets history beat a better description match", async () => {
@@ -92,6 +94,7 @@ describe("rules router with hints", () => {
       hints: new Map([[strong.agentId, hint({ css: 50, grid: 50, layout: 50 })]]),
     });
     expect(d.targets).toEqual([strong.agentId]);
+    expect(d.demoted).toBeUndefined();
   });
 
   it("does not turn a match into a broadcast", async () => {

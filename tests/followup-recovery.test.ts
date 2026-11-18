@@ -136,7 +136,7 @@ describe("restart & reconnect", () => {
     let d = await runDaemon(opts);
     const addr = `127.0.0.1:${d.server.port}`;
     const b = new CafeClient({ daemon: addr });
-    b.onOrder((h) => void h.ack());
+    b.onOrder((h) => void h.ack().catch(() => {}));
     await b.connect(identity("ghost"));
     const res = await fetch(`http://${addr}/api/orders`, { method: "POST", body: JSON.stringify({ body: "job", to: "ghost" }) }).then((r) => r.json());
     await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "working");

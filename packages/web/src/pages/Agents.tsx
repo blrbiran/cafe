@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
-import { api, type AgentStats } from "../api.ts";
+import type { RoutingHint } from "@cafe/protocol";
+import { api } from "../api.ts";
 import { useT, type Dict } from "../i18n.ts";
 import { hashFor, navigate } from "../route.ts";
 import { openComposer, useStore } from "../store.ts";
 import { Dot, Empty, Facts, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
 
-const DAY = 24 * 3600 * 1000;
+const WEEK = 7 * 24 * 3600 * 1000;
 
 export function AgentsPage() {
   const t = useT();
@@ -25,21 +26,21 @@ export function AgentsPage() {
   }
   const hosts = [...byHost.keys()].sort((a, b) => (a === host ? -1 : b === host ? 1 : a.localeCompare(b)));
 
-  // Exact 24h per-agent counts from the daemon; refreshed when traffic changes.
-  const [stats, setStats] = useState<Record<string, AgentStats>>();
+  // 7-day counts per identity (`name@host`, so they survive restarts); refreshed when traffic changes.
+  const [hints, setHints] = useState<Record<string, RoutingHint>>();
   const activity = threads.reduce((n, m) => Math.max(n, m.lastActivityAt ?? m.createdAt), 0);
   useEffect(() => {
     let alive = true;
     api
-      .agentStats(Date.now() - DAY)
-      .then((s) => alive && setStats(s))
+      .routingHints()
+      .then((r) => alive && setHints(r.hints))
       .catch(() => {});
     return () => {
       alive = false;
     };
   }, [activity]);
-  // Fallback for older daemons without the stats endpoint: approximate from thread records.
-  const since = Date.now() - DAY;
+  // Fallback for older daemons without the hints endpoint: approximate from thread records.
+  const since = Date.now() - WEEK;
   const recent = threads.filter((m) => (m.lastActivityAt ?? m.createdAt) >= since);
 
   return (
@@ -60,7 +61,7 @@ export function AgentsPage() {
             </div>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
               {list.map((a) => (
-                <AgentCard key={a.agentId} a={a} threads={threads} recent={recent} stats={stats?.[a.agentId] ?? (stats ? { answered: 0, declined: 0, failed: 0 } : undefined)} t={t} />
+                <AgentCard key={a.agentId} a={a} threads={threads} recent={recent} stats={hints?.[`${a.name}@${a.host}`] ?? (hints ? { identity: "", answered: 0, declined: 0, failed: 0, declinedTopics: {} } : undefined)} t={t} />
               ))}
             </div>
           </section>
@@ -71,7 +72,7 @@ export function AgentsPage() {
   );
 }
 
-function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: ThreadMeta[]; recent: ThreadMeta[]; stats?: AgentStats; t: Dict }) {
+function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: ThreadMeta[]; recent: ThreadMeta[]; stats?: RoutingHint; t: Dict }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
   const current = threads.find((m) => (m.status === "working" || m.status === "delivering") && m.targets.includes(a.agentId));
@@ -79,6 +80,7 @@ function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: 
   const tone: Tone = status === "busy" ? "info" : status === "idle" ? "ok" : undefined;
   const answered = stats?.answered ?? recent.reduce((n, m) => n + m.replies.filter((r) => r.agentId === a.agentId).length, 0);
   const declined = stats?.declined ?? recent.reduce((n, m) => n + m.declines.filter((d) => d.agentId === a.agentId).length, 0);
+  const topics = Object.keys(stats?.declinedTopics ?? {}).slice(0, 3);
   const runsAs = { tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode];
 
   return (
@@ -100,9 +102,10 @@ function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: 
         rows={[
           [t.dir, <span className="mono" title={(a.scope.length ? a.scope : [a.cwd]).join("\n")}>{a.scope[0] ?? a.cwd}</span>],
           [t.runsAs, runsAs],
-          [t.last24h, t.stats(answered, declined)],
+          [t.last7d, t.stats(answered, declined)],
         ]}
       />
+      {topics.length > 0 && <div className="hint">{t.oftenDeclines(t.list(topics))}</div>}
       <div className="mt-0.5 flex gap-2">
         <button
           type="button"

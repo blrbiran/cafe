@@ -132,7 +132,7 @@ export function ConversationPage({ threadId }: { threadId: string }) {
         const o = turnOutcome(t, turn, active, agents, meta, now);
         const isFirst = i === 0;
         const asker = turn.order?.from.address ?? meta.from.address;
-        const why = whyText(t, turn.decision);
+        const why = whyText(t, turn.decision, agents, meta);
         const targets = turn.decision?.targets ?? [];
         return (
           <div key={turn.orderId} className="flex flex-col gap-3.5">

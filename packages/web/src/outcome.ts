@@ -52,14 +52,23 @@ export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentR
 }
 
 /** Plain-language "why this agent" from a routing decision. */
-export function whyText(t: Dict, d: { router?: string; mode?: string; reason?: string } | undefined): string | undefined {
+export function whyText(
+  t: Dict,
+  d: { router?: string; mode?: string; reason?: string; targets?: string[]; demoted?: string[] } | undefined,
+  agents: Record<string, AgentRecord> = {},
+  meta?: ThreadMeta,
+): string | undefined {
   if (!d?.router) return undefined;
   if (d.mode === "broadcast") return t.askEveryone;
   switch (d.router) {
     case "llm":
       return d.reason ? t.whyLlm(d.reason) : t.router.llm;
-    case "rules":
-      return t.whyRules;
+    case "rules": {
+      const target = d.targets?.[0];
+      if (!d.demoted?.length || !target) return t.whyRules;
+      const name = (id: string) => whoName(id, agents, meta);
+      return `${t.whyRules}${t.whyDemoted(t.list(d.demoted.map(name)), name(target))}`;
+    }
     case "explicit":
       return t.whyExplicit;
     case "followup":

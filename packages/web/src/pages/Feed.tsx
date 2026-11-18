@@ -80,7 +80,7 @@ function ThreadCard({ meta }: { meta: ThreadMeta }) {
   useEffect(() => {
     if (bucket === "active") ensureLive(meta.threadId);
   }, [bucket, meta.threadId]);
-  const why = bucket === "active" ? whyText(t, live) : undefined;
+  const why = bucket === "active" ? whyText(t, live, agents, meta) : undefined;
   const first = meta.replies[0];
 
   return (

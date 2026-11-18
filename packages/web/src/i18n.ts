@@ -71,7 +71,8 @@ const zh = {
   nowAnswering: "正在回答：",
   dir: "目录",
   runsAs: "运行方式",
-  last24h: "近 24 小时",
+  last7d: "近 7 天",
+  oftenDeclines: (topics: string) => `最近常说不归它管：${topics}`,
   askIt: "问它",
   disconnect: "断开",
   disconnectHint: "把它从网络上断开（它会自动重连）",
@@ -126,6 +127,7 @@ const zh = {
   whyExplicit: "提问时指定了它（指定）。",
   whyFollowup: "这是追问，发给之前回答过的 agent（追问给原回答者）。",
   whyLlm: (r: string) => `${r}（模型判断）`,
+  whyDemoted: (others: string, target: string) => `${others} 也匹配，但最近说过类似问题不归它管，所以先问 ${target}。`,
 
   // delivery log
   stepReceived: "收到问题，开始挑选合适的 agent",
@@ -236,7 +238,8 @@ const en: Dict = {
   nowAnswering: "Now answering:",
   dir: "Folder",
   runsAs: "Runs as",
-  last24h: "Last 24h",
+  last7d: "Last 7 days",
+  oftenDeclines: (topics) => `Recently said these are not theirs: ${topics}`,
   askIt: "Ask it",
   disconnect: "Disconnect",
   disconnectHint: "Disconnect it from the network (it reconnects by itself)",
@@ -289,6 +292,7 @@ const en: Dict = {
   whyExplicit: "The asker chose it (chosen by the asker).",
   whyFollowup: "This is a follow-up, so it goes to the agents that answered before.",
   whyLlm: (r) => `${r} (model decision)`,
+  whyDemoted: (others, target) => ` ${others} also matched but recently said similar questions were not theirs, so ${target} was asked first.`,
 
   stepReceived: "Question received; picking an agent",
   stepReceivedFrom: (w) => `${w} asked`,

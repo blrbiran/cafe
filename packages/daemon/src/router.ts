@@ -49,7 +49,8 @@ export class RulesRouter implements Router {
     const matched = scored.filter((s) => s.score >= 1);
     const best = matched[0];
     if (best) {
-      const demoted = matched.filter((s) => s.penalty > 0);
+      // Only Baristas that tied with the target on the description were actually moved by history.
+      const demoted = matched.filter((s) => s !== best && s.score === best.score && s.penalty > best.penalty);
       const history = demoted.length
         ? `; history: ${demoted.map((s) => `${s.c.address} declined similar orders`).join(", ")}`
         : "";
@@ -59,6 +60,7 @@ export class RulesRouter implements Router {
         reason: `keyword match (score ${best.score}) on ${best.c.address}${history}`,
         router: "rules",
         candidates: matched.slice(1).map((s) => s.c.agentId),
+        ...(demoted.length ? { demoted: demoted.map((s) => s.c.agentId) } : {}),
       };
     }
     return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "no barista matched; broadcasting", router: "rules", candidates: [] };

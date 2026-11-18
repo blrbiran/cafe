@@ -30,6 +30,7 @@ export interface LiveTurn {
   router?: string;
   mode?: string;
   targets?: string[];
+  demoted?: string[];
 }
 
 let state: State = {
@@ -105,7 +106,7 @@ function foldLive(live: Record<string, LiveTurn>, env: ThreadEnvelope): Record<s
     return { ...live, [env.threadId]: { orderId: ev.order.orderId, startedAt: ev.order.createdAt } };
   }
   if (ev.type === "order.routed" && cur && cur.orderId === env.orderId) {
-    return { ...live, [env.threadId]: { ...cur, reason: ev.decision.reason, router: ev.decision.router, mode: ev.decision.mode, targets: ev.decision.targets } };
+    return { ...live, [env.threadId]: { ...cur, reason: ev.decision.reason, router: ev.decision.router, mode: ev.decision.mode, targets: ev.decision.targets, demoted: ev.decision.demoted } };
   }
   return live;
 }
