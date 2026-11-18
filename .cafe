@@ -1,0 +1,7 @@
+name: cafe
+description: The cafe agent network itself — daemon, routing, protocol, CLI, pi extension and web UI. Ask about how cafe works or to debug the network.
+tags: [cafe, daemon, routing, protocol]
+scope: [.]
+role: barista
+accept: confirm
+concurrency: 1

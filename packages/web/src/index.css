@@ -1,0 +1,103 @@
+@layer theme, base, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+@import "./styles.css" layer(base);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* Every colour utility reads a theme token; Tailwind's own palette is cleared. */
+@theme inline {
+  --color-*: initial;
+  --color-page: var(--bg);
+  --color-card: var(--card);
+  --color-elevated: var(--bg-elevated);
+  --color-well: var(--well);
+  --color-field: var(--field);
+  --color-hover: var(--bg-hover);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-fg: var(--text);
+  --color-fg-strong: var(--text-strong);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-accent-hover: var(--accent-hover);
+  --color-on-accent: var(--on-accent);
+  --color-ok: var(--ok);
+  --color-ok-subtle: var(--ok-subtle);
+  --color-warn: var(--warn);
+  --color-warn-subtle: var(--warn-subtle);
+  --color-danger: var(--danger);
+  --color-danger-subtle: var(--danger-subtle);
+  --color-info: var(--info);
+  --color-info-subtle: var(--info-subtle);
+
+  --spacing: var(--space-1);
+  --spacing-control: var(--control-h);
+  --spacing-control-sm: var(--control-h-sm);
+  --spacing-nav: var(--nav-width);
+
+  --radius-*: initial;
+  --radius-inset: var(--radius-xs);
+  --radius-control: var(--radius-sm);
+  --radius-card: var(--radius);
+  --radius-full: 9999px;
+
+  --shadow-*: initial;
+  --shadow-raise: var(--shadow);
+  --shadow-float: var(--shadow-pop);
+  --shadow-nav-bar: inset 3px 0 0 var(--accent);
+
+  --default-transition-duration: var(--dur);
+  --default-transition-timing-function: var(--ease);
+}
+
+@theme {
+  --text-*: initial;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 22px;
+  --breakpoint-*: initial;
+  --breakpoint-md: 761px;
+}
+
+@theme static {
+  --font-*: initial;
+  --font-data: var(--mono);
+}
+
+@utility num { font-variant-numeric: tabular-nums; }
+@utility meta { color: var(--muted); font-size: var(--text-xs); font-family: var(--mono); overflow-wrap: anywhere; }
+@utility empty { color: var(--muted); border: 1px dashed var(--border-strong); border-radius: var(--radius); padding: 20px; text-align: center; font-size: var(--text-sm); }
+@utility nav-count {
+  min-width: 22px; padding: 0 6px; border-radius: 999px; background: var(--border-strong); color: var(--text-strong); font-size: var(--text-xs); font-weight: 600; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums;
+}
+@utility btn-primary {
+  background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600;
+  &:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+}
+@utility btn-quiet {
+  background: transparent; border-color: transparent; box-shadow: none; color: var(--text);
+  &:hover:not(:disabled) { background: var(--bg-hover); border-color: transparent; color: var(--text-strong); }
+}
+@utility btn-sm { min-height: var(--control-h-sm); padding: 2px 8px; font-size: var(--text-xs); }
+@utility badge {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 999px; border-width: 1px; border-style: solid; font-size: var(--text-xs); font-weight: 500; line-height: 1.5; color: var(--text-strong); white-space: nowrap;
+  &:not([data-tone]) { border-color: var(--border-strong); background: var(--bg-elevated); }
+}
+@utility card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+@utility well {
+  background: var(--well); border-width: 1px; border-style: solid; border-radius: var(--radius-sm); padding: 10px 12px;
+  &:not([data-tone]) { border-color: var(--border); }
+}
+@utility led {
+  display: inline-block; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); opacity: 0.45;
+  &[data-led="busy"] { background: var(--info); opacity: 1; box-shadow: 0 0 6px var(--info); animation: led-pulse 2.4s ease-in-out infinite; }
+  &[data-led="idle"] { background: var(--ok); opacity: 1; }
+  &[data-led="offline"] { background: var(--muted); opacity: 0.45; }
+  &[data-led="danger"] { background: var(--danger); opacity: 1; }
+  &[data-led="warn"] { background: var(--warn); opacity: 1; }
+}
+@utility prose-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }

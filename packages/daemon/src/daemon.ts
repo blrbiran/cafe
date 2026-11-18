@@ -1,0 +1,866 @@
+import { EventEmitter } from "node:events";
+import { networkInterfaces } from "node:os";
+import { ulid } from "ulid";
+import WebSocket from "ws";
+import {
+  ACK_TIMEOUT_MS,
+  AgentIdentity,
+  BROADCAST_DEADLINE_MS,
+  CreateOrderParams,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_MISSES,
+  InitializeParams,
+  MAX_ORDER_DEPTH,
+  Methods,
+  PROTOCOL_VERSION,
+  RegistryDelta,
+  formatAddress,
+  type AgentRecord,
+  type AgentStatus,
+  type DaemonRecord,
+  type Order,
+  type Party,
+  type RoutingDecision,
+  type ThreadEnvelope,
+  type ThreadEventBody,
+  type ThreadMeta,
+} from "@cafe/protocol";
+import { Peer, RpcError } from "@cafe/protocol/peer";
+import { type CafeConfig, saveConfig } from "./config.ts";
+import { Registry } from "./registry.ts";
+import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
+import { Store } from "./store.ts";
+
+export interface DaemonOptions {
+  config: CafeConfig;
+  home: string;
+  /** Override the router (tests inject a fake LLM). */
+  router?: Router;
+  /** Override the timing constants (tests). */
+  timing?: Partial<Timing>;
+  log?: (msg: string) => void;
+}
+
+export interface Timing {
+  ackTimeoutMs: number;
+  heartbeatIntervalMs: number;
+  broadcastDeadlineMs: number;
+  reconnectMinMs: number;
+  reconnectMaxMs: number;
+}
+
+/** Live delivery state of one Order on its origin Daemon. */
+interface Tracking {
+  order: Order;
+  meta: ThreadMeta;
+  decision?: RoutingDecision;
+  /** per-target state */
+  targets: Map<string, "pending" | "acked" | "done" | "failed">;
+  candidates: string[];
+  timers: Map<string, ReturnType<typeof setTimeout>>;
+  deadline?: ReturnType<typeof setTimeout>;
+}
+
+type DaemonEvents = {
+  thread: [ThreadEnvelope, ThreadMeta | undefined];
+  registry: [RegistryDelta];
+  daemons: [DaemonRecord[]];
+};
+
+/**
+ * One Daemon per Host. With `config.mode === "root"` it is also the Root Daemon:
+ * it owns the authoritative Registry and relays every Order (ADR-0001, ADR-0002).
+ */
+export class Daemon extends EventEmitter<DaemonEvents> {
+  readonly config: CafeConfig;
+  readonly store: Store;
+  readonly registry = new Registry();
+  readonly isRoot: boolean;
+  /** Headless Barista process supervisor (set by runDaemon). */
+  supervisor?: import("./supervisor.ts").Supervisor;
+  readonly host: string;
+  private router: Router;
+  private timing: Timing;
+  readonly log: (msg: string) => void;
+
+  /** Local Agent connections by agentId. */
+  private agents = new Map<string, Peer>();
+  /** Customer subscriptions: threadId → peers wanting thread/event. */
+  private subscribers = new Map<string, Set<Peer>>();
+  /** Orders originated here. */
+  private tracking = new Map<string, Tracking>();
+  /** Thread metadata cache for threads seen here (origin or relay). */
+  private metas = new Map<string, ThreadMeta>();
+  private uis = new Set<Peer>();
+  /** Orders seen here (origin or relayed), for parent/chain lookup. */
+  private knownOrders = new Map<string, Order>();
+  /** Agents registered on this Host (authoritative local set, survives Registry snapshots). */
+  private local = new Map<string, AgentRecord>();
+
+  /** Root side: connected child Daemons by host. */
+  private children = new Map<string, Peer>();
+  private daemonRecords = new Map<string, DaemonRecord>();
+  /** Child side: uplink to the Root. */
+  private uplink?: Peer;
+  private uplinkSocket?: WebSocket;
+  private reconnectDelay = 0;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private stopped = false;
+  private rootHost?: string;
+
+  constructor(opts: DaemonOptions) {
+    super();
+    this.config = opts.config;
+    this.isRoot = opts.config.mode === "root";
+    this.host = opts.config.host;
+    this.store = new Store(opts.home);
+    this.log = opts.log ?? ((m) => console.error(`[cafe ${this.host}] ${m}`));
+    this.timing = {
+      ackTimeoutMs: ACK_TIMEOUT_MS,
+      heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+      broadcastDeadlineMs: BROADCAST_DEADLINE_MS,
+      reconnectMinMs: 500,
+      reconnectMaxMs: 30_000,
+      ...opts.timing,
+    };
+    this.router = opts.router ?? new RulesRouter();
+    this.registry.on("delta", (d) => {
+      this.emit("registry", d);
+      this.store.saveRegistry(this.registry.version, this.registry.all());
+      for (const ui of this.uis) ui.notify(Methods.registryDelta, d);
+    });
+    // Replica restored from disk; the Root will resync on connect.
+    const cached = this.store.loadRegistry();
+    if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
+    this.daemonRecords.set(this.host, { host: this.host, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now() });
+  }
+
+  /** Initialise the LLM router if configured. Separate from the constructor because it is async. */
+  async initRouter(): Promise<void> {
+    const model = this.config.router.model;
+    if (!model || this.router.name !== "rules") return;
+    try {
+      this.router = new LlmRouter(await piComplete(model));
+      this.log(`router: llm (${model})`);
+    } catch (err) {
+      this.log(`router: llm unavailable (${(err as Error).message}); using rules`);
+    }
+  }
+
+  url(): string {
+    return `ws://${this.config.advertise ?? lanAddress()}:${this.config.port}`;
+  }
+
+  get rootOnline(): boolean {
+    return this.isRoot || (this.uplink !== undefined && !this.uplink.isClosed);
+  }
+
+  // -------------------------------------------------------------------------
+  // Connections
+  // -------------------------------------------------------------------------
+
+  /** Attach a freshly accepted socket. `local` = loopback (no token required). */
+  accept(ws: WebSocket, local: boolean): void {
+    const peer = new Peer(ws);
+    ws.on("message", (data) => void peer.receive(data.toString()));
+    ws.on("close", () => {
+      peer.closed();
+      this.onPeerClosed(peer);
+    });
+    ws.on("error", () => ws.close());
+    peer.on(Methods.initialize, (raw) => {
+      const p = InitializeParams.parse(raw);
+      if (!local && p.token !== this.config.token) throw new RpcError("unauthorized", "bad token");
+      peer.meta.kind = p.kind;
+      if (p.kind === "daemon") return this.onChildDaemon(peer, p);
+      if (p.kind === "ui") this.uis.add(peer);
+      return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: this.isRoot };
+    });
+    this.bindAgentMethods(peer);
+  }
+
+  private onPeerClosed(peer: Peer): void {
+    this.uis.delete(peer);
+    for (const subs of this.subscribers.values()) subs.delete(peer);
+    if (peer.meta.kind === "daemon" && peer.meta.host) {
+      const host = peer.meta.host as string;
+      if (this.children.get(host) === peer) {
+        this.children.delete(host);
+        const rec = this.daemonRecords.get(host);
+        if (rec) rec.online = false;
+        // Agents behind a disconnected Daemon go offline in the Registry.
+        const offline = this.registry.all().filter((r) => r.host === host).map((r) => ({ ...r, status: "offline" as const }));
+        if (offline.length) this.broadcastDelta(this.registry.upsert(offline));
+        this.emitDaemons();
+        this.log(`daemon ${host} disconnected`);
+      }
+    }
+    const agentId = peer.meta.agentId as string | undefined;
+    if (agentId && this.agents.get(agentId) === peer) {
+      this.agents.delete(agentId);
+      this.local.delete(agentId);
+      this.unregister(agentId);
+      // Fail anything that agent was working on.
+      for (const t of this.tracking.values()) {
+        const s = t.targets.get(agentId);
+        if (s === "pending" || s === "acked") this.targetFailed(t, agentId, "agent disconnected");
+      }
+    }
+  }
+
+  private bindAgentMethods(peer: Peer): void {
+    peer.on(Methods.agentRegister, (raw) => {
+      const identity = AgentIdentity.parse(raw);
+      const n = this.registry.nextInstance(identity.name, this.host);
+      const now = Date.now();
+      const record: AgentRecord = {
+        ...identity,
+        agentId: ulid(),
+        address: formatAddress(identity.name, n, this.host),
+        host: this.host,
+        status: "idle",
+        registeredAt: now,
+        lastSeenAt: now,
+      };
+      peer.meta.agentId = record.agentId;
+      peer.meta.party = { id: record.agentId, address: record.address, host: this.host } satisfies Party;
+      this.agents.set(record.agentId, peer);
+      this.local.set(record.agentId, record);
+      this.publishAgents([record]);
+      this.log(`registered ${record.address} (${identity.mode}, ${identity.role})`);
+      return record;
+    });
+    peer.on(Methods.agentStatus, (raw: { status: AgentStatus }) => {
+      const rec = peer.meta.agentId ? this.local.get(peer.meta.agentId) : undefined;
+      if (rec && rec.status !== raw.status) {
+        const next = { ...rec, status: raw.status, lastSeenAt: Date.now() };
+        this.local.set(rec.agentId, next);
+        this.publishAgents([next]);
+      }
+      return {};
+    });
+    peer.on(Methods.agentsList, () => this.registry.all());
+    peer.on(Methods.orderCreate, (raw) => this.createOrder(CreateOrderParams.parse(raw), peer));
+    peer.on(Methods.orderAck, (p: { orderId: string; threadId: string }) => this.agentEvent(peer, p, { type: "order.acked", agentId: peer.meta.agentId }));
+    peer.on(Methods.orderHeartbeat, (p: { orderId: string; threadId: string; note?: string }) =>
+      this.agentEvent(peer, p, { type: "order.heartbeat", agentId: peer.meta.agentId, note: p.note }),
+    );
+    peer.on(Methods.orderReply, (p: { orderId: string; threadId: string; text: string; final?: boolean }) =>
+      this.agentEvent(peer, p, { type: "order.replied", agentId: peer.meta.agentId, text: p.text, final: p.final ?? true }),
+    );
+    peer.on(Methods.orderDecline, (p: { orderId: string; threadId: string; reason: string }) =>
+      this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason }),
+    );
+    peer.on(Methods.orderCancel, (p: { threadId: string }) => this.cancel(p.threadId, peer.meta.party?.address ?? "customer"));
+    peer.on("thread/subscribe", (p: { threadId: string }) => {
+      this.subscribe(p.threadId, peer);
+      return {};
+    });
+  }
+
+  private agentEvent(peer: Peer, p: { orderId: string; threadId: string }, event: ThreadEventBody): {} {
+    if (!peer.meta.agentId) throw new RpcError("not_registered", "agent/register first");
+    this.recordEvent({ eventId: ulid(), threadId: p.threadId, orderId: p.orderId, host: this.host, at: Date.now(), event });
+    return {};
+  }
+
+  subscribe(threadId: string, peer: Peer): void {
+    let s = this.subscribers.get(threadId);
+    if (!s) this.subscribers.set(threadId, (s = new Set()));
+    s.add(peer);
+  }
+
+  // -------------------------------------------------------------------------
+  // Registry publication
+  // -------------------------------------------------------------------------
+
+  private publishAgents(records: AgentRecord[]): void {
+    if (this.isRoot) this.broadcastDelta(this.registry.upsert(records));
+    else if (this.rootOnline) this.uplink!.notify(Methods.registryUpsert, { records });
+    else this.registry.upsert(records); // Root down: keep a local view; resynced on reconnect.
+  }
+
+  private unregister(agentId: string): void {
+    if (this.isRoot) this.broadcastDelta(this.registry.remove([agentId]));
+    else if (this.rootOnline) this.uplink!.notify(Methods.registryRemove, { agentIds: [agentId] });
+    else this.registry.remove([agentId]);
+  }
+
+  private broadcastDelta(delta: RegistryDelta): void {
+    for (const child of this.children.values()) child.notify(Methods.registryDelta, delta);
+  }
+
+  // -------------------------------------------------------------------------
+  // Orders (origin side)
+  // -------------------------------------------------------------------------
+
+  async createOrder(p: CreateOrderParams, peer?: Peer): Promise<{ orderId: string; threadId: string; decision: RoutingDecision }> {
+    const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
+    const parent = p.parentOrderId ? this.knownOrders.get(p.parentOrderId) : undefined;
+    const depth = parent ? parent.depth + 1 : 0;
+    if (depth > MAX_ORDER_DEPTH) throw new RpcError("too_deep", `order depth ${depth} exceeds ${MAX_ORDER_DEPTH}`);
+    const order: Order = {
+      orderId: ulid(),
+      threadId: ulid(),
+      kind: p.kind,
+      from,
+      to: p.to,
+      body: p.body,
+      parentOrderId: p.parentOrderId,
+      chain: [...(parent?.chain ?? []), ...(parent ? [parent.from.id] : [])],
+      depth,
+      deadlineMs: p.deadlineMs,
+      createdAt: Date.now(),
+    };
+    this.knownOrders.set(order.orderId, order);
+    if (peer) this.subscribe(order.threadId, peer);
+
+    const meta: ThreadMeta = {
+      threadId: order.threadId,
+      orderId: order.orderId,
+      kind: order.kind,
+      from,
+      targets: [],
+      status: "routing",
+      summary: order.body.slice(0, 200),
+      createdAt: order.createdAt,
+      file: this.store.threadFile(order.threadId, order.createdAt),
+    };
+    const t: Tracking = { order, meta, targets: new Map(), candidates: [], timers: new Map() };
+    this.tracking.set(order.orderId, t);
+    this.metas.set(order.threadId, meta);
+    this.emitEvent(order, { type: "order.created", order });
+
+    const decision = await this.route(order);
+    t.decision = decision;
+    t.candidates = [...decision.candidates];
+    this.emitEvent(order, { type: "order.routed", decision });
+    if (decision.targets.length === 0) {
+      this.emitEvent(order, { type: "order.failed", reason: "no barista available" });
+      this.close(t, "failed");
+      return { orderId: order.orderId, threadId: order.threadId, decision };
+    }
+    for (const id of decision.targets) this.dispatch(t, id);
+    if (decision.mode !== "unicast" || order.kind === "notice") {
+      t.deadline = setTimeout(() => this.finishOnDeadline(t), order.deadlineMs ?? this.timing.broadcastDeadlineMs);
+    }
+    return { orderId: order.orderId, threadId: order.threadId, decision };
+  }
+
+  private eligible(order: Order): AgentRecord[] {
+    const excluded = new Set([order.from.id, ...order.chain]);
+    return this.registry
+      .all()
+      .filter((r) => r.role === "barista" && r.status !== "offline" && !excluded.has(r.agentId))
+      .filter((r) => this.rootOnline || r.host === this.host);
+  }
+
+  private async route(order: Order): Promise<RoutingDecision> {
+    const candidates = this.eligible(order);
+    if (order.to) {
+      const ids = this.registry.resolve(order.to).filter((id) => candidates.some((c) => c.agentId === id));
+      return {
+        targets: ids,
+        mode: ids.length === 1 ? "unicast" : "multicast",
+        reason: ids.length ? `explicit address ${order.to}` : `no online barista at ${order.to}`,
+        router: "explicit",
+        candidates: [],
+      };
+    }
+    if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
+      try {
+        return await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId) }, 60_000);
+      } catch (err) {
+        this.log(`root route/decide failed: ${(err as Error).message}`);
+      }
+    }
+    return this.router.decide({ order, candidates });
+  }
+
+  private dispatch(t: Tracking, agentId: string): void {
+    t.targets.set(agentId, "pending");
+    if (!t.meta.targets.includes(agentId)) t.meta.targets.push(agentId);
+    const rec = this.registry.get(agentId);
+    if (!rec) return this.targetFailed(t, agentId, "unknown agent");
+    if (t.order.kind === "order") this.armAck(t, agentId);
+    this.deliver(t.order, agentId);
+  }
+
+  /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally. */
+  private deliver(order: Order, agentId: string): void {
+    const rec = this.registry.get(agentId);
+    if (!rec) return;
+    if (this.isRoot) {
+      if (rec.host === this.host) return this.deliverLocal(order, agentId);
+      const child = this.children.get(rec.host);
+      if (!child) return this.relayFailure(order, agentId, `daemon ${rec.host} offline`);
+      child.notify(Methods.orderRelay, { order, agentId });
+      return;
+    }
+    if (this.rootOnline) {
+      this.uplink!.notify(Methods.orderRelay, { order, agentId });
+      return;
+    }
+    if (rec.host === this.host) return this.deliverLocal(order, agentId);
+    this.relayFailure(order, agentId, "root_unreachable");
+  }
+
+  private deliverLocal(order: Order, agentId: string): void {
+    const peer = this.agents.get(agentId);
+    if (!peer) return this.relayFailure(order, agentId, "agent not connected");
+    peer.notify(Methods.orderDeliver, { order });
+    this.emitEvent(order, { type: "order.delivered", agentId });
+  }
+
+  private relayFailure(order: Order, agentId: string, reason: string): void {
+    this.emitEvent(order, { type: "order.failed", agentId, reason });
+  }
+
+  private armAck(t: Tracking, agentId: string): void {
+    this.clearTimer(t, agentId);
+    t.timers.set(agentId, setTimeout(() => this.targetFailed(t, agentId, "no ack"), this.timing.ackTimeoutMs));
+  }
+
+  private armHeartbeat(t: Tracking, agentId: string): void {
+    this.clearTimer(t, agentId);
+    t.timers.set(
+      agentId,
+      setTimeout(() => this.targetFailed(t, agentId, "lost (missed heartbeats)"), this.timing.heartbeatIntervalMs * HEARTBEAT_MISSES),
+    );
+  }
+
+  private clearTimer(t: Tracking, agentId: string): void {
+    const timer = t.timers.get(agentId);
+    if (timer) clearTimeout(timer);
+    t.timers.delete(agentId);
+  }
+
+  private targetFailed(t: Tracking, agentId: string, reason: string, emit = true): void {
+    if (t.meta.status === "done" || t.meta.status === "cancelled" || t.meta.status === "failed") return;
+    const state = t.targets.get(agentId);
+    if (state === "done" || state === "failed") return;
+    this.clearTimer(t, agentId);
+    t.targets.set(agentId, "failed");
+    if (emit) this.emitEvent(t.order, { type: "order.failed", agentId, reason }, { skipTrack: true });
+    // Unicast: try the next candidate.
+    if (t.decision?.mode === "unicast") {
+      const next = t.candidates.shift();
+      if (next) return this.dispatch(t, next);
+    }
+    this.maybeClose(t);
+  }
+
+  /** Apply an event to origin tracking. */
+  private track(env: ThreadEnvelope): void {
+    const t = this.tracking.get(env.orderId);
+    if (!t) return;
+    const ev = env.event;
+    switch (ev.type) {
+      case "order.acked":
+        if (t.targets.get(ev.agentId) === "pending") t.targets.set(ev.agentId, "acked");
+        t.meta.status = "working";
+        this.armHeartbeat(t, ev.agentId);
+        break;
+      case "order.heartbeat":
+        if (t.targets.get(ev.agentId) === "acked") this.armHeartbeat(t, ev.agentId);
+        break;
+      case "order.replied":
+        t.meta.firstReplyAt ??= env.at;
+        if (ev.final) {
+          this.clearTimer(t, ev.agentId);
+          t.targets.set(ev.agentId, "done");
+          this.maybeClose(t);
+        } else this.armHeartbeat(t, ev.agentId);
+        break;
+      case "order.declined":
+        this.clearTimer(t, ev.agentId);
+        t.targets.set(ev.agentId, "done");
+        if (t.decision?.mode === "unicast" && !this.hasReply(t)) {
+          const next = t.candidates.shift();
+          if (next) {
+            this.dispatch(t, next);
+            break;
+          }
+        }
+        this.maybeClose(t);
+        break;
+      case "order.failed":
+        if (ev.agentId) this.targetFailed(t, ev.agentId, ev.reason, false);
+        break;
+    }
+  }
+
+  private maybeClose(t: Tracking): void {
+    if (t.order.kind === "notice") return; // closed by deadline
+    const states = [...t.targets.values()];
+    if (states.some((s) => s === "pending" || s === "acked")) return;
+    const anyReply = this.hasReply(t);
+    this.close(t, anyReply ? "done" : "failed");
+  }
+
+  private hasReply(t: Tracking): boolean {
+    return t.meta.firstReplyAt !== undefined;
+  }
+
+  private finishOnDeadline(t: Tracking): void {
+    if (t.meta.status === "done" || t.meta.status === "failed" || t.meta.status === "cancelled") return;
+    if (t.order.kind === "notice") return this.close(t, "done");
+    for (const [id, s] of t.targets) if (s === "pending" || s === "acked") this.targetFailed(t, id, "deadline");
+    this.maybeClose(t);
+  }
+
+  private close(t: Tracking, status: "done" | "failed" | "cancelled"): void {
+    if (t.meta.status === "done" || t.meta.status === "failed" || t.meta.status === "cancelled") return;
+    for (const timer of t.timers.values()) clearTimeout(timer);
+    t.timers.clear();
+    if (t.deadline) clearTimeout(t.deadline);
+    this.emitEvent(t.order, { type: "thread.closed", status });
+  }
+
+  cancel(threadId: string, by: string): {} {
+    const t = [...this.tracking.values()].find((x) => x.order.threadId === threadId);
+    if (!t) throw new RpcError("not_found", `no active order on thread ${threadId} at this daemon`);
+    this.emitEvent(t.order, { type: "order.cancelled", by });
+    this.close(t, "cancelled");
+    return {};
+  }
+
+  // -------------------------------------------------------------------------
+  // Events: record locally, update metadata, fan out.
+  // -------------------------------------------------------------------------
+
+  private emitEvent(order: Order, event: ThreadEventBody, opts: { skipTrack?: boolean } = {}): void {
+    const env: ThreadEnvelope = { eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(), event };
+    this.recordEvent(env, opts);
+  }
+
+  /** Entry point for every event, local or relayed. Idempotent on eventId. */
+  private seen = new Set<string>();
+  recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
+    if (this.stopped || this.seen.has(env.eventId)) return;
+    this.seen.add(env.eventId);
+    if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
+
+    const meta = this.updateMeta(env);
+    if (meta) {
+      this.store.appendEvent(meta.file, env);
+      this.store.putThread(meta);
+    }
+    // Fan out first: tracking may synchronously emit follow-up events (e.g. thread.closed).
+
+    for (const s of this.subscribers.get(env.threadId) ?? []) if (s !== opts.from) s.notify(Methods.threadEvent, env);
+    for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
+    if (this.isRoot) this.fanOutToChildren(env, opts.from);
+    else if (this.rootOnline && opts.from !== this.uplink) this.uplink!.notify(Methods.threadEvent, env);
+    this.emit("thread", env, meta);
+    if (!opts.skipTrack) this.track(env);
+  }
+
+  /** Root: forward an event to every Host taking part in the Thread, except where it came from. */
+  private fanOutToChildren(env: ThreadEnvelope, from?: Peer): void {
+    const meta = this.metas.get(env.threadId);
+    const hosts = new Set<string>();
+    if (meta) {
+      hosts.add(meta.from.host);
+      for (const id of meta.targets) {
+        const r = this.registry.get(id);
+        if (r) hosts.add(r.host);
+      }
+    }
+    hosts.delete(this.host);
+    for (const h of hosts) {
+      const child = this.children.get(h);
+      if (child && child !== from) child.notify(Methods.threadEvent, env);
+    }
+  }
+
+  /**
+   * A relayed Order arrived for a Thread this Daemon has not seen yet (its
+   * `order.created` was fanned out before the targets were known). Start the
+   * local Thread copy from the Order itself.
+   */
+  private adoptOrder(order: Order): void {
+    this.knownOrders.set(order.orderId, order);
+    if (this.metas.has(order.threadId) || this.store.getThread(order.threadId)) return;
+    const env: ThreadEnvelope = { eventId: `${order.orderId}:created`, threadId: order.threadId, orderId: order.orderId, host: order.from.host, at: order.createdAt, event: { type: "order.created", order } };
+    const meta = this.updateMeta(env)!;
+    this.store.appendEvent(meta.file, env);
+    this.store.putThread(meta);
+    for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
+  }
+
+  private updateMeta(env: ThreadEnvelope): ThreadMeta | undefined {
+    const ev = env.event;
+    let meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+    if (!meta) {
+      if (ev.type !== "order.created") return undefined;
+      meta = {
+        threadId: env.threadId,
+        orderId: env.orderId,
+        kind: ev.order.kind,
+        from: ev.order.from,
+        targets: [],
+        status: "routing",
+        summary: ev.order.body.slice(0, 200),
+        createdAt: ev.order.createdAt,
+        file: this.store.threadFile(env.threadId, ev.order.createdAt),
+      };
+    }
+    this.metas.set(env.threadId, meta);
+    if (ev.type === "order.created") this.knownOrders.set(ev.order.orderId, ev.order);
+    switch (ev.type) {
+      case "order.routed":
+        meta.mode = ev.decision.mode;
+        for (const id of ev.decision.targets) if (!meta.targets.includes(id)) meta.targets.push(id);
+        meta.status = "delivering";
+        break;
+      case "order.delivered":
+        if (!meta.targets.includes(ev.agentId)) meta.targets.push(ev.agentId);
+        break;
+      case "order.acked":
+        meta.status = "working";
+        break;
+      case "order.replied":
+        meta.firstReplyAt ??= env.at;
+        break;
+      case "thread.closed":
+        meta.status = ev.status;
+        meta.closedAt = env.at;
+        break;
+    }
+    return meta;
+  }
+
+  // -------------------------------------------------------------------------
+  // Root side
+  // -------------------------------------------------------------------------
+
+  private onChildDaemon(peer: Peer, p: InitializeParams) {
+    if (!this.isRoot) throw new RpcError("not_root", "this daemon is not the root");
+    const host = p.host!;
+    const prev = this.children.get(host);
+    if (prev && prev !== peer) prev.close();
+    this.children.set(host, peer);
+    peer.meta.host = host;
+    const now = Date.now();
+    this.daemonRecords.set(host, { host, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now });
+    if (p.url && this.config.knownDaemons[host] !== p.url) {
+      this.config.knownDaemons[host] = p.url;
+      saveConfig(this.config, this.store.home);
+    }
+    peer.on(Methods.registryUpsert, (x: { records: AgentRecord[] }) => {
+      this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
+    });
+    peer.on(Methods.registryRemove, (x: { agentIds: string[] }) => {
+      const own = x.agentIds.filter((id) => this.registry.get(id)?.host === host);
+      this.broadcastDelta(this.registry.remove(own));
+    });
+    peer.on("registry/sync", (x: { records: AgentRecord[] }) => {
+      // Child reports its full local set after (re)connecting: replace that host's entries.
+      const stale = this.registry.all().filter((r) => r.host === host && !x.records.some((n) => n.agentId === r.agentId)).map((r) => r.agentId);
+      if (stale.length) this.broadcastDelta(this.registry.remove(stale));
+      if (x.records.length) this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
+      return {};
+    });
+    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string }) => {
+      this.knownOrders.set(x.order.orderId, x.order);
+      this.deliver(x.order, x.agentId);
+    });
+    peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
+    peer.on("agent/kick", (x: { agentId: string }) => this.kick(x.agentId));
+    peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[] }) => {
+      const cands = x.candidates.map((id) => this.registry.get(id)).filter((r): r is AgentRecord => !!r);
+      return this.router.decide({ order: x.order, candidates: cands });
+    });
+    this.emitDaemons();
+    this.log(`daemon ${host} connected (${p.url})`);
+    // Send snapshot after the initialize response.
+    queueMicrotask(() => peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all() }));
+    return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: true, registryVersion: this.registry.version };
+  }
+
+  /** Root: after moving to a new address, tell every known Daemon where it is now. */
+  async announceRoot(): Promise<void> {
+    if (!this.isRoot) return;
+    const me = `${this.config.advertise ?? lanAddress()}:${this.config.port}`;
+    for (const [host, url] of Object.entries(this.config.knownDaemons)) {
+      if (this.children.has(host)) continue;
+      try {
+        const res = await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
+          body: JSON.stringify({ root: me }),
+          signal: AbortSignal.timeout(3000),
+        });
+        this.log(`announced root to ${host}: ${res.status}`);
+      } catch (err) {
+        this.log(`announce to ${host} failed: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Child side: uplink to the Root
+  // -------------------------------------------------------------------------
+
+  connectRoot(): void {
+    if (this.isRoot || !this.config.root || this.stopped) return;
+    const target = this.config.root;
+    const ws = new WebSocket(`ws://${target}/ws`);
+    this.uplinkSocket = ws;
+    const peer = new Peer(ws);
+    ws.on("open", async () => {
+      try {
+        const hello = await peer.request<{ host: string }>(Methods.initialize, {
+          protocolVersion: PROTOCOL_VERSION,
+          kind: "daemon",
+          token: this.config.token,
+          host: this.host,
+          url: this.url(),
+          registryVersion: this.registry.version,
+        });
+        this.uplink = peer;
+        this.rootHost = hello.host;
+        this.reconnectDelay = 0;
+        this.setRootOnline(true);
+        await peer.request("registry/sync", { records: [...this.local.values()] });
+        this.log(`connected to root ${target}`);
+      } catch (err) {
+        this.log(`root handshake failed: ${(err as Error).message}`);
+        ws.close();
+      }
+    });
+    peer.on(Methods.registrySnapshot, (x: { version: number; records: AgentRecord[] }) => {
+      const remote = x.records.filter((r) => r.host !== this.host);
+      this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
+    });
+    peer.on(Methods.registryDelta, (raw) => {
+      const d = RegistryDelta.parse(raw);
+      if (!this.registry.applyDelta(d)) {
+        // Gap: re-request a full snapshot by reconnecting.
+        ws.close();
+      }
+    });
+    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string }) => {
+      this.adoptOrder(x.order);
+      this.deliverLocal(x.order, x.agentId);
+    });
+    peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
+    peer.on("agent/kick", (x: { agentId: string }) => this.agents.get(x.agentId)?.close());
+    ws.on("message", (data) => void peer.receive(data.toString()));
+    ws.on("error", () => {});
+    ws.on("close", () => {
+      peer.closed();
+      if (this.uplinkSocket !== ws) return;
+      const wasOnline = this.uplink === peer;
+      this.uplink = undefined;
+      if (wasOnline) {
+        this.setRootOnline(false);
+        this.log("root connection lost");
+      }
+      this.scheduleReconnect();
+    });
+  }
+
+  private setRootOnline(online: boolean): void {
+    const rec = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
+    rec.online = online;
+    if (this.rootHost) rec.host = this.rootHost;
+    rec.url = `ws://${this.config.root}`;
+    rec.lastSeenAt = Date.now();
+    if (online) rec.connectedAt = Date.now();
+    this.daemonRecords.set("__root__", rec);
+    if (!online) {
+      // Remote agents become unreachable; keep them visible but offline.
+      const remote = this.registry.all().filter((r) => r.host !== this.host && r.status !== "offline");
+      if (remote.length) this.registry.upsert(remote.map((r) => ({ ...r, status: "offline" as const })));
+    }
+    this.emitDaemons();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped) return;
+    this.reconnectDelay = Math.min(this.timing.reconnectMaxMs, this.reconnectDelay ? this.reconnectDelay * 2 : this.timing.reconnectMinMs);
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => this.connectRoot(), this.reconnectDelay);
+  }
+
+  /** Change the Root address at runtime (CLI `cafe root set`, or Root dial-back). Persists to config.yml. */
+  setRoot(addr: string): void {
+    if (this.isRoot) throw new RpcError("is_root", "this daemon is the root");
+    this.config.root = addr;
+    saveConfig(this.config, this.store.home);
+    this.reconnectDelay = 0;
+    const old = this.uplinkSocket;
+    this.uplinkSocket = undefined;
+    old?.close();
+    this.uplink = undefined;
+    this.connectRoot();
+  }
+
+  // -------------------------------------------------------------------------
+  // Introspection
+  // -------------------------------------------------------------------------
+
+  daemons(): DaemonRecord[] {
+    return [...this.daemonRecords.values()];
+  }
+
+  private emitDaemons(): void {
+    const list = this.daemons();
+    this.emit("daemons", list);
+    for (const ui of this.uis) ui.notify(Methods.daemonsChanged, list);
+  }
+
+  snapshot() {
+    return {
+      host: this.host,
+      isRoot: this.isRoot,
+      rootOnline: this.rootOnline,
+      router: this.router.name,
+      registryVersion: this.registry.version,
+      agents: this.registry.all(),
+      daemons: this.daemons(),
+      threads: this.store.listThreads(200),
+    };
+  }
+
+  thread(threadId: string) {
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!meta) return undefined;
+    return { meta, events: this.store.readEvents(meta.file) };
+  }
+
+  /** Disconnect an Agent (web UI "kick"). Remote Agents are kicked via the Root. */
+  kick(agentId: string): void {
+    const local = this.agents.get(agentId);
+    if (local) return local.close();
+    const rec = this.registry.get(agentId);
+    if (!rec) throw new RpcError("not_found", `unknown agent ${agentId}`);
+    if (this.isRoot) this.children.get(rec.host)?.notify("agent/kick", { agentId });
+    else if (this.rootOnline) this.uplink!.notify("agent/kick", { agentId });
+    else throw new RpcError("root_unreachable", "root offline");
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.registry.removeAllListeners();
+    this.removeAllListeners();
+    clearTimeout(this.reconnectTimer);
+    this.uplinkSocket?.close();
+    for (const t of this.tracking.values()) {
+      for (const timer of t.timers.values()) clearTimeout(timer);
+      if (t.deadline) clearTimeout(t.deadline);
+    }
+    for (const p of this.agents.values()) p.close();
+    for (const p of this.children.values()) p.close();
+    this.store.close();
+  }
+}
+
+export function lanAddress(): string {
+  for (const list of Object.values(networkInterfaces())) {
+    for (const ni of list ?? []) if (ni.family === "IPv4" && !ni.internal) return ni.address;
+  }
+  return "127.0.0.1";
+}

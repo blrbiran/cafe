@@ -1,0 +1,24 @@
+{
+  "name": "cafe",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "daemon": "node packages/cli/src/main.ts daemon run",
+    "cafe": "node packages/cli/src/main.ts",
+    "build:web": "npm run build --workspace @cafe/web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}

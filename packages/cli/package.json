@@ -1,0 +1,17 @@
+{
+  "name": "@cafe/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/main.ts"
+  },
+  "bin": {
+    "cafe": "./bin/cafe.js"
+  },
+  "dependencies": {
+    "@cafe/daemon": "^0.1.0",
+    "@cafe/protocol": "^0.1.0",
+    "commander": "^15.1.0"
+  }
+}
