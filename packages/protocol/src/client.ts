@@ -120,7 +120,12 @@ export class CafeClient {
           ws.close();
         }
       });
-      ws.addEventListener("close", () => {
+      // Node's WebSocket fires only `error` (no `close`) when the connection attempt
+      // fails, so a reconnect chain driven by `close` alone stops after one failure.
+      let gone = false;
+      const onGone = () => {
+        if (gone) return;
+        gone = true;
         peer.closed();
         if (this.ws !== ws) return;
         this.peer = undefined;
@@ -132,6 +137,13 @@ export class CafeClient {
           const delay = Math.min(30_000, 500 * 2 ** this.retry++);
           setTimeout(() => this.open().catch((e) => this.opts.log?.(`reconnect failed: ${(e as Error).message}`)), delay);
         }
+      };
+      ws.addEventListener("close", onGone);
+      ws.addEventListener("error", () => {
+        onGone();
+        try {
+          ws.close();
+        } catch {}
       });
     });
   }
