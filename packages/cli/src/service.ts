@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 /**
@@ -27,6 +27,21 @@ export interface ServiceFile {
   /** Commands that load the service, in order. */
   load: string[][];
   unload: string[][];
+  /** Start an installed but stopped service. */
+  start: string[][];
+}
+
+/**
+ * PATH for the service: this shell's PATH without duplicates, missing dirs, or
+ * dirs that belong to this terminal session only (temp dirs, per-session wrapper
+ * shims such as cmux's) — the service outlives the shell, and a shim that
+ * disappears later would make `pi`/`claude` unresolvable for headless Baristas.
+ */
+export function servicePath(envPath: string | undefined, exists: (d: string) => boolean = existsSync, tmp = tmpdir()): string {
+  const transient = (d: string) =>
+    d.startsWith(tmp) || d.startsWith("/tmp/") || d.startsWith("/private/tmp/") || d.startsWith("/private/var/folders/") || d.startsWith("/var/folders/") ||
+    /\/cmux-cli-shims\//.test(d);
+  return [...new Set((envPath ?? "/usr/bin:/bin").split(":"))].filter((d) => d && !transient(d) && exists(d)).join(":");
 }
 
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -68,6 +83,7 @@ export function serviceFile(spec: ServiceSpec): ServiceFile {
       content,
       load: [["launchctl", "bootstrap", `gui/${uid}`, file]],
       unload: [["launchctl", "bootout", `gui/${uid}/${LABEL}`]],
+      start: [["launchctl", "kickstart", `gui/${uid}/${LABEL}`]],
     };
   }
   if (spec.platform === "linux") {
@@ -97,6 +113,7 @@ WantedBy=default.target
         ["systemctl", "--user", "enable", "--now", "cafe.service"],
       ],
       unload: [["systemctl", "--user", "disable", "--now", "cafe.service"]],
+      start: [["systemctl", "--user", "start", "cafe.service"]],
     };
   }
   throw new Error(`autostart is not supported on ${spec.platform} yet; run \`cafe daemon start\` from your login script`);
@@ -124,4 +141,28 @@ export function uninstallService(f: ServiceFile): boolean {
   run(f.unload, true);
   rmSync(f.file, { force: true });
   return true;
+}
+
+/**
+ * If autostart is installed for this CAFE_HOME, start the daemon through the
+ * service manager (so it stays supervised) and return true. Returns false when
+ * there is no such service or the service manager refused; callers then spawn.
+ */
+export function startInstalledService(cafeHome: string, platform: NodeJS.Platform = process.platform, home?: string, runner = run): boolean {
+  let f: ServiceFile;
+  try {
+    f = serviceFile({ platform, node: "", bin: "", cafeHome, path: "", home });
+  } catch {
+    return false;
+  }
+  if (!existsSync(f.file)) return false;
+  const installed = readFileSync(f.file, "utf8");
+  const marker = platform === "darwin" ? `<key>CAFE_HOME</key><string>${xml(cafeHome)}</string>` : `CAFE_HOME=${cafeHome}"`;
+  if (!installed.includes(marker)) return false;
+  try {
+    runner(f.start);
+    return true;
+  } catch {
+    return false;
+  }
 }

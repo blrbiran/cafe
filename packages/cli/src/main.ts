@@ -8,7 +8,7 @@ import { Command } from "commander";
 import type { AgentRecord, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import { cafeHome, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
-import { installService, serviceFile, uninstallService } from "./service.ts";
+import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAIN = fileURLToPath(import.meta.url);
@@ -46,6 +46,13 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
   if (process.env.CAFE_DAEMON) throw new Error(`cafe daemon at ${process.env.CAFE_DAEMON} is not reachable`);
   const home = cafeHome();
   mkdirSync(home, { recursive: true });
+  // Autostart installed for this home: let launchd/systemd run it so it stays supervised.
+  if (startInstalledService(home)) {
+    for (let i = 0; i < 50; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      if (await healthy()) return;
+    }
+  }
   const out = openSync(join(home, "daemon.log"), "a");
   const args = ["--no-warnings", MAIN, "daemon", "run", ...(opts.root ? ["--root"] : [])];
   const child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", out, out], env: process.env });
@@ -182,8 +189,7 @@ daemon
       node: process.execPath,
       bin: join(here, "..", "bin", "cafe.js"),
       cafeHome: cafeHome(),
-      // Keep existing, unique entries only: the service outlives this shell's temporary PATH additions.
-      path: [...new Set((process.env.PATH ?? "/usr/bin:/bin").split(":"))].filter((d) => d && existsSync(d)).join(":"),
+      path: servicePath(process.env.PATH),
     });
     if (o.dryRun) return out(`# ${f.file}\n${f.content}\n# then: ${f.load.map((c) => c.join(" ")).join(" && ")}`, f);
     if (o.root) setConfigValue("mode", "root");

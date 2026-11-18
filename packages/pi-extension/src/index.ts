@@ -33,7 +33,8 @@ function cafeCliPath(): string {
 
 /**
  * Make sure a local Daemon is running. If `addr` is loopback and nothing answers,
- * start `cafe daemon run` detached and poll /api/health for up to `timeoutMs`.
+ * run `cafe daemon start` detached (it uses the installed autostart service if
+ * there is one, else spawns the daemon) and poll /api/health for up to `timeoutMs`.
  */
 export async function ensureDaemon(addr = daemonAddr(), timeoutMs = 5000): Promise<boolean> {
   if (await healthy(addr)) return true;
@@ -42,7 +43,7 @@ export async function ensureDaemon(addr = daemonAddr(), timeoutMs = 5000): Promi
   const cli = cafeCliPath();
   // Under oh-my-pi (Bun) process.execPath is the omp binary itself: start the daemon with Node.
   const node = process.versions.bun ? (process.env.CAFE_NODE ?? "node") : process.execPath;
-  const child = spawn(node, [cli, "daemon", "run"], { detached: true, stdio: "ignore", env: process.env });
+  const child = spawn(node, [cli, "daemon", "start"], { detached: true, stdio: "ignore", env: process.env });
   child.on("error", () => {});
   child.unref();
   const start = Date.now();
