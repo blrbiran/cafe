@@ -1,6 +1,26 @@
-# v3-1 原生支持 Codex 和 Claude Code（调研 + 决策题）
+# v3-1 原生支持 Codex 和 Claude Code
 
-状态：**只做了调研，等用户回答 Q72–Q79**（2026-11-19）。用户要求本轮只调研，下个 session 回答决策题后再实现。
+状态（2026-11-19）：**Q72–Q79 全部按推荐通过，第一阶段已实现**：headless Barista（Codex、Claude）和 MCP Customer。第二阶段（TUI 会话当 Barista）没做。架构决定见 [ADR-0005](../adr/0005-native-codex-claude-baristas.md)。
+
+## 实现（第一阶段）
+
+| | 用法 | 代码 |
+|---|---|---|
+| Codex Barista | `cafe barista start --dir <dir> --agent codex [--write] [--model m]` | `packages/cli/src/bridge/codex.ts`：常驻 `codex app-server`；`thread/start` / `thread/resume`（失败就新开）→ `turn/start`；回答取 `final_answer`，没有就取最后一条 `agentMessage`；取消用 `turn/interrupt`；审批请求按 `refuseServerRequest()` 一律拒绝 |
+| Claude Barista | `cafe barista start --dir <dir> --agent claude [--write] [--model m]` | `packages/cli/src/bridge/claude.ts`：每题 `claude -p --output-format json --setting-sources user --permission-mode dontAsk --tools Read,Grep,Glob --allowedTools Read,Grep,Glob`，第一问 `--session-id`，追问 `--resume`；有 `ANTHROPIC_API_KEY` 时用 `--bare` 代替 `--setting-sources`；取消发 SIGINT（3 s 后 SIGTERM，6 s 后 SIGKILL） |
+| 公共部分 | `cafe barista run --agent …`（supervisor 启动的就是它，也可前台手动跑） | `packages/cli/src/bridge/barista.ts`：注册 `.cafe` 身份、ack + 心跳、串行队列、取消、`CAFE_DECLINE:`、失败时以 `unavailable` 婉拒；第一问发完整 prompt（含身份和历史），接上已有会话时只发简短的 follow-up |
+| 会话映射 | — | Daemon SQLite 表 `agent_sessions(kind, cwd, thread_id)`；协议方法 `agent/session/get`、`agent/session/set`（A→D，只在本机）；`cafe prune` 一并清理 |
+| MCP Customer | `cafe mcp`（stdio），`cafe mcp install [--client claude\|codex\|all] [--dry-run]` | `packages/cli/src/mcp.ts`：手写的 JSON-RPC 2.0（不加依赖）；工具 `cafe_agents`、`cafe_ask`（最多等 100 s）、`cafe_wait`、`cafe_cancel`；Customer 名默认取 MCP 客户端的名字（如 `claude-code@host`）；`install` 用户级注册 `node <cafe.js> mcp` |
+
+比推荐多做的一点：MCP 多了一个 `cafe_cancel`，因为 `cafe_ask` 提前返回后要有办法放弃。
+
+验证：
+- 测试：`tests/bridge.test.ts` 用假 `codex app-server`（`tests/fixtures/fake-codex.mjs`）和假 `claude`（`fake-claude.mjs`）覆盖回答、追问接同一会话、重启后接上、会话丢失后新开、取消、婉拒、只读 / 可写参数、supervisor 托管；`tests/mcp.test.ts` 覆盖握手、提问、提前返回 + `cafe_wait`、取消、`cafe mcp` 子进程和 `install --dry-run`。`npm run test:release` 也会用假 Codex 跑一个受托管的 Codex Barista。
+- **真 Codex（不花钱）**：codex-cli 0.170.0 的 `codex app-server` + 本地 mock Responses 模型 + 隔离的 `CODEX_HOME`（ccloop codex-qa 的做法），经 `CodexEngine` 跑通：新开、同进程追问、新进程 `thread/resume`、未知 thread 新开、挂起的 turn 被 `turn/interrupt` 打断（约 85 ms 内返回 `interrupted`）。真实 `~/.codex/config.toml` 未改动。
+- **真 Claude（不花钱）**：claude 2.1.327 接受上述全部参数；`--resume` 不存在的会话时输出 `No conversation found with session ID: …`、退出码 1，与桥接的"新开会话"判断一致。
+- **还没做（要付费，需用户逐次同意）**：真模型各问几题：Codex 一次（`~/.codex` 登录），Claude 一次（本机登录）。
+
+第二阶段的入口（没做）：Codex TUI 用共享 app-server 守护进程 + `thread/queue/add`；Claude 只能用 channels（研究预览）。
 
 ## 现状
 
@@ -26,7 +46,7 @@
 - **Claude**：`-p` 默认会执行项目 `.claude/settings.json` 的 hooks 和 `.mcp.json`（`--bare` 可避免，但 `--bare` 只认 API key）。官方政策：第三方产品不得让用户用 claude.ai 订阅登录，除非事先获批。个人自用属于灰色地带，**分发给别人时应要求 API key**。
 - **两边共同**：headless Barista 默认**不能自动批准写操作**。
 
-## 决策题（编号接 Q71）
+## 决策题（编号接 Q71；2026-11-19 全部按推荐通过）
 
 - **Q72 先做哪些角色**
   - 推荐：**先做 1（headless）和 3（MCP Customer）**，两边都做。
@@ -54,7 +74,7 @@
   - 推荐：cafe Thread → 外部会话 id 的映射存进 daemon 的 SQLite，daemon 或 Barista 重启后用 `thread/resume` / `--resume` 继续。
   - 同一个 Thread 同时只跑一个 turn，后来的 Order 排队。
 
-## 实现前要先验证的（不需要用户）
+## 实现前要先验证的（不需要用户；Codex 的 `SandboxMode` 写法和 Claude 的 `--setting-sources` 已确认，TUI 相关的没做）
 
 - Codex：用 mock Responses provider（参考 ccloop 的 codex-qa harness，`/Users/biran/code/skills/orca/ccloop/reference/oh-my-openagent/.agents/skills/codex-qa/`）验证 `thread/queue/add` 的 turn 和 `clientUserMessageId` 的对应关系，以及 TUI 能否显示外部发起的 turn。`SandboxMode` 在线上的写法要按 `codex app-server generate-json-schema --experimental` 的输出为准。
 - Claude：确认 `--setting-sources` 的写法；读 cross-session-messaging 文档。真实调用模型时每次都要用户同意。

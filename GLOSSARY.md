@@ -12,6 +12,10 @@ _Avoid_: node, peer, client
 已注册且可接单的 Agent，带有身份、描述与可访问范围（scope），负责处理路由给它的 Order。
 _Avoid_: producer, worker, provider
 
+**Bridge**:
+替没有扩展接口的 agent（Codex、Claude Code）当 Barista 的 cafe 进程（`cafe barista run --agent codex|claude`）。它注册 `.cafe` 身份，把每个 Order 交给 agent 的一个会话处理，再把回答交回。cafe Thread 和 agent 会话的对应关系存在 Daemon 里（ADR-0005）。
+_Avoid_: adapter, proxy, wrapper
+
 **Customer**:
 某次 Order 的发起方。任何 Agent、CLI 调用者或人都可以作为 Customer；它是一次通信中的角色，不是 Agent 的类型。
 _Avoid_: consumer, requester, client

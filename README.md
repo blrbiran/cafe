@@ -12,8 +12,9 @@ cafe 是一个 agent 网络：任意一方发出的一条消息（Order），会
             │ Registry 副本 · 路由  │   │ Registry 副本 · 路由  │
             └──▲──────▲───────▲────┘   └──▲──────────▲────────┘
                │      │       │           │          │
-          pi (TUI)  pi (rpc)  cafe CLI   pi (TUI)   Claude Code / Codex
-          Barista   Barista   Customer   Barista    （通过 cafe skill 当 Customer）
+          pi (TUI)  pi (rpc)  cafe CLI   Codex /    Claude Code / Codex
+          Barista   Barista   Customer   Claude     （通过 cafe mcp 或 skill
+                                         Barista     当 Customer）
 ```
 
 - 每个 Host 一个 **Daemon**，监听单一端口（默认 4777），在该端口上提供 HTTP API、`/ws` WebSocket 与 web UI。
@@ -27,7 +28,7 @@ cafe 是一个 agent 网络：任意一方发出的一条消息（Order），会
 |---|---|
 | `packages/protocol` | 线协议类型与 zod schema、`Peer`（请求/响应/通知）、`CafeClient`（agent 侧客户端）、`.cafe` 查找 |
 | `packages/daemon` | Daemon/Root、Registry、Router（rules / LLM）、Store、HTTP+WS 服务器、headless Barista supervisor |
-| `packages/cli` | `cafe` 命令 |
+| `packages/cli` | `cafe` 命令；`src/bridge/` 是 Codex / Claude Code Barista 的桥接，`src/mcp.ts` 是 `cafe mcp` |
 | `packages/pi-extension` | pi 扩展：让 pi 成为 Barista（TUI 或 headless），并提供 `cafe_ask` 等工具 |
 | `packages/web` | web UI（React 19 + Vite + Tailwind v4），构建后由 Daemon 托管 |
 | `skills/cafe` | 给 Claude Code / Codex / pi 用的 skill |
@@ -40,7 +41,7 @@ cafe 是一个 agent 网络：任意一方发出的一条消息（Order），会
 npm i -g @blrbiran/cafe          # 命令是 cafe
 cafe daemon start --root          # 本机作为 Root（或 cafe daemon install --root：开机自启）
 pi -e "$(cafe pi-extension-path)" # 让 pi / omp 接入
-cafe skill install                # 给 Claude Code / Codex 装 skill
+cafe mcp install                  # 给 Claude Code / Codex 注册 cafe MCP 工具（或 cafe skill install 装 skill）
 ```
 
 发布（维护者）：`npm version <x.y.z>` → `npm run test:release`（打包、装到临时目录并冒烟测试，不调用模型）→ `npm publish ./release`。见 [`docs/specs/v2-7-publishing.md`](docs/specs/v2-7-publishing.md) 和 [`docs/specs/v2-8-versions-reconnect-release-test.md`](docs/specs/v2-8-versions-reconnect-release-test.md)。
@@ -71,13 +72,24 @@ pi -e "$(cafe pi-extension-path)"     # 仓库里即 packages/pi-extension/src/i
 # 或在 ~/.pi/agent/settings.json 的 "extensions" 中加入该路径
 ```
 
-让 Claude Code / Codex / 任意脚本当 Barista（每个问题跑一次命令，prompt 走 stdin，stdout 即回答，输出 `CAFE_DECLINE: 原因` 表示婉拒）：
+让 Codex / Claude Code 当 Barista（由 Daemon 托管，追问接着同一个 Codex thread / Claude 会话，重启后也能接上）：
 
 ```bash
-cafe serve --preset claude --dir ~/code/billing    # 或 --preset codex，或 --exec "<任意命令>"
+cafe barista start --dir ~/code/billing --agent codex    # codex app-server
+cafe barista start --dir ~/code/billing --agent claude   # claude -p，每题一个进程
 ```
 
-给 Claude Code / Codex 安装 skill：`cafe skill install`。它会创建软链 `~/.claude/skills/cafe` 和 `~/.agents/skills/cafe`。
+默认**只读**（Codex 只读沙箱，拒绝一切审批；Claude 只有 Read / Grep / Glob）。`--write` 允许改 `--dir` 里的文件，不会更多；`--model <m>` 指定模型。Claude 用本机 `claude` 的登录，只读用户级设置；设了 `ANTHROPIC_API_KEY` 就改用 `--bare`。分发或团队使用请配置 API key。设计见 [ADR-0005](docs/adr/0005-native-codex-claude-baristas.md) 和 [`docs/specs/v3-1-native-codex-claude.md`](docs/specs/v3-1-native-codex-claude.md)。
+
+任意脚本当 Barista（每个问题跑一次命令，prompt 走 stdin，stdout 即回答，输出 `CAFE_DECLINE: 原因` 表示婉拒；追问没有会话，只靠 prompt 里的历史）：
+
+```bash
+cafe serve --exec "<任意命令>" --dir ~/code/billing    # 或 --preset claude|codex
+```
+
+让 Claude Code / Codex 当 Customer：
+- MCP（推荐）：`cafe mcp install` 用户级注册 `cafe mcp`（`--dry-run` 只打印命令，`--client claude|codex` 只装一个）。工具：`cafe_agents`、`cafe_ask`（最多等 100 秒，没答完就返回 threadId）、`cafe_wait`、`cafe_cancel`。
+- skill：`cafe skill install` 创建软链 `~/.claude/skills/cafe` 和 `~/.agents/skills/cafe`。
 
 ## 配置
 
