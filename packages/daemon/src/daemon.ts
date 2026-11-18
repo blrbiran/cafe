@@ -180,6 +180,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     } else {
       for (const [h, u] of Object.entries(this.store.getKv<Record<string, string>>("peerUrls") ?? {})) this.peerUrls.set(h, u);
       for (const id of this.store.getKv<string[]>("backfill") ?? []) this.backfill.add(id);
+      // Show the Root's real host name before the first (re)connection.
+      this.rootHost = this.store.getKv<string>("rootHost");
       this.linkSweep = setInterval(() => this.sweepLinks(), Math.min(this.timing.linkIdleMs, 60_000));
       this.linkSweep.unref?.();
     }
@@ -1116,6 +1118,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         });
         this.uplink = peer;
         this.rootHost = hello.host;
+        this.store.setKv("rootHost", hello.host);
         this.reconnectDelay = 0;
         this.setRootOnline(true);
         await peer.request("registry/sync", { records: [...this.local.values()] });

@@ -113,6 +113,8 @@ export const RoutingDecision = z.object({
   candidates: z.array(z.string()).default([]),
   /** Baristas that matched as well as the target but were ranked after it because they recently declined similar Orders. */
   demoted: z.array(z.string()).optional(),
+  /** Set when the LLM router failed and the keyword rules decided instead. */
+  llmError: z.string().optional(),
 });
 export type RoutingDecision = z.infer<typeof RoutingDecision>;
 

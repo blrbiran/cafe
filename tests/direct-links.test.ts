@@ -50,6 +50,8 @@ async function network() {
   const worker = await barista(b.addr, identity("worker", { description: "does the work" }));
   cleanup.push(() => worker.client.close());
   await waitFor(() => a.daemon.registry.all().some((r) => r.name === "worker"));
+  // The Root's host name is remembered for display before the next connection.
+  expect(a.daemon.store.getKv("rootHost")).toBe("root");
   // pc1 learns pc2's address from the Root.
   await waitFor(() => a.daemon.daemons().length > 0 && (a.daemon as any).peerUrls.has("pc2"));
   return { root, a, b, worker };

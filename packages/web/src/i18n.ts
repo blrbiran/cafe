@@ -127,6 +127,7 @@ const zh = {
   whyExplicit: "提问时指定了它（指定）。",
   whyFollowup: "这是追问，发给之前回答过的 agent（追问给原回答者）。",
   whyLlm: (r: string) => `${r}（模型判断）`,
+  whyLlmDown: "模型路由这次没成功，改用关键词：",
   whyDemoted: (others: string, target: string) => `${others} 也匹配，但最近说过类似问题不归它管，所以先问 ${target}。`,
 
   // delivery log
@@ -292,6 +293,7 @@ const en: Dict = {
   whyExplicit: "The asker chose it (chosen by the asker).",
   whyFollowup: "This is a follow-up, so it goes to the agents that answered before.",
   whyLlm: (r) => `${r} (model decision)`,
+  whyLlmDown: "The model router failed this time, so keywords decided: ",
   whyDemoted: (others, target) => ` ${others} also matched but recently said similar questions were not theirs, so ${target} was asked first.`,
 
   stepReceived: "Question received; picking an agent",

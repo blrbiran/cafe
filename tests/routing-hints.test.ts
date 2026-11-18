@@ -130,6 +130,17 @@ describe("llm router with hints", () => {
   });
 });
 
+describe("llm router fallback", () => {
+  it("marks a rules decision taken because the model failed", async () => {
+    const r = new LlmRouter(async () => {
+      throw new Error("model down");
+    });
+    const d = await r.decide({ order: order("css bug"), candidates: [rec("a", { description: "css" })] });
+    expect(d.router).toBe("rules");
+    expect(d.llmError).toBe("model down");
+  });
+});
+
 describe("hints end to end", () => {
   it("records declines, reroutes the next similar order, and replicates hints to a child", async () => {
     const timing = { ...FAST, hintsIntervalMs: 50 };

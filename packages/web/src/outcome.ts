@@ -54,20 +54,21 @@ export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentR
 /** Plain-language "why this agent" from a routing decision. */
 export function whyText(
   t: Dict,
-  d: { router?: string; mode?: string; reason?: string; targets?: string[]; demoted?: string[] } | undefined,
+  d: { router?: string; mode?: string; reason?: string; targets?: string[]; demoted?: string[]; llmError?: string } | undefined,
   agents: Record<string, AgentRecord> = {},
   meta?: ThreadMeta,
 ): string | undefined {
   if (!d?.router) return undefined;
-  if (d.mode === "broadcast") return t.askEveryone;
+  if (d.mode === "broadcast") return d.llmError ? `${t.whyLlmDown}${t.askEveryone}` : t.askEveryone;
   switch (d.router) {
     case "llm":
       return d.reason ? t.whyLlm(d.reason) : t.router.llm;
     case "rules": {
+      const base = d.llmError ? `${t.whyLlmDown}${t.whyRules}` : t.whyRules;
       const target = d.targets?.[0];
-      if (!d.demoted?.length || !target) return t.whyRules;
+      if (!d.demoted?.length || !target) return base;
       const name = (id: string) => whoName(id, agents, meta);
-      return `${t.whyRules}${t.whyDemoted(t.list(d.demoted.map(name)), name(target))}`;
+      return `${base}${t.whyDemoted(t.list(d.demoted.map(name)), name(target))}`;
     }
     case "explicit":
       return t.whyExplicit;

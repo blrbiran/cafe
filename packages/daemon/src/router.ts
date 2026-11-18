@@ -120,7 +120,7 @@ export class LlmRouter implements Router {
       };
     } catch (err) {
       const d = await this.fallback.decide(input);
-      return { ...d, reason: `${d.reason} (llm failed: ${(err as Error).message})` };
+      return { ...d, reason: `${d.reason} (llm failed: ${(err as Error).message})`, llmError: (err as Error).message };
     }
   }
 }
