@@ -14,7 +14,7 @@ export { LlmRouter, RulesRouter, type CompleteFn, type Router } from "./router.t
 export { startServer, type ServerHandle } from "./server.ts";
 export { Store } from "./store.ts";
 export { discoverRoots, type FoundRoot } from "./discovery.ts";
-export { Supervisor, defaultExtensionPath, type BaristaSpec, type SupervisorOptions, type WorkerInfo } from "./supervisor.ts";
+export { Supervisor, defaultCliBin, defaultExtensionPath, type BaristaSpec, type SupervisorOptions, type WorkerInfo } from "./supervisor.ts";
 
 function alive(pid: number): boolean {
   try {

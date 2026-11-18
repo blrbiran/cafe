@@ -1,0 +1,242 @@
+import { createInterface } from "node:readline";
+import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+
+/** Below Claude Code's 2-minute auto-background and Codex's 300 s tool timeout (v3-1 Q77). */
+export const MAX_WAIT_S = 100;
+const LATEST_PROTOCOL = "2025-06-18";
+
+export interface McpOptions {
+  /** `http://host:port` of the local Daemon. */
+  base: string;
+  token?: string;
+  /** Start the local Daemon if needed; called before the first tool runs. */
+  ensure?: () => Promise<void>;
+  /** Customer name shown to others; default: the MCP client's name (e.g. claude-code, codex-mcp-client). */
+  as?: string;
+  version: string;
+  input?: NodeJS.ReadableStream;
+  output?: NodeJS.WritableStream;
+  /** Cap on wait_seconds (tests use small values). */
+  maxWaitS?: number;
+}
+
+const TOOLS = [
+  {
+    name: "cafe_agents",
+    description: "List the agents (Baristas) on the cafe network and what each one is responsible for.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "cafe_ask",
+    description:
+      "Ask the cafe agent network a question. cafe routes it to the agent best placed to answer (or to `to`). " +
+      `Waits up to wait_seconds (max ${MAX_WAIT_S}) for the answer; if it is not ready, returns the threadId — call cafe_wait with it. ` +
+      "Pass threadId to ask a follow-up in an earlier conversation (it goes to whoever answered there).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "The question or task, self-contained." },
+        to: { type: "string", description: "Explicit address (name, name@host, name#n@host); skips routing." },
+        threadId: { type: "string", description: "Continue this conversation (follow-up)." },
+        wait_seconds: { type: "number", description: `How long to wait for the answer (default and max ${MAX_WAIT_S}).` },
+      },
+      required: ["question"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "cafe_wait",
+    description: "Keep waiting for the answer to a question asked with cafe_ask (by threadId). Returns the answer, or says it is still being worked on.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        threadId: { type: "string" },
+        orderId: { type: "string", description: "A specific question in the thread (default: the latest one)." },
+        wait_seconds: { type: "number", description: `Default and max ${MAX_WAIT_S}.` },
+      },
+      required: ["threadId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "cafe_cancel",
+    description: "Cancel a question you asked that is still being worked on.",
+    inputSchema: { type: "object", properties: { threadId: { type: "string" } }, required: ["threadId"], additionalProperties: false },
+  },
+];
+
+class ToolError extends Error {}
+
+/**
+ * `cafe mcp`: cafe as an MCP server over stdio (newline-delimited JSON-RPC 2.0), so Claude Code, Codex or any
+ * MCP client can be a Customer without the skill (v3-1 Q77). Talks to the local Daemon's HTTP API.
+ */
+export function runMcp(opts: McpOptions): Promise<void> {
+  const input = opts.input ?? process.stdin;
+  const output = opts.output ?? process.stdout;
+  const maxWait = Math.min(opts.maxWaitS ?? MAX_WAIT_S, MAX_WAIT_S);
+  let customer = opts.as;
+  let ensured: Promise<void> | undefined;
+
+  const headers = (): Record<string, string> => ({
+    "content-type": "application/json",
+    ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
+  });
+  const api = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
+    ensured ??= (opts.ensure?.() ?? Promise.resolve()).catch((e) => {
+      ensured = undefined;
+      throw e;
+    });
+    await ensured;
+    const res = await fetch(`${opts.base}${path}`, { ...init, headers: headers() });
+    const body = (await res.json().catch(() => ({}))) as any;
+    if (!res.ok) throw new ToolError(`${body.error ?? res.status}: ${body.message ?? ""}`.trim());
+    return body as T;
+  };
+
+  const send = (msg: unknown) => output.write(`${JSON.stringify(msg)}\n`);
+
+  /** Follow one Order over SSE until it closes or `seconds` pass. */
+  const waitOrder = async (threadId: string, orderId: string, seconds: number) => {
+    const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a.address]));
+    const who = (id?: string) => (id ? (agents.get(id) ?? id) : "?");
+    const replies: { from: string; text: string; final: boolean }[] = [];
+    const notes: string[] = [];
+    let status: string | undefined;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.max(0, seconds) * 1000);
+    try {
+      const res = await fetch(`${opts.base}/api/threads/${encodeURIComponent(threadId)}/stream?orderId=${encodeURIComponent(orderId)}`, { headers: headers(), signal: ctrl.signal });
+      if (!res.ok || !res.body) throw new ToolError(`cannot follow thread ${threadId}: ${res.status}`);
+      const decoder = new TextDecoder();
+      let buf = "";
+      for await (const chunk of res.body as any as AsyncIterable<Uint8Array>) {
+        buf += decoder.decode(chunk, { stream: true });
+        let i: number;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const data = buf.slice(0, i).split("\n").find((l) => l.startsWith("data: "));
+          buf = buf.slice(i + 2);
+          if (!data) continue;
+          const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
+          if (env.orderId !== orderId) continue;
+          const e = env.event;
+          if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final });
+          else if (e.type === "order.declined") notes.push(`${who(e.agentId)} declined: ${e.reason}`);
+          else if (e.type === "order.failed") notes.push(`${e.agentId ? who(e.agentId) : "the question"} failed: ${e.reason}`);
+          else if (e.type === "order.cancelled") notes.push(`cancelled by ${e.by}`);
+          else if (e.type === "order.closed") status = e.status;
+        }
+        if (status) break;
+      }
+    } catch (err) {
+      if (!ctrl.signal.aborted) throw err;
+    } finally {
+      clearTimeout(timer);
+      ctrl.abort();
+    }
+    const lines = [`threadId: ${threadId}`, `orderId: ${orderId}`, `status: ${status ?? "still working"}`];
+    for (const r of replies) lines.push("", `## ${r.from}${r.final ? "" : " (progress)"}`, r.text);
+    if (notes.length) lines.push("", ...notes);
+    if (!status) lines.push("", `Not answered yet. Call cafe_wait with threadId "${threadId}" to keep waiting, or cafe_cancel to give up.`);
+    else if (status === "done") lines.push("", `Ask a follow-up with cafe_ask and threadId "${threadId}".`);
+    return { text: lines.join("\n"), isError: !!status && status !== "done" };
+  };
+
+  const seconds = (v: unknown) => (typeof v === "number" && v >= 0 ? Math.min(v, maxWait) : maxWait);
+  const str = (v: unknown, name: string, required = false): string | undefined => {
+    if (v === undefined || v === null || v === "") {
+      if (required) throw new ToolError(`${name} is required`);
+      return undefined;
+    }
+    if (typeof v !== "string") throw new ToolError(`${name} must be a string`);
+    return v;
+  };
+
+  const callTool = async (name: string, args: Record<string, unknown>): Promise<{ text: string; isError?: boolean }> => {
+    switch (name) {
+      case "cafe_agents": {
+        const list = (await api<AgentRecord[]>("/api/agents")).filter((a) => a.role === "barista").sort((a, b) => a.address.localeCompare(b.address));
+        const lines = list.map((a) => `- ${a.address} (${a.status})${a.description ? `: ${a.description}` : ""}${a.tags.length ? ` [${a.tags.join(", ")}]` : ""}`);
+        return { text: lines.join("\n") || "No agents are registered on the cafe network." };
+      }
+      case "cafe_ask": {
+        const body = str(args.question, "question", true)!;
+        const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[] } }>("/api/orders", {
+          method: "POST",
+          body: JSON.stringify({ body, to: str(args.to, "to"), threadId: str(args.threadId, "threadId"), as: customer ?? "mcp" }),
+        });
+        return waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
+      }
+      case "cafe_wait": {
+        const threadId = str(args.threadId, "threadId", true)!;
+        const orderId = str(args.orderId, "orderId") ?? (await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`)).meta.orderId;
+        return waitOrder(threadId, orderId, seconds(args.wait_seconds));
+      }
+      case "cafe_cancel": {
+        const threadId = str(args.threadId, "threadId", true)!;
+        await api(`/api/threads/${encodeURIComponent(threadId)}/cancel`, { method: "POST" });
+        return { text: `cancelled ${threadId}` };
+      }
+      default:
+        throw new ToolError(`unknown tool ${name}`);
+    }
+  };
+
+  const handle = async (msg: any) => {
+    const reply = (result: unknown) => send({ jsonrpc: "2.0", id: msg.id, result });
+    const fail = (code: number, message: string) => send({ jsonrpc: "2.0", id: msg.id, error: { code, message } });
+    switch (msg.method) {
+      case "initialize": {
+        const client = String(msg.params?.clientInfo?.name ?? "").replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/^-+|-+$/g, "");
+        customer ??= client || "mcp";
+        return reply({
+          protocolVersion: typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion : LATEST_PROTOCOL,
+          capabilities: { tools: {} },
+          serverInfo: { name: "cafe", version: opts.version },
+          instructions:
+            "cafe routes questions to other agents on the user's machines. Use cafe_agents to see who is there, cafe_ask to ask, " +
+            "cafe_wait when an answer takes longer than one call.",
+        });
+      }
+      case "ping":
+        return reply({});
+      case "tools/list":
+        return reply({ tools: TOOLS });
+      case "tools/call": {
+        try {
+          const r = await callTool(String(msg.params?.name), (msg.params?.arguments ?? {}) as Record<string, unknown>);
+          return reply({ content: [{ type: "text", text: r.text }], ...(r.isError ? { isError: true } : {}) });
+        } catch (err) {
+          const text = err instanceof ToolError ? err.message : `cafe: ${(err as Error).message}`;
+          return reply({ content: [{ type: "text", text }], isError: true });
+        }
+      }
+      default:
+        if (msg.id !== undefined) return fail(-32601, `method not found: ${msg.method}`);
+    }
+  };
+
+  return new Promise((resolve) => {
+    const rl = createInterface({ input });
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+      let msg: any;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+      }
+      // Requests run concurrently: a long cafe_ask must not block ping or tools/list.
+      void handle(msg).catch((err) => msg.id !== undefined && send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: (err as Error).message } }));
+    });
+    rl.on("close", () => resolve());
+  });
+}
+
+/** Commands that register `cafe mcp` with Claude Code / Codex (user scope). */
+export function mcpInstallCommands(command: string[]): Record<"claude" | "codex", string[]> {
+  return {
+    claude: ["claude", "mcp", "add", "--scope", "user", "cafe", "--", ...command],
+    codex: ["codex", "mcp", "add", "cafe", "--", ...command],
+  };
+}

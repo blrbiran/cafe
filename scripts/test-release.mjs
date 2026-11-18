@@ -67,7 +67,10 @@ try {
   mkdirSync(fakeHome);
   const port = await freePort();
   writeFileSync(join(home, "config.yml"), `port: ${port}\nhost: release-test\nmode: root\ndiscovery: false\n${withOptional ? "router:\n  model: none/none\n" : ""}`);
-  const env = { ...process.env, CAFE_HOME: home, CAFE_DISCOVERY: "0" };
+  const codexState = join(work, "codex-state");
+  mkdirSync(codexState);
+  // The fake `codex app-server` from the tests: exercises the native Codex Barista without a model.
+  const env = { ...process.env, CAFE_HOME: home, CAFE_DISCOVERY: "0", CAFE_CODEX_BIN: join(root, "tests/fixtures/fake-codex.mjs"), FAKE_CODEX_STATE: codexState };
   const cafe = (...a) => execFileSync(cafeBin, a, { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
   check("cafe --version", () => {
@@ -103,6 +106,28 @@ try {
   check("skill install links the packaged skill", () => {
     const outText = execFileSync(cafeBin, ["skill", "install"], { env: { ...env, HOME: fakeHome }, encoding: "utf8" });
     assert(outText.includes(join("@blrbiran", "cafe", "skills", "cafe")) || outText.includes(join(pkg.name, "skills", "cafe")), outText);
+  });
+
+  check("cafe mcp answers an MCP initialize", () => {
+    const line = execFileSync(cafeBin, ["mcp"], { env, encoding: "utf8", input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "release-test" } } })}\n` });
+    const r = JSON.parse(line.trim().split("\n")[0]);
+    assert(r.result?.serverInfo?.name === "cafe", line.slice(0, 200));
+    return `version ${r.result.serverInfo.version}`;
+  });
+
+  const codexDir = join(work, "codexdir");
+  mkdirSync(codexDir);
+  writeFileSync(join(codexDir, ".cafe"), "name: cx\ndescription: native codex barista for the release test\nrole: barista\n");
+  cafe("barista", "start", "--dir", codexDir, "--agent", "codex");
+  let cxUp = false;
+  for (let i = 0; i < 100 && !cxUp; i++) {
+    await sleep(200);
+    cxUp = cafe("agents").includes("cx#");
+  }
+  check("native codex barista (fake app-server) is supervised and answers", () => {
+    assert(cxUp, "cx did not register");
+    const outText = cafe("ask", "--to", "cx", "release smoke");
+    assert(outText.includes("turn=1 kind=fresh q=release smoke"), outText.slice(-200));
   });
 
   let piAvailable = false;

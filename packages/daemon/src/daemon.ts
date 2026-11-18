@@ -327,6 +327,23 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason, ...(p.unavailable ? { unavailable: true } : {}) }),
     );
     peer.on(Methods.orderCancel, (p: { threadId: string }) => this.cancel(p.threadId, peer.meta.party?.address ?? "customer"));
+    // Bridged Baristas (Codex / Claude) remember which external session continues a Thread (v3-1 Q79).
+    const sessionKey = (p: { threadId?: unknown; kind?: unknown }) => {
+      const rec = peer.meta.agentId ? this.local.get(peer.meta.agentId as string) : undefined;
+      if (!rec) throw new RpcError("not_registered", "agent/register first");
+      if (typeof p.threadId !== "string" || typeof p.kind !== "string") throw new RpcError("bad_request", "threadId and kind are required");
+      return { kind: p.kind, cwd: rec.cwd, threadId: p.threadId };
+    };
+    peer.on(Methods.agentSessionGet, (p: { threadId: string; kind: string }) => {
+      const k = sessionKey(p);
+      return { sessionId: this.store.getAgentSession(k.kind, k.cwd, k.threadId) };
+    });
+    peer.on(Methods.agentSessionSet, (p: { threadId: string; kind: string; sessionId: string }) => {
+      const k = sessionKey(p);
+      if (typeof p.sessionId !== "string" || !p.sessionId) throw new RpcError("bad_request", "sessionId is required");
+      this.store.setAgentSession(k.kind, k.cwd, k.threadId, p.sessionId);
+      return {};
+    });
     peer.on("thread/subscribe", (p: { threadId: string }) => {
       this.subscribe(p.threadId, peer);
       return {};
@@ -1244,6 +1261,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return { dryRun, cutoff, threads: stale.length, bytes, agentEvents: this.store.countAgentEventsBefore(cutoff), oldest };
     }
     const bytes = this.store.deleteThreads(stale);
+    this.store.deleteAgentSessions(stale.map((m) => m.threadId));
     for (const m of stale) this.metas.delete(m.threadId);
     const agentEvents = this.store.deleteAgentEventsBefore(cutoff);
     this.hintsDirty = true;

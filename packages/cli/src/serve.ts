@@ -26,8 +26,10 @@ export interface ServeOptions {
   log?: (msg: string) => void;
 }
 
-/** The text handed to the command for one Order. */
-export function buildPrompt(order: Order, self: { address: string; description: string }): string {
+const STDOUT_REPLY = "Answer directly and concisely; your entire stdout is sent back as the reply.";
+
+/** The text handed to the command for one Order. `replyNote` says how the answer gets back (stdout by default). */
+export function buildPrompt(order: Order, self: { address: string; description: string }, replyNote = STDOUT_REPLY): string {
   const lines = [
     `You are ${self.address} on the cafe agent network. Another agent or person sent you this question.`,
     `Your declared responsibility: ${self.description || "(none declared)"}`,
@@ -42,10 +44,21 @@ export function buildPrompt(order: Order, self: { address: string; description: 
     "Question:",
     order.body,
     "",
-    "Answer directly and concisely; your entire stdout is sent back as the reply.",
+    replyNote,
     `If this question is clearly outside your responsibility, print a single line \`${DECLINE_MARKER} <short reason>\` instead.`,
   );
   return lines.join("\n");
+}
+
+/** A Follow-up sent into an agent session that already holds the earlier turns (bridged Codex / Claude Baristas). */
+export function buildFollowup(order: Order): string {
+  return [
+    `Follow-up from ${order.from.address} (turn ${order.turn}) in the same cafe conversation:`,
+    "",
+    order.body,
+    "",
+    `Answer as before. If this is clearly outside your responsibility, reply with a single line \`${DECLINE_MARKER} <short reason>\` instead.`,
+  ].join("\n");
 }
 
 /**

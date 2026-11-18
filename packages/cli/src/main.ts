@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,6 +8,8 @@ import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { cafeHome, defaultExtensionPath, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
+import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
+import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -434,15 +436,22 @@ config
     out(`${key} = ${value}`, { [key]: value });
   });
 
-const barista = program.command("barista").description("headless Baristas (pi --mode rpc) supervised by the daemon");
+const barista = program.command("barista").description("headless Baristas supervised by the daemon (pi, omp, codex, claude)");
 barista
   .command("start")
   .option("--dir <dir>", "directory to run in (its .cafe defines identity)", process.cwd())
-  .option("--agent <bin>", "agent executable: pi (default) or omp (oh-my-pi)")
+  .option("--agent <name>", "pi (default), omp (oh-my-pi), codex (codex app-server) or claude (claude -p)")
+  .option("--write", "codex / claude only: allow editing files in --dir (default: read-only)")
+  .option("--model <model>", "codex / claude only: model to use")
   .action(async (o) => {
+    const native = BRIDGED_AGENTS.includes(o.agent);
+    if ((o.write || o.model) && !native) throw new Error("--write and --model are for --agent codex or claude");
     await ensureDaemon();
-    const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir), ...(o.agent ? { bin: o.agent } : {}) }) });
-    out(`started ${ws.length} worker(s) in ${resolve(o.dir)}`, ws);
+    const spec = native
+      ? { agent: o.agent, ...(o.write ? { access: "workspace-write" } : {}), ...(o.model ? { model: o.model } : {}) }
+      : o.agent ? { bin: o.agent } : {};
+    const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir), ...spec }) });
+    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${resolve(o.dir)}${native ? (o.write ? " (may edit files)" : " (read-only)") : ""}`, ws);
   });
 barista
   .command("stop")
@@ -450,8 +459,67 @@ barista
   .action(async (o) => out("stopped", await api(`/api/baristas?dir=${encodeURIComponent(resolve(o.dir))}`, { method: "DELETE" })));
 barista.command("list").action(async () => {
   const ws = await api<any[]>("/api/baristas");
-  out(ws.map((w) => `${w.running ? "running" : "waiting"} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n") || "(none)", ws);
+  out(ws.map((w) => `${w.running ? "running" : "waiting"} ${String(w.agent ?? "pi").padEnd(6)} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n") || "(none)", ws);
 });
+barista
+  .command("run")
+  .description("run a Codex / Claude Code Barista in the foreground (what `barista start --agent codex|claude` supervises)")
+  .requiredOption("--agent <name>", "codex or claude")
+  .option("--dir <dir>", "directory whose .cafe gives the identity (and where the agent works)", process.cwd())
+  .option("--write", "allow editing files in --dir (default: read-only)")
+  .option("--model <model>", "model to use")
+  .action(async (o) => {
+    if (!BRIDGED_AGENTS.includes(o.agent)) throw new Error(`--agent must be ${BRIDGED_AGENTS.join(" or ")}`);
+    if (!process.env.CAFE_DAEMON) await ensureDaemon();
+    const { stop } = await runBridge({
+      agent: o.agent as AgentKind,
+      dir: o.dir,
+      daemon: base().replace(/^http:\/\//, ""),
+      token: process.env.CAFE_TOKEN,
+      access: o.write ? "workspace-write" : "read-only",
+      model: o.model,
+    });
+    let quitting = false;
+    const quit = async () => {
+      if (quitting) return;
+      quitting = true;
+      await stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", quit);
+    process.on("SIGTERM", quit);
+  });
+
+const mcp = program
+  .command("mcp")
+  .description("run cafe as an MCP server on stdio (tools: cafe_agents, cafe_ask, cafe_wait, cafe_cancel)")
+  .option("--as <name>", "customer name shown to others (default: the MCP client's name)")
+  .action(async (o) => {
+    await runMcp({ base: base(), token: process.env.CAFE_TOKEN, ensure: ensureDaemon, as: o.as, version: cafeVersion() });
+  });
+mcp
+  .command("install")
+  .description("register `cafe mcp` with Claude Code and/or Codex (user scope)")
+  .option("--client <name>", "claude, codex or all", "all")
+  .option("--dry-run", "print the commands without running them")
+  .action((o) => {
+    if (!["claude", "codex", "all"].includes(o.client)) throw new Error("--client must be claude, codex or all");
+    const cmds = mcpInstallCommands([process.execPath, join(here, "..", "bin", "cafe.js"), "mcp"]);
+    const chosen = (o.client === "all" ? ["claude", "codex"] : [o.client]) as ("claude" | "codex")[];
+    const results: { client: string; command: string; status: string }[] = [];
+    for (const c of chosen) {
+      const cmd = cmds[c];
+      const shown = cmd.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ");
+      if (o.dryRun) {
+        results.push({ client: c, command: shown, status: "dry-run" });
+        continue;
+      }
+      const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
+      const status = r.error ? `skipped: ${cmd[0]} not found` : r.status === 0 ? "added" : `failed: ${(r.stderr || r.stdout).trim().split("\n").at(-1)}`;
+      results.push({ client: c, command: shown, status });
+    }
+    out(results.map((r) => `${r.client}: ${r.status}\n  ${r.command}`).join("\n"), results);
+  });
 
 program
   .command("serve")

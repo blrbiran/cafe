@@ -243,7 +243,8 @@ export type RegistryDelta = z.infer<typeof RegistryDelta>;
  * Method catalogue. Direction: A = agent, D = daemon (local), R = root, U = web UI.
  *
  * A→D  initialize, agent/register, agent/status, order/create, order/ack,
- *      order/heartbeat, order/reply, order/decline, order/cancel, agents/list
+ *      order/heartbeat, order/reply, order/decline, order/cancel, agents/list,
+ *      agent/session/get, agent/session/set
  * D→A  order/deliver (notification), thread/event (notification, to Customers)
  * D→R  initialize(kind=daemon), registry/upsert, registry/remove, order/relay,
  *      thread/event, route/decide
@@ -255,6 +256,9 @@ export const Methods = {
   agentRegister: "agent/register",
   agentStatus: "agent/status",
   agentsList: "agents/list",
+  /** A→D: the external session (Codex thread, Claude session) a bridged Barista uses for a cafe Thread. */
+  agentSessionGet: "agent/session/get",
+  agentSessionSet: "agent/session/set",
   orderCreate: "order/create",
   orderDeliver: "order/deliver",
   /** D→A: an Order you were working on was cancelled by its Customer. */

@@ -13,6 +13,12 @@ export interface BaristaSpec {
   args?: string[];
   /** Agent executable for this Barista (`pi` by default; `omp` for oh-my-pi). */
   bin?: string;
+  /** Native Codex / Claude Code Barista: runs `cafe barista run --agent …` instead of pi (v3-1). */
+  agent?: "codex" | "claude";
+  /** For `agent`: read-only (default) or workspace-write. Never full access. */
+  access?: "read-only" | "workspace-write";
+  /** For `agent`: model passed to codex / claude. */
+  model?: string;
 }
 
 interface Worker {
@@ -29,6 +35,8 @@ interface Worker {
 
 export interface WorkerInfo {
   dir: string;
+  /** pi, omp, codex or claude. */
+  agent: string;
   slot: number;
   pid?: number;
   restarts: number;
@@ -55,6 +63,8 @@ export interface SupervisorOptions {
   graceMs?: number;
   /** First restart delay; doubles per consecutive crash up to 60s (default 1s). */
   backoffBaseMs?: number;
+  /** `bin/cafe.js` that runs `cafe barista run` for Codex / Claude Baristas (default: found next to this package). */
+  cliBin?: string;
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -76,8 +86,16 @@ export function defaultExtensionPath(): string {
   }
 }
 
+/** The `cafe` entry script: `bin/cafe.js` next to dist/ in the published package, else the workspace CLI package. */
+export function defaultCliBin(): string {
+  if (process.env.CAFE_CLI_BIN) return process.env.CAFE_CLI_BIN;
+  const bundled = resolve(here, "../bin/cafe.js");
+  if (existsSync(bundled)) return bundled;
+  return resolve(here, "../../cli/bin/cafe.js");
+}
+
 /**
- * Keeps headless Baristas alive: one `pi --mode rpc` per concurrency slot, restarted with exponential
+ * Keeps headless Baristas alive: one `pi --mode rpc` (or one `cafe barista run --agent codex|claude`) per concurrency slot, restarted with exponential
  * backoff. Registration and Order handling happen inside pi (cafe extension); the supervisor only owns
  * process lifetime.
  *
@@ -96,6 +114,7 @@ export class Supervisor {
   private readonly extension: string;
   private readonly graceMs: number;
   private readonly backoffBaseMs: number;
+  private readonly cliBin: string;
 
   constructor(opts: SupervisorOptions) {
     this.file = join(opts.home, "baristas.json");
@@ -105,6 +124,7 @@ export class Supervisor {
     this.extension = opts.extension ?? defaultExtensionPath();
     this.graceMs = opts.graceMs ?? 5000;
     this.backoffBaseMs = opts.backoffBaseMs ?? 1000;
+    this.cliBin = opts.cliBin ?? defaultCliBin();
     this.env = {
       ...process.env,
       CAFE_DAEMON: opts.daemonAddr,
@@ -159,6 +179,7 @@ export class Supervisor {
   list(): WorkerInfo[] {
     return this.workers.map((w) => ({
       dir: w.spec.dir,
+      agent: w.spec.agent ?? (w.spec.bin ?? this.piBin).split(/[\\/]/).pop()!,
       slot: w.slot,
       pid: w.child?.pid,
       restarts: w.restarts,
@@ -193,8 +214,22 @@ export class Supervisor {
         log = undefined;
       }
     };
-    const bin = w.spec.bin ?? this.piBin;
-    const args = [GUARD, bin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
+    const bin = w.spec.agent ? process.execPath : (w.spec.bin ?? this.piBin);
+    const args = w.spec.agent
+      ? [
+          GUARD,
+          bin,
+          this.cliBin,
+          "barista",
+          "run",
+          "--agent",
+          w.spec.agent,
+          "--dir",
+          w.spec.dir,
+          ...(w.spec.access === "workspace-write" ? ["--write"] : []),
+          ...(w.spec.model ? ["--model", w.spec.model] : []),
+        ]
+      : [GUARD, bin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.
     const child = spawn(process.execPath, args, { cwd: w.spec.dir, env: this.env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
     // Attach 'error' first: an unhandled spawn error would crash the daemon.

@@ -36,6 +36,14 @@ export class Store {
         thread_id TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS agent_events_at ON agent_events(at);
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        kind TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (kind, cwd, thread_id)
+      );
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
@@ -118,6 +126,24 @@ export class Store {
       }
     }
     return bytes;
+  }
+
+  /** External session (Codex thread / Claude session) used by a bridged Barista in `cwd` for a cafe Thread. */
+  getAgentSession(kind: string, cwd: string, threadId: string): string | undefined {
+    const row = this.db.prepare("SELECT session_id FROM agent_sessions WHERE kind = ? AND cwd = ? AND thread_id = ?").get(kind, cwd, threadId) as { session_id: string } | undefined;
+    return row?.session_id;
+  }
+
+  setAgentSession(kind: string, cwd: string, threadId: string, sessionId: string): void {
+    this.db
+      .prepare("INSERT INTO agent_sessions(kind, cwd, thread_id, session_id, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(kind, cwd, thread_id) DO UPDATE SET session_id=excluded.session_id, updated_at=excluded.updated_at")
+      .run(kind, cwd, threadId, sessionId, Date.now());
+  }
+
+  /** Forget the session mappings of these Threads (pruning). Only cafe's mapping goes; the Codex / Claude history stays. */
+  deleteAgentSessions(threadIds: string[]): void {
+    const del = this.db.prepare("DELETE FROM agent_sessions WHERE thread_id = ?");
+    for (const id of threadIds) del.run(id);
   }
 
   countAgentEventsBefore(cutoff: number): number {

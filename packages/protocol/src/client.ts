@@ -178,6 +178,20 @@ export class CafeClient {
     if (this.peer && this.record) await this.peer.request(Methods.agentStatus, { status });
   }
 
+  /**
+   * External session id stored by this Agent's Daemon for a cafe Thread (bridged Codex / Claude Baristas).
+   * Keyed by `kind`, this Agent's directory and the Thread, so any slot of the same Barista can resume it.
+   */
+  async getSession(threadId: string, kind: string): Promise<string | undefined> {
+    if (!this.peer) throw new Error("not connected to cafe daemon");
+    const r = await this.peer.request<{ sessionId?: string }>(Methods.agentSessionGet, { threadId, kind });
+    return r.sessionId;
+  }
+
+  async setSession(threadId: string, kind: string, sessionId: string): Promise<void> {
+    await this.req(Methods.agentSessionSet, { threadId, kind, sessionId });
+  }
+
   async agents(): Promise<AgentRecord[]> {
     if (!this.peer) throw new Error("not connected to cafe daemon");
     return this.peer.request(Methods.agentsList, {});
