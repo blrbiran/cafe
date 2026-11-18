@@ -1,8 +1,8 @@
 # cafe — handoff
 
-Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is still open, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
+Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs for v2 are in [`docs/specs/`](../specs/). Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
 
-> Git state: this document is committed together with the work it describes. Run `git log --oneline` for the history. The commit that adds this file is the newest commit in the handoff.
+> Git state: this document is committed together with the work it describes. Run `git log --oneline` for the history; the commit that adds this version of the file is the newest one in the handoff. The v2 work starts after `docs: add handoff document for the next agent`.
 
 ## 1. What cafe is
 
@@ -11,16 +11,14 @@ cafe is an agent network. A message (an **Order**) is routed to the agent or age
 - Each machine (**Host**) runs one **Daemon**. One of them is the **Root Daemon**, shown as "中心节点 / Hub" in the UI.
 - The Root holds the authoritative **Registry** of all agents and replicates it to every Daemon.
 - The Daemon where an Order starts makes the **Routing Decision**:
-  - When `router.model` is set, a pi-SDK LLM decides.
-  - Otherwise keyword rules decide.
-  - An explicit address skips routing (`--to`).
-  - A **Follow-up** goes to whoever already answered in that Thread.
-- While the Root is online, every Order goes through it, including Orders between agents on the same Host (ADR-0001). That is how the Root's web UI shows all traffic.
-- Ways to be a Barista:
-  - pi with the cafe extension, in a TUI or headless (`pi --mode rpc`, supervised by the Daemon)
-  - `cafe serve --exec/--preset claude|codex`, which runs any prompt-in / answer-out command
+  - When `router.model` is set, a pi-SDK LLM decides; otherwise keyword rules decide (CJK text is split into bigrams).
+  - Recent declines are a **weak hint** (`router.learn`, default on): they only reorder Baristas that tie on the description. See `docs/specs/v2-1-routing-hints.md`.
+  - An explicit address skips routing (`--to`). A **Follow-up** goes to whoever already answered in that Thread.
+- While the Root is online, every Order goes through it (ADR-0001), so the Root's web UI shows all traffic. **While the Root is offline, cross-host Orders go over a direct Daemon-to-Daemon link** and are backfilled to the Root when it returns (ADR-0004).
+- On a LAN a Daemon without `root` finds the Root over mDNS. `cafe daemon install` gives autostart (launchd / systemd --user).
+- Ways to be a Barista: pi with the cafe extension (TUI or headless `pi --mode rpc`, supervised by the Daemon); the same extension inside **oh-my-pi** (`--agent omp`); `cafe serve --exec/--preset claude|codex` for any prompt-in / answer-out command.
 - Ways to be a Customer: any agent, the `cafe` CLI plus skill (Claude Code / Codex), or the web UI.
-- A Thread holds several turns. A Barista can decline ("不归我管"). An acknowledged Order has no overall timeout, because heartbeats keep it alive.
+- A Thread holds several turns. A Barista can decline ("不归我管"); operational declines (timeout, abort, shutdown, command failure) carry `unavailable` and do not count against a topic. An acknowledged Order has no overall timeout, because heartbeats keep it alive.
 
 ## 2. Code map
 
@@ -28,129 +26,119 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 
 | Path | What it does |
 |---|---|
-| `packages/protocol/src/index.ts` | zod wire types: Order, ThreadEvent (`order.created/routed/delivered/acked/heartbeat/replied/declined/failed/cancelled/closed`), ThreadMeta, AgentRecord, the method list |
-| `packages/protocol/src/peer.ts` | Symmetric RPC over a socket: requests carry `id+method`, notifications carry `method` only, there is no `jsonrpc` field (codex app-server style) |
-| `packages/protocol/src/client.ts` | `CafeClient`, the agent-side connection: register (resumes its agentId on reconnect), `onOrder`, `onCancel`, `ask`, `keepAlive` |
-| `packages/protocol/src/cafeFile.ts` | `.cafe` lookup, walking up from cwd |
-| `packages/daemon/src/daemon.ts` | Core. Root/child modes, Registry replication, Order lifecycle (30 s ack timeout, heartbeats, unicast fallback candidates, broadcast deadline, depth/chain loop guard), follow-ups, `recover()` after a restart, Root relay and fan-out, cancel notification |
-| `packages/daemon/src/router.ts` | `RulesRouter`, `LlmRouter`, `piComplete()` (pi SDK `createAgentSession`, reuses pi's auth) |
-| `packages/daemon/src/store.ts` | SQLite (`node:sqlite`) for thread metadata, the registry cache and `agent_events` stats. Thread contents are JSONL files under `~/.cafe/sessions/<date>/<threadId>.jsonl` (ADR-0003) |
-| `packages/daemon/src/server.ts` | One port (default 4777) serves the HTTP API, `/ws` and the static web UI. Loopback needs no token; LAN needs a token (Bearer or `?token=`) |
-| `packages/daemon/src/supervisor.ts`, `proc/` | Headless pi workers: each runs under a guard (`proc/guard.mjs`, fd-3 parent watch) that dies with the Daemon. Stale process groups are reaped by pid plus start time. Logs are capped. Ported from ccloop |
-| `packages/daemon/src/index.ts` | `runDaemon()`, single-instance lock (`daemon.lock`) |
-| `packages/cli/src/main.ts` | The `cafe` command. It starts the Daemon automatically when needed |
+| `packages/protocol/src/index.ts` | zod wire types: Order, ThreadEvent, ThreadMeta, AgentRecord, RoutingDecision (`demoted`, `llmError`), RoutingHint, ClientKind (`agent/daemon/ui/peer`), the method list |
+| `packages/protocol/src/peer.ts` | Symmetric RPC over a socket (codex app-server style, no `jsonrpc` field) |
+| `packages/protocol/src/client.ts` | `CafeClient`: register (resumes agentId), `onOrder`, `onCancel`, `ask`, `keepAlive`, `decline(reason, {unavailable})` |
+| `packages/daemon/src/daemon.ts` | Core: Root/child modes, Registry replication, Order lifecycle, follow-ups, `recover()`, Root relay/fan-out, routing hints (record/compute/push), **direct links + backfill**, prune/search |
+| `packages/daemon/src/hints.ts` | Tokenizer (CJK bigrams), order keywords, time-decayed decline topics, penalty (< 1) |
+| `packages/daemon/src/router.ts` | `RulesRouter` (description score, then idle bonus − history penalty), `LlmRouter` (weak-hint lines), `piComplete()` |
+| `packages/daemon/src/discovery.ts` | mDNS advertise (Root) / discover (`multicast-dns`) |
+| `packages/daemon/src/store.ts` | SQLite: thread metadata, registry cache, `agent_events` (+ `identity`, `tokens`), `kv` (peerUrls, backfill, rootHost); prune helpers. Thread contents are JSONL under `~/.cafe/sessions/<date>/` (ADR-0003) |
+| `packages/daemon/src/server.ts` | One port (4777): HTTP API, `/ws`, static web UI. New: `/api/routing/hints`, `/api/search`, `/api/prune`, `/api/threads?before=` |
+| `packages/daemon/src/supervisor.ts`, `proc/` | Headless workers under a guard that dies with the Daemon; per-Barista `bin` (pi / omp) |
+| `packages/daemon/src/index.ts` | `runDaemon()`, lock, discovery start/stop |
+| `packages/cli/src/main.ts` | The `cafe` command. New: `stats`, `search`, `prune`, `root discover`, `daemon install/uninstall`, `barista start --agent` |
+| `packages/cli/src/service.ts` | launchd plist / systemd unit generation and (un)install |
 | `packages/cli/src/serve.ts` | `cafe serve` |
-| `packages/pi-extension/src/index.ts` | pi extension, described below |
-| `packages/web/` | React 19 + Vite 6 + Tailwind v4 with Orca design tokens; `i18n.ts` (zh/en); single store using `useSyncExternalStore` (snapshot, then WS deltas) |
+| `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below |
+| `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore` |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
-| `tests/` | vitest, 42 tests: multi-daemon e2e, follow-up and recovery, pi extension against a fake pi, serve, supervisor |
+| `tests/` | vitest, **66 tests**: e2e, follow-up/recovery, pi extension (incl. omp mode) against a fake pi, serve, supervisor, routing hints, routing eval, direct links, discovery (real multicast), service files, retention/search |
 
 **pi extension behaviour**
-- Orders queue (FIFO). Each is acknowledged and heartbeated as soon as it arrives.
-- An Order is injected only when pi is idle, using `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
-- The reply is the last assistant text after that message's `message_end` and before the next human message. This is what fixed the interleaving bug.
-- Watchdog: an Order that pi never picks up is declined after `CAFE_INJECT_TIMEOUT_MS` (default 120 s).
-- Cancel: a queued Order is dropped; a running Order is stopped with `ctx.abort()`.
-- Tools: `cafe_ask` (non-blocking by default; takes `threadId` for follow-ups), `cafe_agents`, `cafe_reply`, `cafe_decline`.
+- Orders queue (FIFO), are acked and heartbeated on arrival, and are injected only when idle with `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
+- The reply is the last assistant text after that message's `message_end` and before the next human message.
+- Run end: `agent_settled` on pi; on omp the `agent_end` without `willContinue` (abort read from the last assistant `stopReason`).
+- System prompt: pi `systemPromptOptions.sections.cafe`; omp returns `{systemPrompt: [...]}`.
+- Watchdog `CAFE_INJECT_TIMEOUT_MS` (120 s) declines as `unavailable`. Cancel drops a queued Order or `ctx.abort()`s a running one.
+- Tools: `cafe_ask`, `cafe_agents`, `cafe_reply`, `cafe_decline`.
 
 ## 3. Run / verify
 
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 42 must pass
+npm test                   # vitest; all 66 must pass (run twice: earlier flakes were unhandled rejections)
 npm run check --workspace @cafe/web && npm run build:web
 node packages/cli/bin/cafe.js daemon start --root     # or `npm link --workspace @cafe/cli` then `cafe ...`
 open http://127.0.0.1:4777/
 ```
 
-To experiment without touching the user's real `~/.cafe`, use a scratch home with its own port:
+Scratch home for experiments (never touch the user's `~/.cafe`); turn discovery off so it does not answer on the LAN:
 
 ```bash
-export CAFE_HOME=$(mktemp -d); printf 'port: 47821\nhost: test\nmode: root\n' > $CAFE_HOME/config.yml
+export CAFE_HOME=$(mktemp -d); printf 'port: 47821\nhost: test\nmode: root\ndiscovery: false\n' > $CAFE_HOME/config.yml
 ```
 
-Real model checks:
-- Real pi checks have passed in a TUI (in tmux) and headless (`cafe barista start`).
-- `claude -p` has passed via `cafe serve --preset claude`.
-- The user allows real-model tests with their configured pi model (`magpie/group/smart`). Keep each to a few prompts.
+Tests run with `CAFE_DISCOVERY=0` (vitest.config.ts); `tests/discovery.test.ts` opts back in on a private service name.
+
+Real checks done so far: pi TUI (tmux) and headless; `claude -p` via `cafe serve --preset claude`; **omp 18.17.0 loads the extension and registers as a Barista** (no model call); web UI for the routing-hint display checked in a browser against a scripted scenario. The user allows real-model tests with their pi model (`magpie/group/smart`), a few prompts each, but **every new paid run needs its own approval**.
 
 ## 4. Decisions you must not silently undo
 
-- Terminology is fixed in `GLOSSARY.md`: Customer / Barista / Order / Reply / Notice / Thread / Follow-up / Daemon / Root Daemon / Registry / Address (`name#n@host`). Do not use "producer" or "consumer".
-- ADR-0001: the Root relays every Order while it is online, for observability, and does not re-route. ADR-0002: Registry replication; routing happens on the Daemon where the Order starts. ADR-0003: JSONL threads plus SQLite metadata.
+- Terminology is fixed in `GLOSSARY.md`. Do not use "producer" or "consumer".
+- ADR-0001: the Root relays every Order while online and does not re-route. ADR-0002: Registry replication, routing at the origin. ADR-0003: JSONL + SQLite. **ADR-0004: direct links only while the Root is offline**, backfill on return.
 - Every running instance is its own Agent, including two in the same directory.
-- Injected Orders start immediately. The `accept: confirm` option was **removed at the user's request**; do not bring it back. If a human is mid-turn in a TUI, the Order runs as a `followUp` after that turn. `steer` would interrupt the human and was offered but not chosen.
-- Web UI principle, a strong user preference: conversation-first, understandable at a glance, plain language, never bury the key information.
-  - No protocol jargon in the primary UI: no unicast, registry, ack, kick.
-  - Internals such as the registry version appear only in the collapsed "调试信息" section.
-  - zh/en switchable.
-  - Before changing the UI, build a clickable prototype and get it approved.
-- Routing LLM: routing only, the Order text passes through unmodified. The keyword-rules fallback must keep working without an LLM.
+- Injected Orders start immediately. `accept: confirm` was **removed at the user's request**; do not bring it back. `followUp` (not `steer`, not omp `aside`).
+- Routing: descriptions are primary. History is auxiliary: penalty < 1, never excludes, never beats a better description match, only declines count (no bonus for answering). Operational declines do not count against topics.
+- Web UI: conversation-first, plain language, no protocol jargon, internals collapsed, zh/en; **prototype and get approval before UI changes**.
+- Routing LLM: routing only; the Order text passes through unmodified; rules fallback must work without an LLM.
+- Data safety: nothing is deleted automatically unless the user sets `retention.days`; `cafe prune` is a dry run unless `--yes`.
 
-## 5. Two-machine test (the user will run this; not done yet)
+## 5. Waiting on the user (start the next session here)
 
-Everything so far has been verified on one machine only: two Daemons on different ports, plus Root restart and `root set`. To test across machines:
+Everything below was done with the recommended defaults while the user was away; ask the user to review:
 
-1. **Root machine A**:
-   - Run `cafe daemon start --root`.
-   - Run `cafe config get token` and note the token.
-   - Make sure port 4777 is reachable on the LAN or tailnet.
-2. **Machine B**:
-   - `git clone <cafe repo> && npm install && npm run build:web`
-   - `cafe config set token <A's token>`
-   - `cafe root set <A-ip>:4777`
-   - `cafe daemon start`
-3. On B, start a Barista in a directory that has a `.cafe`: `cafe serve --preset claude --dir <dir>` or `cafe barista start --dir <dir>`.
-4. Check on A's web UI (`http://<A-ip>:4777/`):
-   - The Network page shows B as online.
-   - The Agents page shows B's Barista.
-   - `cafe ask "..."` from A is answered by B, and the conversation shows on both A's and B's UI.
-   - A follow-up (`cafe ask --thread <id> ...`) goes back to the same Barista.
+1. **Review the v2 defaults** in `docs/specs/v2-3-discovery-autostart.md` (discovery on by default; several Roots → not auto-picked; user-level services only) and `docs/specs/v2-5-retention-search.md` (no automatic pruning by default).
+2. **Publishing (Q60–Q64)** in `docs/specs/v2-7-publishing.md`: package name/scope, one package vs several, esbuild build, where `skills/` lives, release flow. Sibling-package lookups were already switched to `import.meta.resolve` with a repo-path fallback.
+3. **Real omp Q&A** (needs a model call): `cafe barista start --dir <dir> --agent omp`, then `cafe ask --to <name> "..."`; also look at an injected Order in omp's TUI.
+4. **`cafe daemon install` on the real Mac**: never executed here (it writes `~/Library/LaunchAgents/dev.cafe.daemon.plist` and takes over the running daemon). `--dry-run` output passed `plutil -lint`. Reinstall after changing Node version (nvm path is pinned in the plist) or moving the repo.
+5. **Two-machine test** (section 6), now also covering direct links, discovery and autostart.
+6. Web "load older threads": backend `?before=` exists; the UI needs a prototype first.
+7. Suggest `pi update` (local pi 1.5.0, extension targets 1.5.2).
+
+## 6. Two-machine test (the user runs this)
+
+1. **Root A**: `cafe daemon start --root`; `cafe config get token`; port 4777 reachable on the LAN/tailnet.
+2. **B**: `git clone <cafe repo> && npm install && npm run build:web`; `cafe config set token <A's token>`; then either `cafe root set <A-ip>:4777` or, on the same LAN, just `cafe daemon start` and check `cafe root discover` / the log line `discovered root`.
+3. On B start a Barista in a dir with `.cafe`: `cafe serve --preset claude --dir <dir>`, `cafe barista start --dir <dir>` or `--agent omp`.
+4. On A's UI (`http://<A-ip>:4777/`, remote browsers need `?token=`): Network shows B online; Agents shows B's Barista with "近 7 天" counts; `cafe ask` from A is answered by B and shows on both UIs; a follow-up goes back to the same Barista.
 5. Failure cases:
-   - Stop A: on B, local questions still work, and cross-host questions fail with `root_unreachable`. Start A again: B reconnects by itself (exponential backoff) and re-syncs its agents.
-   - **Change A's IP** and restart A: A dials back the Daemons in `knownDaemons` (POST `/api/root`). If that fails, run `cafe root set <new-ip>:4777` on B.
-   - Restart B's daemon while a question is running there: the order recovers or fails cleanly, and no duplicate pi workers appear.
-   - Opening A's UI from another machine needs `?token=<token>` in the URL.
-6. Logs to check: `~/.cafe/daemon.log` and `~/.cafe/logs/barista-*.log`.
+   - **Stop A** with a third machine C (or two child daemons): a question from C to B's Barista still gets answered (direct link). Start A again: C reconnects and A's UI shows that conversation (backfill).
+   - Stop A and B: a question from C fails with "中心节点和对方机器都连不上" (`root_unreachable`).
+   - Change A's IP and restart A: A dials back `knownDaemons`; else `cafe root set <new-ip>:4777` on B.
+   - Restart B's daemon mid-question: recovers or fails cleanly, no duplicate pi workers.
+   - `cafe daemon install` on B, reboot or `kill -9` the daemon: it comes back; `cafe daemon stop` keeps it stopped.
+6. Logs: `~/.cafe/daemon.log`, `~/.cafe/logs/barista-*.log`.
 
-## 6. Next: v2 backlog (the user wants this done next session)
+## 7. Backlog after v2
 
-Suggested order. Each item is a user-visible decision, so confirm the shape with the user before building.
+- Multi-level Daemon hierarchy (codex `parent`/AgentPath idea) — not started; only two levels exist.
+- Publishing (section 5 item 2).
+- SQLite FTS if `cafe search` gets slow (it scans JSONL files).
+- Web: "load older", maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
 
-1. **Routing that learns from declines.** `agent_events` already records answered, declined and failed per agent. Feed recent outcomes into the router: demote agents that keep declining a topic, and add an eval or report showing how good routing is.
-2. **Daemon-to-daemon direct connections (P2P).** The Registry already stores each Daemon's URL. ADR-0001 would need revisiting: the Root still wants to see the traffic. One option is to send the data directly and copy only the events to the Root.
-3. **mDNS discovery on the LAN**, so a new machine finds the Root without `root set`.
-4. **Autostart**: a launchd plist from something like `cafe daemon install`.
-5. **Data retention**: prune old `sessions/` files and SQLite rows. There is no full-text search yet.
-6. **oh-my-pi Barista adapter**: omp runs only on Bun, uses `.omp/` paths, and has `deliverAs: "aside"`. See the earlier research: `/Users/biran/code/skills/agent/oh-my-pi`.
-7. **Publishable npm packages.** pi-extension → cli and supervisor → pi-extension use relative paths across packages (`../../cli/src/main.ts`, `../../pi-extension/src/index.ts`); these break once packages are published separately. There is also no build output.
-8. Possible multi-level Daemon hierarchy. The `parent` / AgentPath idea from codex is not implemented; only two levels exist.
+## 8. Traps already found
 
-Smaller known gaps:
-- A child Daemon shows the Root as host `"root"` until its first connection.
-- When the LLM router fails and falls back to rules, the reason is only in the `reason` text.
-- Web thread lists load at most 200 threads, with no "load older".
-- `agent_events` has no retention.
-- Local pi is 1.5.0 and the extension targets 1.5.2. That works so far; suggest `pi update` to the user.
-
-## 7. Traps already found
-
-- **`npx tsc` is rewritten by the user's rtk hook** to an old global tsc, which gives bogus errors. Use `npm run typecheck` or `node_modules/.bin/tsc`.
-- `rm` is aliased to interactive in the user's shell and hangs a command. Use `/bin/rm -f` for files you created.
-- The user's global rules: never delete or overwrite user data without asking, show the diff before committing, never force-push. Use a scratch `CAFE_HOME`, not `~/.cafe`, for experiments.
-- pnpm is not installed, which is why this repo uses npm workspaces. Do not run two `npm install` at the same time (ENOTEMPTY).
-- zsh does not word-split `$VAR` commands. Wrap multi-command smoke tests in `bash -c` with a `cafe(){ node packages/cli/bin/cafe.js "$@"; }` function.
+- **`npx tsc` is rewritten by the user's rtk hook** to an old global tsc. Use `npm run typecheck` or `node_modules/.bin/tsc`.
+- `rm` is aliased to interactive and hangs; use `/bin/rm -f` for files you created.
+- User rules: never delete or overwrite user data without asking, show the diff/stat before committing, never force-push. Use a scratch `CAFE_HOME`.
+- pnpm is not installed (npm workspaces). Never run two `npm install` at once (ENOTEMPTY).
+- zsh does not word-split `$VAR` commands: wrap smoke tests in `bash -c` with `cafe(){ node packages/cli/bin/cafe.js "$@"; }`.
 - `node:sqlite` prints an ExperimentalWarning; `bin/cafe.js` filters it.
-- `erasableSyntaxOnly` is on, so TS parameter properties and enums are not allowed.
-- Daemon event ordering: fan-out happens **before** origin tracking in `recordEvent`, because tracking can emit `order.closed` synchronously. A follow-up must capture who answered **before** emitting `order.created`, because `updateMeta` resets `replies` for the new turn.
-- pi has no request ids. Correlation goes through the custom message's `details.order.orderId` on `message_end`, not `agent_start`, because auto-retry runs omit the start message from `agent_end.messages`.
-- `.gitignore` contains `.cafe`, which someone other than the agents added. The repo-root `.cafe` is tracked anyway; new `.cafe` files elsewhere will not be committed.
-- Reference repos are found with `sourceget find pi codex oh-my-pi`. Orca web is at `/Users/biran/code/skills/orca/Orca/web` and ccloop at `/Users/biran/code/skills/orca/ccloop`. Research them with subagents.
+- `erasableSyntaxOnly` is on: no TS parameter properties or enums.
+- Daemon event ordering: fan-out happens **before** origin tracking in `recordEvent`; a follow-up captures who answered **before** emitting `order.created`.
+- pi has no request ids: correlate through `details.order.orderId` on `message_end`.
+- **A Root shutting down must not mark children's Agents offline**, and a child losing the Root keeps Agents on directly reachable hosts online; otherwise direct links never get used (both guarded now).
+- Test daemons must not advertise on the real LAN: keep `CAFE_DISCOVERY=0` in vitest config.
+- In test Barista handlers, catch rejections (`h.ack().catch(()=>{})`, wrap async handlers): closing a client rejects pending requests and vitest reports an unhandled error even when all tests pass.
+- Under omp (Bun) `process.execPath` is the omp binary; the extension starts the daemon with `node` (`CAFE_NODE`).
+- `.gitignore` contains `.cafe`; the repo-root `.cafe` is tracked anyway.
+- Reference repos: `sourceget find pi codex oh-my-pi`; oh-my-pi at `/Users/biran/code/skills/agent/oh-my-pi`; Orca web at `/Users/biran/code/skills/orca/Orca/web`; ccloop at `/Users/biran/code/skills/orca/ccloop`. Research them with subagents.
 
-## 8. Working with this user
+## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They make design calls quickly when given numbered questions, each with a recommended answer.
-- For new feature areas, go through the decisions with them before building (the grill-with-docs style). Small fixes can go straight ahead.
-- Commit when asked, with a stat or diff shown first. Commit messages end with the Co-Authored-By line.
-- The UI prototype from the last session is a Claude artifact: https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q64**).
+- New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
+- Commit when asked, with a stat or diff shown first; messages end with the Co-Authored-By line.
+- UI prototypes are Claude artifacts: v1 https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK, routing-history display https://claude.ai/artifact/JJit3GCxiQZUypYVWZFxFg (approved: Q51–Q53 as recommended).
