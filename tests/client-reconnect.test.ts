@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CafeClient } from "@cafe/protocol/client";
+import { CafeClient, defaultReconnectMaxMs } from "@cafe/protocol/client";
 import { identity, startDaemon, waitFor } from "./helpers.ts";
 
 describe("client reconnect", () => {
@@ -23,4 +23,11 @@ describe("client reconnect", () => {
       await second.stop();
     }
   }, 15000);
+
+  it("waits at most 5 s between attempts for a local daemon, 30 s for a remote one", () => {
+    expect(defaultReconnectMaxMs("127.0.0.1:4777")).toBe(5000);
+    expect(defaultReconnectMaxMs("localhost:4777")).toBe(5000);
+    expect(defaultReconnectMaxMs("[::1]:4777")).toBe(5000);
+    expect(defaultReconnectMaxMs("192.168.3.129:4777")).toBe(30000);
+  });
 });

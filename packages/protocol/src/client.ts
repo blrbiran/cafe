@@ -19,7 +19,17 @@ export interface ClientOptions {
   token?: string;
   /** Reconnect automatically and re-register (long-lived agents). */
   reconnect?: boolean;
+  /** cafe release of this client, for the daemon's mismatch message. */
+  cafeVersion?: string;
+  /** Longest wait between reconnect attempts. Default: 5 s for a Daemon on this machine, 30 s otherwise. */
+  reconnectMaxMs?: number;
   log?: (msg: string) => void;
+}
+
+/** A local Daemon restarts in seconds (launchd, `cafe daemon start`); do not leave its Agents waiting 30 s. */
+export function defaultReconnectMaxMs(daemon: string): number {
+  const host = daemon.replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
+  return host === "127.0.0.1" || host === "localhost" || host === "::1" ? 5_000 : 30_000;
 }
 
 export interface OrderHandle {
@@ -105,7 +115,7 @@ export class CafeClient {
       ws.addEventListener("message", (e) => void peer.receive(String(e.data)));
       ws.addEventListener("open", async () => {
         try {
-          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, kind: "agent", token: this.opts.token });
+          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, kind: "agent", token: this.opts.token, cafeVersion: this.opts.cafeVersion });
           this.peer = peer;
           this.retry = 0;
           // Keep the same agentId across reconnects so in-flight Orders stay attributable.
@@ -134,7 +144,7 @@ export class CafeClient {
           reject(new Error(`cannot connect to cafe daemon at ${this.opts.daemon}`));
         }
         if (this.opts.reconnect && !this.closedByUser) {
-          const delay = Math.min(30_000, 500 * 2 ** this.retry++);
+          const delay = Math.min(this.opts.reconnectMaxMs ?? defaultReconnectMaxMs(this.opts.daemon), 500 * 2 ** this.retry++);
           setTimeout(() => this.open().catch((e) => this.opts.log?.(`reconnect failed: ${(e as Error).message}`)), delay);
         }
       };

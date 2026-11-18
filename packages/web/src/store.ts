@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { AgentRecord, DaemonRecord, RegistryDelta, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { api, token, wsUrl, type SearchHit, type Snapshot, type ThreadDetail } from "./api.ts";
 
 export interface State {
@@ -240,7 +241,7 @@ function connect(): void {
   ws = sock;
   let nextId = 1;
   sock.addEventListener("open", () => {
-    sock.send(JSON.stringify({ id: nextId++, method: "initialize", params: { protocolVersion: 1, kind: "ui", token } }));
+    sock.send(JSON.stringify({ id: nextId++, method: "initialize", params: { protocolVersion: PROTOCOL_VERSION, kind: "ui", token } }));
   });
   sock.addEventListener("message", (e) => {
     let frame: any;

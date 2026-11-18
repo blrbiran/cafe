@@ -37,6 +37,8 @@ import { Store } from "./store.ts";
 export interface DaemonOptions {
   config: CafeConfig;
   home: string;
+  /** cafe release, exchanged in `initialize` (default "dev"). */
+  version?: string;
   /** Override the router (tests inject a fake LLM). */
   router?: Router;
   /** Override the timing constants (tests). */
@@ -93,6 +95,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Headless Barista process supervisor (set by runDaemon). */
   supervisor?: import("./supervisor.ts").Supervisor;
   readonly host: string;
+  readonly version: string;
   private router: Router;
   private timing: Timing;
   readonly log: (msg: string) => void;
@@ -121,6 +124,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private stopped = false;
   private rootHost?: string;
+  /** cafe release of the Root, from the last handshake. */
+  private rootVersion?: string;
 
   /** Routing hints computed from this Daemon's own outcomes (agent_events). */
   private localHints: Record<string, RoutingHint> = {};
@@ -148,6 +153,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   constructor(opts: DaemonOptions) {
     super();
     this.config = opts.config;
+    this.version = opts.version ?? "dev";
     this.isRoot = opts.config.mode === "root";
     this.host = opts.config.host;
     this.store = new Store(opts.home);
@@ -172,7 +178,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Replica restored from disk; the Root will resync on connect.
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
-    this.daemonRecords.set(this.host, { host: this.host, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now() });
+    this.daemonRecords.set(this.host, { host: this.host, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
     this.schedulePrune();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
@@ -223,18 +229,25 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.initialize, (raw) => {
       const p = InitializeParams.parse(raw);
       if (!local && p.token !== this.config.token) throw new RpcError("unauthorized", "bad token");
+      if (p.protocolVersion !== PROTOCOL_VERSION) throw new RpcError("protocol_mismatch", this.mismatchMessage(p));
       peer.meta.kind = p.kind;
       if (p.kind === "daemon") return this.onChildDaemon(peer, p);
       if (p.kind === "peer") {
         peer.meta.host = p.host;
         if (p.host && p.url && !this.isRoot) this.learnPeers([{ host: p.host, url: p.url }]);
         this.bindLink(peer);
-        return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: this.isRoot };
+        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: this.isRoot };
       }
       if (p.kind === "ui") this.uis.add(peer);
-      return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: this.isRoot };
+      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: this.isRoot };
     });
     this.bindAgentMethods(peer);
+  }
+
+  /** Why a connection from another cafe release was refused, with the fix. */
+  private mismatchMessage(p: InitializeParams): string {
+    const who = p.host ? `${p.host} (cafe ${p.cafeVersion ?? "unknown"})` : `this client (cafe ${p.cafeVersion ?? "unknown"})`;
+    return `${who} speaks protocol ${p.protocolVersion}, but ${this.host} (cafe ${this.version}) speaks protocol ${PROTOCOL_VERSION}; install the same cafe release on both (npm i -g @blrbiran/cafe@${this.version})`;
   }
 
   private onPeerClosed(peer: Peer): void {
@@ -540,7 +553,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       });
       ws.on("open", async () => {
         try {
-          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, kind: "peer", token: this.config.token, host: this.host, url: this.url() });
+          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, kind: "peer", token: this.config.token, host: this.host, url: this.url() });
           clearTimeout(timer);
           this.links.set(host, { peer, ws, lastUsed: Date.now() });
           this.log(`direct link to ${host} open`);
@@ -1029,7 +1042,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.children.set(host, peer);
     peer.meta.host = host;
     const now = Date.now();
-    this.daemonRecords.set(host, { host, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now });
+    this.daemonRecords.set(host, { host, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
+    if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
     if (p.url && this.config.knownDaemons[host] !== p.url) {
       this.config.knownDaemons[host] = p.url;
       saveConfig(this.config, this.store.home);
@@ -1073,7 +1087,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all() });
       this.pushHints(peer);
     });
-    return { protocolVersion: PROTOCOL_VERSION, host: this.host, isRoot: true, registryVersion: this.registry.version };
+    return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: true, registryVersion: this.registry.version };
   }
 
   /** Root: after moving to a new address, tell every known Daemon where it is now. */
@@ -1108,8 +1122,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const peer = new Peer(ws);
     ws.on("open", async () => {
       try {
-        const hello = await peer.request<{ host: string }>(Methods.initialize, {
+        const hello = await peer.request<{ host: string; cafeVersion?: string }>(Methods.initialize, {
           protocolVersion: PROTOCOL_VERSION,
+          cafeVersion: this.version,
           kind: "daemon",
           token: this.config.token,
           host: this.host,
@@ -1118,6 +1133,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         });
         this.uplink = peer;
         this.rootHost = hello.host;
+        this.rootVersion = hello.cafeVersion;
         this.store.setKv("rootHost", hello.host);
         this.reconnectDelay = 0;
         this.setRootOnline(true);
@@ -1170,6 +1186,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const rec = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
     rec.online = online;
     if (this.rootHost) rec.host = this.rootHost;
+    if (online) rec.version = this.rootVersion;
     rec.url = `ws://${this.config.root}`;
     rec.lastSeenAt = Date.now();
     if (online) rec.connectedAt = Date.now();

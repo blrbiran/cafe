@@ -1,7 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 1;
-export const DEFAULT_PORT = 4777;
+export { DEFAULT_PORT, onlineVersions, PROTOCOL_VERSION } from "./version.ts";
 
 /** Delivery deadlines (ms). See GLOSSARY: Order lifecycle. */
 export const ACK_TIMEOUT_MS = 30_000;
@@ -62,8 +61,11 @@ export const DaemonRecord = z.object({
   online: z.boolean(),
   connectedAt: z.number().optional(),
   lastSeenAt: z.number(),
+  /** cafe release running on that Host (absent: older than this field). */
+  version: z.string().optional(),
 });
 export type DaemonRecord = z.infer<typeof DaemonRecord>;
+
 
 // ---------------------------------------------------------------------------
 // Orders
@@ -212,6 +214,8 @@ export const InitializeParams = z.object({
   host: z.string().optional(),
   url: z.string().optional(),
   registryVersion: z.number().int().optional(),
+  /** cafe release of the connecting side, for mismatch messages and the Network view. */
+  cafeVersion: z.string().optional(),
 });
 export type InitializeParams = z.infer<typeof InitializeParams>;
 

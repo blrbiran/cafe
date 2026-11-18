@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import type { AgentRecord, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { cafeHome, defaultExtensionPath, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
@@ -149,6 +149,15 @@ function cafeVersion(): string {
   return "0.0.0";
 }
 
+/** Per-Host versions when the network runs more than one cafe release. */
+function versionLines(daemons: DaemonRecord[]): string[] {
+  if (onlineVersions(daemons).length <= 1) return [];
+  return [
+    "warning:   machines run different cafe versions; install the same release everywhere",
+    ...daemons.filter((d) => d.online).map((d) => `           ${d.host}${d.isRoot ? " (root)" : ""}: ${d.version ?? "unknown (older than 0.1.0)"}`),
+  ];
+}
+
 const program = new Command("cafe")
   .description("cafe: route a message to the agent(s) on the network that can answer it")
   .version(cafeVersion(), "-V, --version")
@@ -164,7 +173,7 @@ daemon
   .option("--root", "run as the Root Daemon")
   .option("--port <port>", "listen port", Number)
   .action(async (o) => {
-    const running = await runDaemon({ mode: o.root ? "root" : undefined, port: o.port });
+    const running = await runDaemon({ mode: o.root ? "root" : undefined, port: o.port, version: cafeVersion() });
     const stop = async () => {
       await running.stop();
       process.exit(0);
@@ -230,11 +239,13 @@ daemon
     out(
       [
         `host:      ${s.host}${s.isRoot ? " (root)" : ""}`,
+        `version:   ${(await api("/api/health")).version ?? "unknown"}`,
         `url:       ${base()}`,
         `root:      ${s.isRoot ? "self" : s.rootOnline ? "online" : "offline"}`,
         `router:    ${s.router}`,
         `agents:    ${s.agents.length} (registry v${s.registryVersion})`,
         `threads:   ${s.threads.length}`,
+        ...versionLines(s.daemons),
       ].join("\n"),
       { running: true, ...s, threads: s.threads.length },
     );

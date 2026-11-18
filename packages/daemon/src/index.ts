@@ -64,6 +64,8 @@ export interface RunOptions {
   noLock?: boolean;
   /** Do not manage headless Baristas (tests). */
   noSupervisor?: boolean;
+  /** cafe release reported to other Daemons. */
+  version?: string;
 }
 
 export interface Running {
@@ -80,7 +82,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   if (opts.root) config.root = opts.root;
   const release = opts.noLock ? () => {} : acquireLock(home);
   if (!release) throw new Error(`another cafe daemon is already running for ${home}`);
-  const daemon = new Daemon({ config, home, router: opts.router, timing: opts.timing, log: opts.log });
+  const daemon = new Daemon({ config, home, router: opts.router, timing: opts.timing, log: opts.log, version: opts.version });
   await daemon.initRouter();
   let server: ServerHandle;
   try {

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
 import { useStore } from "../store.ts";
@@ -21,6 +22,13 @@ export function NetworkPage() {
   const self = daemons.find((d) => d.host === host);
   const anyFile = threads.find((m) => m.file)?.file;
   const dataDir = anyFile ? anyFile.replace(/\/[^/]+\/[^/]+$/, "/") : "~/.cafe/sessions/";
+  // Reference release: the hub's, else this machine's. Machines on another release are marked.
+  const target = (daemons.find((d) => d.isRoot && d.online) ?? self)?.version;
+  const mixed = onlineVersions(daemons).length > 1;
+  const versionList = daemons
+    .filter((d) => d.online)
+    .map((d) => `${!d.isRoot || d.host !== "root" ? d.host : t.hub} ${d.version ?? t.versionUnknown}`)
+    .join(" · ");
   const count = (h: string) => Object.values(agents).filter((a) => a.host === h && a.role === "barista" && a.status !== "offline").length;
 
   return (
@@ -30,6 +38,12 @@ export function NetworkPage() {
       {!isRoot && !rootOnline && (
         <div role="status" className="well text-sm" data-tone="warn">
           {t.hubOfflineWarn}
+        </div>
+      )}
+      {mixed && (
+        <div role="status" className="well flex flex-col gap-1 text-sm" data-tone="warn">
+          <b>{t.versionsDiffer}</b>
+          <span>{t.versionsDifferBody(versionList, target ?? "latest")}</span>
         </div>
       )}
       {!isRoot && <div className="hint">{t.childView}</div>}
@@ -62,6 +76,10 @@ export function NetworkPage() {
                     [t.address, <span className="mono">{d.url.replace(/^wss?:\/\//, "") || "—"}</span>],
                     ["Agents", d.host === "root" && !isThis ? "—" : String(count(d.host))],
                     [t.since, d.online ? ago(t, d.connectedAt, now) : t.lostAt(ago(t, d.lastSeenAt, now))],
+                    [
+                      t.version,
+                      <span className={`mono ${mixed && d.online && d.version !== target ? "font-semibold text-warn" : ""}`}>{d.version ?? t.versionUnknown}</span>,
+                    ],
                   ]}
                 />
               </article>

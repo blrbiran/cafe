@@ -133,7 +133,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
 
-  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid });
+  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version });
   if (m === "GET" && path === "/api/snapshot") return send(res, 200, daemon.snapshot());
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "GET" && path === "/api/agents/stats") {
