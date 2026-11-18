@@ -135,7 +135,18 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && path === "/api/routing/hints") return send(res, 200, { learn: daemon.config.router.learn, hints: daemon.routingHints() });
   if (m === "GET" && path === "/api/daemons") return send(res, 200, daemon.daemons());
   if (m === "GET" && path === "/api/threads") {
-    return send(res, 200, daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined));
+    const before = url.searchParams.get("before");
+    return send(res, 200, daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined, before ? Number(before) : undefined));
+  }
+  if (m === "GET" && path === "/api/search") {
+    const q = url.searchParams.get("q") ?? "";
+    if (!q.trim()) throw new RpcError("bad_request", "q required");
+    return send(res, 200, daemon.search(q, Number(url.searchParams.get("limit") ?? 20)));
+  }
+  if (m === "POST" && path === "/api/prune") {
+    const { olderThanDays, dryRun } = await readJson(req);
+    if (typeof olderThanDays !== "number" || olderThanDays < 1) throw new RpcError("bad_request", "olderThanDays (>= 1) required");
+    return send(res, 200, daemon.prune(olderThanDays, dryRun !== false));
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)$/.exec(path))) {
     const t = daemon.thread(match[1]!);

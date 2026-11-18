@@ -292,6 +292,37 @@ program
   });
 
 program
+  .command("search")
+  .description("find past questions and answers containing some text")
+  .argument("<text...>")
+  .option("--limit <n>", "max threads", Number, 20)
+  .action(async (words: string[], o) => {
+    await ensureDaemon();
+    const q = words.join(" ");
+    const found = await api<{ meta: ThreadMeta; hits: { who: string; text: string; at: number }[] }[]>(`/api/search?${new URLSearchParams({ q, limit: String(o.limit) })}`);
+    const lines = found.flatMap((f) => [
+      `${f.meta.threadId}  ${time(f.meta.createdAt)}  ${f.meta.summary.replace(/\s+/g, " ").slice(0, 70)}`,
+      ...f.hits.slice(0, 3).map((h) => `    ${h.who}: ${h.text.replace(/\s+/g, " ")}`),
+    ]);
+    out(lines.join("\n") || `(nothing matches "${q}")`, found);
+  });
+
+program
+  .command("prune")
+  .description("delete finished threads and stats older than N days (shows what would go unless --yes)")
+  .requiredOption("--older-than <days>", "age in days", Number)
+  .option("--yes", "really delete")
+  .action(async (o) => {
+    await ensureDaemon();
+    const r = await api<{ dryRun: boolean; threads: number; bytes: number; agentEvents: number; oldest?: number }>("/api/prune", {
+      method: "POST",
+      body: JSON.stringify({ olderThanDays: o.olderThan, dryRun: !o.yes }),
+    });
+    const what = `${r.threads} finished thread(s) (${(r.bytes / 1024).toFixed(1)} KiB${r.oldest ? `, oldest ${new Date(r.oldest).toLocaleDateString()}` : ""}) and ${r.agentEvents} stat row(s) older than ${o.olderThan} day(s)`;
+    out(r.dryRun ? `would delete ${what}\nrun again with --yes to delete` : `deleted ${what}`, r);
+  });
+
+program
   .command("threads")
   .description("list recent threads")
   .option("--status <status>")

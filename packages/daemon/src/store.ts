@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 
@@ -79,11 +79,58 @@ export class Store {
     return row ? (JSON.parse(row.meta) as ThreadMeta) : undefined;
   }
 
-  listThreads(limit = 200, status?: string): ThreadMeta[] {
+  /** Newest first. `before`: only threads created before this time (paging to older threads). */
+  listThreads(limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER): ThreadMeta[] {
     const rows = (status
-      ? this.db.prepare("SELECT meta FROM threads WHERE status = ? ORDER BY created_at DESC LIMIT ?").all(status, limit)
-      : this.db.prepare("SELECT meta FROM threads ORDER BY created_at DESC LIMIT ?").all(limit)) as { meta: string }[];
+      ? this.db.prepare("SELECT meta FROM threads WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(status, before, limit)
+      : this.db.prepare("SELECT meta FROM threads WHERE created_at < ? ORDER BY created_at DESC LIMIT ?").all(before, limit)) as { meta: string }[];
     return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+  }
+
+  /** Finished threads whose last activity is before `cutoff` (candidates for pruning). */
+  staleThreads(cutoff: number): ThreadMeta[] {
+    const rows = this.db.prepare("SELECT meta FROM threads WHERE created_at < ?").all(cutoff) as { meta: string }[];
+    return rows
+      .map((r) => JSON.parse(r.meta) as ThreadMeta)
+      .filter((m) => (m.lastActivityAt ?? m.createdAt) < cutoff && ["done", "failed", "cancelled"].includes(m.status));
+  }
+
+  /** Delete thread rows and their JSONL files; empty day directories go too. Returns bytes freed. */
+  deleteThreads(metas: ThreadMeta[]): number {
+    let bytes = 0;
+    const dirs = new Set<string>();
+    const del = this.db.prepare("DELETE FROM threads WHERE thread_id = ?");
+    for (const m of metas) {
+      del.run(m.threadId);
+      // Never touch files outside this home's sessions/ directory, whatever the metadata says.
+      const sessions = resolve(this.home, "sessions") + sep;
+      if (resolve(m.file).startsWith(sessions) && existsSync(m.file)) {
+        bytes += statSync(m.file).size;
+        rmSync(m.file, { force: true });
+        dirs.add(dirname(m.file));
+      }
+    }
+    for (const d of dirs) {
+      try {
+        if (readdirSync(d).length === 0) rmdirSync(d);
+      } catch {
+        // already gone or not empty
+      }
+    }
+    return bytes;
+  }
+
+  countAgentEventsBefore(cutoff: number): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM agent_events WHERE at < ?").get(cutoff) as { n: number }).n;
+  }
+
+  deleteAgentEventsBefore(cutoff: number): number {
+    return Number(this.db.prepare("DELETE FROM agent_events WHERE at < ?").run(cutoff).changes);
+  }
+
+  /** Every thread, newest first (for full-text search over the JSONL files). */
+  allThreads(): ThreadMeta[] {
+    return (this.db.prepare("SELECT meta FROM threads ORDER BY created_at DESC").all() as { meta: string }[]).map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 
   saveRegistry(version: number, records: AgentRecord[]): void {

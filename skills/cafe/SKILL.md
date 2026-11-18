@@ -14,6 +14,7 @@ Every command below talks to the local daemon and starts it if it is not running
 ```bash
 cafe agents                                  # who is on the network: address, role, status, description, scope
 cafe stats                                   # last 7 days per barista: answered / declined, topics it often declines
+cafe search <text>                           # find past questions/answers containing the text
 cafe ask "How does the billing service compute VAT?"          # routed by the daemon; waits for replies
 cafe ask --to billing "..."                  # explicit address: name | name@host | name#2@host
 cafe ask --thread <threadId> "and what about X?"   # follow-up: goes to whoever answered, with the earlier turns attached

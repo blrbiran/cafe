@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { statSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { ulid } from "ulid";
 import WebSocket from "ws";
@@ -141,6 +142,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Threads that went direct while the Root was offline; sent to the Root when it is back. */
   private backfill = new Set<string>();
   private linkSweep?: ReturnType<typeof setInterval>;
+  private pruneTimer?: ReturnType<typeof setTimeout>;
+  private pruneInterval?: ReturnType<typeof setInterval>;
 
   constructor(opts: DaemonOptions) {
     super();
@@ -170,6 +173,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
     this.daemonRecords.set(this.host, { host: this.host, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now() });
+    this.schedulePrune();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
       this.hintsTimer.unref?.();
@@ -1196,6 +1200,77 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   // -------------------------------------------------------------------------
+  // Retention and search (docs/specs/v2-5-retention-search.md)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Finished threads and outcome stats older than `days`. `dryRun` (the default
+   * for callers) only reports what would go; nothing is deleted without it off.
+   */
+  prune(days: number, dryRun: boolean): { dryRun: boolean; cutoff: number; threads: number; bytes: number; agentEvents: number; oldest?: number } {
+    const cutoff = Date.now() - days * 24 * 3600_000;
+    const open = new Set([...this.tracking.values()].filter((t) => t.status === "open").map((t) => t.order.threadId));
+    const stale = this.store.staleThreads(cutoff).filter((m) => !open.has(m.threadId));
+    const oldest = stale.reduce<number | undefined>((o, m) => (o === undefined || m.createdAt < o ? m.createdAt : o), undefined);
+    if (dryRun) {
+      let bytes = 0;
+      for (const m of stale) {
+        try {
+          bytes += statSync(m.file).size;
+        } catch {
+          // file already gone
+        }
+      }
+      return { dryRun, cutoff, threads: stale.length, bytes, agentEvents: this.store.countAgentEventsBefore(cutoff), oldest };
+    }
+    const bytes = this.store.deleteThreads(stale);
+    for (const m of stale) this.metas.delete(m.threadId);
+    const agentEvents = this.store.deleteAgentEventsBefore(cutoff);
+    this.hintsDirty = true;
+    this.log(`pruned ${stale.length} thread(s), ${agentEvents} stat row(s) older than ${days} day(s)`);
+    return { dryRun, cutoff, threads: stale.length, bytes, agentEvents, oldest };
+  }
+
+  /** Plain substring search over questions and answers, newest threads first. Scans the JSONL files. */
+  search(q: string, limit = 20): { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] {
+    const needle = q.toLowerCase();
+    const out: { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] = [];
+    for (const meta of this.store.allThreads()) {
+      const hits: { orderId: string; who: string; text: string; at: number }[] = [];
+      for (const env of this.store.readEvents(meta.file)) {
+        const ev = env.event;
+        const [who, text] =
+          ev.type === "order.created" ? [ev.order.from.address, ev.order.body] : ev.type === "order.replied" ? [this.registry.get(ev.agentId)?.address ?? ev.agentId, ev.text] : [undefined, undefined];
+        if (!text || !who) continue;
+        const i = text.toLowerCase().indexOf(needle);
+        if (i < 0) continue;
+        const start = Math.max(0, i - 60);
+        hits.push({ orderId: env.orderId, who, at: env.at, text: `${start ? "…" : ""}${text.slice(start, i + needle.length + 100)}` });
+      }
+      if (hits.length) out.push({ meta, hits });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  /** Daily automatic pruning when `retention.days` is set. */
+  private schedulePrune(): void {
+    const days = this.config.retention.days;
+    if (!days) return;
+    const run = () => {
+      try {
+        this.prune(days, false);
+      } catch (err) {
+        this.log(`prune failed: ${(err as Error).message}`);
+      }
+    };
+    this.pruneTimer = setTimeout(run, 60_000);
+    this.pruneInterval = setInterval(run, 24 * 3600_000);
+    this.pruneTimer.unref?.();
+    this.pruneInterval.unref?.();
+  }
+
+  // -------------------------------------------------------------------------
   // Introspection
   // -------------------------------------------------------------------------
 
@@ -1251,6 +1326,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearTimeout(this.reconnectTimer);
     clearInterval(this.hintsTimer);
     clearInterval(this.linkSweep);
+    clearTimeout(this.pruneTimer);
+    clearInterval(this.pruneInterval);
     for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();
     for (const t of this.tracking.values()) {

@@ -79,6 +79,8 @@ router:
   fallback: rules          # rules | root（本地没有 LLM 时请 Root 代为路由）
   learn: true              # 参考最近 7 天的婉拒记录，在描述同样匹配的 Barista 之间排先后
 discovery: true            # 局域网 mDNS：Root 应答，未配 root 的 Daemon 自动查找
+retention:
+  days: 90                 # 可选；不设则永不自动清理，用 `cafe prune --older-than N [--yes]` 手动清
 ```
 
 路由主要看 Barista 的描述；`router.learn` 只是辅助：最近在类似问题上婉拒过的 Barista 会排到后面，但不会被排除，也不会盖过描述更匹配的 Barista。`cafe stats` 查看每个 Barista 最近 7 天回答、婉拒的次数和常婉拒的话题。详见 [`docs/specs/v2-1-routing-hints.md`](docs/specs/v2-1-routing-hints.md)。

@@ -24,6 +24,8 @@ export const CafeConfig = z.object({
       learn: z.boolean().default(true),
     })
     .default({}),
+  /** Automatic pruning: delete finished threads and stats older than `days`. Unset = never (use `cafe prune`). */
+  retention: z.object({ days: z.number().int().positive().optional() }).default({}),
   /** LAN discovery over mDNS: the Root answers, a Daemon without `root` looks for one. */
   discovery: z.boolean().default(true),
   /** Root only: last known URLs of Daemons, for dial-back after the Root moves. */
