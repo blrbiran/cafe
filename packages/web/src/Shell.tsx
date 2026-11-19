@@ -63,6 +63,8 @@ export function Shell({
   const t = useT();
   const lang = useLang();
   const host = useStore((s) => s.host);
+  const displayName = useStore((s) => s.displayName);
+  const webStale = useStore((s) => s.webStale);
   const isRoot = useStore((s) => s.isRoot);
   const rootOnline = useStore((s) => s.rootOnline);
   const connected = useStore((s) => s.connected);
@@ -111,7 +113,8 @@ export function Shell({
           <div className="well flex flex-col gap-1.5 max-md:hidden">
             <div className="cap">{t.thisMachine}</div>
             <div className="flex flex-wrap items-center gap-2">
-              <span className="mono text-sm text-fg-strong">{host || "…"}</span>
+              <span className="mono text-sm text-fg-strong">{displayName ?? (host || "…")}</span>
+              {displayName && displayName !== host && <span className="mono text-[11px] text-muted">{host}</span>}
               {isRoot && (
                 <Pill tone="info" dot={false}>
                   {t.hub}
@@ -236,7 +239,14 @@ export function Shell({
       </nav>
 
       <main onClick={onBlankClick} className="box-border min-w-0 flex-1 overflow-y-auto px-8 pt-7 pb-12 max-md:overflow-visible max-md:px-4 max-md:pb-16">
-        <div className="mx-auto flex max-w-[1180px] flex-col gap-5 min-[1600px]:max-w-[1360px] min-[2000px]:max-w-[1560px]">{children}</div>
+        <div className="mx-auto flex max-w-[1180px] flex-col gap-5 min-[1600px]:max-w-[1360px] min-[2000px]:max-w-[1560px]">
+          {webStale && (
+            <div role="status" className="well text-sm" data-tone="warn">
+              {t.webStaleHint}
+            </div>
+          )}
+          {children}
+        </div>
       </main>
 
       {detail}

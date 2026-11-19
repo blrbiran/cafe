@@ -47,10 +47,18 @@ export async function customer(addr: string) {
  * run the fake Codex/Claude processes can be slow to start and 5 s flaked. */
 export function untilClosed(c: CafeClient, threadId: string, timeoutMs = 12_000): Promise<ThreadEnvelope[]> {
   return new Promise((resolve, reject) => {
-    const events: ThreadEnvelope[] = [];
+    // Start from what the client already saw: a fast Barista can close the
+    // Thread between `ask()` resolving and this listener being attached. For a
+    // follow-up, only the latest turn counts.
+    const all = c.recentEvents(threadId);
+    const turnStart = all.map((e) => e.event.type).lastIndexOf("order.created");
+    const events = turnStart >= 0 ? all.slice(turnStart) : all;
+    const seen = new Set(events.map((e) => e.eventId));
+    if (events.some((e) => e.event.type === "order.closed")) return resolve(events);
     const t = setTimeout(() => reject(new Error(`thread ${threadId} not closed; got ${events.map((e) => e.event.type).join(",")}`)), timeoutMs);
     const off = c.onThreadEvent((env) => {
-      if (env.threadId !== threadId) return;
+      if (env.threadId !== threadId || seen.has(env.eventId)) return;
+      seen.add(env.eventId);
       events.push(env);
       if (env.event.type === "order.closed") {
         clearTimeout(t);

@@ -5,7 +5,7 @@ import { ago, useT, type Dict } from "../i18n.ts";
 import { useNow } from "../format.ts";
 import { askerOf, whoAddress, whoName, whyText } from "../outcome.ts";
 import { hashFor } from "../route.ts";
-import { isActive, useStore } from "../store.ts";
+import { isActive, loadOlderEvents, useStore } from "../store.ts";
 import { Disclosure, KindTag, Pill, type Tone } from "../ui/bits.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
 
@@ -160,6 +160,14 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
             <div className="cap">{t.ctxRouter}</div>
             <div className="text-fg-strong">{routerText}</div>
           </div>
+        </div>
+      )}
+
+      {detail.hasMore && (
+        <div className="flex justify-center">
+          <button type="button" className="btn-sm" aria-busy={detail.loadingOlder} disabled={detail.loadingOlder} onClick={() => void loadOlderEvents()}>
+            {detail.loadingOlder ? t.loadingOlder : t.loadOlder}
+          </button>
         </div>
       )}
 

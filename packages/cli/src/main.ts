@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
-import { cafeHome, CONFIG_KEYS, defaultExtensionPath, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
+import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
 import { PRESETS, serve } from "./serve.ts";
 import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
@@ -56,8 +56,8 @@ async function setAndApply(key: string, value: string): Promise<{ human: string;
   const before = loadConfig() as Record<string, any>;
   const old = key.split(".").reduce((o, k) => o?.[k], before);
   setConfigValue(key, value);
-  // Only router/root can be applied to a running daemon today; say so instead of pretending.
-  if (!(key === "root" || key.startsWith("router."))) {
+  // Only hot keys can be applied to a running daemon; say which mode a key has instead of pretending.
+  if (configApplyMode(key) !== "hot") {
     return { human: `${key} = ${value}\n(saved; restart required: cafe daemon restart)`, data: { [key]: value, applied: false, restartRequired: true } };
   }
   if (!(await healthy())) return { human: `${key} = ${value}`, data: { [key]: value, applied: false } };
@@ -688,6 +688,36 @@ config
   .action(async (key: string, value: string) => {
     const r = await setAndApply(key, value);
     out(r.human, r.data);
+  });
+config
+  .command("diff")
+  .description("compare config.yml with the running daemon; mark each change hot or restart-required")
+  .action(async () => {
+    const file = loadConfig();
+    if (!(await healthy())) {
+      out("daemon is not running; config.yml will be used on the next start", { running: false });
+      return;
+    }
+    const running = await api<any>("/api/config");
+    const rows = diffConfig(file, running);
+    if (!rows.length) {
+      out("no differences: the running daemon uses config.yml", rows);
+      return;
+    }
+    const fmt = (v: unknown) => (v === undefined ? "(not set)" : typeof v === "string" ? v : JSON.stringify(v));
+    out(rows.map((r) => `${r.key}: ${fmt(r.file)} -> ${fmt(r.running)} (${r.mode})`).join("\n"), rows);
+  });
+config
+  .command("apply")
+  .description("apply hot changes (router/root) to the running daemon and list what still needs a restart")
+  .action(async () => {
+    if (!(await healthy())) throw new Error("daemon is not running; start it with `cafe daemon start`");
+    const res = await api<any>("/api/reload", { method: "POST" });
+    const running = await api<any>("/api/config");
+    const pending = diffConfig(loadConfig(), running).filter((r) => r.mode === "restart-required");
+    const lines = [`router: ${res.router}${res.model ? ` (${res.model})` : ""}`];
+    lines.push(pending.length ? `restart required for: ${pending.map((r) => r.key).join(", ")}; run \`cafe daemon restart\`` : "no restart-required changes");
+    out(lines.join("\n"), { ...res, pending });
   });
 
 const router = program.command("router").description("LLM routing: pick a model and see what is actually running");

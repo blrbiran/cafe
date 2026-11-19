@@ -56,7 +56,8 @@ export function AgentsPage() {
           <section key={h} className="flex flex-col gap-2.5">
             <div className="flex flex-wrap items-center gap-2">
               <Dot tone={online ? "ok" : undefined} />
-              <h2 className="mono m-0 text-base text-fg-strong">{h}</h2>
+              <h2 className="mono m-0 text-base text-fg-strong">{rec?.displayName ?? h}</h2>
+              {rec?.displayName && rec.displayName !== h && <span className="mono text-[11px] text-muted">{h}</span>}
               {note && <span className="hint">{note}</span>}
             </div>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
@@ -98,7 +99,7 @@ function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: 
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 flex-col">
           <span className="flex flex-wrap items-center gap-2 text-lg font-semibold text-fg-strong">
-            {a.name}
+            {a.displayName ?? a.name}
             <KindTag a={a} />
           </span>
           <span className="mono truncate text-xs text-muted">{a.address}</span>

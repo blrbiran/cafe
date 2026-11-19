@@ -58,6 +58,55 @@ export function cafeHome(): string {
   return process.env.CAFE_HOME ?? join(homedir(), ".cafe");
 }
 
+/**
+ * How a config change reaches the running daemon: `hot` keys are applied by
+ * `/api/reload`; everything else needs `cafe daemon restart`. Kept next to the
+ * schema so CLI and Web describe the same contract.
+ */
+export function configApplyMode(key: string): "hot" | "restart-required" {
+  return key === "root" || key.startsWith("router.") ? "hot" : "restart-required";
+}
+
+/** Leaves worth comparing between config.yml and the running daemon. */
+const DIFF_KEYS = [
+  "mode",
+  "host",
+  "displayName",
+  "port",
+  "advertise",
+  "root",
+  "router.model",
+  "router.fallback",
+  "router.learn",
+  "router.timeoutMs",
+  "router.concurrency",
+  "retention.days",
+  "discovery",
+] as const;
+
+function leaf(obj: unknown, key: string): unknown {
+  return key.split(".").reduce<any>((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+export interface ConfigDiff {
+  key: string;
+  file: unknown;
+  running: unknown;
+  mode: "hot" | "restart-required";
+}
+
+/** Compare what is saved in config.yml with what the daemon is actually using. */
+export function diffConfig(file: unknown, running: unknown): ConfigDiff[] {
+  const out: ConfigDiff[] = [];
+  for (const key of DIFF_KEYS) {
+    const a = leaf(file, key);
+    const b = leaf(running, key);
+    if (JSON.stringify(a) === JSON.stringify(b)) continue;
+    out.push({ key, file: a, running: b, mode: configApplyMode(key) });
+  }
+  return out;
+}
+
 export function configPath(home = cafeHome()): string {
   return join(home, "config.yml");
 }

@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { ThreadEnvelope } from "@cafe/protocol";
 import { eventMatches, parseEventFilter, replayAfter } from "../packages/daemon/src/events.ts";
+import { barista, customer, identity, startDaemon, untilClosed } from "./helpers.ts";
+
+const cleanup: Array<() => Promise<void> | void> = [];
+afterEach(async () => {
+  while (cleanup.length) await cleanup.pop()!();
+});
 
 const env = (host: string, type: string, threadId = "T1"): ThreadEnvelope =>
   ({ eventId: "E1", threadId, orderId: "O1", host, at: 1, event: { type } as ThreadEnvelope["event"] });
@@ -36,5 +42,27 @@ describe("event stream filters", () => {
     expect(replayAfter(ring, "E3")).toEqual([]);
     expect(replayAfter(ring, "gone")).toEqual([]);
     expect(replayAfter(ring)).toEqual([]);
+  });
+});
+
+describe("event history endpoint", () => {
+  it("replays the ring after the last event the Web client saw", async () => {
+    const d = await startDaemon("pc1", { mode: "root" });
+    cleanup.push(d.stop);
+    const b = await barista(d.addr, identity("widgets"));
+    cleanup.push(() => b.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const res = await c.ask({ body: "hello" });
+    const events = await untilClosed(c, res.threadId);
+    const first = events[0]!.eventId;
+
+    const body = (await (await fetch(`http://${d.addr}/api/events/history?after=${first}`)).json()) as { events: ThreadEnvelope[]; gap: boolean };
+    expect(body.gap).toBe(false);
+    expect(body.events.length).toBeGreaterThan(0);
+    expect(body.events[0]!.eventId).not.toBe(first);
+
+    const tooOld = (await (await fetch(`http://${d.addr}/api/events/history?after=gone`)).json()) as { events: ThreadEnvelope[]; gap: boolean };
+    expect(tooOld).toEqual({ events: [], gap: true });
   });
 });

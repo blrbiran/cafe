@@ -8,7 +8,7 @@ import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress } from "./daemon.ts";
 
 export { Daemon, lanAddress, type DaemonOptions, type Timing } from "./daemon.ts";
-export { CafeConfig, CONFIG_KEYS, cafeHome, configPath, loadConfig, saveConfig, setConfigValue } from "./config.ts";
+export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configPath, diffConfig, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";

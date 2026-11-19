@@ -57,6 +57,8 @@ export class CafeClient {
   private orderListeners = new Set<Listener<OrderHandle>>();
   private cancelListeners = new Set<Listener<{ orderId: string; threadId: string; by: string }>>();
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
+  /** Recent events, so a listener attached after a fast thread closed can still read it. */
+  private recent: ThreadEnvelope[] = [];
   private connectListeners = new Set<Listener<AgentRecord | undefined>>();
   record?: AgentRecord;
 
@@ -82,6 +84,11 @@ export class CafeClient {
   onThreadEvent(fn: Listener<ThreadEnvelope>): () => void {
     this.eventListeners.add(fn);
     return () => this.eventListeners.delete(fn);
+  }
+
+  /** Thread events already seen by this client (newest last), for late subscribers. */
+  recentEvents(threadId?: string): ThreadEnvelope[] {
+    return (threadId ? this.recent.filter((e) => e.threadId === threadId) : this.recent).slice();
   }
 
   onConnect(fn: Listener<AgentRecord | undefined>): () => void {
@@ -110,6 +117,8 @@ export class CafeClient {
         for (const fn of this.orderListeners) fn(h);
       });
       peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
+        this.recent.push(env);
+        if (this.recent.length > 500) this.recent.splice(0, this.recent.length - 500);
         for (const fn of this.eventListeners) fn(env);
       });
       ws.addEventListener("message", (e) => void peer.receive(String(e.data)));

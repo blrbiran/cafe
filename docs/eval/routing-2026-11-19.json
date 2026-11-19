@@ -1,0 +1,19 @@
+{
+  "router": "llm",
+  "model": "magpie/group/smart",
+  "repeat": 2,
+  "cases": 53,
+  "attempts": 106,
+  "accuracy": 0.9905660377358491,
+  "passed": 105,
+  "fallbacks": 0,
+  "p50ms": 3220,
+  "p95ms": 5940,
+  "misses": [
+    {
+      "q": "search suggestions are empty",
+      "expected": "unicast: search",
+      "got": "multicast: search, web"
+    }
+  ]
+}

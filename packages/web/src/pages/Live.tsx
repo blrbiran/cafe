@@ -61,6 +61,7 @@ export function LivePage() {
   const rows = shown.filter((e) => (!host || e.host === host) && (!failedOnly || FAILED.has(e.event.type)));
   const latest = shown[0]?.at;
   const hosts = [...new Set(daemons.map((d) => d.host))].sort();
+  const hostLabel = (h: string) => daemons.find((d) => d.host === h)?.displayName ?? h;
 
   const togglePause = () => {
     if (!paused) setFrozen(events);
@@ -77,7 +78,7 @@ export function LivePage() {
           </button>
           {hosts.map((h) => (
             <button key={h} type="button" className="chip" aria-pressed={host === h} onClick={() => setHost(host === h ? "" : h)}>
-              {h}
+              {hostLabel(h)}
             </button>
           ))}
           <button type="button" className="chip" aria-pressed={failedOnly} onClick={() => setFailedOnly((v) => !v)}>

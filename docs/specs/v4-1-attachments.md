@@ -123,9 +123,32 @@ attachments:
 - `cafe prune --yes` 删除 Thread 后附件目录消失；不带 `--yes` 只报告。
 - JSONL 正文里搜不到二进制内容；事件里只有元数据。
 
+## 独立评审结论（2026-11-19，待用户拍板）
+
+一个独立 subagent 对照代码评审了 Q1–Q4。建议如下（与原草案不同的地方已标出）：
+
+- **Q1：协议一次定好，但第一阶段只实现 Customer → Barista 的传输。** reply 附件先支持“同 Host 落盘 + 元数据”，跨机 reply 传输放第二阶段。理由：CLI 没有 `cafe reply`，MCP 没有 `cafe_reply`，Bridge 的回复路径是 `h.reply(text)`，没有给 agent 附文件的入口；reply 到达时 Customer 可能离线，pull 需要另一套“上线后补拉”的队列。协议字段（`order.replied.attachments`）可以现在加，不升 `PROTOCOL_VERSION`。
+- **Q2：选 pull，但不要让 Root 代理 blob。** daemon 间永远直连 origin 的 HTTP（peerUrls / 已配置地址），Root 在线与否只影响 Order 路由。必须补三处：
+  1. **pull 在通知 Agent 之前完成**（`deliverLocal` 先 await 拉取再 `orderDeliver`），否则 Bridge/pi 已经用没有落盘的附件开工。
+  2. **ack 超时与 fallback 重投**：25MB 慢链路可能超过 30s ack；带附件的 Order 要么把 armAck 移到 `order.delivered` 之后，要么放宽窗口，避免 origin 因 no-ack 把同一个 Order 重投给另一台 Barista 再拉一遍。
+  3. **backfill 只有元数据、没有 blob** 是设计后果：Root/Web 显示附件但下载不到时，必须由本地 daemon 按 `attachment.host` 代理 GET，并给可操作错误（“origin 不可达 / 已被 retention 清理”）。
+- **Q3：HTTP/CLI 的 25MB / 100MB / 10 个合理，保留；MCP 不要走 base64。** `cafe mcp` 是本地 stdio 进程，应接受本地文件路径由 MCP server 自己读盘上传；base64 只留给 agent 内存里生成的小内容，解码后上限建议 ≤5MB。限额放进 `CafeConfig.attachments`，`cafe config set attachments.maxMb` 天然可用。上传必须流式写临时文件、边收边算 size/sha，不能走全量 `readJson`；thread 配额在 `order/create` 时校验。
+- **Q4：做缩略图，但纯浏览器端缩放，服务端零生成。** 不引入 sharp/native 依赖。响应 MIME 只对 png/jpeg/webp/gif 保留真实类型并加 `X-Content-Type-Options: nosniff`；SVG/HTML/未知一律 `application/octet-stream`，点击仍走 `?download=1` 的 attachment。`<img>` 渲染本身不执行 SVG 脚本，安全规则保得住；token 走 query（与 SSE 一致）。
+
+### 评审发现的 blocking 缺口（实现前必须补进 spec）
+
+1. **Attachment 缺 origin host**：follow-up 可以来自第三台 Host，同一 Thread 的附件可来自多台机器；`uploader` 是 optional 且语义不同，不能兼任“去哪台机器拉 blob”。
+2. **上传时还没有 threadId**：存储路径 `artifacts/<threadId>/…` 与“先上传再发 Order”矛盾。需要 `artifacts/_staging/<id>`，`order/create` 时 move 到 thread 目录，并清理 staging 孤儿。
+3. **Web/CLI 的跨 Host 下载路径不存在**：浏览器只跟本地 daemon 说话，也没有 CORS；需要本地 daemon 的流式代理 GET，并维护 `attachmentId → (threadId, host, path)` 索引。
+4. **pull 与开工 / ack 的时序**：见 Q2 的三点，是“远端 Barista 能引用文件内容”能否成立的关键。
+5. **旧 daemon 静默丢附件**：zod 默认 strip、`CreateOrderParams.parse` 会丢掉新字段。客户端必须做能力检测（`/api/health` 的 version），不支持就本地报错，不发半个 Order；不要升 `PROTOCOL_VERSION`。
+6. **Barista 怎么读到文件**：Bridge 的 prompt 只有 body/history，Order 元数据没有本地路径。要么 daemon 在 prompt 注入落盘绝对路径，要么给 Barista 侧一个列举/下载工具。
+
+后续要记一笔（不阻塞第一阶段）：thread 配额记账的 source of truth、retention/prune 同时删 artifacts、并发上传/in-flight pull 合并、MCP schema 同步、Web 上传进度（XHR/ReadableStream）、同 Thread 同 sha 去重。
+
 ## 待用户确认
 
-- **Q1**：第一阶段是否同时支持 Barista reply 附件，还是先只做 Customer → Barista？（建议：都支持，协议一次定好，CLI 的 reply 参数可以后补。）
-- **Q2**：跨机器走 pull-from-origin（建议）还是 push-with-order？
-- **Q3**：默认限额 25MB / 100MB / 10 个是否合适？是否要允许按 Host 配置覆盖？
-- **Q4**：图片是否要缩略图预览，还是第一阶段全部只做下载？
+- **Q1**：第一阶段是否同时支持 Barista reply 附件，还是先只做 Customer → Barista？（评审建议：协议都定，第一阶段先 Customer→Barista；reply 先同 Host。）
+- **Q2**：跨机器走 pull-from-origin（建议）还是 push-with-order？（评审建议：pull，直连 origin，不经 Root。）
+- **Q3**：默认限额 25MB / 100MB / 10 个是否合适？是否要允许按 Host 配置覆盖？（评审建议：保留，放进 config，MCP 改传路径。）
+- **Q4**：图片是否要缩略图预览，还是第一阶段全部只做下载？（评审建议：做，纯浏览器缩放。）

@@ -15,7 +15,7 @@ export function bucketOf(t: ThreadMeta): Bucket {
 /** Display name of an agent id, preferring the live registry, then addresses carried in the meta. */
 export function whoName(id: string, agents: Record<string, AgentRecord>, meta?: ThreadMeta): string {
   const a = agents[id];
-  if (a) return a.name;
+  if (a) return a.displayName ?? a.name;
   const fromMeta = meta?.replies.find((r) => r.agentId === id)?.address ?? meta?.declines.find((d) => d.agentId === id)?.address;
   return fromMeta ? nameOf(fromMeta) : id.slice(-6);
 }

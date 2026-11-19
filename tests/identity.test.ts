@@ -67,6 +67,76 @@ describe("agent display names", () => {
   });
 });
 
+describe("name conflicts", () => {
+  it("rejects a Host name that another Host already uses (id, display name, or alias)", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1"));
+
+    expect(() => root.daemon.setHostIdentity("pc1")).toThrow(/already used/);
+    root.daemon.renameHost("pc1", "pc-one");
+    expect(() => root.daemon.setHostIdentity("pc-one")).toThrow(/already used/);
+    expect(() => root.daemon.setHostIdentity("hub", ["pc-one"])).toThrow(/already used/);
+  });
+
+  it("lets a Host reuse one of its own old names", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    root.daemon.setHostIdentity("hub");
+    expect(root.daemon.setHostIdentity("root").displayName).toBe("root");
+  });
+
+  it("rejects an Agent name that another Agent on the same Host already uses", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const a = await barista(root.addr, identity("widgets"));
+    cleanup.push(() => a.client.close());
+    const b = await barista(root.addr, identity("gadgets"));
+    cleanup.push(() => b.client.close());
+
+    expect(() => root.daemon.renameAgent(a.rec.agentId, "gadgets")).toThrow(/already used/);
+    expect(() => root.daemon.renameAgent(a.rec.agentId, "gadgets#1")).toThrow(/must not contain/);
+    expect(() => root.daemon.aliasAgent(a.rec.agentId, "gadgets")).toThrow(/already used/);
+  });
+
+  it("allows the same Agent display name on different Hosts", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline);
+    const a = await barista(root.addr, identity("widgets"));
+    cleanup.push(() => a.client.close());
+    const b = await barista(child.addr, identity("widgets"));
+    cleanup.push(() => b.client.close());
+    await waitFor(() => root.daemon.registry.all().some((r) => r.host === "pc1" && r.name === "widgets"));
+
+    expect(root.daemon.renameAgent(a.rec.agentId, "shared").displayName).toBe("shared");
+    await expect(root.daemon.renameAgentAny("widgets#1@pc1", "shared")).resolves.toMatchObject({ displayName: "shared" });
+  });
+});
+
+describe("host diagnostics", () => {
+  it("reports latency for a reachable Host and failure for a stopped one", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1" && d.online));
+
+    const ok = await root.daemon.testHost("pc1");
+    expect(ok).toMatchObject({ host: "pc1", online: true });
+    expect(ok.latencyMs).toBeGreaterThanOrEqual(0);
+
+    await child.stop();
+    const bad = await root.daemon.testHost("pc1");
+    expect(bad.online).toBe(false);
+    expect(bad.error).toBeTruthy();
+  });
+});
+
 describe("remote host rename", () => {
   it("updates the Root record and the child's own view", async () => {
     const root = await startDaemon("root", { mode: "root" });

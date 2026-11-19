@@ -8,6 +8,7 @@ export interface State {
   connected: boolean;
   error?: string;
   host: string;
+  displayName?: string;
   isRoot: boolean;
   rootOnline: boolean;
   router: string;
@@ -15,12 +16,16 @@ export interface State {
   agents: Record<string, AgentRecord>;
   daemons: DaemonRecord[];
   threads: ThreadMeta[];
+  /** The running daemon still serves an older web build than the one on disk. */
+  webStale?: boolean;
   /** The open Thread detail, kept live while open. */
-  detail?: ThreadDetail & { loading?: boolean };
+  detail?: ThreadDetail & { loading?: boolean; loadingOlder?: boolean };
   /** Per-thread facts about the latest turn that ThreadMeta does not carry. */
   live: Record<string, LiveTurn>;
   /** Newest first, capped: the global "Live" page. */
   events: ThreadEnvelope[];
+  /** The newest event id, used to resume Live after a WebSocket reconnect. */
+  lastEventId?: string;
   /** The "Ask" composer on the feed; `to` prefilled by "Ask it". */
   composer?: { to?: string };
   /** Older threads fetched with "Load older" (beyond the snapshot's newest SNAPSHOT_LIMIT). */
@@ -104,6 +109,7 @@ function applySnapshot(s: Snapshot): void {
     loaded: true,
     error: undefined,
     host: s.host,
+    displayName: s.displayName,
     isRoot: s.isRoot,
     rootOnline: s.rootOnline,
     router: s.router,
@@ -112,6 +118,7 @@ function applySnapshot(s: Snapshot): void {
     daemons: s.daemons,
     threads: [...fresh, ...kept],
     older: { ...state.older, done },
+    webStale: s.webStale,
   });
 }
 
@@ -192,11 +199,11 @@ function appendEvent(env: ThreadEnvelope): void {
     const live = foldLive(s.live, env);
     // Global Live page: newest first, bounded; the same envelope can be replayed on reconnect.
     const events = s.events[0]?.eventId === env.eventId ? s.events : [env, ...s.events].slice(0, 300);
-    if (!s.detail || s.detail.meta.threadId !== env.threadId) return { live, events };
+    if (!s.detail || s.detail.meta.threadId !== env.threadId) return { live, events, lastEventId: env.eventId };
     const detailEvents = s.detail.events;
     // Notifications arrive in order; a repeated id can only be the one just appended.
-    if (detailEvents.length && detailEvents[detailEvents.length - 1]!.eventId === env.eventId) return { live, events };
-    return { live, events, detail: { ...s.detail, events: [...detailEvents, env] } };
+    if (detailEvents.length && detailEvents[detailEvents.length - 1]!.eventId === env.eventId) return { live, events, lastEventId: env.eventId };
+    return { live, events, lastEventId: env.eventId, detail: { ...s.detail, events: [...detailEvents, env] } };
   });
 }
 
@@ -246,8 +253,22 @@ async function refresh(): Promise<void> {
     applySnapshot(await api.snapshot());
     const open = state.detail?.meta.threadId;
     if (open) await openThread(open);
+    await backfillEvents();
   } catch (err) {
     set({ error: (err as Error).message });
+  }
+}
+
+/** After a reconnect the WebSocket only resumes from now; fill the gap from the daemon's ring. */
+async function backfillEvents(): Promise<void> {
+  const after = state.lastEventId;
+  if (!after) return;
+  try {
+    const { events, gap } = await api.eventHistory(after);
+    if (gap) return; // too old for the ring; the snapshot already resynced the thread list
+    for (const env of events) appendEvent(env);
+  } catch {
+    // Backfill is best-effort; live events keep arriving through the socket.
   }
 }
 
@@ -309,7 +330,7 @@ export async function openThread(threadId: string): Promise<void> {
     set({ detail: meta ? { meta, events: [], loading: true } : undefined });
   }
   try {
-    const d = await api.thread(threadId);
+    const d = await api.thread(threadId, { limit: 100 });
     set((s) => {
       // Merge in any live events that arrived while fetching.
         const pending = s.detail?.meta.threadId === threadId ? s.detail.events : [];
@@ -318,7 +339,7 @@ export async function openThread(threadId: string): Promise<void> {
         d.events,
         pending.filter((e) => !known.has(e.eventId)),
       );
-      return { detail: { meta: norm(d.meta), events }, live: liveFromEvents(events, s.live) };
+      return { detail: { meta: norm(d.meta), events, hasMore: d.hasMore }, live: liveFromEvents(events, s.live) };
     });
   } catch (err) {
     set({ error: (err as Error).message, detail: undefined });
@@ -327,6 +348,26 @@ export async function openThread(threadId: string): Promise<void> {
 
 export function closeThread(): void {
   set({ detail: undefined });
+}
+
+/** Fetch the page before the oldest event currently loaded (long conversations). */
+export async function loadOlderEvents(): Promise<void> {
+  const d = state.detail;
+  if (!d || d.loading || d.loadingOlder || !d.hasMore) return;
+  const oldest = d.events[0]?.eventId;
+  if (!oldest) return;
+  set({ detail: { ...d, loadingOlder: true } });
+  try {
+    const page = await api.thread(d.meta.threadId, { limit: 100, before: oldest });
+    set((s) => {
+      const cur = s.detail;
+      if (!cur || cur.meta.threadId !== d.meta.threadId) return {};
+      const known = new Set(cur.events.map((e) => e.eventId));
+      return { detail: { ...cur, events: [...page.events.filter((e) => !known.has(e.eventId)), ...cur.events], hasMore: page.hasMore, loadingOlder: false } };
+    });
+  } catch (err) {
+    set({ detail: { ...d, loadingOlder: false }, error: (err as Error).message });
+  }
 }
 
 /** Address of an agent id, or the id itself if unknown. */

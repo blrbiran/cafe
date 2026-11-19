@@ -488,6 +488,81 @@ export default function cafe(pi: ExtensionAPI) {
   });
 
   // ---------------------------------------------------------------------------
+  // /cafe command (pi / omp)
+  // ---------------------------------------------------------------------------
+
+  try {
+    pi.registerCommand("cafe", {
+      description: "cafe network: agents | ask <question> | status | thread <id> | help",
+      handler: async (args, ctx) => {
+        const notify = (message: string, type: "info" | "warning" | "error" = "info") => ctx.ui.notify(message, type);
+        const full = args.trim();
+        const cmd = full.split(/\s+/)[0] ?? "";
+        const rest = full.slice(cmd.length).trim();
+        try {
+          switch (cmd) {
+            case "agents": {
+              const list = await requireClient().agents();
+              notify(
+                list.length
+                  ? list.map((a) => `${a.displayName ?? a.name} · ${a.address} · ${a.role}${a.status ? ` · ${a.status}` : ""}${a.description ? ` — ${a.description}` : ""}`).join("\n")
+                  : "no agents registered",
+              );
+              break;
+            }
+            case "ask": {
+              if (!rest) return notify("usage: /cafe ask <question>", "warning");
+              const c = requireClient();
+              await refreshRegistry(c);
+              const res = await c.ask({ body: rest });
+              track(res.threadId, { orderId: res.orderId });
+              notify(`Order ${res.orderId} sent to ${res.decision.targets.map(addrOf).join(", ") || "nobody"} (thread ${res.threadId}). Replies arrive as cafe-reply messages.`);
+              break;
+            }
+            case "status": {
+              const parts = [
+                `role: ${role}`,
+                `daemon: ${daemonAddr()}`,
+                client?.connected ? `connected as ${client.record?.address ?? "?"}` : `not connected${startupError ? ` (${startupError})` : ""}`,
+                `queue: ${queue.length}`,
+                `working on: ${current ? current.handle.order.orderId : "nothing"}`,
+              ];
+              if (client?.connected) {
+                try {
+                  parts.push(`agents: ${(await client.agents()).length}`);
+                } catch {
+                  // registry is optional here
+                }
+              }
+              notify(parts.join("\n"));
+              break;
+            }
+            case "thread": {
+              if (!rest) return notify("usage: /cafe thread <threadId>", "warning");
+              const res = await fetch(`http://${daemonAddr()}/api/threads/${encodeURIComponent(rest)}`);
+              if (!res.ok) return notify(`thread ${rest}: HTTP ${res.status}`, "error");
+              const body = (await res.json()) as { events?: ThreadEnvelope[] };
+              const lines = (body.events ?? [])
+                .slice(-20)
+                .map((e) => describeEvent(e, addrOf))
+                .filter((l): l is string => !!l);
+              notify(lines.join("\n") || "(no events)");
+              break;
+            }
+            default:
+              notify("cafe commands:\n/cafe agents\n/cafe ask <question>\n/cafe status\n/cafe thread <id>\n/cafe help");
+          }
+        } catch (err) {
+          notify((err as Error).message, "error");
+        }
+      },
+    });
+  } catch (err) {
+    // A user-owned /cafe command wins; the tools and the skill still work.
+    console.warn(`cafe: /cafe command not registered: ${(err as Error).message}`);
+  }
+
+  // ---------------------------------------------------------------------------
   // Tools
   // ---------------------------------------------------------------------------
 

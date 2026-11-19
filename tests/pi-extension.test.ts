@@ -11,6 +11,7 @@ type Handler = (event: any, ctx: any) => unknown;
 function fakePi() {
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
   const sent: Array<{ message: any; options: any }> = [];
   const api = {
     on(event: string, h: Handler) {
@@ -19,6 +20,9 @@ function fakePi() {
     },
     registerTool(t: any) {
       tools.set(t.name, t);
+    },
+    registerCommand(name: string, options: any) {
+      commands.set(name, options);
     },
     registerMessageRenderer() {},
     sendMessage(message: any, options: any) {
@@ -40,6 +44,7 @@ function fakePi() {
   return {
     api,
     tools,
+    commands,
     sent,
     statuses,
     notices,
@@ -51,6 +56,11 @@ function fakePi() {
       return last;
     },
     has: (event: string) => (handlers.get(event)?.length ?? 0) > 0,
+    async runCommand(name: string, args: string, cwd: string) {
+      const cmd = commands.get(name);
+      if (!cmd) throw new Error(`no command ${name}`);
+      return cmd.handler(args, ctx(cwd));
+    },
   };
 }
 
@@ -414,5 +424,18 @@ describe("pi extension under oh-my-pi", () => {
     await pi.fire("agent_end", { type: "agent_end", messages }, dir);
     const events = await closed;
     expect(events.find((e) => e.event.type === "order.declined")?.event).toMatchObject({ reason: "aborted by the operator", unavailable: true });
+  });
+});
+
+describe("pi extension /cafe command", () => {
+  it("registers /cafe and prints the command list", async () => {
+    const pi = fakePi();
+    cafe(pi.api as any);
+    expect(pi.commands.has("cafe")).toBe(true);
+    await pi.runCommand("cafe", "help", "/tmp");
+    const text = pi.notices.join("\n");
+    expect(text).toContain("/cafe agents");
+    expect(text).toContain("/cafe ask");
+    expect(text).toContain("/cafe status");
   });
 });

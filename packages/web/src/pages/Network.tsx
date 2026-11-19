@@ -2,7 +2,8 @@ import { useState } from "react";
 import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
-import { useStore } from "../store.ts";
+import { api } from "../api.ts";
+import { refreshStore, useStore } from "../store.ts";
 import { Disclosure, Empty, Facts, PageHeader, Pill } from "../ui/bits.tsx";
 
 export function NetworkPage() {
@@ -17,6 +18,41 @@ export function NetworkPage() {
   const agents = useStore((s) => s.agents);
   const threads = useStore((s) => s.threads);
   const [debug, setDebug] = useState(false);
+  const [busy, setBusy] = useState<string>();
+  const [editing, setEditing] = useState<Record<string, string>>({});
+  const [note, setNote] = useState<Record<string, { text: string; ok: boolean }>>({});
+
+  const run = async (key: string, fn: () => Promise<void>) => {
+    setBusy(key);
+    try {
+      await fn();
+    } catch (err) {
+      setNote((n) => ({ ...n, [key.split(":")[1]!]: { text: (err as Error).message, ok: false } }));
+    } finally {
+      setBusy(undefined);
+    }
+  };
+  const test = (h: string) =>
+    run(`test:${h}`, async () => {
+      const r = await api.testHost(h);
+      setNote((n) => ({ ...n, [h]: r.online ? { text: `${t.hostReachable}${r.latencyMs !== undefined ? ` · ${r.latencyMs}ms` : ""}`, ok: true } : { text: `${t.hostUnreachable}: ${r.error ?? ""}`, ok: false } }));
+    });
+  const reconnect = (h: string) =>
+    run(`reconnect:${h}`, async () => {
+      const r = await api.reconnectHost(h);
+      await refreshStore();
+      setNote((n) => ({ ...n, [h]: r.online ? { text: t.hostReachable, ok: true } : { text: `${t.hostUnreachable}: ${r.error ?? ""}`, ok: false } }));
+    });
+  const rename = (h: string, self: boolean) =>
+    run(`rename:${h}`, async () => {
+      const name = (editing[h] ?? "").trim();
+      if (!name) return;
+      if (self) await api.setHostIdentity(name, []);
+      else await api.renameHost(h, name);
+      setEditing((e) => ({ ...e, [h]: "" }));
+      await refreshStore();
+      setNote((n) => ({ ...n, [h]: { text: t.settingsSaved, ok: true } }));
+    });
 
   const sorted = [...daemons].sort((a, b) => Number(b.host === host) - Number(a.host === host) || Number(b.isRoot) - Number(a.isRoot) || a.host.localeCompare(b.host));
   const self = daemons.find((d) => d.host === host);
@@ -54,12 +90,15 @@ export function NetworkPage() {
           {sorted.map((d) => {
             const isThis = d.host === host;
             // A child daemon only knows the hub as a synthetic "root" record.
-            const name = !isThis && d.isRoot && d.host === "root" ? t.hub : d.host;
+            const name = !isThis && d.isRoot && d.host === "root" ? t.hub : (d.displayName ?? d.host);
             const badges = [d.isRoot || (isThis && isRoot) ? t.hub : undefined, isThis ? t.thisMachine : undefined].filter(Boolean) as string[];
             return (
               <article key={`${d.host}-${d.isRoot}`} className="card flex flex-col gap-2.5 p-4">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="mono truncate text-base text-fg-strong">{name}</span>
+                  <div className="flex min-w-0 flex-col">
+                    <span className="mono truncate text-base text-fg-strong">{name}</span>
+                    {name !== d.host && <span className="mono truncate text-[11px] text-muted">{d.host}</span>}
+                  </div>
                   <Pill tone={d.online ? "ok" : undefined}>{d.online ? t.online : t.mOffline}</Pill>
                 </div>
                 {badges.length > 0 && (
@@ -82,6 +121,42 @@ export function NetworkPage() {
                     ],
                   ]}
                 />
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button type="button" className="btn-sm" aria-busy={busy === `test:${d.host}`} onClick={() => test(d.host)}>
+                    {busy === `test:${d.host}` ? t.hostTesting : t.hostTest}
+                  </button>
+                  {!isThis && isRoot && !d.online && (
+                    <button type="button" className="btn-sm" aria-busy={busy === `reconnect:${d.host}`} onClick={() => reconnect(d.host)}>
+                      {t.hostReconnect}
+                    </button>
+                  )}
+                  {(isThis || isRoot) && (
+                    <button type="button" className="btn-sm" onClick={() => setEditing((e) => ({ ...e, [d.host]: e[d.host] ?? "" }))}>
+                      {t.settingsRename}
+                    </button>
+                  )}
+                </div>
+                {editing[d.host] !== undefined && (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      className="!min-h-0 min-w-0 flex-1 !py-1 !text-xs"
+                      placeholder={t.settingsNewName}
+                      value={editing[d.host]}
+                      onChange={(e) => setEditing((x) => ({ ...x, [d.host]: e.target.value }))}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void rename(d.host, isThis);
+                        }
+                      }}
+                    />
+                    <button type="button" className="btn-sm" aria-busy={busy === `rename:${d.host}`} disabled={!(editing[d.host] ?? "").trim()} onClick={() => rename(d.host, isThis)}>
+                      {t.settingsSave}
+                    </button>
+                  </div>
+                )}
+                {!isThis && !isRoot && <span className="hint">{t.settingsRootOnly}</span>}
+                {note[d.host] && <div className={`text-xs ${note[d.host]!.ok ? "text-ok" : "text-danger"}`}>{note[d.host]!.text}</div>}
               </article>
             );
           })}

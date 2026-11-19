@@ -88,4 +88,20 @@ describe("config get", () => {
     expect(saved).toMatchObject({ mode: "daemon", root: "10.0.0.5:4777", token: "shared" });
     expect(r.stdout).toContain("restart required");
   });
+
+  it("config diff reports that there is no running daemon to compare with", () => {
+    const h = home();
+    writeFileSync(join(h, "config.yml"), "port: 47821\n");
+    const r = cafe(h, "config", "diff");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("daemon is not running");
+  });
+
+  it("config apply fails when no daemon is running", () => {
+    const h = home();
+    writeFileSync(join(h, "config.yml"), "port: 47821\n");
+    const r = cafe(h, "config", "apply");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("daemon is not running");
+  });
 });

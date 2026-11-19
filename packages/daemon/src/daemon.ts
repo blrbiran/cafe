@@ -451,12 +451,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Rename this Host (hot) and/or add aliases. Addresses embed the stable `host`, not this name. */
   setHostIdentity(displayName?: string, addAliases: string[] = []): DaemonRecord {
+    if (displayName) this.assertHostNameFree(displayName);
+    for (const alias of addAliases.filter(Boolean)) this.assertHostNameFree(alias);
     if (displayName) {
       if (this.displayName && this.displayName !== displayName) this.hostAliases = [...new Set([...this.hostAliases, this.displayName])];
-      this.displayName = displayName;
-      this.config.displayName = displayName;
+      this.displayName = displayName.trim();
+      this.config.displayName = this.displayName;
     }
-    this.hostAliases = [...new Set([...this.hostAliases, ...addAliases.filter(Boolean)])];
+    this.hostAliases = [...new Set([...this.hostAliases, ...addAliases.map((a) => a.trim()).filter(Boolean)])];
     this.config.aliases = this.hostAliases;
     saveConfig(this.config, this.store.home);
     const rec = this.daemonRecords.get(this.host)!;
@@ -473,13 +475,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!this.isRoot) throw new RpcError("not_root", "only the Root can rename another Host");
     const rec = this.daemonRecords.get(host);
     if (!rec) throw new RpcError("not_found", `no daemon '${host}'`);
+    this.assertHostNameFree(displayName, host);
+    const name = displayName.trim();
     const prev = rec.displayName ?? rec.host;
     const aliases = [...new Set([...(rec.aliases ?? []), prev, host])];
-    rec.displayName = displayName;
+    rec.displayName = name;
     rec.aliases = aliases;
-    this.config.hostNames[host] = { displayName, aliases };
+    this.config.hostNames[host] = { displayName: name, aliases };
     saveConfig(this.config, this.store.home);
-    this.children.get(host)?.notify(Methods.hostIdentity, { displayName, aliases });
+    this.children.get(host)?.notify(Methods.hostIdentity, { displayName: name, aliases });
     this.emitDaemons();
     return rec;
   }
@@ -488,8 +492,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   renameAgent(agentId: string, displayName: string): AgentRecord {
     const rec = this.local.get(agentId);
     if (!rec) throw new RpcError("not_found", "not a local agent");
+    this.assertAgentNameFree(displayName, rec.host, agentId);
+    const name = displayName.trim();
     const aliases = [...new Set([...rec.aliases, rec.displayName ?? rec.name])];
-    const next = { ...rec, displayName, aliases };
+    const next = { ...rec, displayName: name, aliases };
     this.local.set(agentId, next);
     this.publishAgents([next]);
     return next;
@@ -510,7 +516,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   aliasAgent(agentId: string, alias: string): AgentRecord {
     const rec = this.local.get(agentId);
     if (!rec) throw new RpcError("not_found", "not a local agent");
-    const next = { ...rec, aliases: [...new Set([...rec.aliases, alias])] };
+    this.assertAgentNameFree(alias, rec.host, agentId);
+    const next = { ...rec, aliases: [...new Set([...rec.aliases, alias.trim()])] };
     this.local.set(agentId, next);
     this.publishAgents([next]);
     return next;
@@ -526,6 +533,50 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return child.request<AgentRecord>(Methods.agentRename, { agentId: rec.agentId, alias });
   }
 
+  /** Reachability check from this machine to another Host's HTTP API (Web "Test"). */
+  async testHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }> {
+    if (host === this.host) return { host, online: true, latencyMs: 0, version: this.version };
+    const rec = this.daemons().find((d) => d.host === host);
+    const url = rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
+    if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
+    const started = Date.now();
+    try {
+      const res = await fetch(`${url.replace(/^ws/, "http")}/api/health`, {
+        headers: { authorization: `Bearer ${this.config.token}` },
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!res.ok) {
+        return { host, online: false, error: res.status === 401 ? "unauthorized: the hosts use different tokens" : `HTTP ${res.status}` };
+      }
+      const info = (await res.json()) as { version?: string };
+      return { host, online: true, latencyMs: Date.now() - started, ...(info.version ? { version: info.version } : {}) };
+    } catch (err) {
+      return { host, online: false, error: (err as Error).message };
+    }
+  }
+
+  /** Root: ask a known Host to dial back (used by the Web Network page). */
+  async reconnectHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }> {
+    if (!this.isRoot) throw new RpcError("not_root", "only the Root can reconnect another Host");
+    if (this.children.has(host)) return this.testHost(host);
+    const rec = this.daemons().find((d) => d.host === host);
+    const url = rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
+    if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
+    const me = `${this.config.advertise ?? lanAddress()}:${this.config.port}`;
+    try {
+      await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
+        body: JSON.stringify({ root: me }),
+        signal: AbortSignal.timeout(2000),
+      });
+    } catch {
+      // testHost below reports the concrete failure.
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    return this.testHost(host);
+  }
+
   /** Translate `name@alias` to `name@host` using Daemon display names and aliases. */
   private normalizeAddress(address: string): string {
     const a = parseAddress(address);
@@ -533,6 +584,37 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const rec = this.daemons().find((d) => d.host === a.host || d.displayName === a.host || d.aliases.includes(a.host!));
     if (!rec || rec.host === a.host) return address;
     return `${a.name}${a.n === undefined ? "" : `#${a.n}`}@${rec.host}`;
+  }
+
+  /** Names appear in addresses, so `@` and `#` would make an Agent unreachable. */
+  private cleanName(name: string, what: string): string {
+    const n = name.trim();
+    if (!n) throw new RpcError("bad_request", `${what} must not be empty`);
+    if (/[@#]/.test(n)) throw new RpcError("bad_request", `${what} must not contain '@' or '#'`);
+    return n;
+  }
+
+  /** Display names and aliases are alternate Host ids, so they must be unique network-wide. */
+  private assertHostNameFree(name: string, exceptHost = this.host): void {
+    const n = this.cleanName(name, "host name");
+    for (const d of this.daemons()) {
+      if (d.host === exceptHost) continue;
+      if (d.host === n || d.displayName === n || (d.aliases ?? []).includes(n))
+        throw new RpcError("conflict", `host name '${n}' is already used by ${d.host}`);
+    }
+  }
+
+  /** Agent names resolve inside one Host's namespace, so only collisions on the same Host matter. */
+  private assertAgentNameFree(name: string, host: string, exceptAgentId?: string): void {
+    const n = this.cleanName(name, "agent name");
+    const seen = new Map<string, AgentRecord>();
+    for (const r of this.registry.all()) seen.set(r.agentId, r);
+    for (const r of this.local.values()) seen.set(r.agentId, r);
+    for (const r of seen.values()) {
+      if (r.host !== host || r.agentId === exceptAgentId) continue;
+      if (r.name === n || r.displayName === n || r.aliases.includes(n))
+        throw new RpcError("conflict", `agent name '${n}' is already used by ${r.address}`);
+    }
   }
 
   private unregister(agentId: string): void {
@@ -1595,6 +1677,36 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) for (const child of this.children.values()) child.notify(Methods.daemonsChanged, list);
   }
 
+  /** What the running process is actually using (for `cafe config diff`); never includes the token. */
+  runtimeConfig() {
+    return {
+      mode: this.isRoot ? "root" : "daemon",
+      host: this.host,
+      displayName: this.config.displayName,
+      port: this.config.port,
+      advertise: this.config.advertise,
+      root: this.config.root,
+      router: this.config.router,
+      retention: this.config.retention,
+      discovery: this.config.discovery,
+    };
+  }
+
+  /** List views need the latest outcome, not the whole reply text. */
+  summaryMeta(meta: ThreadMeta): ThreadMeta {
+    return {
+      ...meta,
+      replies: (meta.replies ?? []).slice(-3).map((r) => {
+        const text = String(r.text ?? "");
+        return { ...r, text: text.length > 160 ? `${text.slice(0, 159)}…` : text };
+      }),
+      declines: (meta.declines ?? []).slice(-3).map((d) => {
+        const reason = String(d.reason ?? "");
+        return { ...d, reason: reason.length > 160 ? `${reason.slice(0, 159)}…` : reason };
+      }),
+    };
+  }
+
   snapshot() {
     return {
       host: this.host,
@@ -1608,14 +1720,20 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       registryVersion: this.registry.version,
       agents: this.registry.all(),
       daemons: this.daemons(),
-      threads: this.store.listThreads(200),
+      threads: this.store.listThreads(200).map((m) => this.summaryMeta(m)),
     };
   }
 
-  thread(threadId: string) {
+  thread(threadId: string, opts: { limit?: number; before?: string } = {}) {
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) return undefined;
-    return { meta, events: this.store.readEvents(meta.file) };
+    const all = this.store.readEvents(meta.file);
+    if (opts.limit === undefined && opts.before === undefined) return { meta, events: all, hasMore: false };
+    const stop = opts.before ? all.findIndex((e) => e.eventId === opts.before) : all.length;
+    if (stop < 0) return { meta, events: [], hasMore: false };
+    const limit = Math.max(1, opts.limit ?? all.length);
+    const start = Math.max(0, stop - limit);
+    return { meta, events: all.slice(start, stop), hasMore: start > 0 };
   }
 
   /** Disconnect an Agent (web UI "kick"). Remote Agents are kicked via the Root. */

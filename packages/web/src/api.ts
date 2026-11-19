@@ -2,6 +2,8 @@ import type { AgentRecord, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnv
 
 export interface Snapshot {
   host: string;
+  displayName?: string;
+  aliases?: string[];
   isRoot: boolean;
   rootOnline: boolean;
   router: string;
@@ -9,11 +11,15 @@ export interface Snapshot {
   agents: AgentRecord[];
   daemons: DaemonRecord[];
   threads: ThreadMeta[];
+  /** The daemon's in-memory web UI is older than the build on disk; restart it. */
+  webStale?: boolean;
 }
 
 export interface ThreadDetail {
   meta: ThreadMeta;
   events: ThreadEnvelope[];
+  /** There are older events before the returned page. */
+  hasMore?: boolean;
 }
 
 /** Daemons on the LAN require the shared token; open the UI with `?token=…` and it is reused for every call. */
@@ -80,7 +86,13 @@ export const api = {
   threads: (before: number, limit: number) => call<ThreadMeta[]>("GET", `/api/threads?before=${before}&limit=${limit}`),
   /** Full-text search over questions and answers (all threads, not only the loaded ones). */
   search: (q: string, limit: number) => call<{ meta: ThreadMeta; hits: SearchHit[] }[]>("GET", `/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
-  thread: (id: string) => call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}`),
+  thread: (id: string, opts?: { limit?: number; before?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.limit) qs.set("limit", String(opts.limit));
+    if (opts?.before) qs.set("before", opts.before);
+    const q = qs.toString();
+    return call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}${q ? `?${q}` : ""}`);
+  },
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
   createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string }) =>
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),
@@ -90,6 +102,8 @@ export const api = {
   /** Last 7 days per Barista identity (`name@host`); survives Barista restarts. */
   routingHints: () => call<{ learn: boolean; hints: Record<string, RoutingHint> }>("GET", "/api/routing/hints"),
   health: () => call<{ ok: boolean; host: string; isRoot: boolean; router: string; model?: string; error?: string; version?: string }>("GET", "/api/health"),
+  /** Events after `after` from the daemon's recent ring (WebSocket reconnect backfill). */
+  eventHistory: (after: string) => call<{ events: ThreadEnvelope[]; gap: boolean }>("GET", `/api/events/history?after=${encodeURIComponent(after)}`),
   /** pi's model catalogue for the routing picker. */
   routerModels: (search?: string) => call<{ models: string[] }>("GET", `/api/router/models${search ? `?search=${encodeURIComponent(search)}` : ""}`),
   /** Apply a model, or clear to rules with null. A bad model is rolled back by the daemon. */
@@ -97,6 +111,8 @@ export const api = {
   /** Local Host display name and its aliases; internal ids never change. */
   setHostIdentity: (displayName: string, aliases: string[]) => call<{ host: string; displayName?: string; aliases: string[] }>("POST", "/api/host", { displayName, aliases }),
   renameHost: (host: string, displayName: string) => call<unknown>("POST", "/api/hosts/rename", { host, displayName }),
+  testHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/test", { host }),
+  reconnectHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/reconnect", { host }),
   renameAgent: (address: string, displayName: string) => call<unknown>("POST", "/api/agents/rename", { address, displayName }),
   aliasAgent: (address: string, alias: string) => call<unknown>("POST", "/api/agents/rename", { address, alias }),
   baristas: () => call<BaristaInfo[]>("GET", "/api/baristas"),

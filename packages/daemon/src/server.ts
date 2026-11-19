@@ -91,7 +91,20 @@ export interface ServerHandle {
 
 /** One port serves the HTTP API, the WebSocket endpoint (`/ws`) and the web UI. */
 export function startServer(daemon: Daemon, opts: { port: number; bind?: string; webDist?: string }): Promise<ServerHandle> {
-  const statics = loadStatic(opts.webDist ?? defaultWebDist());
+  const webDir = opts.webDist ?? defaultWebDist();
+  const statics = loadStatic(webDir);
+  // The UI is read into memory at start; remember which build that was so the
+  // page can say "restart the daemon" instead of silently serving old HTML/JS.
+  const stampOf = () => {
+    try {
+      const s = statSync(join(webDir, "index.html"));
+      return `${s.mtimeMs}:${s.size}`;
+    } catch {
+      return undefined;
+    }
+  };
+  const loadedStamp = stampOf();
+  const webStale = () => !!loadedStamp && stampOf() !== undefined && stampOf() !== loadedStamp;
   const wss = new WebSocketServer({ noServer: true });
   // A short ring of recent events, so an SSE client that reconnects with
   // Last-Event-ID resumes where it stopped instead of losing the gap.
@@ -111,7 +124,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         if (!isLoopback(req) && tokenOf(req, url) !== daemon.config.token) {
           return send(res, 401, { error: "unauthorized", message: "token mismatch or wrong Root address; compare `cafe config get token` on both hosts" });
         }
-        return await api(daemon, req, res, url);
+        return await api(daemon, req, res, url, webStale, recent);
       }
       const key = path === "/" ? "index.html" : path.slice(1);
       const file = statics.get(key);
@@ -155,7 +168,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
   });
 }
 
-async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, url: URL, webStale: () => boolean, recent: ThreadEnvelope[]): Promise<void> {
   const path = url.pathname;
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
@@ -169,8 +182,17 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (model !== null && model !== undefined && typeof model !== "string") throw new RpcError("bad_request", "model must be a string or null");
     return send(res, 200, await daemon.setRouterModel(model ?? null));
   }
+  if (m === "GET" && path === "/api/events/history") {
+    const after = url.searchParams.get("after") ?? undefined;
+    if (!after) return send(res, 200, { events: [], gap: false });
+    const at = recent.findIndex((e) => e.eventId === after);
+    return send(res, 200, at >= 0 ? { events: recent.slice(at + 1), gap: false } : { events: [], gap: true });
+  }
   if (m === "GET" && path === "/api/events") return eventStream(daemon, url, req, res, recentEvents.get(daemon) ?? []);
-  if (m === "GET" && path === "/api/snapshot") return send(res, 200, daemon.snapshot());
+  if (m === "GET" && path === "/api/snapshot") {
+    const snap = daemon.snapshot();
+    return send(res, 200, webStale() ? { ...snap, webStale: true } : snap);
+  }
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {
     const { displayName, aliases } = await readJson(req);
@@ -181,6 +203,16 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const { host, displayName } = await readJson(req);
     if (typeof host !== "string" || typeof displayName !== "string" || !displayName.trim()) throw new RpcError("bad_request", "host and displayName are required");
     return send(res, 200, daemon.renameHost(host, displayName.trim()));
+  }
+  if (m === "POST" && path === "/api/hosts/test") {
+    const { host } = await readJson(req);
+    if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host required");
+    return send(res, 200, await daemon.testHost(host));
+  }
+  if (m === "POST" && path === "/api/hosts/reconnect") {
+    const { host } = await readJson(req);
+    if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host required");
+    return send(res, 200, await daemon.reconnectHost(host));
   }
   if (m === "POST" && path === "/api/agents/rename") {
     const { address, displayName, alias } = await readJson(req);
@@ -203,9 +235,11 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       ...(token ? { tokenHint: `${"•".repeat(Math.max(0, token.length - 4))}${token.slice(-4)}` } : {}),
     });
   }
+  if (m === "GET" && path === "/api/config") return send(res, 200, daemon.runtimeConfig());
   if (m === "GET" && path === "/api/threads") {
     const before = url.searchParams.get("before");
-    return send(res, 200, daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined, before ? Number(before) : undefined));
+    const rows = daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined, before ? Number(before) : undefined);
+    return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
   }
   if (m === "GET" && path === "/api/search") {
     const q = url.searchParams.get("q") ?? "";
@@ -218,7 +252,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, daemon.prune(olderThanDays, dryRun !== false));
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)$/.exec(path))) {
-    const t = daemon.thread(match[1]!);
+    const rawLimit = Number(url.searchParams.get("limit"));
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+    const before = url.searchParams.get("before") ?? undefined;
+    const t = daemon.thread(match[1]!, { ...(limit ? { limit } : {}), ...(before ? { before } : {}) });
     return t ? send(res, 200, t) : send(res, 404, { error: "not_found" });
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
@@ -286,7 +323,10 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
     write(env);
   };
   daemon.on("thread", onEvent);
-  for (const env of daemon.thread(threadId)?.events ?? []) onEvent(env);
+  const after = new URL(req.url ?? "/", "http://x").searchParams.get("after");
+  const replay = daemon.thread(threadId)?.events ?? [];
+  const from = after ? replay.findIndex((e) => e.eventId === after) + 1 : 0;
+  for (const env of replay.slice(Math.max(0, from))) onEvent(env);
   const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
   const done = () => {
     clearInterval(ping);
