@@ -65,6 +65,7 @@ cpSync(join(root, "packages/web/dist"), join(out, "web"), { recursive: true });
 cpSync(join(root, "skills/cafe"), join(out, "skills/cafe"), { recursive: true });
 for (const part of [".claude-plugin/plugin.json", "hooks"]) cpSync(join(root, "claude-plugin", part), join(out, "claude-plugin", part), { recursive: true });
 cpSync(join(root, "README.md"), join(out, "README.md"));
+if (existsSync(join(root, "README_zh.md"))) cpSync(join(root, "README_zh.md"), join(out, "README_zh.md"));
 if (existsSync(join(root, "LICENSE"))) cpSync(join(root, "LICENSE"), join(out, "LICENSE"));
 
 mkdirSync(join(out, "bin"));
@@ -88,7 +89,7 @@ const pkg = {
   description: "cafe: a DNS-like network of coding agents — ask a question, the right agent answers",
   type: "module",
   bin: { cafe: "bin/cafe.js" },
-  files: ["bin", "dist", "web", "skills", "claude-plugin", "README.md", ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])],
+  files: ["bin", "dist", "web", "skills", "claude-plugin", "README.md", ...(existsSync(join(root, "README_zh.md")) ? ["README_zh.md"] : []), ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])],
   engines: rootPkg.engines,
   // Model-based routing (router.model) only; rules routing works without it.
   optionalDependencies: { "@earendil-works/pi-coding-agent": `^${piVersion}` },

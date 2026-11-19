@@ -105,7 +105,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 Done and approved earlier: v2 defaults; Q60–Q70; omp real Q&A; `cafe daemon install` on the Mac; web load-older + search; **Q71 A (Network page versions) approved**; the user restarted their daemon. The user published 0.1.0 and 0.1.1 themselves. Q72–Q79 answered as recommended; Q80 = C (no side work, focus on v3-1).
 
-Done on 2026-11-19 with the user: v3-1 reviewed (the extra `cafe_cancel` MCP tool approved); both paid Bridge runs done and passed (section 3); `cafe mcp install` run by the user and checked. **v3-2** (`docs/specs/v3-2-agent-kind.md`, Q81–Q83, prototype https://claude.ai/artifact/X3F3dx2PtBQf3R5HwsiRL5): kind tags on Agent cards and in conversations, `cafe agents` shows `codex·rw`, `claude·tui`, …; fixes the old "后台 pi" label. The user published **0.1.2** (`latest` on npm; commit + tag `v0.1.2`). The daemon was restarted by the agent and reports 0.1.2.
+Done on 2026-11-19 with the user: v3-1 reviewed (the extra `cafe_cancel` MCP tool approved); both paid Bridge runs done and passed (section 3); `cafe mcp install` run by the user and checked. **v3-2** (`docs/specs/v3-2-agent-kind.md`, Q81–Q83, prototype https://claude.ai/artifact/X3F3dx2PtBQf3R5HwsiRL5): kind tags on Agent cards and in conversations, `cafe agents` shows `codex·rw`, `claude·tui`, …; fixes the old "后台 pi" label. The user published **0.1.2** (`latest` on npm; commit + tag `v0.1.2`). The daemon was restarted by the agent and reports 0.1.2. The dogfooding batch below was reviewed and the user published **0.1.3** (commit + tag `v0.1.3`); the daemon reports 0.1.3. README is now English with a Chinese `README_zh.md`, linked from both; the release package ships both.
 
 Done on 2026-11-19 while the user was away (asked to finish phase 2), **to review**: **v3-1 phase 2** (Q84–Q88 as recommended; ADR-0006; spec section "第二阶段"):
 1. Claude Code: `claude-plugin/` (mod) + `cafe session-host` + `cafe claude install|uninstall`. Verified free with a real Claude Code TUI and a fake API (section 3).
@@ -114,7 +114,7 @@ Done on 2026-11-19 while the user was away (asked to finish phase 2), **to revie
 4. Commits: `feat: running Claude Code sessions as Baristas …`, `feat: a running Codex session as a Barista …`, and this handoff.
 
 Waiting on the user:
-1. Phase 2 is not in 0.1.2: publish **0.1.3** after review (`npm version 0.1.3` → `npm run test:release` → `npm publish ./release`, then the agent restarts the daemon).
+1. ~~Publish 0.1.3~~ — done (see above). Next release after the Web workbench / remaining backlog.
 2. **Install the Claude Code plugin**: `cafe claude install --dry-run`, then `cafe claude install` (changes `~/.claude` plugin settings; the agent did not run it). Then open sessions need `/reload-plugins`, new ones join automatically. Note: this repo has a `.cafe`, so Claude Code sessions opened here will answer cafe questions (`/cafe off` to pause).
 3. **Approve two paid real-model runs** (Q88): a running Claude Code session and a running Codex session (`cafe barista start --dir <dir> --agent codex --tui` next to a `codex` in that dir), each: answer, follow-up, cancel.
 4. **Real two-machine test** (section 6), later.
@@ -189,6 +189,8 @@ Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, 
 - Mod test kit: `$.http.fetch` hooks get `{url, init}`; every `$.ui.*` call needs a test hook (`{ value: undefined }`); `$` may only be passed to functions declared outside `register`.
 - Codex seen from another process: a turn still running in the TUI reads `interrupted` with `completedAt: null`; `turn/interrupt` on a thread loaded elsewhere fails with `thread not found`; after an Esc interrupt the queue is not dispatched until the next completed turn (`ext/queue/src/service.rs` `on_thread_idle`).
 - Tests that share JSON state files with a fake process must write atomically (temp file + rename), or the fake reads half a file and dies.
+- `cafe daemon start` polls `/api/health` for only ~5 s. With an LLM router configured, `initRouter()` (ModelRuntime + ResourceLoader) can take ~1 min before the server listens, so the CLI may report "did not start" while launchd is still bringing it up. Check `cafe daemon status` / the log before treating it as a failure; widen the wait when autostart is installed.
+- npm publish to a scoped package returns **E404** when unauthenticated (not E401); `npm whoami` first. A successful publish may return 202 "being processed" and take a few minutes to appear in `npm view`.
 - Artifacts are unavailable when the session authenticates with `ANTHROPIC_AUTH_TOKEN`: every Artifact call is refused. UI prototypes need a claude.ai login; otherwise write a local HTML file.
 - Tests that spawn a CLI with `spawnSync` while the daemon lives in the vitest process deadlock: the parent's event loop is blocked, so the daemon cannot answer. Use async `spawn` (see `tests/doctor.test.ts`).
 - `config.yml` is YAML (not JSON): tests must use `yaml.parse`, not `JSON.parse`.
