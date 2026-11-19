@@ -4,6 +4,7 @@ import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import { buildFollowup, buildPrompt, DECLINE_MARKER } from "../serve.ts";
 import { ClaudeEngine } from "./claude.ts";
 import { CodexEngine } from "./codex.ts";
+import { CodexTuiEngine } from "./codex-tui.ts";
 import type { Access, AgentKind, Engine } from "./engine.ts";
 
 export type { Access, AgentKind } from "./engine.ts";
@@ -19,6 +20,12 @@ export interface BridgeOptions {
   model?: string;
   /** Agent executable (tests use fakes). */
   bin?: string;
+  /** Codex only: answer in a running Codex session (the TUI) instead of a headless thread (v3-1 phase 2). */
+  tui?: boolean;
+  /** With `tui`: the Codex thread to use (default: the newest one started in `dir`). */
+  thread?: string;
+  /** With `tui`: tuning for tests. */
+  tuiTiming?: { injectTimeoutMs?: number; pollMs?: number };
   log?: (msg: string) => void;
 }
 
@@ -38,7 +45,12 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
   if (cafe.role !== "barista") throw new Error(`${file} declares role "${cafe.role}"; set role: barista to receive questions`);
   const access: Access = opts.access ?? "read-only";
   const engineOpts = { dir, access, model: opts.model, bin: opts.bin, log };
-  const engine: Engine = opts.agent === "codex" ? new CodexEngine(engineOpts) : new ClaudeEngine(engineOpts);
+  if (opts.tui && opts.agent !== "codex") throw new Error("--tui is for --agent codex; Claude Code sessions join through the cafe plugin (`cafe claude install`)");
+  const engine: Engine = opts.tui
+    ? new CodexTuiEngine({ ...engineOpts, thread: opts.thread, ...opts.tuiTiming })
+    : opts.agent === "codex"
+      ? new CodexEngine(engineOpts)
+      : new ClaudeEngine(engineOpts);
 
   const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log });
   const queue: OrderHandle[] = [];
@@ -110,8 +122,13 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
     log(`cancelled by ${by}: ${orderId}`);
   });
 
-  const rec = await client.connect({ ...cafe, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid });
-  log(`${opts.agent} barista ${rec?.address} ready (${access})`);
+  // A TUI session works under the person's own permissions and approvals: no access level of ours to report.
+  const rec = await client.connect(
+    opts.tui
+      ? { ...cafe, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }
+      : { ...cafe, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid },
+  );
+  log(`${opts.agent} barista ${rec?.address} ready (${opts.tui ? `answers in the running Codex session${opts.thread ? ` ${opts.thread}` : ""}` : access})`);
   return {
     client,
     stop: async () => {

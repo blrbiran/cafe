@@ -81,6 +81,16 @@ cafe barista start --dir ~/code/billing --agent claude   # claude -p，每题一
 
 默认**只读**（Codex 只读沙箱，拒绝一切审批；Claude 只有 Read / Grep / Glob）。`--write` 允许改 `--dir` 里的文件，不会更多；`--model <m>` 指定模型。Claude 用本机 `claude` 的登录，只读用户级设置；设了 `ANTHROPIC_API_KEY` 就改用 `--bare`。分发或团队使用请配置 API key。设计见 [ADR-0005](docs/adr/0005-native-codex-claude-baristas.md) 和 [`docs/specs/v3-1-native-codex-claude.md`](docs/specs/v3-1-native-codex-claude.md)。
 
+让**正在用的** Claude Code / Codex 终端会话当 Barista（问题在会话空闲时作为新的一轮进入，你在终端里看得到问题和回答；审批照常在终端里由你处理）：
+
+```bash
+cafe claude install            # 装 cafe 的 Claude Code 插件（--dry-run 先看）；之后在有 .cafe 的目录里开的 Claude Code 会话自动接问题
+                               # 会话里：/cafe 看地址，/cafe off 暂停，/cafe on 恢复；cafe claude uninstall 卸载
+cafe barista start --dir ~/code/billing --agent codex --tui   # 问题放进该目录最近活动的 Codex 会话（--thread <id> 指定）
+```
+
+会话 120 秒内没开始（忙、按 Esc 打断后还没发新消息、或已关闭）就以"暂时不可用"婉拒。设计见 [ADR-0006](docs/adr/0006-tui-sessions-as-baristas.md)。
+
 任意脚本当 Barista（每个问题跑一次命令，prompt 走 stdin，stdout 即回答，输出 `CAFE_DECLINE: 原因` 表示婉拒；追问没有会话，只靠 prompt 里的历史）：
 
 ```bash

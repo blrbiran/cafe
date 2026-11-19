@@ -13,7 +13,10 @@ _Avoid_: node, peer, client
 _Avoid_: producer, worker, provider
 
 **Bridge**:
-替没有扩展接口的 agent（Codex、Claude Code）当 Barista 的 cafe 进程（`cafe barista run --agent codex|claude`）。它注册 `.cafe` 身份，把每个 Order 交给 agent 的一个会话处理，再把回答交回。cafe Thread 和 agent 会话的对应关系存在 Daemon 里（ADR-0005）。
+替没有扩展接口的 agent（Codex、Claude Code）当 Barista 的 cafe 进程（`cafe barista run --agent codex|claude`）。它注册 `.cafe` 身份，把每个 Order 交给 agent 的一个会话处理，再把回答交回。cafe Thread 和 agent 会话的对应关系存在 Daemon 里（ADR-0005）。加 `--tui` 时，Codex 的 Bridge 把 Order 放进用户正在用的 Codex 会话（ADR-0006）。
+
+**Session host**:
+替正在使用的 Claude Code 会话当 Barista 的 cafe 子进程（`cafe session-host`），由 cafe 的 Claude Code 插件（mod）在会话里启动；它连 Daemon、收 Order，mod 负责把 Order 作为新的一轮提交进会话并交回回答（ADR-0006）。
 _Avoid_: adapter, proxy, wrapper
 
 **Customer**:

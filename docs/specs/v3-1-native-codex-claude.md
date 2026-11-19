@@ -1,6 +1,31 @@
 # v3-1 原生支持 Codex 和 Claude Code
 
-状态（2026-11-19）：**Q72–Q79 全部按推荐通过，第一阶段已实现**：headless Barista（Codex、Claude）和 MCP Customer。第二阶段（TUI 会话当 Barista）没做。架构决定见 [ADR-0005](../adr/0005-native-codex-claude-baristas.md)。
+状态（2026-11-19）：**第一阶段已实现**（Q72–Q79）：headless Barista（Codex、Claude）和 MCP Customer，见 [ADR-0005](../adr/0005-native-codex-claude-baristas.md)。**第二阶段已实现**（Q84–Q88）：正在用的 Claude Code / Codex 终端会话当 Barista，见下面"第二阶段"和 [ADR-0006](../adr/0006-tui-sessions-as-baristas.md)。真模型实测待用户同意。
+
+## 第二阶段：终端会话当 Barista（Q84–Q88 按推荐，已实现）
+
+决策（2026-11-19）：
+- **Q84 A** 两边都做，先 Claude 后 Codex。
+- **Q85 A** 装了插件后，有 Barista `.cafe` 的目录里的交互式 Claude Code 会话自动加入；`/cafe off` / `/cafe on` 暂停、恢复。
+- **Q86 A** Codex：`cafe barista start --dir <dir> --agent codex --tui`，问题放进该目录最近活动的 Codex 会话的队列；`--thread <id>` 可指定；120 秒没被取走就撤回并以"暂时不可用"婉拒。
+- **Q87 A** 权限沿用会话自己的设置，审批留给终端前的人；网页标"终端里（有人在用）"。
+- **Q88 A** 先免费验证（`claude plugin test`、mock 模型 + tmux 里的真终端），最后各做一次付费实测（单独征得同意）。
+
+| | 用法 | 代码 |
+|---|---|---|
+| Claude Code 会话 | `cafe claude install`（`--dry-run` 先看）；会话里 `/cafe`、`/cafe off`、`/cafe on`；`cafe claude uninstall` | `claude-plugin/hooks/register.ts`（mod）+ `packages/cli/src/bridge/session-host.ts`（`cafe session-host`，隐藏子命令）+ `packages/cli/src/claude-plugin.ts`（安装：在 `CAFE_HOME/claude-marketplace` 写本地 marketplace 和 `cafe.json`，再 `claude plugin marketplace add` + `claude plugin install cafe@cafe-local`） |
+| Codex 会话 | `cafe barista start --dir <dir> --agent codex --tui [--thread <id>]` | `packages/cli/src/bridge/codex-tui.ts`（`CodexTuiEngine`），由 `barista.ts` 的 `tui` 选项选用；supervisor 对 `tui` 只起一个进程 |
+
+**Claude 流程**：会话启动（交互式才做）→ mod `$.process.spawn([node, cafe.js, "session-host", "--agent", "claude", "--dir", cwd])` → session-host 读 `.cafe`，没有 Barista 身份就输出 `{"type":"none"}` 后退出；有就注册（`mode: tui`，`agent: claude`，pid 是会话的 pid），开一个仅本人可读写的 Unix socket，输出 `{"type":"ready", address, socket}`。Order 到达：session-host ack + 心跳，一次只交给 mod 一个（`{"type":"order", orderId, marker, text}`，text 第一行是 `[cafe order <id>]`）；mod `$.prompt.submit({text})`；`turn.start` 里 text 含标记的那一轮就是它，mod POST `/started`；`turn.complete` 时 POST `/done {text: answer, aborted, error}`。session-host 按 `CAFE_DECLINE:` / 中断 / 出错 / 空回答决定回答还是婉拒。这个会话回答过的 Thread，追问只发简短的 follow-up。取消：session-host 发 `{"type":"cancel"}`，mod 对已开始的一轮 `$.turn.abort`，还没开始的等它开始时立刻中止。120 秒（`CAFE_INJECT_TIMEOUT_MS`）没收到 `/started` 就婉拒并发 cancel。会话退出：session-host 发现自己被重新挂到别的父进程（或 stdout 断开）就注销退出。
+
+**Codex 流程**：桥接进程常驻一个自己的 `codex app-server`（stdio），每个 Order：`thread/list` 找 cwd 等于 `--dir`（比较 realpath）、非临时、`updatedAt` 最新的会话 → `thread/queue/add {threadId, input, clientUserMessageId: "cafe-<uuid>"}` → 每秒 `thread/turns/list`，找 `userMessage.clientId` 等于它的那一轮：`completed` 取 `final_answer`（没有就取最后一条 `agentMessage`）；`failed`，或 `interrupted` 且有 `completedAt`（真被打断）→ 婉拒（暂时不可用）；`interrupted` 且没有 `completedAt` 表示 TUI 还在跑，继续等。cafe Thread → Codex thread 的映射仍存 Daemon，同一个会话里的追问只发 follow-up。取消：还在队列里就 `thread/queue/delete`；已开始的无法从外部打断（`turn/interrupt` 对别的进程加载的会话报 `thread not found`），照常跑完，回答丢弃。
+
+**实测结论**（不花钱）：
+- Claude 2.1.328：`claude plugin validate` / `claude plugin test`（4 个测试）通过。真引擎端到端：隔离的 `CLAUDE_CONFIG_DIR`（预先写入 `hasCompletedOnboarding`、`customApiKeyResponses.approved` 和项目信任）+ 假 Anthropic API（`ANTHROPIC_BASE_URL`，脚本在会话 scratchpad 的 `cc-e2e/mock-anthropic.mjs`）+ tmux 里的 `claude --plugin-dir`：状态栏 `cafe: ☕ falcon#1@test`，`cafe agents` 显示 `claude·tui`；问答、追问（简短 follow-up）、`CAFE_DECLINE` 婉拒、取消（中止正在跑的一轮，下一题正常）、`/cafe off|on`、`/exit` 后 Agent 下线且 socket 删除，全部通过。终端里显示为 "Prompt from the cafe plugin" + 问题原文 + 回答。
+- Codex 0.170.0（`--no-daemon`，和 cmux 一样走内置服务）+ ccloop mock 模型 + 隔离 `CODEX_HOME`：另一个 stdio app-server `thread/queue/add` 后约 5 秒被 TUI 取走，TUI 显示问题和回答，我们的 app-server 没有自己跑；`thread/queue/delete` 撤回有效；`turn/interrupt` 跨进程无效；正在跑的一轮从外部读是 `interrupted` + `completedAt=null`，Esc 打断后 `completedAt` 有值；**Esc 打断后 Codex 暂停派发队列**（`ext/queue/src/service.rs` `on_thread_idle` 对 `Interrupted` 直接返回），用户发下一条消息后恢复——期间的问题按 120 秒撤回。经 `cafe barista run --agent codex --tui` 端到端：问答约 6 秒、追问、超时撤回都通过。`~/.codex/config.toml` 哈希前后一致。
+- 陷阱：PATH 上 `/opt/homebrew/bin/claude` 是旧的 2.0.19（没有 `plugin test`），用 nvm 下的 `claude`；隔离配置的 API key 确认屏默认选 "No"，会转去浏览器登录。
+
+**还没做（要付费，需用户逐次同意）**：真模型各一次——你正在用的 Claude Code 会话接一题、追问、取消；Codex 终端会话接一题、追问、取消。另外 `cafe claude install` 会改 `~/.claude` 的插件设置，由用户执行（或明确同意后代为执行）。
 
 ## 实现（第一阶段）
 
@@ -20,7 +45,7 @@
 - **真 Claude（不花钱）**：claude 2.1.327 接受上述全部参数；`--resume` 不存在的会话时输出 `No conversation found with session ID: …`、退出码 1，与桥接的"新开会话"判断一致。
 - **还没做（要付费，需用户逐次同意）**：真模型各问几题：Codex 一次（`~/.codex` 登录），Claude 一次（本机登录）。
 
-第二阶段的入口（没做）：Codex TUI 用共享 app-server 守护进程 + `thread/queue/add`；Claude 只能用 channels（研究预览）。
+第二阶段已实现，见上面"第二阶段"一节（Claude 最终用 mod 而不是 channels；Codex 不依赖共享守护进程）。
 
 ## 现状
 

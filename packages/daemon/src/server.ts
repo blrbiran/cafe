@@ -177,12 +177,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
     if (m === "GET") return send(res, 200, sup.list());
     if (m === "POST") {
-      const { dir, args, bin, agent, access, model } = await readJson(req);
+      const { dir, args, bin, agent, access, model, tui, thread } = await readJson(req);
       if (bin !== undefined && (typeof bin !== "string" || !/^[\w./-]+$/.test(bin))) throw new RpcError("bad_request", "bin must be an executable name or path");
       if (agent !== undefined && agent !== "codex" && agent !== "claude") throw new RpcError("bad_request", "agent must be codex or claude");
       if (access !== undefined && access !== "read-only" && access !== "workspace-write") throw new RpcError("bad_request", "access must be read-only or workspace-write");
       if (model !== undefined && (typeof model !== "string" || !/^[\w./:@-]+$/.test(model))) throw new RpcError("bad_request", "bad model name");
-      return send(res, 200, sup.start({ dir, args, ...(bin ? { bin } : {}), ...(agent ? { agent } : {}), ...(access ? { access } : {}), ...(model ? { model } : {}) }));
+      if (tui !== undefined && (tui !== true || agent !== "codex")) throw new RpcError("bad_request", "tui is for agent codex");
+      if (thread !== undefined && (!tui || typeof thread !== "string" || !/^[\w-]+$/.test(thread))) throw new RpcError("bad_request", "bad thread id (needs tui)");
+      return send(res, 200, sup.start({ dir, args, ...(bin ? { bin } : {}), ...(agent ? { agent } : {}), ...(access ? { access } : {}), ...(model ? { model } : {}), ...(tui ? { tui } : {}), ...(thread ? { thread } : {}) }));
     }
     if (m === "DELETE") return send(res, 200, { stopped: sup.stop(url.searchParams.get("dir") ?? "") });
   }

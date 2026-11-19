@@ -50,6 +50,8 @@ cafe config set router.model anthropic/claude-haiku-4-5  # LLM routing via pi au
 cafe daemon start --root                              # make this machine the Root
 cafe barista start --dir ~/code/billing               # run a headless pi Barista for that directory
 cafe barista start --dir ~/code/billing --agent codex # a Codex Barista (codex app-server); --agent claude for Claude Code
+cafe barista start --dir ~/code/billing --agent codex --tui  # answer in the Codex session already running there
+cafe claude install                                   # running Claude Code sessions in a dir with .cafe answer questions (/cafe off pauses)
                                                       # read-only by default; --write lets it edit files in --dir
 cafe mcp install                                      # register `cafe mcp` (tools cafe_ask / cafe_wait / …) with Claude Code and Codex
 cafe serve --preset claude --dir ~/code/billing       # one `claude -p` per question, no session (or --preset codex)

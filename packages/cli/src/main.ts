@@ -452,15 +452,21 @@ barista
   .option("--agent <name>", "pi (default), omp (oh-my-pi), codex (codex app-server) or claude (claude -p)")
   .option("--write", "codex / claude only: allow editing files in --dir (default: read-only)")
   .option("--model <model>", "codex / claude only: model to use")
+  .option("--tui", "codex only: answer in the Codex session running in --dir (the TUI), not a headless one")
+  .option("--thread <id>", "with --tui: the Codex thread to use (default: the newest session started in --dir)")
   .action(async (o) => {
     const native = BRIDGED_AGENTS.includes(o.agent);
     if ((o.write || o.model) && !native) throw new Error("--write and --model are for --agent codex or claude");
+    if (o.tui && o.agent !== "codex") throw new Error("--tui is for --agent codex; for Claude Code run `cafe claude install`");
+    if (o.thread && !o.tui) throw new Error("--thread needs --tui");
+    if (o.tui && (o.write || o.model)) throw new Error("--tui uses the session's own model and permissions; drop --write / --model");
     await ensureDaemon();
     const spec = native
-      ? { agent: o.agent, ...(o.write ? { access: "workspace-write" } : {}), ...(o.model ? { model: o.model } : {}) }
+      ? { agent: o.agent, ...(o.write ? { access: "workspace-write" } : {}), ...(o.model ? { model: o.model } : {}), ...(o.tui ? { tui: true } : {}), ...(o.thread ? { thread: o.thread } : {}) }
       : o.agent ? { bin: o.agent } : {};
     const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir), ...spec }) });
-    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${resolve(o.dir)}${native ? (o.write ? " (may edit files)" : " (read-only)") : ""}`, ws);
+    const how = o.tui ? " (answers in the running Codex session)" : native ? (o.write ? " (may edit files)" : " (read-only)") : "";
+    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${resolve(o.dir)}${how}`, ws);
   });
 barista
   .command("stop")
@@ -477,6 +483,8 @@ barista
   .option("--dir <dir>", "directory whose .cafe gives the identity (and where the agent works)", process.cwd())
   .option("--write", "allow editing files in --dir (default: read-only)")
   .option("--model <model>", "model to use")
+  .option("--tui", "codex only: answer in the running Codex session in --dir")
+  .option("--thread <id>", "with --tui: the Codex thread to use")
   .action(async (o) => {
     if (!BRIDGED_AGENTS.includes(o.agent)) throw new Error(`--agent must be ${BRIDGED_AGENTS.join(" or ")}`);
     if (!process.env.CAFE_DAEMON) await ensureDaemon();
@@ -487,6 +495,8 @@ barista
       token: process.env.CAFE_TOKEN,
       access: o.write ? "workspace-write" : "read-only",
       model: o.model,
+      tui: !!o.tui,
+      thread: o.thread,
     });
     let quitting = false;
     const quit = async () => {

@@ -15,6 +15,6 @@ Codex 和 Claude Code 没有 pi 那样的扩展接口，cafe 用一个**桥接�
 
 ## Consequences
 
-- Barista 列表只显示"后台运行"，看不出是 pi、Codex 还是 Claude；要区分需要改 UI（先出原型）。
+- ~~Barista 列表只显示"后台运行"~~：v3-2 起 Agent 上报种类和只读 / 可写，网页和 `cafe agents` 都标出来（`docs/specs/v3-2-agent-kind.md`）。
 - Codex 的 app-server 协议有实验字段，升级 Codex 后先跑一次 mock 模型检查（见 `docs/specs/v3-1-native-codex-claude.md`）。
-- 第二阶段（TUI 会话当 Barista：Codex `thread/queue/add`，Claude channels）没做。
+- 第二阶段（TUI 会话当 Barista）见 [ADR-0006](0006-tui-sessions-as-baristas.md)：Claude 改用 mod（不用 channels），Codex 用 `thread/queue/add`。

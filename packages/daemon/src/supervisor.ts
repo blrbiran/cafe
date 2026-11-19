@@ -19,6 +19,10 @@ export interface BaristaSpec {
   access?: "read-only" | "workspace-write";
   /** For `agent`: model passed to codex / claude. */
   model?: string;
+  /** codex only: answer in a running Codex session instead of a headless thread (one worker, whatever the concurrency). */
+  tui?: boolean;
+  /** With `tui`: the Codex thread to use. */
+  thread?: string;
 }
 
 interface Worker {
@@ -158,7 +162,8 @@ export class Supervisor {
     const dir = resolve(spec.dir);
     if (this.workers.some((w) => w.spec.dir === dir)) throw new Error(`barista already running in ${dir}`);
     const { cafe } = loadIdentity(dir);
-    for (let slot = 1; slot <= cafe.concurrency; slot++) {
+    // A running session answers one question at a time: one worker per TUI Barista.
+    for (let slot = 1; slot <= (spec.tui ? 1 : cafe.concurrency); slot++) {
       const w: Worker = { spec: { ...spec, dir }, slot, restarts: 0, stopping: false };
       this.workers.push(w);
       this.launch(w);
@@ -228,6 +233,8 @@ export class Supervisor {
           w.spec.dir,
           ...(w.spec.access === "workspace-write" ? ["--write"] : []),
           ...(w.spec.model ? ["--model", w.spec.model] : []),
+          ...(w.spec.tui ? ["--tui"] : []),
+          ...(w.spec.thread ? ["--thread", w.spec.thread] : []),
         ]
       : [GUARD, bin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.

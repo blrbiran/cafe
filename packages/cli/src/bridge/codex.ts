@@ -30,7 +30,7 @@ export function refuseServerRequest(method: string): { result: Json } | { error:
 }
 
 /** Minimal client for `codex app-server` (stdio, one JSON object per line, no `jsonrpc` field). */
-class AppServer {
+export class AppServer {
   private child: ChildProcess;
   private nextId = 0;
   private pending = new Map<number, Pending>();
