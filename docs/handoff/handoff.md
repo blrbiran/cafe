@@ -19,6 +19,9 @@ cafe is an agent network. A message (an **Order**) is routed to the agent or age
 - Daemons exchange their cafe version in `initialize`: a different `PROTOCOL_VERSION` is refused with `protocol_mismatch` and an upgrade hint; a different cafe version on the same protocol only warns (`cafe daemon status`, Network page). Published as the npm package `@blrbiran/cafe` (command `cafe`).
 - Ways to be a Barista: pi with the cafe extension (TUI or headless `pi --mode rpc`, supervised by the Daemon); the same extension inside **oh-my-pi** (`--agent omp`); **native Codex / Claude Code** (`cafe barista start --agent codex|claude`, a **Bridge** process supervised by the Daemon, read-only by default, follow-ups continue the same Codex thread / Claude session; ADR-0005); `cafe serve --exec/--preset claude|codex` for any prompt-in / answer-out command (no session); **a running Claude Code session** (the cafe Claude Code plugin, a mod, installed with `cafe claude install`; ADR-0006) and **a running Codex session** (`cafe barista start --agent codex --tui`, Orders go into the session's queue; ADR-0006).
 - Ways to be a Customer: any agent, **`cafe mcp`** (MCP stdio server: `cafe_agents`, `cafe_ask`, `cafe_wait`, `cafe_cancel`; `cafe mcp install` registers it with Claude Code / Codex), the `cafe` CLI plus skill, or the web UI.
+- First use: `cafe init` writes a commented `.cafe` (interactive or `--yes --name …`), `cafe extension install` puts the extension into pi's settings and links it with omp, `cafe doctor` checks daemon / identity / extension / skill / router / root and prints the next command. `cafe config get` prints `(not set)` for unset known keys and fails for unknown ones.
+- Display names: `cafe host rename|alias`, `cafe agent rename|alias`, `cafe daemon rename` (Root). Internal `host` / `agentId` / Address never change; old names become aliases (ADR-0007). `knownDaemons` is written only after the Root can reach the child (prevents Docker-internal IPs).
+- Routing control: `cafe router models|set|status|apply`; `router.model` can be switched and cleared on a running daemon, unknown models are rejected and rolled back. `router.timeoutMs` (10 s) and `router.concurrency` (2) bound the LLM. `cafe daemon restart` applies restart-required config; `cafe config set` says whether a change was applied or needs a restart.
 - A Thread holds several turns. A Barista can decline ("不归我管"); operational declines (timeout, abort, shutdown, command failure) carry `unavailable` and do not count against a topic. An acknowledged Order has no overall timeout, because heartbeats keep it alive.
 
 ## 2. Code map
@@ -27,19 +30,21 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 
 | Path | What it does |
 |---|---|
-| `packages/protocol/src/index.ts` | zod wire types: Order, ThreadEvent, ThreadMeta, AgentRecord (v3-2 display fields `agent` / `access` / `command`, plain optional strings), RoutingDecision (`demoted`, `llmError`), RoutingHint, ClientKind (`agent/daemon/ui/peer`), the method list (incl. `agent/session/get|set`, local A→D only) |
+| `packages/protocol/src/index.ts` | zod wire types: Order, ThreadEvent, ThreadMeta (v3-2 display fields, `summaryTurn`), AgentRecord (`displayName`, `aliases`), DaemonRecord (`hostId`, `displayName`, `aliases`), RoutingDecision (`demoted`, `llmError`), RoutingHint, ClientKind (`agent/daemon/ui/peer`), the method list (incl. `agent/session/get|set`, `agent/rename`, `host/identity`) |
 | `packages/protocol/src/peer.ts` | Symmetric RPC over a socket (codex app-server style, no `jsonrpc` field) |
 | `packages/protocol/src/version.ts` | Dependency-free `PROTOCOL_VERSION`, `DEFAULT_PORT`, `onlineVersions()` — the web UI imports only this (`@cafe/protocol/version`), never the zod index |
 | `packages/protocol/src/client.ts` | `CafeClient`: register (resumes agentId), `onOrder`, `onCancel`, `ask`, `keepAlive`, `decline(reason, {unavailable})`, `getSession` / `setSession`; reconnect handles `error` and `close`, waits at most 5 s for a local daemon, 30 s for a remote one |
-| `packages/daemon/src/daemon.ts` | Core: Root/child modes, Registry replication, Order lifecycle, follow-ups, `recover()`, Root relay/fan-out, routing hints (record/compute/push), **direct links + backfill**, prune/search |
+| `packages/daemon/src/daemon.ts` | Core: Root/child modes, Registry replication, Order lifecycle, follow-ups, `recover()` (only unfinished threads), Root relay/fan-out, routing hints (record/compute/push), direct links + backfill, display names/aliases + remote rename, `knownDaemons` reachability probe, prune/search |
 | `packages/daemon/src/hints.ts` | Tokenizer (CJK bigrams), order keywords, time-decayed decline topics, penalty (< 1) |
-| `packages/daemon/src/router.ts` | `RulesRouter` (description score, then idle bonus − history penalty), `LlmRouter` (weak-hint lines), `piComplete()` |
+| `packages/daemon/src/router.ts` | `RulesRouter`, `LlmRouter` (weak hints, 10 s timeout, single-candidate short circuit, concurrency gate), `piComplete()` (reuses one ResourceLoader, aborts on timeout), `listRouterModels()` |
 | `packages/daemon/src/discovery.ts` | mDNS advertise (Root) / discover (`multicast-dns`) |
-| `packages/daemon/src/store.ts` | SQLite: thread metadata, registry cache, `agent_events` (+ `identity`, `tokens`), `agent_sessions` (Bridge Thread → Codex thread / Claude session, keyed by kind + Barista dir + Thread), `kv` (peerUrls, backfill, rootHost); prune helpers. Thread contents are JSONL under `~/.cafe/sessions/<date>/` (ADR-0003) |
-| `packages/daemon/src/server.ts` | One port (4777): HTTP API, `/ws`, static web UI. New: `/api/routing/hints`, `/api/search`, `/api/prune`, `/api/threads?before=` |
+| `packages/daemon/src/store.ts` | SQLite: thread metadata, registry cache (upsert instead of delete+insert), `agent_events` (+ `identity`, `tokens`), `agent_sessions`, `kv`. `readEventsTail` / `openThreads` for long Threads and recovery. Thread contents are JSONL under `~/.cafe/sessions/<date>/` (ADR-0003) |
+| `packages/daemon/src/summary.ts` | Faithful list titles: word/sentence-boundary truncation with `…` |
+| `packages/daemon/src/server.ts` | One port (4777): HTTP API, `/ws`, static web UI. New: `/api/host`, `/api/hosts/rename`, `/api/agents/rename`, structured `/api/reload` (`ok/router/model/error`) |
 | `packages/daemon/src/supervisor.ts`, `proc/` | Headless workers under a guard that dies with the Daemon; per-Barista `bin` (pi / omp) or `agent` (codex / claude → `node <defaultCliBin()> barista run`), `access`, `model`, `tui` + `thread` (codex only; one worker whatever the concurrency) |
 | `packages/daemon/src/index.ts` | `runDaemon()`, lock, discovery start/stop |
-| `packages/cli/src/main.ts` | The `cafe` command. New: `stats`, `search`, `prune`, `root discover`, `daemon install/uninstall`, `barista start --agent`, `pi-extension-path`, `--version`. `daemon start` (and the pi extension's auto-start) goes through launchd/systemd when autostart is installed for this `CAFE_HOME` |
+| `packages/cli/src/main.ts` | The `cafe` command. New: `init`, `doctor`, `extension install|status|uninstall`, `router models|set|status|apply`, `host rename|alias`, `agent rename|alias`, `daemon rename|restart`, `connect`, `root test`; help has a Quick start; unknown commands fail even with `--help` |
+| `packages/cli/src/init.ts`, `doctor.ts`, `extension.ts`, `errors.ts` | Guided `.cafe` creation; health checks; pi/omp extension install/status; daemon API error formatting |
 | `packages/cli/src/service.ts` | launchd plist / systemd unit generation and (un)install; `servicePath()` drops temp and per-terminal shim dirs (cmux) from the service PATH; `startInstalledService()` |
 | `scripts/build-release.mjs` | esbuild → `release/` (publishable package `@blrbiran/cafe`), see `docs/specs/v2-7-publishing.md` |
 | `scripts/test-release.mjs` | `npm run test:release`: pack, install into a temp prefix, smoke-test the installed `cafe` (no model; includes `cafe mcp` and a supervised Codex Barista on the fake app-server). Run before every publish |
@@ -52,7 +57,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below |
 | `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore`; feed has "load older" and full-text search |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
-| `tests/` | vitest, **105 tests** (+4 mod tests via `npm run test:claude-plugin`): **session host** (`session-host.test.ts`), **Codex TUI Barista** (`codex-tui.test.ts`, fake `fixtures/fake-codex-tui.mjs`; the test plays the TUI), e2e, follow-up/recovery, pi extension (incl. omp mode) against a fake pi, serve, supervisor, routing hints, routing eval, direct links, discovery (real multicast), service files, retention/search, client reconnect while the daemon stays down, versions across Daemons and protocol mismatch, **Bridges** (`bridge.test.ts`, fakes `fixtures/fake-codex.mjs` / `fake-claude.mjs`), **MCP** (`mcp.test.ts`) |
+| `tests/` | vitest, **151 tests** (+4 mod tests via `npm run test:claude-plugin`): identity/display names/aliases (`identity.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), CLI init/help/config/errors (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), plus session host, Codex TUI, e2e, follow-up/recovery, pi extension, serve, supervisor, routing hints/eval, direct links, discovery, service files, retention/search, client reconnect, versions, Bridges, MCP |
 
 **pi extension behaviour**
 - Orders queue (FIFO), are acked and heartbeated on arrival, and are injected only when idle with `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
@@ -67,7 +72,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 105 must pass (run twice: earlier flakes were unhandled rejections)
+npm test                   # vitest; all 151 must pass (run twice: earlier flakes were unhandled rejections)
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
 npm run test:release       # only when packaging/paths changed; ~1 min, no model
@@ -115,6 +120,15 @@ Waiting on the user:
 4. **Real two-machine test** (section 6), later.
 5. Suggest `pi update` (local pi 1.5.0, extension targets 1.5.2). Reinstall autostart (`cafe daemon install`), `cafe mcp install` and `cafe claude install` after changing Node version or moving the repo (all register absolute node + cafe.js paths).
 
+Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, rest as recommended), **to review**:
+- Correctness/UX: `.cafe` directories are skipped (no more `EISDIR` from `~/.cafe`), broken `.cafe` errors name the file/field and show a template; pi extension reports why it is unavailable; CLI does not repeat `EISDIR`; `config get` prints `(not set)` / fails unknown keys; thread summaries cut at word boundaries with `…` and follow the latest turn; skill text now has a mandatory `$cafe` workflow.
+- First use: `cafe init`, corrected help with Quick start (unknown commands fail even with `--help`), `cafe extension install|status|uninstall`, `cafe doctor`, rewritten README.
+- Routing: `initRouter` can switch model and clear to rules; unknown models roll back; timeout/single-candidate/concurrency; ResourceLoader reused; `cafe router models|set|status|apply`; `daemon status` shows the running model.
+- Multi-machine: child addresses are probed before entering `knownDaemons`; `cafe connect`, `root test`, `daemon restart`, restart-required config reporting, clearer `unauthorized`.
+- Identity (ADR-0007): `displayName`/`aliases` for Hosts and Agents, local and Root-relayed rename; internal ids/Addresses never change, so no history migration.
+- Performance (targeted): debounced meta writes, tail-only follow-up history, recovery query, registry upsert, parallel `announceRoot`; web store single set, O(1) duplicate check, linear merge, memoized Feed/Conversation, coarser `useNow` in cards.
+- No Web layout redesign yet: the artifact tool refused this session (authenticated with `ANTHROPIC_AUTH_TOKEN`), and UI changes still need an approved prototype (#18/#22/#23/#24/#30).
+
 ## 6. Two-machine test (the user runs this)
 
 1. **Root A**: `cafe daemon start --root`; `cafe config get token`; port 4777 reachable on the LAN/tailnet.
@@ -132,6 +146,10 @@ Waiting on the user:
 ## 7. Backlog after v2
 
 - Multi-level Daemon hierarchy (codex `parent`/AgentPath idea) — not started; only two levels exist.
+- Web workbench (dogfooding #18/#22/#23/#24/#26/#30): fixed-height nav, compact cards, right drawer, responsive widths, settings/admin actions. Needs an approved prototype.
+- LLM routing eval harness with 50+ cases, repeat runs and latency (dogfooding #14); full router status/health details.
+- Full event store (SQLite/FTS) and web virtualization (dogfooding #31/#33/#34) — only targeted fixes are in.
+- Global `cafe tail` (#19), attachments (#20), self-update/rollback (#27), connector SDK (#28), slash commands (#11).
 - Phase 2 follow-ups: the web UI could show "paused" for a Claude session (`/cafe off` currently just leaves the network); a Codex `--tui` Barista could prefer the shared app-server daemon's live events when the TUI uses it (today it always polls `thread/turns/list`, ~1 s).
 - CI (GitHub Actions: typecheck, test, build:web, test:release) — suggested, not started.
 - LAN security (token is plain text over HTTP/WS; TLS or tailnet-only) — needs a spec.
@@ -171,11 +189,16 @@ Waiting on the user:
 - Mod test kit: `$.http.fetch` hooks get `{url, init}`; every `$.ui.*` call needs a test hook (`{ value: undefined }`); `$` may only be passed to functions declared outside `register`.
 - Codex seen from another process: a turn still running in the TUI reads `interrupted` with `completedAt: null`; `turn/interrupt` on a thread loaded elsewhere fails with `thread not found`; after an Esc interrupt the queue is not dispatched until the next completed turn (`ext/queue/src/service.rs` `on_thread_idle`).
 - Tests that share JSON state files with a fake process must write atomically (temp file + rename), or the fake reads half a file and dies.
+- Artifacts are unavailable when the session authenticates with `ANTHROPIC_AUTH_TOKEN`: every Artifact call is refused. UI prototypes need a claude.ai login; otherwise write a local HTML file.
+- Tests that spawn a CLI with `spawnSync` while the daemon lives in the vitest process deadlock: the parent's event loop is blocked, so the daemon cannot answer. Use async `spawn` (see `tests/doctor.test.ts`).
+- `config.yml` is YAML (not JSON): tests must use `yaml.parse`, not `JSON.parse`.
+- Commander falls back to top-level help with exit 0 for an unknown command; `main.ts` checks the first positional itself before parsing.
+- `Store.readEventsTail` is the follow-up history path; `recover()` uses `store.openThreads()` so finished Threads are not reread. Metadata writes are coalesced (150 ms) except `order.created` / `order.closed` and on `stop()`.
 - Reference repos: `sourceget find pi codex oh-my-pi`; oh-my-pi at `/Users/biran/code/skills/agent/oh-my-pi`; Orca web at `/Users/biran/code/skills/orca/Orca/web`; ccloop at `/Users/biran/code/skills/orca/ccloop`. Research them with subagents.
 
 ## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q88**; nothing open).
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q97**; nothing open).
 - New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
 - Commit when asked (or at the end of an away batch they asked to hand off), with a stat or diff shown first; messages end with the Co-Authored-By line.
 - Restart their daemon yourself after daemon / web changes (section 8). Publishing to npm and changing their Claude / Codex config stay with them.
