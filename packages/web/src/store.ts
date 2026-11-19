@@ -185,12 +185,26 @@ function liveFromEvents(events: ThreadEnvelope[], live: Record<string, LiveTurn>
 }
 
 function appendEvent(env: ThreadEnvelope): void {
-  set((s) => ({ live: foldLive(s.live, env) }));
   set((s) => {
-    if (!s.detail || s.detail.meta.threadId !== env.threadId) return {};
-    if (s.detail.events.some((e) => e.eventId === env.eventId)) return {};
-    return { detail: { ...s.detail, events: [...s.detail.events, env] } };
+    const live = foldLive(s.live, env);
+    if (!s.detail || s.detail.meta.threadId !== env.threadId) return { live };
+    const events = s.detail.events;
+    // Notifications arrive in order; a repeated id can only be the one just appended.
+    if (events.length && events[events.length - 1]!.eventId === env.eventId) return { live };
+    return { live, detail: { ...s.detail, events: [...events, env] } };
   });
+}
+
+/** Merge two arrays that are each sorted by `at` without a full sort. */
+function mergeByAt<T extends { at: number }>(a: T[], b: T[]): T[] {
+  const out: T[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    if (j >= b.length || (i < a.length && a[i]!.at <= b[j]!.at)) out.push(a[i++]!);
+    else out.push(b[j++]!);
+  }
+  return out;
 }
 
 function applyDelta(d: RegistryDelta): void {
@@ -289,8 +303,11 @@ export async function openThread(threadId: string): Promise<void> {
     set((s) => {
       // Merge in any live events that arrived while fetching.
         const pending = s.detail?.meta.threadId === threadId ? s.detail.events : [];
-      const ids = new Set(d.events.map((e) => e.eventId));
-      const events = [...d.events, ...pending.filter((e) => !ids.has(e.eventId))].sort((a, b) => a.at - b.at);
+      const known = new Set(d.events.map((e) => e.eventId));
+      const events = mergeByAt(
+        d.events,
+        pending.filter((e) => !known.has(e.eventId)),
+      );
       return { detail: { meta: norm(d.meta), events }, live: liveFromEvents(events, s.live) };
     });
   } catch (err) {

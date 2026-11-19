@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { ThreadMeta } from "@cafe/protocol";
 import { api } from "../api.ts";
 import { ago, useT } from "../i18n.ts";
@@ -16,11 +16,13 @@ export function FeedPage({ filter }: { filter: Filter }) {
   const search = useStore((s) => s.search);
   const searching = search.q.trim() !== "";
 
-  const active = threads.filter((x) => bucketOf(x) === "active");
-  const rest = threads
-    .filter((x) => bucketOf(x) !== "active")
-    .sort((a, b) => (b.lastActivityAt ?? b.createdAt) - (a.lastActivityAt ?? a.createdAt));
-  const done = rest.filter((x) => filter === "all" || bucketOf(x) === filter);
+  const { active, done } = useMemo(() => {
+    const active = threads.filter((x) => bucketOf(x) === "active");
+    const rest = threads
+      .filter((x) => bucketOf(x) !== "active")
+      .sort((a, b) => (b.lastActivityAt ?? b.createdAt) - (a.lastActivityAt ?? a.createdAt));
+    return { active, done: rest.filter((x) => filter === "all" || bucketOf(x) === filter) };
+  }, [threads, filter]);
   const showActive = (filter === "all" || filter === "active") && active.length > 0;
   const showDone = filter !== "active";
 
@@ -169,12 +171,12 @@ function Highlight({ text, q }: { text: string; q: string }) {
   return <>{parts}</>;
 }
 
-function ThreadCard({ meta }: { meta: ThreadMeta }) {
+function ThreadCardImpl({ meta }: { meta: ThreadMeta }) {
   const t = useT();
-  const now = useNow();
   const agents = useStore((s) => s.agents);
   const live = useStore((s) => s.live[meta.threadId]);
   const bucket = bucketOf(meta);
+  const now = useNow(bucket === "active" ? 1_000 : 30_000);
   const o = outcome(t, meta, agents, live, now);
   const open = () => navigate({ page: "thread", threadId: meta.threadId });
 
@@ -232,6 +234,8 @@ function ThreadCard({ meta }: { meta: ThreadMeta }) {
     </article>
   );
 }
+
+const ThreadCard = memo(ThreadCardImpl);
 
 function Composer({ initialTo }: { initialTo?: string }) {
   const t = useT();

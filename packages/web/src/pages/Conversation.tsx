@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { AgentRecord, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, ThreadStatus } from "@cafe/protocol";
 import { api, ApiError } from "../api.ts";
 import { ago, useT, type Dict } from "../i18n.ts";
@@ -107,7 +107,7 @@ export function ConversationPage({ threadId }: { threadId: string }) {
   }
 
   const { meta, events } = detail;
-  const turns = buildTurns(events);
+  const turns = useMemo(() => buildTurns(events), [events]);
   const threadActive = isActive(meta.status);
   const first = turns[0];
   const last = turns.at(-1);

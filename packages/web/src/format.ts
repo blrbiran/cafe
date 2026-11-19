@@ -1,18 +1,37 @@
 import { useSyncExternalStore } from "react";
 
 let now = Date.now();
-const ticks = new Set<() => void>();
-setInterval(() => {
-  now = Date.now();
-  for (const t of ticks) t();
-}, 1_000);
+const listeners = new Map<number, Set<() => void>>();
+const timers = new Map<number, ReturnType<typeof setInterval>>();
 
-/** A "now" that re-renders every second, for live durations and relative times. */
-export function useNow(): number {
+/**
+ * A "now" that re-renders at `intervalMs`. List cards use a coarse interval
+ * (relative times do not need 1 s precision); only live durations use 1 s.
+ */
+export function useNow(intervalMs = 1_000): number {
   return useSyncExternalStore(
     (l) => {
-      ticks.add(l);
-      return () => ticks.delete(l);
+      let set = listeners.get(intervalMs);
+      if (!set) {
+        set = new Set();
+        listeners.set(intervalMs, set);
+        timers.set(
+          intervalMs,
+          setInterval(() => {
+            now = Date.now();
+            for (const f of set!) f();
+          }, intervalMs),
+        );
+      }
+      set.add(l);
+      return () => {
+        set!.delete(l);
+        if (set!.size === 0) {
+          clearInterval(timers.get(intervalMs));
+          timers.delete(intervalMs);
+          listeners.delete(intervalMs);
+        }
+      };
     },
     () => now,
   );
