@@ -6,10 +6,14 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
-import { cafeHome, defaultExtensionPath, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
+import { cafeHome, CONFIG_KEYS, defaultExtensionPath, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
+import { formatApiError } from "./errors.ts";
 import { PRESETS, serve } from "./serve.ts";
 import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
 import { runSessionHost, type HostMessage } from "./bridge/session-host.ts";
+import { runInit } from "./init.ts";
+import { extensionPackageDir, installPiExtension, ompExtensionCommand, ompExtensionState, piExtensionState, removePiExtension } from "./extension.ts";
+import { runDoctor } from "./doctor.ts";
 import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
 import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
@@ -31,7 +35,7 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
   const res = await fetch(`${base()}${path}`, { ...init, headers: { ...headers, ...(init.headers as any) } });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`${body.error ?? res.status}: ${body.message ?? ""}`.trim());
+  if (!res.ok) throw new Error(formatApiError(body, res.status));
   return body as T;
 }
 
@@ -42,6 +46,28 @@ async function healthy(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Write a config value and apply it. A value the running daemon rejects (an
+ * unknown router model) is rolled back, so config and running state stay equal.
+ */
+async function setAndApply(key: string, value: string): Promise<{ human: string; data: any }> {
+  const before = loadConfig() as Record<string, any>;
+  const old = key.split(".").reduce((o, k) => o?.[k], before);
+  setConfigValue(key, value);
+  // Only router/root can be applied to a running daemon today; say so instead of pretending.
+  if (!(key === "root" || key.startsWith("router."))) {
+    return { human: `${key} = ${value}\n(saved; restart required: cafe daemon restart)`, data: { [key]: value, applied: false, restartRequired: true } };
+  }
+  if (!(await healthy())) return { human: `${key} = ${value}`, data: { [key]: value, applied: false } };
+  const res = await api<any>("/api/reload", { method: "POST" });
+  if (!res.ok) {
+    setConfigValue(key, old === undefined ? "" : String(old));
+    throw new Error(`${key} was not applied: ${res.error ?? "reload failed"} (still using ${res.router}${res.model ? ` ${res.model}` : ""})`);
+  }
+  const running = `router: ${res.router}${res.model ? ` (${res.model})` : ""}`;
+  return { human: `${key} = ${value}\n${running}`, data: { [key]: value, applied: true, ...res } };
 }
 
 /** Start the local daemon in the background if it is not running (lock in the daemon prevents duplicates). */
@@ -170,6 +196,38 @@ const program = new Command("cafe")
     JSON_OUT = !!cmd.opts().json;
   });
 
+program.addHelpText(
+  "after",
+  `
+Quick start:
+  cafe init                                  create a .cafe identity in this directory
+  cafe daemon start --root                   run this machine as the Root daemon
+  cafe extension install                     load the cafe extension in new pi / omp sessions
+  cafe skill install                         register the cafe skill for Claude Code / Codex
+  cafe mcp install                           let Claude Code / Codex ask questions as a Customer
+  cafe barista start --dir <dir>             a pi/omp Barista for that directory
+  cafe config set router.model <provider/model>   optional: LLM routing
+  open http://127.0.0.1:4777/                the web UI
+`,
+);
+
+program
+  .command("init")
+  .argument("[dir]", "directory to initialise (default: the current directory)")
+  .description("create a .cafe identity file and print the next step")
+  .option("--name <name>", "agent name (default: the directory name)")
+  .option("--description <text>", "what this agent owns and can answer")
+  .option("--tags <list>", "comma-separated tags")
+  .option("--scope <list>", "comma-separated paths this agent covers")
+  .option("--role <role>", "barista or customer", "barista")
+  .option("--concurrency <n>", "headless worker processes", "1")
+  .option("-y, --yes", "use the defaults without asking")
+  .option("--force", "overwrite an existing .cafe")
+  .action(async (dir: string | undefined, o) => {
+    const res = await runInit({ dir, name: o.name, description: o.description, tags: o.tags, scope: o.scope, role: o.role, concurrency: o.concurrency, yes: o.yes, force: o.force });
+    out(`created ${res.file}\n\nnext:\n${res.next.map((s) => `  ${s}`).join("\n")}`, res);
+  });
+
 const daemon = program.command("daemon").description("manage the local daemon");
 daemon
   .command("run")
@@ -202,6 +260,28 @@ daemon
     if (!(await healthy())) return out("cafe daemon is not running", { running: false });
     await api("/api/shutdown", { method: "POST" });
     out("cafe daemon stopping", { stopping: true });
+  });
+daemon
+  .command("restart")
+  .description("stop and start the daemon (config changes marked restart required)")
+  .action(async () => {
+    const cfg = loadConfig();
+    if (await healthy()) {
+      await api("/api/shutdown", { method: "POST" });
+      for (let i = 0; i < 50 && (await healthy()); i++) await new Promise((r) => setTimeout(r, 100));
+    }
+    await ensureDaemon({ root: cfg.mode === "root" });
+    const h = await api("/api/health");
+    out(`cafe daemon restarted on ${base()} (host ${h.host}${h.isRoot ? ", root" : ""}, pid ${h.pid})`, h);
+  });
+daemon
+  .command("rename")
+  .argument("<host>")
+  .argument("<name>")
+  .description("Root: change another Daemon's display name (works while it is offline)")
+  .action(async (hostName: string, name: string) => {
+    const rec = await api<DaemonRecord>("/api/hosts/rename", { method: "POST", body: JSON.stringify({ host: hostName, displayName: name }) });
+    out(`renamed ${rec.host} to ${rec.displayName}`, rec);
   });
 daemon
   .command("install")
@@ -240,18 +320,21 @@ daemon
   .action(async () => {
     if (!(await healthy())) return out("cafe daemon is not running", { running: false });
     const s = await api("/api/snapshot");
+    const h = await api("/api/health");
     out(
       [
         `host:      ${s.host}${s.isRoot ? " (root)" : ""}`,
-        `version:   ${(await api("/api/health")).version ?? "unknown"}`,
+        `mode:      ${s.isRoot ? "root" : "daemon"}`,
+        `version:   ${h.version ?? "unknown"}`,
         `url:       ${base()}`,
-        `root:      ${s.isRoot ? "self" : s.rootOnline ? "online" : "offline"}`,
-        `router:    ${s.router}`,
+        `advertise: ${loadConfig().advertise ?? "(not set; other machines use lanAddress)"}`,
+        `root:      ${s.isRoot ? "self" : loadConfig().root ? `${loadConfig().root} (${s.rootOnline ? "online" : "offline"})` : "mDNS discovery"}`,
+        `router:    ${h.router}${h.model ? ` (${h.model})` : ""}`,
         `agents:    ${s.agents.length} (registry v${s.registryVersion})`,
         `threads:   ${s.threads.length}`,
         ...versionLines(s.daemons),
       ].join("\n"),
-      { running: true, ...s, threads: s.threads.length },
+      { running: true, ...s, threads: s.threads.length, routerModel: h.model, routerError: h.error },
     );
   });
 
@@ -397,6 +480,68 @@ program
     out(lines.join("\n"), t);
   });
 
+program
+  .command("connect")
+  .argument("<host:port>")
+  .description("join another machine's Root: saves mode, root and token")
+  .option("--token <token>", "the Root's token (cafe config get token on the Root)")
+  .action((addr: string, o) => {
+    if (!o.token) throw new Error("--token is required (cafe config get token on the Root)");
+    setConfigValue("mode", "daemon");
+    setConfigValue("root", addr);
+    setConfigValue("token", o.token);
+    out(`saved root ${addr}; restart required: cafe daemon restart`, { mode: "daemon", root: addr, restartRequired: true });
+  });
+
+const host = program.command("host").description("this Host's display name and aliases (internal ids and Addresses stay stable)");
+host
+  .command("rename")
+  .argument("<name>")
+  .description("change the name shown in the UI and CLI (hot; no restart)")
+  .action(async (name: string) => {
+    if (await healthy()) {
+      const rec = await api<DaemonRecord>("/api/host", { method: "POST", body: JSON.stringify({ displayName: name }) });
+      out(`renamed ${rec.host} to ${rec.displayName}`, rec);
+    } else {
+      setConfigValue("displayName", name);
+      out(`${name} (saved; takes effect when the daemon starts)`, { displayName: name });
+    }
+  });
+host
+  .command("alias")
+  .argument("<alias>")
+  .description("add a name that still identifies this Host in addresses")
+  .action(async (alias: string) => {
+    if (await healthy()) {
+      const rec = await api<DaemonRecord>("/api/host", { method: "POST", body: JSON.stringify({ aliases: [alias] }) });
+      out(`aliases: ${rec.aliases.join(", ") || "(none)"}`, rec);
+    } else {
+      const c = loadConfig();
+      saveConfig({ ...c, aliases: [...new Set([...c.aliases, alias])] }, cafeHome());
+      out(`${alias} (saved; takes effect when the daemon starts)`, { alias });
+    }
+  });
+
+const agent = program.command("agent").description("display names and aliases for Agents (agentId and Address stay stable)");
+agent
+  .command("rename")
+  .argument("<address>")
+  .argument("<name>")
+  .description("change an Agent's display name; the old name keeps resolving")
+  .action(async (address: string, name: string) => {
+    const rec = await api<AgentRecord>("/api/agents/rename", { method: "POST", body: JSON.stringify({ address, displayName: name }) });
+    out(`${rec.address} is now ${rec.displayName}`, rec);
+  });
+agent
+  .command("alias")
+  .argument("<address>")
+  .argument("<alias>")
+  .description("add another name that resolves to this Agent")
+  .action(async (address: string, alias: string) => {
+    const rec = await api<AgentRecord>("/api/agents/rename", { method: "POST", body: JSON.stringify({ address, alias }) });
+    out(`aliases: ${rec.aliases.join(", ") || "(none)"}`, rec);
+  });
+
 const root = program.command("root").description("Root Daemon address");
 root
   .command("set")
@@ -420,18 +565,48 @@ root
   });
 root
   .command("show")
+  .description("print the Root this Daemon uses")
   .action(() => {
     const c = loadConfig();
     out(c.mode === "root" ? "this host is the root" : (c.root ?? "(no root configured)"), { mode: c.mode, root: c.root });
+  });
+root
+  .command("test")
+  .description("do a token-authenticated handshake with the configured Root")
+  .action(async () => {
+    const c = loadConfig();
+    if (!c.root) throw new Error("no root configured; use `cafe root discover` or `cafe connect <host:port> --token <token>`");
+    try {
+      const res = await fetch(`http://${c.root}/api/health`, {
+        headers: { authorization: `Bearer ${c.token}` },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.status === 401) throw new Error("unauthorized: the token differs from the Root's (`cafe config get token` on both hosts)");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const info: any = await res.json();
+      out(`root ${c.root} online (${info.host}${info.isRoot ? ", root" : ""}${info.version ? `, cafe ${info.version}` : ""})`, info);
+    } catch (err) {
+      throw new Error(`root ${c.root}: ${(err as Error).message}`);
+    }
   });
 
 const config = program.command("config").description("~/.cafe/config.yml");
 config
   .command("get")
   .argument("[key]")
+  .description("print one value (no key: the whole file); an unset value prints (not set)")
   .action((key?: string) => {
     const c = loadConfig() as Record<string, any>;
-    const v = key ? key.split(".").reduce((o, k) => o?.[k], c) : c;
+    if (!key) {
+      out(JSON.stringify(c, null, 2), c);
+      return;
+    }
+    if (!CONFIG_KEYS.includes(key)) throw new Error(`unknown config key '${key}'`);
+    const v = key.split(".").reduce((o, k) => o?.[k], c);
+    if (v === undefined) {
+      out("(not set)", null);
+      return;
+    }
     out(typeof v === "string" ? v : JSON.stringify(v, null, 2), v);
   });
 config
@@ -440,14 +615,53 @@ config
   .argument("<value>")
   .description("set a value (e.g. router.model anthropic/claude-haiku-4-5) and reload the running daemon")
   .action(async (key: string, value: string) => {
-    setConfigValue(key, value);
-    if (await healthy()) await api("/api/reload", { method: "POST" });
-    out(`${key} = ${value}`, { [key]: value });
+    const r = await setAndApply(key, value);
+    out(r.human, r.data);
+  });
+
+const router = program.command("router").description("LLM routing: pick a model and see what is actually running");
+router
+  .command("models")
+  .argument("[search]")
+  .description("list the provider/model ids pi knows (optionally filtered)")
+  .action(async (search?: string) => {
+    const models = await listRouterModels(search);
+    out(models.join("\n") || "(no models found)", models);
+  });
+router
+  .command("set")
+  .argument("<model>")
+  .description("validate and apply a model; a failure leaves the old router in place")
+  .action(async (model: string) => {
+    const r = await setAndApply("router.model", model);
+    out(r.human, r.data);
+  });
+router
+  .command("status")
+  .description("show the configured router and the one actually running")
+  .action(async () => {
+    const c = loadConfig();
+    const running: any = (await healthy()) ? await api("/api/health") : { router: "daemon not running" };
+    const lines = [
+      `configured: ${c.router.model ? `llm (${c.router.model})` : "rules"}`,
+      `running:    ${running.router}${running.model ? ` (${running.model})` : ""}`,
+      ...(running.error ? [`last error: ${running.error}`] : []),
+    ];
+    out(lines.join("\n"), { configured: c.router.model ?? null, running });
+  });
+router
+  .command("apply")
+  .description("apply the configured router to the running daemon")
+  .action(async () => {
+    const res = await api<any>("/api/reload", { method: "POST" });
+    out(`router: ${res.router}${res.model ? ` (${res.model})` : ""}${res.error ? `\nlast error: ${res.error}` : ""}`, res);
+    if (!res.ok) process.exitCode = 1;
   });
 
 const barista = program.command("barista").description("headless Baristas supervised by the daemon (pi, omp, codex, claude)");
 barista
   .command("start")
+  .description("start a Barista for a directory and let the daemon supervise it")
   .option("--dir <dir>", "directory to run in (its .cafe defines identity)", process.cwd())
   .option("--agent <name>", "pi (default), omp (oh-my-pi), codex (codex app-server) or claude (claude -p)")
   .option("--write", "codex / claude only: allow editing files in --dir (default: read-only)")
@@ -470,9 +684,13 @@ barista
   });
 barista
   .command("stop")
-  .option("--dir <dir>", "", process.cwd())
+  .description("stop the Baristas supervised for one directory")
+  .option("--dir <dir>", "directory whose Baristas should stop", process.cwd())
   .action(async (o) => out("stopped", await api(`/api/baristas?dir=${encodeURIComponent(resolve(o.dir))}`, { method: "DELETE" })));
-barista.command("list").action(async () => {
+barista
+  .command("list")
+  .description("list the Baristas this daemon supervises")
+  .action(async () => {
   const ws = await api<any[]>("/api/baristas");
   out(ws.map((w) => `${w.running ? "running" : "waiting"} ${String(w.agent ?? "pi").padEnd(6)} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n") || "(none)", ws);
 });
@@ -641,10 +859,87 @@ program
   .description("print the path of the cafe pi extension (for `pi -e` / `omp -e` or the extensions list)")
   .action(() => out(defaultExtensionPath(), { path: defaultExtensionPath() }));
 
+const extension = program.command("extension").description("install the cafe extension so new pi / omp sessions load it automatically");
+extension
+  .command("install")
+  .description("add the extension to pi's settings and link it with omp")
+  .option("--agent <name>", "pi, omp or all", "all")
+  .option("--dry-run", "print what would change without writing")
+  .option("--force", "reinstall / relink")
+  .action((o) => {
+    if (!["pi", "omp", "all"].includes(o.agent)) throw new Error("--agent must be pi, omp or all");
+    const source = defaultExtensionPath();
+    const chosen = (o.agent === "all" ? ["pi", "omp"] : [o.agent]) as ("pi" | "omp")[];
+    const results: string[] = [];
+    for (const agent of chosen) {
+      if (agent === "pi") {
+        const r = installPiExtension(homedir(), source, { dryRun: o.dryRun });
+        results.push(`pi: ${r.alreadyInstalled ? "already installed" : o.dryRun ? `would add ${resolve(source)} to ${r.settingsPath}` : `added ${resolve(source)} to ${r.settingsPath}`}`);
+      } else {
+        const target = extensionPackageDir(source) ?? source;
+        const cmd = ompExtensionCommand("install", target, { dryRun: o.dryRun, force: o.force });
+        if (o.dryRun) {
+          results.push(`omp: would run ${cmd.join(" ")}`);
+          continue;
+        }
+        const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
+        results.push(`omp: ${r.error ? "omp not found on PATH" : r.status === 0 ? "installed" : `failed: ${(r.stderr || r.stdout).trim().split("\n").at(-1)}`}`);
+      }
+    }
+    out(results.join("\n"), results);
+  });
+extension
+  .command("status")
+  .description("show whether pi / omp load the cafe extension")
+  .action(() => {
+    const source = defaultExtensionPath();
+    const pi = piExtensionState(homedir(), source);
+    const omp = ompExtensionState(source);
+    const lines = [
+      `pi:  ${pi.installed ? "installed" : "not installed"} (${pi.settingsPath})`,
+      `omp: ${omp.available ? (omp.installed ? "installed" : "not installed") : omp.detail}`,
+    ];
+    out(lines.join("\n"), { source, pi, omp });
+  });
+extension
+  .command("uninstall")
+  .description("remove the extension from pi's settings and unlink it from omp")
+  .option("--agent <name>", "pi, omp or all", "all")
+  .action((o) => {
+    if (!["pi", "omp", "all"].includes(o.agent)) throw new Error("--agent must be pi, omp or all");
+    const source = defaultExtensionPath();
+    const chosen = (o.agent === "all" ? ["pi", "omp"] : [o.agent]) as ("pi" | "omp")[];
+    const results: string[] = [];
+    for (const agent of chosen) {
+      if (agent === "pi") {
+        const r = removePiExtension(homedir(), source);
+        results.push(`pi: ${r.changed ? `removed from ${r.settingsPath}` : "not installed"}`);
+      } else {
+        const target = extensionPackageDir(source) ?? source;
+        const cmd = ompExtensionCommand("uninstall", target, {});
+        const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
+        results.push(`omp: ${r.error ? "omp not found on PATH" : r.status === 0 ? "uninstalled" : `failed: ${(r.stderr || r.stdout).trim().split("\n").at(-1)}`}`);
+      }
+    }
+    out(results.join("\n"), results);
+  });
+
+program
+  .command("doctor")
+  .description("check daemon, identity, extension, skill and root; print the next command")
+  .action(async () => {
+    const res = await runDoctor({ base: base(), home: cafeHome(), cwd: process.cwd(), token: process.env.CAFE_TOKEN });
+    const lines = res.checks.map((c) => `${c.level.padEnd(4)} ${c.name.padEnd(9)} ${c.detail}${c.next ? `\n     next: ${c.next}` : ""}`);
+    if (res.ok) lines.push("all checks passed");
+    out(lines.join("\n"), { ok: res.ok, checks: res.checks });
+    if (!res.ok) process.exitCode = 1;
+  });
+
 program
   .command("skill")
-  .description("install the cafe skill for Claude Code / Codex / pi")
+  .description("manage the cafe skill for Claude Code / Codex / pi")
   .command("install")
+  .description("symlink it into ~/.claude/skills/cafe and ~/.agents/skills/cafe")
   .action(() => {
     // Published package: dist/cli.js with ../skills/cafe; repo: packages/cli/src → ../../../skills/cafe.
     const src = [resolve(here, "../skills/cafe"), resolve(here, "../../../skills/cafe")].find((d) => existsSync(join(d, "SKILL.md")))!;
@@ -672,6 +967,18 @@ function lstatSafe(p: string) {
   } catch {
     return undefined;
   }
+}
+
+// Commander falls back to the top-level help (exit 0) for `cafe <typo> --help`.
+// Check the first positional ourselves so a misspelt command always fails.
+const commandNames = new Set(program.commands.map((c) => c.name()));
+for (const arg of process.argv.slice(2)) {
+  if (["--json", "-V", "--version", "-h", "--help"].includes(arg) || arg.startsWith("-")) continue;
+  if (arg !== "help" && !commandNames.has(arg)) {
+    console.error(`cafe: unknown command '${arg}'`);
+    process.exit(1);
+  }
+  break;
 }
 
 program.parseAsync().catch((err) => {

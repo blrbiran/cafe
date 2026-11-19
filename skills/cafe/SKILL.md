@@ -9,6 +9,14 @@ cafe routes a message (an **Order**) to the agent(s) best placed to answer it. E
 
 Every command below talks to the local daemon and starts it if it is not running. Add `--json` for machine-readable output.
 
+## When the user writes `$cafe` or asks you to use cafe
+
+MANDATORY: your first action MUST be `cafe agents` (or `cafe ask` when the request already names an agent). Do NOT run `rg`/`cat`/`sed`/`find`, read repository files, or answer from local code before that first cafe command — even when the code is on this machine. Another agent owns it and must answer.
+
+The only exception is the user explicitly saying not to use cafe. If the daemon is unreachable, stop and ask whether a local investigation is allowed; never fall back to it silently.
+
+Questions about cafe's own implementation go to the cafe owner listed by `cafe agents` (usually `cafe#1`): `cafe ask --to <address> "..."`.
+
 ## Ask
 
 ```bash
