@@ -107,20 +107,20 @@ Done and approved earlier: v2 defaults; Q60–Q70; omp real Q&A; `cafe daemon in
 
 Done on 2026-11-19 with the user: v3-1 reviewed (the extra `cafe_cancel` MCP tool approved); both paid Bridge runs done and passed (section 3); `cafe mcp install` run by the user and checked. **v3-2** (`docs/specs/v3-2-agent-kind.md`, Q81–Q83, prototype https://claude.ai/artifact/X3F3dx2PtBQf3R5HwsiRL5): kind tags on Agent cards and in conversations, `cafe agents` shows `codex·rw`, `claude·tui`, …; fixes the old "后台 pi" label. The user published **0.1.2** (`latest` on npm; commit + tag `v0.1.2`). The daemon was restarted by the agent and reports 0.1.2. The dogfooding batch below was reviewed and the user published **0.1.3** (commit + tag `v0.1.3`); the daemon reports 0.1.3. README is now English with a Chinese `README_zh.md`, linked from both; the release package ships both.
 
-Done on 2026-11-19 while the user was away (asked to finish phase 2), **to review**: **v3-1 phase 2** (Q84–Q88 as recommended; ADR-0006; spec section "第二阶段"):
-1. Claude Code: `claude-plugin/` (mod) + `cafe session-host` + `cafe claude install|uninstall`. Verified free with a real Claude Code TUI and a fake API (section 3).
+Done on 2026-11-19 while the user was away (asked to finish phase 2), **reviewed and shipped in 0.1.3**: **v3-1 phase 2** (Q84–Q88 as recommended; ADR-0006; spec section "第二阶段"):
+1. Claude Code: `claude-plugin/` (mod) + `cafe session-host` + `cafe claude install|uninstall`. Verified free with a real Claude Code TUI and a fake API (section 3). The user has run `cafe claude install`.
 2. Codex: `cafe barista start --dir <dir> --agent codex --tui [--thread <id>]`. Verified free with a real Codex TUI and a mock model.
 3. Findings worth knowing: after Esc in the terminal, both Claude (mod prompts refused) and Codex (queue dispatch paused) take no cafe questions until the person sends a message; a Codex turn that has started cannot be interrupted from outside, so cancel only withdraws queued questions; the user's cmux `codex` wrapper forces the TUI's embedded app-server, which the design handles (no shared daemon needed).
-4. Commits: `feat: running Claude Code sessions as Baristas …`, `feat: a running Codex session as a Barista …`, and this handoff.
+4. Commits: `feat: running Claude Code sessions as Baristas …`, `feat: a running Codex session as a Barista …`, and the handoff.
 
 Waiting on the user:
-1. ~~Publish 0.1.3~~ — done (see above). Next release after the Web workbench / remaining backlog.
-2. **Install the Claude Code plugin**: `cafe claude install --dry-run`, then `cafe claude install` (changes `~/.claude` plugin settings; the agent did not run it). Then open sessions need `/reload-plugins`, new ones join automatically. Note: this repo has a `.cafe`, so Claude Code sessions opened here will answer cafe questions (`/cafe off` to pause).
-3. **Approve two paid real-model runs** (Q88): a running Claude Code session and a running Codex session (`cafe barista start --dir <dir> --agent codex --tui` next to a `codex` in that dir), each: answer, follow-up, cancel.
-4. **Real two-machine test** (section 6), later.
-5. Suggest `pi update` (local pi 1.5.0, extension targets 1.5.2). Reinstall autostart (`cafe daemon install`), `cafe mcp install` and `cafe claude install` after changing Node version or moving the repo (all register absolute node + cafe.js paths).
+1. **Run the two approved paid real-model runs** (Q88, approved but not yet executed): a running Claude Code session and a running Codex session (`cafe barista start --dir <dir> --agent codex --tui` next to a `codex` in that dir), each: answer, follow-up, cancel. Every new paid run still needs its own approval.
+2. **Web workbench prototype** (#18/#22/#23/#24/#26/#30): needs a claude.ai login (Artifact is refused under `ANTHROPIC_AUTH_TOKEN`). Prototype first, get approval, then implement; #35's card line-clamp rides along.
+3. Optionally run `cafe extension install` on the user's machine (pi/omp currently have no persistent cafe extension; `cafe extension status` shows both missing). It writes `~/.pi/agent/settings.json` and links omp — ask first.
+4. `pi update` (local pi 1.5.0, extension targets 1.5.2). Reinstall autostart (`cafe daemon install`), `cafe mcp install` and `cafe claude install` after changing Node version or moving the repo (all register absolute node + cafe.js paths).
+5. Nothing is pushed; the user pushes when they want.
 
-Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, rest as recommended), **to review**:
+Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, rest as recommended), **reviewed, committed and shipped in 0.1.3** (four commits: daemon/protocol, CLI onboarding, web perf, docs; then a bilingual-README commit):
 - Correctness/UX: `.cafe` directories are skipped (no more `EISDIR` from `~/.cafe`), broken `.cafe` errors name the file/field and show a template; pi extension reports why it is unavailable; CLI does not repeat `EISDIR`; `config get` prints `(not set)` / fails unknown keys; thread summaries cut at word boundaries with `…` and follow the latest turn; skill text now has a mandatory `$cafe` workflow.
 - First use: `cafe init`, corrected help with Quick start (unknown commands fail even with `--help`), `cafe extension install|status|uninstall`, `cafe doctor`, rewritten README.
 - Routing: `initRouter` can switch model and clear to rules; unknown models roll back; timeout/single-candidate/concurrency; ResourceLoader reused; `cafe router models|set|status|apply`; `daemon status` shows the running model.
@@ -130,6 +130,8 @@ Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, 
 - No Web layout redesign yet: the artifact tool refused this session (authenticated with `ANTHROPIC_AUTH_TOKEN`), and UI changes still need an approved prototype (#18/#22/#23/#24/#30).
 
 ## 6. Two-machine test (the user runs this)
+
+A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker child); it produced dogfooding #25/#29, both fixed in 0.1.3. Re-run this checklist after the fixes when convenient.
 
 1. **Root A**: `cafe daemon start --root`; `cafe config get token`; port 4777 reachable on the LAN/tailnet.
 2. **B**: `npm i -g @blrbiran/cafe` (same version as A; or clone + `npm install && npm run build:web`); `cafe config set token <A's token>`; then either `cafe root set <A-ip>:4777` or, on the same LAN, just `cafe daemon start` and check `cafe root discover` / the log line `discovered root`.
@@ -200,8 +202,10 @@ Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, 
 
 ## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q97**; nothing open).
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q100**; nothing open).
 - New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
 - Commit when asked (or at the end of an away batch they asked to hand off), with a stat or diff shown first; messages end with the Co-Authored-By line.
 - Restart their daemon yourself after daemon / web changes (section 8). Publishing to npm and changing their Claude / Codex config stay with them.
 - UI prototypes are Claude artifacts: v1 https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK, routing-history display https://claude.ai/artifact/JJit3GCxiQZUypYVWZFxFg (approved: Q51–Q53 as recommended), older threads + search https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ (approved: Q67–Q68 as recommended), versions https://claude.ai/artifact/SVLEJhirFrxq7ugMipjeiZ (Q71 A, implemented), agent kinds https://claude.ai/artifact/X3F3dx2PtBQf3R5HwsiRL5 (Q81–Q83 as recommended, implemented).
+
+**Suggested skills for the next agent** (call via the Skill tool): `superpowers:brainstorming` before designing the Web workbench; `artifact-design` when building its prototype (needs a claude.ai login); `superpowers:writing-plans` / `superpowers:executing-plans` for the remaining backlog; `superpowers:test-driven-development` for every fix; `superpowers:systematic-debugging` for the paid phase-2 runs and any flake; the `cafe` skill when debugging the network itself.
