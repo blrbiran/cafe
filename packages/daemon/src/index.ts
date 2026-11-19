@@ -8,9 +8,9 @@ import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress } from "./daemon.ts";
 
 export { Daemon, lanAddress, type DaemonOptions, type Timing } from "./daemon.ts";
-export { CafeConfig, cafeHome, configPath, loadConfig, saveConfig, setConfigValue } from "./config.ts";
+export { CafeConfig, CONFIG_KEYS, cafeHome, configPath, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
-export { LlmRouter, RulesRouter, type CompleteFn, type Router } from "./router.ts";
+export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";
 export { Store } from "./store.ts";
 export { discoverRoots, type FoundRoot } from "./discovery.ts";
@@ -58,6 +58,7 @@ export interface RunOptions {
   root?: string;
   webDist?: string;
   router?: DaemonOptions["router"];
+  routerFactory?: DaemonOptions["routerFactory"];
   timing?: DaemonOptions["timing"];
   log?: (m: string) => void;
   /** Skip the single-instance lock (tests run several daemons with distinct homes anyway). */
@@ -82,7 +83,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   if (opts.root) config.root = opts.root;
   const release = opts.noLock ? () => {} : acquireLock(home);
   if (!release) throw new Error(`another cafe daemon is already running for ${home}`);
-  const daemon = new Daemon({ config, home, router: opts.router, timing: opts.timing, log: opts.log, version: opts.version });
+  const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, timing: opts.timing, log: opts.log, version: opts.version });
   await daemon.initRouter();
   let server: ServerHandle;
   try {

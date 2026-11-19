@@ -355,6 +355,28 @@ describe("pi extension", () => {
   });
 });
 
+describe("pi extension startup failure", () => {
+  it("reports a broken .cafe and does not claim the network is reachable", async () => {
+    const bad = mkdtempSync(join(tmpdir(), "cafe-ext-bad-"));
+    cleanup.push(() => rmSync(bad, { recursive: true, force: true }));
+    writeFileSync(join(bad, ".cafe"), "name: [unclosed\n");
+    process.env.CAFE_DAEMON = "127.0.0.1:9"; // never consulted: identity loading fails first
+    const pi = fakePi();
+    cafe(pi.api as any);
+
+    await expect(pi.fire("session_start", { type: "session_start", reason: "startup" }, bad)).resolves.toBeUndefined();
+    expect(pi.statuses.at(-1)).toMatch(/not connected/i);
+    expect(pi.notices.join("\n")).toMatch(/\.cafe/);
+
+    const event = { type: "before_agent_start", systemPromptOptions: { sections: {} as Record<string, string> } };
+    await pi.fire("before_agent_start", event, bad);
+    expect(event.systemPromptOptions.sections.cafe).toMatch(/unavailable/i);
+    expect(event.systemPromptOptions.sections.cafe).not.toContain("You can reach the cafe agent network");
+
+    await expect(pi.tools.get("cafe_agents").execute("t", {})).rejects.toThrow(/not connected[\s\S]*cafe init/);
+  });
+});
+
 describe("pi extension under oh-my-pi", () => {
   it("ends a run on the agent_end that will not continue, and extends a string[] system prompt", async () => {
     process.env.CAFE_HOST_AGENT = "omp";

@@ -194,6 +194,8 @@ export default function cafe(pi: ExtensionAPI) {
   let client: CafeClient | undefined;
   let ctxRef: ExtensionContext | undefined;
   let role: "barista" | "customer" = "customer";
+  /** Why cafe is unavailable in this session (bad .cafe, unreachable daemon); cleared on startup. */
+  let startupError: string | undefined;
   /** Received Orders waiting their turn; acked and heartbeating from arrival. */
   const queue: Array<{ handle: OrderHandle; stopHeartbeat: () => void }> = [];
   let current: Working | undefined;
@@ -342,41 +344,56 @@ export default function cafe(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctxRef = ctx;
+    startupError = undefined;
     if (client) return;
-    const { cafe: id } = loadIdentity(ctx.cwd);
-    role = id.role;
-    const addr = daemonAddr();
-    if (!(await ensureDaemon(addr))) {
-      setUiStatus("☕ cafe: daemon unreachable");
-      return;
-    }
-    const c = new CafeClient({ daemon: addr, token: process.env.CAFE_TOKEN, reconnect: true });
-    c.onOrder((h) => {
-      if (known.has(h.order.orderId)) return;
-      known.add(h.order.orderId);
-      // Ack on receipt (delivery confirmation) and heartbeat while queued, so an Order
-      // waiting behind long work is not failed by the daemon's ack/heartbeat timers.
-      void persist(() => h.ack(), 3).catch(() => {});
-      queue.push({ handle: h, stopHeartbeat: keepAlive(h, heartbeatMs()) });
-      void drain();
-    });
-    c.onThreadEvent(onThreadEvent);
-    c.onCancel(onCancelled);
-    c.onConnect((rec) => {
-      setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");
-      void refreshRegistry(c);
-    });
     try {
-      await c.connect({ ...id, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
-      client = c;
+      const { cafe: id } = loadIdentity(ctx.cwd);
+      role = id.role;
+      const addr = daemonAddr();
+      if (!(await ensureDaemon(addr))) {
+        startupError = "daemon unreachable";
+        setUiStatus("☕ cafe: daemon unreachable");
+        return;
+      }
+      const c = new CafeClient({ daemon: addr, token: process.env.CAFE_TOKEN, reconnect: true });
+      c.onOrder((h) => {
+        if (known.has(h.order.orderId)) return;
+        known.add(h.order.orderId);
+        // Ack on receipt (delivery confirmation) and heartbeat while queued, so an Order
+        // waiting behind long work is not failed by the daemon's ack/heartbeat timers.
+        void persist(() => h.ack(), 3).catch(() => {});
+        queue.push({ handle: h, stopHeartbeat: keepAlive(h, heartbeatMs()) });
+        void drain();
+      });
+      c.onThreadEvent(onThreadEvent);
+      c.onCancel(onCancelled);
+      c.onConnect((rec) => {
+        setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");
+        void refreshRegistry(c);
+      });
+      try {
+        await c.connect({ ...id, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
+        client = c;
+      } catch (err) {
+        startupError = `cannot connect to the cafe daemon at ${addr}: ${(err as Error).message}`;
+        setUiStatus(`☕ cafe: ${(err as Error).message}`);
+      }
     } catch (err) {
-      setUiStatus(`☕ cafe: ${(err as Error).message}`);
+      // A broken .cafe must be visible: pi itself only prints a generic "Extension error".
+      startupError = (err as Error).message;
+      setUiStatus(`☕ cafe: not connected (${startupError})`);
+      try {
+        ctx.ui.notify(`cafe is unavailable: ${startupError}`, "warning");
+      } catch {
+        // best effort
+      }
     }
   });
 
   pi.on("session_shutdown", async () => {
     const c = client;
     client = undefined;
+    startupError = undefined;
     if (current) {
       const w = current;
       release(w);
@@ -435,10 +452,17 @@ export default function cafe(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     const rec = client?.record;
-    const lines = [
-      rec ? `You are connected to the cafe agent network as ${rec.address} (role: ${role}).` : "You can reach the cafe agent network.",
-      "Other agents on the network may know things you don't. Use cafe_agents to see who is registered and cafe_ask to send them a question (non-blocking by default; replies arrive as cafe-reply messages; pass threadId to follow up with whoever answered).",
-    ];
+    const connectedLine = rec
+      ? `You are connected to the cafe agent network as ${rec.address} (role: ${role}).`
+      : startupError
+        ? `cafe is unavailable in this session: ${startupError}. Do not claim to reach the cafe network; tell the user and suggest fixing .cafe (run \`cafe init\`) or the daemon first.`
+        : "You can reach the cafe agent network.";
+    const lines = [connectedLine];
+    if (!startupError) {
+      lines.push(
+        "Other agents on the network may know things you don't. Use cafe_agents to see who is registered and cafe_ask to send them a question (non-blocking by default; replies arrive as cafe-reply messages; pass threadId to follow up with whoever answered).",
+      );
+    }
     if (role === "barista") lines.push("Messages of type cafe-order are questions from other agents: answer them, or call cafe_decline if they are not your responsibility.");
     // pi exposes named sections; oh-my-pi passes the prompt as a string[] to extend.
     const ev = event as unknown as { systemPromptOptions?: { sections: Record<string, string> }; systemPrompt?: string[] };
@@ -469,7 +493,13 @@ export default function cafe(pi: ExtensionAPI) {
 
   const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
   const requireClient = (): CafeClient => {
-    if (!client?.connected) throw new Error("not connected to the cafe daemon");
+    if (!client?.connected) {
+      throw new Error(
+        startupError
+          ? `cafe is not connected: ${startupError}. Next: run \`cafe init\` in this directory (or check ~/.cafe/config.yml), then restart pi.`
+          : "not connected to the cafe daemon",
+      );
+    }
     return client;
   };
 

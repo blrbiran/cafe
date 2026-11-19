@@ -58,11 +58,21 @@ export const AgentRecord = AgentIdentity.extend({
   status: AgentStatus,
   registeredAt: z.number(),
   lastSeenAt: z.number(),
+  /** User-visible name (defaults to `name`); changing it does not change the Address. */
+  displayName: z.string().optional(),
+  /** Previous names/aliases that still resolve to this Agent. */
+  aliases: z.array(z.string()).default([]),
 });
 export type AgentRecord = z.infer<typeof AgentRecord>;
 
 export const DaemonRecord = z.object({
   host: z.string(),
+  /** Stable internal id; `host` is the original slug. Absent on older Daemons. */
+  hostId: z.string().optional(),
+  /** User-visible name (defaults to `host`). Renaming it does not change routing keys. */
+  displayName: z.string().optional(),
+  /** Previous names that still identify this Host in addresses. */
+  aliases: z.array(z.string()).default([]),
   url: z.string(),
   isRoot: z.boolean(),
   online: z.boolean(),
@@ -178,6 +188,8 @@ export const ThreadMeta = z.object({
   mode: DeliveryMode.optional(),
   status: ThreadStatus,
   summary: z.string(),
+  /** Turn (question) the summary shows; follow-ups update it. */
+  summaryTurn: z.number().int().default(1),
   createdAt: z.number(),
   firstReplyAt: z.number().optional(),
   closedAt: z.number().optional(),
@@ -219,6 +231,9 @@ export const InitializeParams = z.object({
   token: z.string().optional(),
   /** For kind=daemon: the connecting Daemon's host and reachable URL. */
   host: z.string().optional(),
+  /** Display name and aliases of the connecting Daemon (rename does not change `host`). */
+  displayName: z.string().optional(),
+  aliases: z.array(z.string()).optional(),
   url: z.string().optional(),
   registryVersion: z.number().int().optional(),
   /** cafe release of the connecting side, for mismatch messages and the Network view. */
@@ -266,6 +281,10 @@ export const Methods = {
   /** A→D: the external session (Codex thread, Claude session) a bridged Barista uses for a cafe Thread. */
   agentSessionGet: "agent/session/get",
   agentSessionSet: "agent/session/set",
+  /** Root → owning Daemon: change an Agent's display name (Address stays stable). */
+  agentRename: "agent/rename",
+  /** Child → Root: this Host's display name / aliases changed. */
+  hostIdentity: "host/identity",
   orderCreate: "order/create",
   orderDeliver: "order/deliver",
   /** D→A: an Order you were working on was cancelled by its Customer. */

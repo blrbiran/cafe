@@ -135,7 +135,7 @@ describe("llm router fallback", () => {
     const r = new LlmRouter(async () => {
       throw new Error("model down");
     });
-    const d = await r.decide({ order: order("css bug"), candidates: [rec("a", { description: "css" })] });
+    const d = await r.decide({ order: order("css bug"), candidates: [rec("a", { description: "css" }), rec("b", { description: "sql" })] });
     expect(d.router).toBe("rules");
     expect(d.llmError).toBe("model down");
   });

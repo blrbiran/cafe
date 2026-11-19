@@ -84,7 +84,9 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
     const path = url.pathname;
     try {
       if (path.startsWith("/api/")) {
-        if (!isLoopback(req) && tokenOf(req, url) !== daemon.config.token) return send(res, 401, { error: "unauthorized" });
+        if (!isLoopback(req) && tokenOf(req, url) !== daemon.config.token) {
+          return send(res, 401, { error: "unauthorized", message: "token mismatch or wrong Root address; compare `cafe config get token` on both hosts" });
+        }
         return await api(daemon, req, res, url);
       }
       const key = path === "/" ? "index.html" : path.slice(1);
@@ -133,9 +135,26 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
 
-  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version });
+  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, ...daemon.routerStatus() });
   if (m === "GET" && path === "/api/snapshot") return send(res, 200, daemon.snapshot());
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
+  if (m === "POST" && path === "/api/host") {
+    const { displayName, aliases } = await readJson(req);
+    if (displayName !== undefined && (typeof displayName !== "string" || !displayName.trim())) throw new RpcError("bad_request", "displayName must be a non-empty string");
+    return send(res, 200, daemon.setHostIdentity(typeof displayName === "string" ? displayName.trim() : undefined, Array.isArray(aliases) ? aliases.filter((a: unknown): a is string => typeof a === "string" && !!a) : []));
+  }
+  if (m === "POST" && path === "/api/hosts/rename") {
+    const { host, displayName } = await readJson(req);
+    if (typeof host !== "string" || typeof displayName !== "string" || !displayName.trim()) throw new RpcError("bad_request", "host and displayName are required");
+    return send(res, 200, daemon.renameHost(host, displayName.trim()));
+  }
+  if (m === "POST" && path === "/api/agents/rename") {
+    const { address, displayName, alias } = await readJson(req);
+    if (typeof address !== "string" || !address) throw new RpcError("bad_request", "address is required");
+    if (typeof displayName === "string" && displayName.trim()) return send(res, 200, await daemon.renameAgentAny(address, displayName.trim()));
+    if (typeof alias === "string" && alias.trim()) return send(res, 200, await daemon.aliasAgentAny(address, alias.trim()));
+    throw new RpcError("bad_request", "displayName or alias is required");
+  }
   if (m === "GET" && path === "/api/agents/stats") {
     const since = Number(url.searchParams.get("since") ?? Date.now() - 24 * 3600_000);
     return send(res, 200, daemon.store.agentStats(since));
@@ -197,9 +216,9 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "POST" && path === "/api/reload") {
     const fresh = loadConfig(daemon.store.home);
     daemon.config.router = fresh.router;
-    await daemon.initRouter();
+    const applied = await daemon.initRouter();
     if (!daemon.isRoot && fresh.root && fresh.root !== daemon.config.root) daemon.setRoot(fresh.root);
-    return send(res, 200, { ok: true });
+    return send(res, 200, applied);
   }
   if (m === "POST" && path === "/api/shutdown") {
     send(res, 200, { ok: true });

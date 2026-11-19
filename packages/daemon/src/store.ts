@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
@@ -74,6 +74,45 @@ export class Store {
           return [];
         }
       });
+  }
+
+  /** The last `limit` events, read from the end so a long Thread is not parsed whole. */
+  readEventsTail(file: string, limit: number): ThreadEnvelope[] {
+    if (!existsSync(file) || limit <= 0) return [];
+    const fd = openSync(file, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const chunk = 64 * 1024;
+      let pos = size;
+      let buf = Buffer.alloc(0);
+      let newlines = 0;
+      while (pos > 0 && newlines <= limit) {
+        const len = Math.min(chunk, pos);
+        pos -= len;
+        const b = Buffer.alloc(len);
+        readSync(fd, b, 0, len, pos);
+        buf = Buffer.concat([b, buf]);
+        newlines = 0;
+        for (const byte of buf) if (byte === 10) newlines++;
+      }
+      const lines = buf.toString("utf8").split("\n").filter(Boolean);
+      return lines.slice(-limit).flatMap((line) => {
+        try {
+          return [JSON.parse(line) as ThreadEnvelope];
+        } catch {
+          return [];
+        }
+      });
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+
+  /** Unfinished threads (recovery after a restart). Finished ones are never read back. */
+  openThreads(limit = 1000): ThreadMeta[] {
+    const rows = this.db.prepare("SELECT meta FROM threads WHERE status NOT IN ('done','failed','cancelled') ORDER BY created_at DESC LIMIT ?").all(limit) as { meta: string }[];
+    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 
   putThread(meta: ThreadMeta): void {
@@ -162,8 +201,11 @@ export class Store {
   saveRegistry(version: number, records: AgentRecord[]): void {
     this.db.exec("BEGIN");
     try {
-      this.db.exec("DELETE FROM registry");
-      const ins = this.db.prepare("INSERT INTO registry(agent_id, record) VALUES (?, ?)");
+      const keep = new Set(records.map((r) => r.agentId));
+      const existing = (this.db.prepare("SELECT agent_id FROM registry").all() as { agent_id: string }[]).map((r) => r.agent_id);
+      const del = this.db.prepare("DELETE FROM registry WHERE agent_id = ?");
+      for (const id of existing) if (!keep.has(id)) del.run(id);
+      const ins = this.db.prepare("INSERT INTO registry(agent_id, record) VALUES (?, ?) ON CONFLICT(agent_id) DO UPDATE SET record=excluded.record");
       for (const r of records) ins.run(r.agentId, JSON.stringify(r));
       this.db.prepare("INSERT INTO kv(key, value) VALUES ('registryVersion', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(version));
       this.db.exec("COMMIT");

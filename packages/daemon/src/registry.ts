@@ -64,8 +64,9 @@ export class Registry extends EventEmitter<{ delta: [RegistryDelta] }> {
   resolve(address: string): string[] {
     const a = parseAddress(address);
     if (!a) return this.agents.has(address) ? [address] : [];
+    const named = (r: AgentRecord) => r.name === a.name || r.displayName === a.name || r.aliases.includes(a.name);
     return this.all()
-      .filter((r) => r.name === a.name && (a.host === undefined || r.host === a.host))
+      .filter((r) => named(r) && (a.host === undefined || r.host === a.host))
       .filter((r) => a.n === undefined || parseAddress(r.address)?.n === a.n)
       .map((r) => r.agentId);
   }

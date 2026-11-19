@@ -67,7 +67,44 @@ export class RulesRouter implements Router {
   }
 }
 
-export type CompleteFn = (system: string, prompt: string) => Promise<string>;
+export type CompleteFn = (system: string, prompt: string, signal?: AbortSignal) => Promise<string>;
+
+/** Hands out at most `limit` slots; waiters are served in order. */
+class Gate {
+  private active = 0;
+  private waiters: Array<() => void> = [];
+  private limit: number;
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (this.active < this.limit) {
+      this.active++;
+      return () => this.release();
+    }
+    await new Promise<void>((resolve, reject) => {
+      const wake = () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        const i = this.waiters.indexOf(wake);
+        if (i >= 0) this.waiters.splice(i, 1);
+        reject(new Error("llm timeout while waiting for a slot"));
+      };
+      this.waiters.push(wake);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    return () => this.release();
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) next(); // hand the slot over without dropping the count
+    else this.active--;
+  }
+}
 
 const SYSTEM_PROMPT = `You are the router of "cafe", a network of AI agents.
 Given an Order (a question or task) and a list of Baristas (agents that can answer, each with a description and scope),
@@ -86,15 +123,22 @@ export class LlmRouter implements Router {
   readonly name = "llm" as const;
   private complete: CompleteFn;
   private fallback: Router;
+  private timeoutMs: number;
+  private gate: Gate;
 
-  constructor(complete: CompleteFn, fallback: Router = new RulesRouter()) {
+  constructor(complete: CompleteFn, fallback: Router = new RulesRouter(), opts: { timeoutMs?: number; concurrency?: number } = {}) {
     this.complete = complete;
     this.fallback = fallback;
+    this.timeoutMs = opts.timeoutMs ?? 10_000;
+    this.gate = new Gate(opts.concurrency ?? 2);
   }
 
   async decide(input: RouteInput): Promise<RoutingDecision> {
     const { order, candidates, hints } = input;
     if (candidates.length === 0) return this.fallback.decide(input);
+    if (candidates.length === 1) {
+      return { targets: [candidates[0]!.agentId], mode: "unicast", reason: "only eligible barista (no model call)", router: "llm", candidates: [] };
+    }
     const body = tokenize(order.body);
     const list = candidates
       .map((c) => {
@@ -104,8 +148,15 @@ export class LlmRouter implements Router {
       })
       .join("\n");
     const prompt = `Order from ${order.from.address}:\n"""\n${order.body}\n"""\n\nBaristas:\n${list}`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    const timeout = new Promise<never>((_, reject) => {
+      ctrl.signal.addEventListener("abort", () => reject(new Error(`llm timeout after ${this.timeoutMs}ms`)), { once: true });
+    });
+    let release: (() => void) | undefined;
     try {
-      const text = await this.complete(SYSTEM_PROMPT, prompt);
+      release = await this.gate.acquire(ctrl.signal);
+      const text = await Promise.race([this.complete(SYSTEM_PROMPT, prompt, ctrl.signal), timeout]);
       const json = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
       const valid = new Set(candidates.map((c) => c.agentId));
       const targets: string[] = (json.targets ?? []).filter((t: string) => valid.has(t));
@@ -119,8 +170,12 @@ export class LlmRouter implements Router {
         candidates: (json.candidates ?? []).filter((t: string) => valid.has(t) && !targets.includes(t)),
       };
     } catch (err) {
+      const message = ctrl.signal.aborted ? `llm timeout after ${this.timeoutMs}ms` : (err as Error).message;
       const d = await this.fallback.decide(input);
-      return { ...d, reason: `${d.reason} (llm failed: ${(err as Error).message})`, llmError: (err as Error).message };
+      return { ...d, reason: `${d.reason} (llm failed: ${message})`, llmError: message };
+    } finally {
+      clearTimeout(timer);
+      release?.();
     }
   }
 }
@@ -136,17 +191,18 @@ export async function piComplete(model: string): Promise<CompleteFn> {
   const runtime = await pi.ModelRuntime.create();
   const m = runtime.getModel(provider, modelId);
   if (!m) throw new Error(`unknown model ${model}`);
-  return async (system, prompt) => {
-    const loader = new pi.DefaultResourceLoader({
-      cwd: process.cwd(),
-      agentDir: pi.getAgentDir(),
-      systemPromptOverride: () => system,
-      appendSystemPromptOverride: () => [],
-      noExtensions: true,
-      noSkills: true,
-      noContextFiles: true,
-    });
-    await loader.reload();
+  // The loader (skills/context scanning) is the expensive part; keep it for every Order.
+  const loader = new pi.DefaultResourceLoader({
+    cwd: process.cwd(),
+    agentDir: pi.getAgentDir(),
+    systemPromptOverride: () => SYSTEM_PROMPT,
+    appendSystemPromptOverride: () => [],
+    noExtensions: true,
+    noSkills: true,
+    noContextFiles: true,
+  });
+  await loader.reload();
+  return async (_system, prompt, signal) => {
     const { session } = await pi.createAgentSession({
       model: m,
       modelRuntime: runtime,
@@ -155,11 +211,30 @@ export async function piComplete(model: string): Promise<CompleteFn> {
       sessionManager: pi.SessionManager.inMemory(),
       noTools: "all",
     });
+    const onAbort = () => void session.abort().catch(() => {});
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const aborted = new Promise<never>((_, reject) => {
+      if (signal?.aborted) reject(new Error("aborted"));
+      signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    });
     try {
-      await session.prompt(prompt);
+      await Promise.race([session.prompt(prompt), aborted]);
       return session.getLastAssistantText() ?? "";
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       session.dispose();
     }
   };
+}
+
+/** Every `provider/model` the pi runtime knows, for `cafe router models`. */
+export async function listRouterModels(search?: string): Promise<string[]> {
+  const pi: any = await import("@earendil-works/pi-coding-agent" as string);
+  const runtime = await pi.ModelRuntime.create();
+  const q = search?.toLowerCase();
+  return runtime
+    .getModels()
+    .map((m: any) => `${m.provider}/${m.id}`)
+    .filter((id: string) => !q || id.toLowerCase().includes(q))
+    .sort();
 }

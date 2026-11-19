@@ -10,7 +10,7 @@ import { computeHints, identityOf, orderKeywords, type OutcomeRow } from "../pac
  */
 
 function rec(name: string, tags: string[], description: string): AgentRecord {
-  return { agentId: `id-${name}`, address: `${name}#1@h`, host: "h", name, tags, description, scope: [], role: "barista", concurrency: 1, mode: "headless", cwd: "/tmp", status: "idle", registeredAt: 0, lastSeenAt: 0 };
+  return { agentId: `id-${name}`, address: `${name}#1@h`, host: "h", name, tags, description, scope: [], role: "barista", concurrency: 1, mode: "headless", cwd: "/tmp", status: "idle", registeredAt: 0, lastSeenAt: 0, aliases: [] };
 }
 
 const BARISTAS = [

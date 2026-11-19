@@ -16,6 +16,7 @@ import {
   PROTOCOL_VERSION,
   RegistryDelta,
   formatAddress,
+  parseAddress,
   type AgentRecord,
   type AgentStatus,
   type DaemonRecord,
@@ -33,6 +34,7 @@ import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints
 import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
 import { Store } from "./store.ts";
+import { summarize } from "./summary.ts";
 
 export interface DaemonOptions {
   config: CafeConfig;
@@ -41,6 +43,8 @@ export interface DaemonOptions {
   version?: string;
   /** Override the router (tests inject a fake LLM). */
   router?: Router;
+  /** Build the LLM router for a configured model (tests inject a fake). */
+  routerFactory?: (model: string) => Promise<Router>;
   /** Override the timing constants (tests). */
   timing?: Partial<Timing>;
   log?: (msg: string) => void;
@@ -97,6 +101,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   readonly host: string;
   readonly version: string;
   private router: Router;
+  private routerFactory?: (model: string) => Promise<Router>;
+  /** An explicitly injected router (tests) is not replaced by rules when no model is configured. */
+  private hasInjectedRouter = false;
+  /** Model the running LLM router was built for (undefined: rules). */
+  routerModel?: string;
+  private lastRouterError?: string;
+  /** User-visible name for this Host; `host` stays the stable routing key. */
+  private displayName: string;
+  private hostAliases: string[];
   private timing: Timing;
   readonly log: (msg: string) => void;
 
@@ -126,6 +139,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private rootHost?: string;
   /** cafe release of the Root, from the last handshake. */
   private rootVersion?: string;
+  private rootDisplayName?: string;
 
   /** Routing hints computed from this Daemon's own outcomes (agent_events). */
   private localHints: Record<string, RoutingHint> = {};
@@ -156,6 +170,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.version = opts.version ?? "dev";
     this.isRoot = opts.config.mode === "root";
     this.host = opts.config.host;
+    this.displayName = opts.config.displayName ?? opts.config.host;
+    this.hostAliases = [...opts.config.aliases];
     this.store = new Store(opts.home);
     this.log = opts.log ?? ((m) => console.error(`[cafe ${this.host}] ${m}`));
     this.timing = {
@@ -170,6 +186,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       ...opts.timing,
     };
     this.router = opts.router ?? new RulesRouter();
+    this.hasInjectedRouter = opts.router !== undefined;
+    this.routerFactory = opts.routerFactory;
     this.registry.on("delta", (d) => {
       this.emit("registry", d);
       this.store.saveRegistry(this.registry.version, this.registry.all());
@@ -178,7 +196,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Replica restored from disk; the Root will resync on connect.
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
-    this.daemonRecords.set(this.host, { host: this.host, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
+    this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
     this.schedulePrune();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
@@ -193,16 +211,43 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  /** Initialise the LLM router if configured. Separate from the constructor because it is async. */
-  async initRouter(): Promise<void> {
+  /**
+   * Rebuild the router from the current config. Idempotent: switching models and
+   * turning the LLM off both work while the daemon is running. The result says
+   * what is actually running, so `/api/reload` and `cafe config set` can report it.
+   */
+  async initRouter(): Promise<{ ok: boolean; router: Router["name"]; model?: string; error?: string }> {
     const model = this.config.router.model;
-    if (!model || this.router.name !== "rules") return;
-    try {
-      this.router = new LlmRouter(await piComplete(model));
-      this.log(`router: llm (${model})`);
-    } catch (err) {
-      this.log(`router: llm unavailable (${(err as Error).message}); using rules`);
+    if (!model) {
+      if (this.hasInjectedRouter) return { ok: true, router: this.router.name };
+      const changed = this.router.name !== "rules";
+      this.router = new RulesRouter();
+      this.routerModel = undefined;
+      this.lastRouterError = undefined;
+      if (changed) this.log("router: rules");
+      return { ok: true, router: "rules" };
     }
+    if (this.router.name === "llm" && this.routerModel === model) return { ok: true, router: "llm", model };
+    try {
+      const build =
+        this.routerFactory ??
+        (async (m: string) =>
+          new LlmRouter(await piComplete(m), new RulesRouter(), { timeoutMs: this.config.router.timeoutMs, concurrency: this.config.router.concurrency }));
+      this.router = await build(model);
+      this.routerModel = model;
+      this.lastRouterError = undefined;
+      this.log(`router: llm (${model})`);
+      return { ok: true, router: this.router.name, model };
+    } catch (err) {
+      this.lastRouterError = (err as Error).message;
+      this.log(`router: llm unavailable (${this.lastRouterError}); using ${this.router.name}`);
+      return { ok: false, router: this.router.name, model, error: this.lastRouterError };
+    }
+  }
+
+  /** What the router is actually doing now (config may differ from it). */
+  routerStatus(): { router: string; model?: string; error?: string } {
+    return { router: this.router.name, ...(this.routerModel ? { model: this.routerModel } : {}), ...(this.lastRouterError ? { error: this.lastRouterError } : {}) };
   }
 
   url(): string {
@@ -236,10 +281,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         peer.meta.host = p.host;
         if (p.host && p.url && !this.isRoot) this.learnPeers([{ host: p.host, url: p.url }]);
         this.bindLink(peer);
-        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: this.isRoot };
+        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
       }
       if (p.kind === "ui") this.uis.add(peer);
-      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: this.isRoot };
+      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
     });
     this.bindAgentMethods(peer);
   }
@@ -296,6 +341,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         status: "idle",
         registeredAt: now,
         lastSeenAt: now,
+        aliases: resumable?.aliases ?? [],
+        ...(resumable?.displayName ? { displayName: resumable.displayName } : {}),
       };
       peer.meta.agentId = record.agentId;
       peer.meta.party = { id: record.agentId, address: record.address, host: this.host } satisfies Party;
@@ -315,6 +362,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return {};
     });
     peer.on(Methods.agentsList, () => this.registry.all());
+    peer.on(Methods.agentRename, (x: { agentId: string; displayName?: string; alias?: string }) => {
+      if (typeof x.agentId !== "string") throw new RpcError("bad_request", "agentId is required");
+      if (x.displayName) return this.renameAgent(x.agentId, x.displayName);
+      if (x.alias) return this.aliasAgent(x.agentId, x.alias);
+      throw new RpcError("bad_request", "displayName or alias is required");
+    });
     peer.on(Methods.orderCreate, (raw) => this.createOrder(CreateOrderParams.parse(raw), peer));
     peer.on(Methods.orderAck, (p: { orderId: string; threadId: string }) => this.agentEvent(peer, p, { type: "order.acked", agentId: peer.meta.agentId }));
     peer.on(Methods.orderHeartbeat, (p: { orderId: string; threadId: string; note?: string }) =>
@@ -370,6 +423,96 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) this.broadcastDelta(this.registry.upsert(records));
     else if (this.rootOnline) this.uplink!.notify(Methods.registryUpsert, { records });
     else this.registry.upsert(records); // Root down: keep a local view; resynced on reconnect.
+  }
+
+  // -------------------------------------------------------------------------
+  // Identity: display names and aliases (internal host/agent ids never change)
+  // -------------------------------------------------------------------------
+
+  /** Rename this Host (hot) and/or add aliases. Addresses embed the stable `host`, not this name. */
+  setHostIdentity(displayName?: string, addAliases: string[] = []): DaemonRecord {
+    if (displayName) {
+      if (this.displayName && this.displayName !== displayName) this.hostAliases = [...new Set([...this.hostAliases, this.displayName])];
+      this.displayName = displayName;
+      this.config.displayName = displayName;
+    }
+    this.hostAliases = [...new Set([...this.hostAliases, ...addAliases.filter(Boolean)])];
+    this.config.aliases = this.hostAliases;
+    saveConfig(this.config, this.store.home);
+    const rec = this.daemonRecords.get(this.host)!;
+    rec.displayName = this.displayName;
+    rec.aliases = this.hostAliases;
+    this.emitDaemons();
+    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases });
+    this.log(`renamed host to ${this.displayName}${this.hostAliases.length ? ` (aliases: ${this.hostAliases.join(", ")})` : ""}`);
+    return rec;
+  }
+
+  /** Root: rename another Daemon. Works while it is offline (the alias is applied on reconnect). */
+  renameHost(host: string, displayName: string): DaemonRecord {
+    if (!this.isRoot) throw new RpcError("not_root", "only the Root can rename another Host");
+    const rec = this.daemonRecords.get(host);
+    if (!rec) throw new RpcError("not_found", `no daemon '${host}'`);
+    const prev = rec.displayName ?? rec.host;
+    const aliases = [...new Set([...(rec.aliases ?? []), prev, host])];
+    rec.displayName = displayName;
+    rec.aliases = aliases;
+    this.config.hostNames[host] = { displayName, aliases };
+    saveConfig(this.config, this.store.home);
+    this.children.get(host)?.notify(Methods.hostIdentity, { displayName, aliases });
+    this.emitDaemons();
+    return rec;
+  }
+
+  /** Rename a local Agent: the Address (and agentId) stay stable; the old name becomes an alias. */
+  renameAgent(agentId: string, displayName: string): AgentRecord {
+    const rec = this.local.get(agentId);
+    if (!rec) throw new RpcError("not_found", "not a local agent");
+    const aliases = [...new Set([...rec.aliases, rec.displayName ?? rec.name])];
+    const next = { ...rec, displayName, aliases };
+    this.local.set(agentId, next);
+    this.publishAgents([next]);
+    return next;
+  }
+
+  /** Local agent or, at the Root, an Agent on a connected child (relayed over `agent/rename`). */
+  async renameAgentAny(address: string, displayName: string): Promise<AgentRecord> {
+    const ids = this.registry.resolve(address);
+    const rec = ids.length ? this.registry.get(ids[0]!) : undefined;
+    if (!rec) throw new RpcError("not_found", `no agent at '${address}'`);
+    if (rec.host === this.host) return this.renameAgent(rec.agentId, displayName);
+    const child = this.children.get(rec.host);
+    if (!child) throw new RpcError("unreachable", `${rec.host} is not connected to the Root`);
+    return child.request<AgentRecord>(Methods.agentRename, { agentId: rec.agentId, displayName });
+  }
+
+  /** Add an alias that still resolves to a local Agent (no rename). */
+  aliasAgent(agentId: string, alias: string): AgentRecord {
+    const rec = this.local.get(agentId);
+    if (!rec) throw new RpcError("not_found", "not a local agent");
+    const next = { ...rec, aliases: [...new Set([...rec.aliases, alias])] };
+    this.local.set(agentId, next);
+    this.publishAgents([next]);
+    return next;
+  }
+
+  async aliasAgentAny(address: string, alias: string): Promise<AgentRecord> {
+    const ids = this.registry.resolve(address);
+    const rec = ids.length ? this.registry.get(ids[0]!) : undefined;
+    if (!rec) throw new RpcError("not_found", `no agent at '${address}'`);
+    if (rec.host === this.host) return this.aliasAgent(rec.agentId, alias);
+    const child = this.children.get(rec.host);
+    if (!child) throw new RpcError("unreachable", `${rec.host} is not connected to the Root`);
+    return child.request<AgentRecord>(Methods.agentRename, { agentId: rec.agentId, alias });
+  }
+
+  /** Translate `name@alias` to `name@host` using Daemon display names and aliases. */
+  private normalizeAddress(address: string): string {
+    const a = parseAddress(address);
+    if (!a?.host) return address;
+    const rec = this.daemons().find((d) => d.host === a.host || d.displayName === a.host || d.aliases.includes(a.host!));
+    if (!rec || rec.host === a.host) return address;
+    return `${a.name}${a.n === undefined ? "" : `#${a.n}`}@${rec.host}`;
   }
 
   private unregister(agentId: string): void {
@@ -452,7 +595,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Earlier turns of a Thread, oldest first, bounded for prompt size. */
   private history(meta: ThreadMeta): Order["history"] {
     const out: Order["history"] = [];
-    for (const env of this.store.readEvents(meta.file)) {
+    for (const env of this.store.readEventsTail(meta.file, 200)) {
       const ev = env.event;
       if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: ev.order.body.slice(0, 4000) });
       else if (ev.type === "order.replied" && ev.final) out.push({ from: this.registry.get(ev.agentId)?.address ?? ev.agentId, role: "barista", text: ev.text.slice(0, 4000) });
@@ -475,7 +618,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     if (order.to) {
-      const ids = this.registry.resolve(order.to).filter((id) => candidates.some((c) => c.agentId === id));
+      const ids = this.registry.resolve(this.normalizeAddress(order.to)).filter((id) => candidates.some((c) => c.agentId === id));
       return {
         targets: ids,
         mode: ids.length === 1 ? "unicast" : "multicast",
@@ -792,6 +935,28 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Entry point for every event, local or relayed. Idempotent on eventId. */
   private seen = new Set<string>();
+  /** Pending metadata writes, coalesced so a burst of events does not rewrite a growing row each time. */
+  private metaFlush = new Map<string, ReturnType<typeof setTimeout>>();
+  private scheduleMeta(meta: ThreadMeta): void {
+    if (this.metaFlush.has(meta.threadId)) return;
+    const timer = setTimeout(() => {
+      this.metaFlush.delete(meta.threadId);
+      const latest = this.metas.get(meta.threadId);
+      if (latest) this.store.putThread(latest);
+    }, 150);
+    timer.unref?.();
+    this.metaFlush.set(meta.threadId, timer);
+  }
+
+  private flushMetas(): void {
+    for (const [threadId, timer] of this.metaFlush) {
+      clearTimeout(timer);
+      const meta = this.metas.get(threadId);
+      if (meta) this.store.putThread(meta);
+    }
+    this.metaFlush.clear();
+  }
+
   recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
     if (this.stopped || this.seen.has(env.eventId)) return;
     this.seen.add(env.eventId);
@@ -800,7 +965,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const meta = this.updateMeta(env);
     if (meta) {
       this.store.appendEvent(meta.file, env);
-      this.store.putThread(meta);
+      // Thread creation / closure is durable immediately; heartbeats and interim events can wait.
+      if (env.event.type === "order.created" || env.event.type === "order.closed") {
+        const pending = this.metaFlush.get(meta.threadId);
+        if (pending) clearTimeout(pending);
+        this.metaFlush.delete(meta.threadId);
+        this.store.putThread(meta);
+      } else {
+        this.scheduleMeta(meta);
+      }
     }
     // Fan out first: tracking may synchronously emit follow-up events (e.g. order.closed).
 
@@ -932,7 +1105,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         from: ev.order.from,
         targets: [],
         status: "routing",
-        summary: ev.order.body.slice(0, 200),
+        summary: summarize(ev.order.body),
+        summaryTurn: ev.order.turn,
         createdAt: ev.order.createdAt,
         file: this.store.threadFile(env.threadId, ev.order.createdAt),
         turns: 0,
@@ -949,6 +1123,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (ev.order.orderId !== meta.orderId || meta.turns === 0) {
         meta.orderId = ev.order.orderId;
         meta.turns = Math.max(meta.turns + 1, ev.order.turn);
+        meta.summary = summarize(ev.order.body);
+        meta.summaryTurn = ev.order.turn;
         meta.turnStartedAt = ev.order.createdAt;
         meta.reason = undefined;
         meta.router = undefined;
@@ -1002,7 +1178,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   recover(): number {
     let n = 0;
-    for (const meta of this.store.listThreads(1000)) {
+    for (const meta of this.store.openThreads(1000)) {
       if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
       const events = this.store.readEvents(meta.file).filter((e) => e.orderId === meta.orderId);
       const created = events.find((e) => e.event.type === "order.created")?.event;
@@ -1059,12 +1235,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.children.set(host, peer);
     peer.meta.host = host;
     const now = Date.now();
-    this.daemonRecords.set(host, { host, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
+    const override = this.config.hostNames[host];
+    const displayName = override?.displayName ?? p.displayName ?? host;
+    const aliases = [...new Set([...(p.aliases ?? []), ...(override?.aliases ?? [])])];
+    this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
     if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
-    if (p.url && this.config.knownDaemons[host] !== p.url) {
-      this.config.knownDaemons[host] = p.url;
-      saveConfig(this.config, this.store.home);
-    }
+    if (p.url) void this.rememberChildUrl(host, p.url);
+    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[] }) => {
+      const rec = this.daemonRecords.get(host);
+      if (rec) {
+        if (x.displayName) rec.displayName = x.displayName;
+        if (x.aliases) rec.aliases = [...new Set([...rec.aliases, ...x.aliases])];
+        this.emitDaemons();
+      }
+      return {};
+    });
     peer.on(Methods.registryUpsert, (x: { records: AgentRecord[] }) => {
       this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
     });
@@ -1107,24 +1292,52 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: true, registryVersion: this.registry.version };
   }
 
+  /**
+   * Root: remember a child's dial-back address only after a short probe. A child
+   * in Docker/NAT often reports a container-internal IP that is unreachable from
+   * the Root; writing it would poison `knownDaemons` and announceRoot forever.
+   */
+  private async rememberChildUrl(host: string, url: string): Promise<void> {
+    if (this.config.knownDaemons[host] === url) return;
+    try {
+      const res = await fetch(`${url.replace(/^ws/, "http")}/api/health`, {
+        headers: { authorization: `Bearer ${this.config.token}` },
+        signal: AbortSignal.timeout(1000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      this.log(`not saving ${host} address ${url}: not reachable from the Root (${(err as Error).message}); set advertise on ${host} if the Root must dial back`);
+      return;
+    }
+    if (this.config.knownDaemons[host] === url) return;
+    this.config.knownDaemons[host] = url;
+    saveConfig(this.config, this.store.home);
+    this.log(`known daemon ${host} -> ${url}`);
+  }
+
   /** Root: after moving to a new address, tell every known Daemon where it is now. */
   async announceRoot(): Promise<void> {
     if (!this.isRoot) return;
     const me = `${this.config.advertise ?? lanAddress()}:${this.config.port}`;
-    for (const [host, url] of Object.entries(this.config.knownDaemons)) {
-      if (this.children.has(host)) continue;
-      try {
-        const res = await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
-          body: JSON.stringify({ root: me }),
-          signal: AbortSignal.timeout(3000),
-        });
-        this.log(`announced root to ${host}: ${res.status}`);
-      } catch (err) {
-        this.log(`announce to ${host} failed: ${(err as Error).message}`);
+    const targets = Object.entries(this.config.knownDaemons).filter(([host]) => !this.children.has(host));
+    // Probe in parallel: one dead Daemon must not delay the others.
+    const worker = async () => {
+      for (let next = targets.shift(); next; next = targets.shift()) {
+        const [host, url] = next;
+        try {
+          const res = await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
+            body: JSON.stringify({ root: me }),
+            signal: AbortSignal.timeout(1500),
+          });
+          this.log(`announced root to ${host}: ${res.status}`);
+        } catch (err) {
+          this.log(`announce to ${host} failed: ${(err as Error).message}`);
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, targets.length) }, worker));
   }
 
   // -------------------------------------------------------------------------
@@ -1139,18 +1352,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const peer = new Peer(ws);
     ws.on("open", async () => {
       try {
-        const hello = await peer.request<{ host: string; cafeVersion?: string }>(Methods.initialize, {
+        const hello = await peer.request<{ host: string; displayName?: string; aliases?: string[]; cafeVersion?: string }>(Methods.initialize, {
           protocolVersion: PROTOCOL_VERSION,
           cafeVersion: this.version,
           kind: "daemon",
           token: this.config.token,
           host: this.host,
+          displayName: this.displayName,
+          aliases: this.hostAliases,
           url: this.url(),
           registryVersion: this.registry.version,
         });
         this.uplink = peer;
-        this.rootHost = hello.host;
-        this.rootVersion = hello.cafeVersion;
+        this.bindAgentMethods(peer); // the Root may relay agent/rename down this connection
+        this.rootHost = hello.host;        this.rootVersion = hello.cafeVersion;
+        this.rootDisplayName = hello.displayName;
         this.store.setKv("rootHost", hello.host);
         this.reconnectDelay = 0;
         this.setRootOnline(true);
@@ -1167,6 +1383,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
+    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[] }) => {
+      if (x.displayName) {
+        this.displayName = x.displayName;
+        this.config.displayName = x.displayName;
+      }
+      if (x.aliases) {
+        this.hostAliases = [...new Set([...this.hostAliases, ...x.aliases])];
+        this.config.aliases = this.hostAliases;
+      }
+      saveConfig(this.config, this.store.home);
+      const self = this.daemonRecords.get(this.host);
+      if (self) {
+        self.displayName = this.displayName;
+        self.aliases = this.hostAliases;
+      }
+      this.emitDaemons();
+      return {};
+    });
     peer.on(Methods.hintsUpdate, (x: { hints: Record<string, RoutingHint> }) => {
       this.rootHints = x.hints;
     });
@@ -1200,9 +1434,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private setRootOnline(online: boolean): void {
-    const rec = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
+    const rec: DaemonRecord = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", hostId: this.rootHost, aliases: [], url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
     rec.online = online;
     if (this.rootHost) rec.host = this.rootHost;
+    if (this.rootDisplayName) rec.displayName = this.rootDisplayName;
     if (online) rec.version = this.rootVersion;
     rec.url = `ws://${this.config.root}`;
     rec.lastSeenAt = Date.now();
@@ -1315,7 +1550,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   daemons(): DaemonRecord[] {
     // The listening port is only known after the server starts.
     const self = this.daemonRecords.get(this.host);
-    if (self) self.url = this.url();
+    if (self) {
+      self.url = this.url();
+      self.displayName = this.displayName;
+      self.aliases = this.hostAliases;
+    }
     return [...this.daemonRecords.values()];
   }
 
@@ -1330,9 +1569,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   snapshot() {
     return {
       host: this.host,
+      displayName: this.displayName,
+      aliases: this.hostAliases,
       isRoot: this.isRoot,
       rootOnline: this.rootOnline,
       router: this.router.name,
+      ...(this.routerModel ? { routerModel: this.routerModel } : {}),
+      ...(this.lastRouterError ? { routerError: this.lastRouterError } : {}),
       registryVersion: this.registry.version,
       agents: this.registry.all(),
       daemons: this.daemons(),
@@ -1359,6 +1602,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   stop(): void {
     this.stopped = true;
+    this.flushMetas();
     this.registry.removeAllListeners();
     this.removeAllListeners();
     clearTimeout(this.reconnectTimer);
