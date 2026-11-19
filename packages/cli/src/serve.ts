@@ -12,6 +12,12 @@ export const PRESETS: Record<string, string> = {
   codex: "codex exec --skip-git-repo-check -",
 };
 
+/** The command as shown on the Agents page (the identity field holds at most 80 characters). */
+export function commandLabel(exec: string): string {
+  const one = exec.replace(/\s+/g, " ").trim();
+  return one.length > 80 ? `${one.slice(0, 79)}…` : one;
+}
+
 export const DECLINE_MARKER = "CAFE_DECLINE:";
 const MAX_OUTPUT = 1024 * 1024;
 
@@ -132,7 +138,7 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
     log(`cancelled by ${by}: ${orderId}`);
   });
 
-  const rec = await client.connect({ ...cafe, mode: "cli", cwd: dir, pid: process.pid });
+  const rec = await client.connect({ ...cafe, mode: "cli", agent: "command", command: commandLabel(opts.exec), cwd: dir, pid: process.pid });
   log(`serving as ${rec?.address} with: ${opts.exec}`);
   return {
     client,

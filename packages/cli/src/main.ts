@@ -298,9 +298,16 @@ program
     const list = await api<AgentRecord[]>("/api/agents");
     const lines = list
       .sort((a, b) => a.address.localeCompare(b.address))
-      .map((a) => `${a.status.padEnd(7)} ${a.role.padEnd(8)} ${a.mode.padEnd(8)} ${a.address.padEnd(28)} ${a.description}${a.scope.length ? ` [${a.scope.join(", ")}]` : ""}`);
+      .map((a) => `${a.status.padEnd(7)} ${a.role.padEnd(8)} ${runsAs(a).padEnd(12)} ${a.address.padEnd(28)} ${a.description}${a.scope.length ? ` [${a.scope.join(", ")}]` : ""}`);
     out(lines.join("\n") || "(no agents)", list);
   });
+
+/** Short "what runs it" column for `cafe agents`: the agent kind (pi, omp, codex, claude, command), `·tui` when
+ * someone is using it in a terminal, `·ro` / `·rw` for Bridges. Falls back to the mode for agents that do not report a kind. */
+function runsAs(a: Pick<AgentRecord, "mode" | "agent" | "access">): string {
+  if (!a.agent) return a.mode;
+  return [a.agent, a.mode === "tui" ? "tui" : undefined, a.access === "read-only" ? "ro" : a.access === "write" ? "rw" : undefined].filter(Boolean).join("·");
+}
 
 const printThreads = (list: ThreadMeta[], agents: Map<string, AgentRecord>) =>
   list

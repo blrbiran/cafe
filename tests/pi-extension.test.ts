@@ -114,7 +114,8 @@ describe("pi extension", () => {
   });
 
   it("serves an Order: inject when idle, reply with the turn's final text", async () => {
-    const { pi, c } = await setup();
+    const { pi, c, root } = await setup();
+    expect(root.daemon.registry.all().find((r) => r.address === "widgets#1@root")).toMatchObject({ agent: "pi" });
     const res = await c.ask({ body: "how many widgets?" });
     await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-order"));
     const injected = pi.sent.find((s) => s.message.customType === "cafe-order")!;
@@ -357,7 +358,8 @@ describe("pi extension", () => {
 describe("pi extension under oh-my-pi", () => {
   it("ends a run on the agent_end that will not continue, and extends a string[] system prompt", async () => {
     process.env.CAFE_HOST_AGENT = "omp";
-    const { pi, c } = await setup();
+    const { pi, c, root } = await setup();
+    expect(root.daemon.registry.all().find((r) => r.address === "widgets#1@root")).toMatchObject({ agent: "omp" });
     expect(pi.has("agent_settled")).toBe(false);
     expect(pi.has("agent_end")).toBe(true);
 

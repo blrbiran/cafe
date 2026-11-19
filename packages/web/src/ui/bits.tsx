@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import type { AgentRecord } from "@cafe/protocol";
+import { useT } from "../i18n.ts";
 
 export type Tone = "info" | "ok" | "warn" | "danger" | undefined;
 
@@ -62,4 +64,11 @@ function FactRow({ k, v }: { k: string; v: ReactNode }) {
       <span className="min-w-0 overflow-hidden text-ellipsis text-fg">{v}</span>
     </>
   );
+}
+
+/** Which agent runs this Barista (pi, oh-my-pi, Codex, Claude Code, a command). Nothing for agents that do not say. */
+export function KindTag({ a }: { a?: Pick<AgentRecord, "agent"> }) {
+  const t = useT();
+  if (!a?.agent) return null;
+  return <span className="kind-tag">{t.agentKind[a.agent] ?? a.agent}</span>;
 }

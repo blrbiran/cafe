@@ -110,7 +110,7 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
     log(`cancelled by ${by}: ${orderId}`);
   });
 
-  const rec = await client.connect({ ...cafe, mode: "headless", cwd: dir, pid: process.pid });
+  const rec = await client.connect({ ...cafe, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid });
   log(`${opts.agent} barista ${rec?.address} ready (${access})`);
   return {
     client,

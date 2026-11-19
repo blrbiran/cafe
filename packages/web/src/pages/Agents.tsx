@@ -5,7 +5,7 @@ import { api } from "../api.ts";
 import { useT, type Dict } from "../i18n.ts";
 import { hashFor, navigate } from "../route.ts";
 import { openComposer, useStore } from "../store.ts";
-import { Dot, Empty, Facts, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
+import { Dot, Empty, Facts, KindTag, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
 
 const WEEK = 7 * 24 * 3600 * 1000;
 
@@ -81,13 +81,26 @@ function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: 
   const answered = stats?.answered ?? recent.reduce((n, m) => n + m.replies.filter((r) => r.agentId === a.agentId).length, 0);
   const declined = stats?.declined ?? recent.reduce((n, m) => n + m.declines.filter((d) => d.agentId === a.agentId).length, 0);
   const topics = Object.keys(stats?.declinedTopics ?? {}).slice(0, 3);
-  const runsAs = { tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode];
+  const runsAs =
+    a.agent === "command" && a.command ? (
+      t.runsCommand(a.command)
+    ) : (
+      <>
+        {{ tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode]}
+        {a.access && " · "}
+        {a.access === "read-only" && <span className="text-muted">{t.readOnly}</span>}
+        {a.access === "write" && <span className="text-warn">{t.canWrite}</span>}
+      </>
+    );
 
   return (
     <article className={`card flex flex-col gap-2.5 p-4 ${status === "offline" ? "opacity-70" : ""}`}>
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 flex-col">
-          <span className="text-lg font-semibold text-fg-strong">{a.name}</span>
+          <span className="flex flex-wrap items-center gap-2 text-lg font-semibold text-fg-strong">
+            {a.name}
+            <KindTag a={a} />
+          </span>
           <span className="mono truncate text-xs text-muted">{a.address}</span>
         </div>
         <Pill tone={tone}>{t[status]}</Pill>

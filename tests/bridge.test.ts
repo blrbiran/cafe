@@ -56,7 +56,9 @@ const replyOf = (events: { event: { type: string } }[]) => (events.find((e) => e
 
 describe.each(["codex", "claude"] as const)("native %s barista", (agent) => {
   it("answers, continues the same session for a follow-up, and is read-only by default", async () => {
-    const { ask, logged } = await setup(agent);
+    const { ask, logged, root } = await setup(agent);
+    // The Registry says which agent runs it and that it is read-only (shown on the Agents page).
+    expect(root.daemon.registry.all().find((r) => r.name === "coder")).toMatchObject({ mode: "headless", agent, access: "read-only" });
     const first = await ask("what is x");
     expect(replyOf(first.events)).toBe("turn=1 kind=fresh q=what is x");
     const second = await ask("and y", first.threadId);
@@ -131,7 +133,8 @@ describe.each(["codex", "claude"] as const)("native %s barista", (agent) => {
   });
 
   it("--write gives workspace-write, never more", async () => {
-    const { ask, logged } = await setup(agent, "workspace-write");
+    const { ask, logged, root } = await setup(agent, "workspace-write");
+    expect(root.daemon.registry.all().find((r) => r.name === "coder")).toMatchObject({ agent, access: "write" });
     await ask("edit something");
     if (agent === "codex") {
       expect(logged().find((m) => m.method === "thread/start").params).toMatchObject({ sandbox: "workspace-write", approvalPolicy: "never" });

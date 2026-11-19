@@ -367,7 +367,7 @@ export default function cafe(pi: ExtensionAPI) {
       void refreshRegistry(c);
     });
     try {
-      await c.connect({ ...id, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", cwd: ctx.cwd, pid: process.pid });
+      await c.connect({ ...id, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
       client = c;
     } catch (err) {
       setUiStatus(`☕ cafe: ${(err as Error).message}`);

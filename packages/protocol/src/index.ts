@@ -36,6 +36,13 @@ export type AgentStatus = z.infer<typeof AgentStatus>;
 /** What an Agent declares when it registers with its Daemon. */
 export const AgentIdentity = CafeFile.extend({
   mode: AgentMode,
+  // Display-only fields (v3-2). Plain strings, so a newer client with new values still registers with an older Daemon.
+  /** Which agent runs this identity: pi, omp, codex, claude or command (`cafe serve`). Unknown values are shown as-is. */
+  agent: z.string().optional(),
+  /** Bridges only: "read-only" or "write" (may edit files in its directory). */
+  access: z.string().optional(),
+  /** `cafe serve` only: the command run once per Order (the client truncates it to 80 characters). */
+  command: z.string().optional(),
   cwd: z.string(),
   pid: z.number().int().optional(),
   /** On reconnect: ask to keep the agentId/Address from the previous connection. */

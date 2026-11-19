@@ -29,7 +29,8 @@ async function setup(exec: string, cafe = "name: echo\ndescription: echoes quest
 
 describe("cafe serve --exec", () => {
   it("replies with the command's stdout; the prompt arrives on stdin", async () => {
-    const { c } = await setup(`node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log('GOT:'+s.split('Question:')[1].trim().split('\\\\n')[0]))"`);
+    const { c, root } = await setup(`node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log('GOT:'+s.split('Question:')[1].trim().split('\\\\n')[0]))"`);
+    expect(root.daemon.registry.all().find((r) => r.name === "echo")).toMatchObject({ mode: "cli", agent: "command", command: expect.stringMatching(/^node -e /) });
     const res = await c.ask({ body: "echo ping", to: "echo" });
     const events = await untilClosed(c, res.threadId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "GOT:echo ping" });

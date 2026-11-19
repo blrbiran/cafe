@@ -6,7 +6,7 @@ import { useNow } from "../format.ts";
 import { whoAddress, whoName, whyText } from "../outcome.ts";
 import { hashFor } from "../route.ts";
 import { isActive, useStore } from "../store.ts";
-import { Disclosure, Pill, type Tone } from "../ui/bits.tsx";
+import { Disclosure, KindTag, Pill, type Tone } from "../ui/bits.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
 
 interface Turn {
@@ -169,7 +169,14 @@ export function ConversationPage({ threadId }: { threadId: string }) {
                   <div className="cap">{t.routedTo}</div>
                   <div className="text-base">
                     {targets.length ? (
-                      <span className="mono text-fg-strong">{targets.map((id) => whoAddress(id, agents, meta)).join(", ")}</span>
+                      <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        {targets.map((id) => (
+                          <span key={id} className="inline-flex items-center gap-2">
+                            <span className="mono text-fg-strong">{whoAddress(id, agents, meta)}</span>
+                            <KindTag a={agents[id]} />
+                          </span>
+                        ))}
+                      </span>
                     ) : (
                       <span className="text-muted">{t.stepNoTarget}</span>
                     )}
@@ -215,6 +222,7 @@ function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: Th
         <div key={r.key} className="card flex flex-col gap-2 px-4.5 py-3.5">
           <div className="flex flex-wrap items-center gap-2.5">
             <span className="mono text-sm text-fg-strong">{whoAddress(r.who, agents, meta)}</span>
+            <KindTag a={agents[r.who]} />
             <Pill tone={r.tone} dot={false}>
               {r.kind}
             </Pill>
