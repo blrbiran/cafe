@@ -370,6 +370,46 @@ program
   });
 
 program
+  .command("tail")
+  .description("follow routed / delivered / acked / replied / closed events across the network")
+  .option("--host <host>", "only events originating on this Host")
+  .option("--type <types>", "comma-separated event types, e.g. order.routed,order.replied")
+  .option("--thread <threadId>", "only this Thread")
+  .option("--verbose", "include heartbeats")
+  .action(async (o) => {
+    await ensureDaemon();
+    const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
+    const params = new URLSearchParams();
+    if (o.host) params.set("host", o.host);
+    if (o.type) params.set("type", o.type);
+    if (o.thread) params.set("thread", o.thread);
+    if (o.verbose) params.set("verbose", "1");
+    const res = await fetch(`${base()}/api/events?${params}`, {
+      headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
+    });
+    if (!res.ok || !res.body) throw new Error(`cannot stream events: ${res.status}`);
+    const decoder = new TextDecoder();
+    let buf = "";
+    for await (const chunk of res.body as any as AsyncIterable<Uint8Array>) {
+      buf += decoder.decode(chunk, { stream: true });
+      let i: number;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const data = block.split("\n").find((l) => l.startsWith("data: "));
+        if (!data) continue;
+        const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
+        if (JSON_OUT) {
+          console.log(JSON.stringify(env));
+          continue;
+        }
+        const line = describe(env, agents);
+        if (line) console.log(`${time(env.at)} ${env.threadId.slice(-6)} ${line}`);
+      }
+    }
+  });
+
+program
   .command("cancel")
   .description("cancel an active thread you started")
   .argument("<threadId>")

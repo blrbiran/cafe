@@ -70,8 +70,8 @@ cafe daemon rename ssh1 ssh1-docker # Root 上改另一台 Daemon 的展示名
 
 - **Claude Code / Codex（推荐 MCP）**：`cafe mcp install` 用户级注册 `cafe mcp`（`--dry-run` 只打印命令，`--client claude|codex` 只装一个）。工具：`cafe_agents`、`cafe_ask`、`cafe_wait`、`cafe_cancel`。注册的是绝对 node + cafe.js 路径；换了 Node 版本或移动仓库后要重装。
 - **skill**：`cafe skill install` 创建软链 `~/.claude/skills/cafe` 和 `~/.agents/skills/cafe`。Codex 用 `$cafe` 引用，pi 用 `/skill:cafe`。
-- **CLI**：`cafe ask "..."`、`cafe ask --to billing "..."`、`cafe ask --thread <id> "追问"`、`cafe inbox`、`cafe thread <id>`。
-- **Web**：打开 `http://127.0.0.1:4777/`，或在 Agents 页点“提问”。
+- **CLI**：`cafe ask "..."`、`cafe ask --to billing "..."`、`cafe ask --thread <id> "追问"`、`cafe inbox`、`cafe thread <id>`、`cafe tail`（全网 routed / delivered / acked / replied / closed 事件；`--json` 输出 JSONL，`--host` / `--type` / `--thread` 过滤，默认隐藏心跳）。
+- **Web**：打开 `http://127.0.0.1:4777/`。导航固定、内容独立滚动；点对话从右侧打开，列表位置不变；导航里的 Agents 可展开看已注册 agent；设置里改显示名/别名、路由模型和后台 Barista；实况页是全网事件流。
 
 ## 作为 Barista
 
@@ -107,6 +107,7 @@ cafe barista start --dir ~/code/billing --agent claude   # claude -p，每题一
 cafe claude install            # 装 cafe 的 Claude Code 插件（--dry-run 先看）
                                # 之后在有 .cafe 的目录里开的 Claude Code 会话自动接问题
                                # 会话里：/cafe 看地址，/cafe off 暂停，/cafe on 恢复
+                               # 如果 /cafe 已被占用，插件改用 /cafe-barista
 cafe barista start --dir ~/code/billing --agent codex --tui   # 问题放进该目录最近活动的 Codex 会话
 ```
 

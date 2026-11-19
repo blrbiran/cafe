@@ -81,14 +81,28 @@ function clockOf(at: number): string {
   return new Date(at).toLocaleTimeString([], { hour12: false });
 }
 
-export function ConversationPage({ threadId }: { threadId: string }) {
+export function ConversationPage({ threadId, drawer = false, onClose }: { threadId: string; drawer?: boolean; onClose?: () => void }) {
   const t = useT();
-  const now = useNow();
   const detail = useStore((s) => s.detail);
   const agents = useStore((s) => s.agents);
+  const threadStatus = detail?.meta.status ?? "";
+  const threadActive = isActive(threadStatus);
+  const now = useNow(threadActive ? 1_000 : 30_000);
   const [showLog, setShowLog] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
+  const [copied, setCopied] = useState(false);
+
+  const events = detail?.events ?? [];
+  const turns = useMemo(() => buildTurns(events), [events]);
+
+  const copy = () => {
+    if (!detail) return;
+    void navigator.clipboard?.writeText(detail.meta.threadId).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
+  };
 
   const back = (
     <div>
@@ -97,20 +111,22 @@ export function ConversationPage({ threadId }: { threadId: string }) {
       </a>
     </div>
   );
+
   if (!detail || detail.meta.threadId !== threadId) {
     return (
       <>
-        {back}
+        {!drawer && back}
         <div className="hint">{t.loading}</div>
       </>
     );
   }
 
-  const { meta, events } = detail;
-  const turns = useMemo(() => buildTurns(events), [events]);
-  const threadActive = isActive(meta.status);
+  const { meta } = detail;
   const first = turns[0];
   const last = turns.at(-1);
+  const lastOutcome = last ? turnOutcome(t, last, threadActive, agents, meta, now) : undefined;
+  const participants = [...new Set([meta.from.address, ...turns.flatMap((turn) => turn.replies.map((r) => whoAddress(r.agentId, agents, meta)))])];
+  const routerText = last?.decision ? (t.router[last.decision.router] ?? last.decision.router) : "—";
 
   const stop = async () => {
     setBusy(true);
@@ -124,9 +140,29 @@ export function ConversationPage({ threadId }: { threadId: string }) {
     }
   };
 
-  return (
-    <>
-      {back}
+  const main = (
+    <div className="thread-main flex flex-col gap-5">
+      {drawer && (
+        <div className="well grid grid-cols-2 gap-x-4 gap-y-2 px-3 py-2.5 text-xs min-[900px]:grid-cols-4">
+          <div>
+            <div className="cap">{t.ctxStatus}</div>
+            <div className="text-fg-strong">{lastOutcome?.text ?? t.loading}</div>
+          </div>
+          <div>
+            <div className="cap">{t.ctxPeople}</div>
+            <div className="truncate text-fg-strong">{participants.map((p) => p.replace(/@.*$/, "")).join(" · ")}</div>
+          </div>
+          <div>
+            <div className="cap">{t.ctxTurns}</div>
+            <div className="text-fg-strong">{t.turns(turns.length || 1)}</div>
+          </div>
+          <div>
+            <div className="cap">{t.ctxRouter}</div>
+            <div className="text-fg-strong">{routerText}</div>
+          </div>
+        </div>
+      )}
+
       {turns.map((turn, i) => {
         const active = threadActive && turn === last;
         const o = turnOutcome(t, turn, active, agents, meta, now);
@@ -200,10 +236,80 @@ export function ConversationPage({ threadId }: { threadId: string }) {
         );
       })}
       {first === undefined && <div className="hint">{t.loading}</div>}
-      <FollowUp meta={meta} busy={threadActive} />
       <Disclosure show={t.processShow} hide={t.processHide} open={showLog} onToggle={() => setShowLog((v) => !v)}>
         <DeliveryLog events={events} meta={meta} />
       </Disclosure>
+    </div>
+  );
+
+  const rail = (
+    <aside className="thread-rail" aria-label={t.navFeed}>
+      <div className="card flex flex-col gap-1.5 p-3 text-xs">
+        <div className="cap">{t.ctxStatus}</div>
+        <div className="text-fg-strong">{lastOutcome?.text ?? "—"}</div>
+        <div className="text-muted">
+          {t.ctxRouter}: {routerText}
+        </div>
+        <div className="text-muted">
+          {t.ctxTurns}: {t.turns(turns.length || 1)}
+        </div>
+      </div>
+      <div className="card flex flex-col gap-1 p-3 text-xs">
+        <div className="cap">{t.ctxPeople}</div>
+        {participants.map((p) => (
+          <div key={p} className="mono truncate">
+            {p}
+          </div>
+        ))}
+      </div>
+      <div className="card flex flex-col gap-1 p-3 text-xs">
+        <div className="cap">{t.ctxThread}</div>
+        <div className="mono break-all">{meta.threadId}</div>
+        <button type="button" className="btn-sm mt-1" onClick={copy}>
+          {copied ? t.copied : t.copyId}
+        </button>
+      </div>
+      <div className="card flex flex-col gap-1.5 p-3 text-xs">
+        <div className="cap">{t.ctxLog}</div>
+        <DeliveryLog events={events.slice(-12)} meta={meta} />
+      </div>
+    </aside>
+  );
+
+  if (drawer) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <header className="flex items-center gap-2 border-b border-line px-4 py-3">
+          <button type="button" className="iconbtn" aria-label={t.drawerClose} onClick={onClose}>
+            ✕
+          </button>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-fg-strong">{t.navFeed}</div>
+            <div className="mono truncate text-[11px] text-muted">{meta.threadId}</div>
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            {lastOutcome && <Pill tone={lastOutcome.tone}>{lastOutcome.text}</Pill>}
+            <button type="button" className="btn-sm whitespace-nowrap max-md:hidden" onClick={copy}>
+              {copied ? t.copied : t.copyId}
+            </button>
+          </div>
+        </header>
+        <div className="thread-body min-h-0 flex-1 overflow-y-auto px-5 py-4 max-md:px-4">
+          {main}
+          {rail}
+        </div>
+        <div className="border-t border-line bg-card px-5 py-3 max-md:px-4">
+          <FollowUp meta={meta} busy={threadActive} drawer />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {back}
+      {main}
+      <FollowUp meta={meta} busy={threadActive} />
     </>
   );
 }
@@ -242,7 +348,7 @@ function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: Th
   );
 }
 
-function FollowUp({ meta, busy }: { meta: ThreadMeta; busy: boolean }) {
+function FollowUp({ meta, busy, drawer = false }: { meta: ThreadMeta; busy: boolean; drawer?: boolean }) {
   const t = useT();
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
@@ -265,7 +371,7 @@ function FollowUp({ meta, busy }: { meta: ThreadMeta; busy: boolean }) {
 
   return (
     <form
-      className="card flex flex-col gap-2.5 px-4.5 py-3.5"
+      className={drawer ? "flex flex-col gap-2" : "card flex flex-col gap-2.5 px-4.5 py-3.5"}
       onSubmit={(e) => {
         e.preventDefault();
         void send();

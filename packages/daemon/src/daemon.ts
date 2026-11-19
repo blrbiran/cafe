@@ -250,6 +250,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return { router: this.router.name, ...(this.routerModel ? { model: this.routerModel } : {}), ...(this.lastRouterError ? { error: this.lastRouterError } : {}) };
   }
 
+  /**
+   * Choose the router model at runtime. Unlike `setConfigValue` + reload, a model
+   * the running daemon cannot load is rolled back here, so the config file and
+   * the running router never disagree. `null` / "" turns the LLM off (rules).
+   */
+  async setRouterModel(model: string | null): Promise<{ ok: boolean; router: Router["name"]; model?: string; error?: string }> {
+    const next = model?.trim() || undefined;
+    const previous = this.config.router.model;
+    if (next === previous) return this.initRouter();
+    this.config.router.model = next;
+    saveConfig(this.config, this.store.home);
+    const applied = await this.initRouter();
+    if (applied.ok) return applied;
+    // Roll the config back and keep the previous router running; report the failure.
+    this.config.router.model = previous;
+    saveConfig(this.config, this.store.home);
+    const restored = await this.initRouter();
+    return { ok: false, router: restored.router, ...(restored.model ? { model: restored.model } : {}), error: applied.error };
+  }
+
   url(): string {
     return `ws://${this.config.advertise ?? lanAddress()}:${this.config.port}`;
   }

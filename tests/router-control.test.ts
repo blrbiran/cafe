@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRecord, Order, RoutingHint } from "@cafe/protocol";
+import { loadConfig } from "@cafe/daemon";
 import { LlmRouter, RulesRouter } from "../packages/daemon/src/router.ts";
 import { startDaemon } from "./helpers.ts";
 
@@ -106,5 +107,31 @@ describe("initRouter", () => {
     expect(await d.initRouter()).toMatchObject({ ok: true, router: "rules" });
     expect(d.snapshot()).toMatchObject({ router: "rules" });
     expect(d.snapshot().routerModel).toBeUndefined();
+  });
+
+  it("setRouterModel applies, rolls back a bad model, and clears to rules", async () => {
+    const root = await startDaemon("root", {
+      mode: "root",
+      routerFactory: async (model) => {
+        if (model === "bad/model") throw new Error(`unknown model ${model}`);
+        return new LlmRouter(async () => JSON.stringify({ targets: [], mode: "broadcast", reason: model }), new RulesRouter());
+      },
+    });
+    cleanup.push(root.stop);
+    const d = root.daemon;
+
+    expect(await d.setRouterModel("good/one")).toMatchObject({ ok: true, router: "llm", model: "good/one" });
+    expect(loadConfig(root.home).router.model).toBe("good/one");
+
+    const bad = await d.setRouterModel("bad/model");
+    expect(bad).toMatchObject({ ok: false, router: "llm", model: "good/one" });
+    expect(bad.error).toMatch(/unknown model/);
+    // A rejected switch is not written: config and the running router still agree.
+    expect(loadConfig(root.home).router.model).toBe("good/one");
+    expect(d.routerStatus()).toMatchObject({ router: "llm", model: "good/one" });
+
+    expect(await d.setRouterModel(null)).toMatchObject({ ok: true, router: "rules" });
+    expect(loadConfig(root.home).router.model).toBeUndefined();
+    expect(d.routerStatus()).toMatchObject({ router: "rules" });
   });
 });

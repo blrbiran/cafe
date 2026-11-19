@@ -5,7 +5,7 @@ import { expect, test } from 'claude-code/testing'
 
 type Post = { path: string; body: Record<string, unknown> }
 
-function fakeHost(on: any) {
+function fakeHost(on: any, opts: { refuse?: string[] } = {}) {
   const lines: string[] = []
   let wake: (() => void) | undefined
   let closed = false
@@ -13,9 +13,14 @@ function fakeHost(on: any) {
   const submits: string[] = []
   const aborts: string[] = []
   const spawned: string[][] = []
+  const registered: string[] = []
 
   on('fs.read', () => ({ value: JSON.stringify({ argv: ['node', '/opt/cafe/bin/cafe.js'] }) }))
-  on('command.register', () => ({ value: { command: 'cafe' } }))
+  on('command.register', (_: unknown, e: { name: string }) => {
+    registered.push(e.name)
+    if (opts.refuse?.includes(e.name)) throw new Error(`"/${e.name}" refused: it is the user's /${e.name}`)
+    return { value: { command: e.name } }
+  })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('process.spawn', async function* (_: unknown, e: { argv: string[] }) {
     spawned.push([...e.argv])
@@ -53,7 +58,7 @@ function fakeHost(on: any) {
     closed = true
     wake?.()
   }
-  return { feed, close, posts, submits, aborts, spawned }
+  return { feed, close, posts, submits, aborts, spawned, registered }
 }
 
 const settle = () => new Promise(r => setTimeout(r, 20))
@@ -114,6 +119,20 @@ test('a non-interactive run (claude -p, SDK) never joins the network', async ($,
   await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
   await settle()
   expect(host.spawned).toEqual([])
+})
+
+test('a user-owned /cafe does not abort session.start; it falls back to /cafe-barista', async ($, on) => {
+  const host = fakeHost(on, { refuse: ['cafe'] })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true } as any)
+  await settle()
+  // The refused registration is retried under another name, and the session still becomes a Barista.
+  expect(host.registered).toEqual(['cafe', 'cafe-barista'])
+  expect(host.spawned).toHaveLength(1)
+
+  await host.feed({ type: 'ready', address: 'w#1@mac', socket: '/tmp/s.sock' })
+  const out = await $.command.run({ command: 'cafe-barista', args: '' } as any)
+  expect(JSON.stringify(out)).toContain('w#1@mac')
+  host.close()
 })
 
 test('/cafe off and /cafe on pause and resume taking questions', async ($, on) => {

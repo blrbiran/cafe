@@ -7,6 +7,18 @@ import { CreateOrderParams, Methods, type ThreadEnvelope } from "@cafe/protocol"
 import { RpcError } from "@cafe/protocol/peer";
 import type { Daemon } from "./daemon.ts";
 import { loadConfig } from "./config.ts";
+import { eventMatches, parseEventFilter } from "./events.ts";
+import { listRouterModels } from "./router.ts";
+
+/** pi's model catalogue is expensive to build; settings can ask for it repeatedly. */
+let modelCache: { at: number; models: string[] } | undefined;
+async function routerModels(search?: string): Promise<string[]> {
+  if (!modelCache || Date.now() - modelCache.at > 60_000) {
+    modelCache = { at: Date.now(), models: await listRouterModels() };
+  }
+  const q = search?.toLowerCase();
+  return q ? modelCache.models.filter((m) => m.toLowerCase().includes(q)) : modelCache.models;
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -136,6 +148,15 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   let match: RegExpExecArray | null;
 
   if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, ...daemon.routerStatus() });
+  if (m === "GET" && path === "/api/router/models") {
+    return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });
+  }
+  if (m === "POST" && path === "/api/router") {
+    const { model } = await readJson(req);
+    if (model !== null && model !== undefined && typeof model !== "string") throw new RpcError("bad_request", "model must be a string or null");
+    return send(res, 200, await daemon.setRouterModel(model ?? null));
+  }
+  if (m === "GET" && path === "/api/events") return eventStream(daemon, url, req, res);
   if (m === "GET" && path === "/api/snapshot") return send(res, 200, daemon.snapshot());
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {
@@ -245,6 +266,25 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   };
   daemon.on("thread", onEvent);
   for (const env of daemon.thread(threadId)?.events ?? []) onEvent(env);
+  const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
+  const done = () => {
+    clearInterval(ping);
+    daemon.off("thread", onEvent);
+  };
+  req.on("close", done);
+  res.on("close", done);
+}
+
+/** SSE: every Thread event on the network, filtered. Heartbeats are hidden unless asked for. */
+function eventStream(daemon: Daemon, url: URL, req: IncomingMessage, res: ServerResponse): void {
+  const filter = parseEventFilter(url);
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  res.write(": connected\n\n");
+  const onEvent = (env: ThreadEnvelope) => {
+    if (!eventMatches(env, filter)) return;
+    res.write(`data: ${JSON.stringify(env)}\n\n`);
+  };
+  daemon.on("thread", onEvent);
   const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
   const done = () => {
     clearInterval(ping);

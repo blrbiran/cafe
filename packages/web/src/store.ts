@@ -19,6 +19,8 @@ export interface State {
   detail?: ThreadDetail & { loading?: boolean };
   /** Per-thread facts about the latest turn that ThreadMeta does not carry. */
   live: Record<string, LiveTurn>;
+  /** Newest first, capped: the global "Live" page. */
+  events: ThreadEnvelope[];
   /** The "Ask" composer on the feed; `to` prefilled by "Ask it". */
   composer?: { to?: string };
   /** Older threads fetched with "Load older" (beyond the snapshot's newest SNAPSHOT_LIMIT). */
@@ -61,6 +63,7 @@ let state: State = {
   daemons: [],
   threads: [],
   live: {},
+  events: [],
   older: { loading: false, loaded: false, done: false },
   search: { q: "", loading: false },
 };
@@ -187,11 +190,13 @@ function liveFromEvents(events: ThreadEnvelope[], live: Record<string, LiveTurn>
 function appendEvent(env: ThreadEnvelope): void {
   set((s) => {
     const live = foldLive(s.live, env);
-    if (!s.detail || s.detail.meta.threadId !== env.threadId) return { live };
-    const events = s.detail.events;
+    // Global Live page: newest first, bounded; the same envelope can be replayed on reconnect.
+    const events = s.events[0]?.eventId === env.eventId ? s.events : [env, ...s.events].slice(0, 300);
+    if (!s.detail || s.detail.meta.threadId !== env.threadId) return { live, events };
+    const detailEvents = s.detail.events;
     // Notifications arrive in order; a repeated id can only be the one just appended.
-    if (events.length && events[events.length - 1]!.eventId === env.eventId) return { live };
-    return { live, detail: { ...s.detail, events: [...events, env] } };
+    if (detailEvents.length && detailEvents[detailEvents.length - 1]!.eventId === env.eventId) return { live, events };
+    return { live, events, detail: { ...s.detail, events: [...detailEvents, env] } };
   });
 }
 
@@ -291,6 +296,11 @@ export function start(): void {
   started = true;
   void refresh();
   connect();
+}
+
+/** Re-fetch the snapshot after a settings write (display names, router). */
+export async function refreshStore(): Promise<void> {
+  await refresh();
 }
 
 export async function openThread(threadId: string): Promise<void> {

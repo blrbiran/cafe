@@ -6,7 +6,7 @@ import { useNow } from "../format.ts";
 import { bucketOf, outcome, whoAddress, whyText } from "../outcome.ts";
 import { navigate, type Filter } from "../route.ts";
 import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setSearch, useStore, type SearchResult } from "../store.ts";
-import { Empty, PageHeader, Pill } from "../ui/bits.tsx";
+import { Empty, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
 
 export function FeedPage({ filter }: { filter: Filter }) {
   const t = useT();
@@ -73,14 +73,14 @@ export function FeedPage({ filter }: { filter: Filter }) {
         <section className="flex flex-col gap-2.5">
           <h2 className="section-cap">{t.inProgress}</h2>
           {active.map((m) => (
-            <ThreadCard key={m.threadId} meta={m} />
+            <ThreadCard key={m.threadId} meta={m} filter={filter} />
           ))}
         </section>
       )}
       {showDone && threads.length > 0 && (
         <section className="flex flex-col gap-2.5">
           <h2 className="section-cap">{t.recent}</h2>
-          {done.length === 0 ? <Empty>{t.emptyFilter}</Empty> : done.map((m) => <ThreadCard key={m.threadId} meta={m} />)}
+          {done.length === 0 ? <Empty>{t.emptyFilter}</Empty> : done.map((m) => <ThreadCard key={m.threadId} meta={m} filter={filter} />)}
           {!older.done ? (
             <div className="flex justify-center pt-1">
               <button type="button" onClick={() => void loadOlder()} disabled={older.loading} aria-busy={older.loading}>
@@ -113,7 +113,7 @@ function SearchResults({ filter }: { filter: Filter }) {
       <h2 className="section-cap">{t.searchFound(rows.length)}</h2>
       {rows.map(({ meta, hits }) => {
         const o = outcome(t, meta, agents, undefined, now);
-        const open = () => navigate({ page: "thread", threadId: meta.threadId });
+        const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter });
         return (
           <article key={meta.threadId} className="card flex flex-col gap-2.5 px-4.5 py-4">
             <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
@@ -171,14 +171,13 @@ function Highlight({ text, q }: { text: string; q: string }) {
   return <>{parts}</>;
 }
 
-function ThreadCardImpl({ meta }: { meta: ThreadMeta }) {
+function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) {
   const t = useT();
   const agents = useStore((s) => s.agents);
   const live = useStore((s) => s.live[meta.threadId]);
   const bucket = bucketOf(meta);
   const now = useNow(bucket === "active" ? 1_000 : 30_000);
-  const o = outcome(t, meta, agents, live, now);
-  const open = () => navigate({ page: "thread", threadId: meta.threadId });
+  const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter });
 
   // In-progress cards show "why this agent", which needs the routing decision: fetch it lazily.
   useEffect(() => {
@@ -186,51 +185,66 @@ function ThreadCardImpl({ meta }: { meta: ThreadMeta }) {
   }, [bucket, meta.threadId]);
   const why = bucket === "active" ? whyText(t, live, agents, meta) : undefined;
   const first = meta.replies[0];
+  const started = live?.startedAt ?? meta.turnStartedAt ?? (meta.turns <= 1 ? meta.createdAt : undefined);
+  const end = bucket === "answered" ? (first?.at ?? meta.closedAt) : undefined;
+  const timing =
+    bucket === "active"
+      ? started
+        ? t.dur(now - started)
+        : undefined
+      : bucket === "answered" && started && end
+        ? t.dur(end - started)
+        : undefined;
+  const status =
+    bucket === "active"
+      ? { tone: "info" as Tone, text: t.statusWorking }
+      : bucket === "answered"
+        ? { tone: "ok" as Tone, text: t.statusAnswered }
+        : bucket === "cancelled"
+          ? { tone: undefined, text: t.statusCancelled }
+          : { tone: (meta.declines.length ? "warn" : "danger") as Tone, text: t.statusUnanswered };
+  const preview = first
+    ? plain(first.text)
+    : bucket === "unanswered" && meta.declines.length
+      ? meta.declines.map((d) => `${whoAddress(d.agentId, agents, meta)}：${d.reason}`).join(" · ")
+      : undefined;
 
   return (
-    <article className={`card flex flex-col gap-2.5 px-4.5 py-4 ${bucket === "active" ? "card-live" : ""}`}>
-      <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
-        <span className="mono text-fg">{meta.from.address}</span>
-        <span>{t.askedVerb}</span>
-        <span>· {ago(t, meta.createdAt, now)}</span>
-        {meta.turns > 1 && <span>· {t.turns(meta.turns)}</span>}
+    <article
+      role="link"
+      tabIndex={0}
+      data-thread-id={meta.threadId}
+      aria-label={`${meta.summary} — ${status.text}`}
+      title={why}
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      }}
+      className={`card flex cursor-pointer flex-col gap-1.5 px-3.5 py-2.5 transition-colors hover:border-line-strong ${bucket === "active" ? "card-live" : ""}`}
+    >
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <div className="flex min-w-0 items-center gap-1.5 text-muted">
+          <span className="mono truncate text-fg">{meta.from.address}</span>
+          <span>{t.askedVerb}</span>
+          <span>· {ago(t, meta.createdAt, now)}</span>
+          {meta.turns > 1 && <span>· {t.turns(meta.turns)}</span>}
+        </div>
+        <div className="flex flex-none items-center gap-2">
+          <Pill tone={status.tone}>{status.text}</Pill>
+          {timing && <span className="mono text-muted">{timing}</span>}
+        </div>
       </div>
-      <button type="button" className="qbtn" onClick={open}>
-        {meta.summary || "—"}
-      </button>
-      <div className="flex flex-wrap items-center gap-2.5">
-        <Pill tone={o.tone}>{o.text}</Pill>
-        {why && (
-          <span className="hint">
-            {t.why}
-            {why}
-          </span>
-        )}
-      </div>
+      <div className="clamp2 text-[15px] font-semibold leading-snug text-fg-strong">{meta.summary || "—"}</div>
       {bucket === "answered" && first && (
-        <div className="well flex flex-col gap-1.5 px-3.5 py-3">
-          <div className="mono text-xs text-ok">{first.address ?? whoAddress(first.agentId, agents, meta)}</div>
-          <div className="answer clamp3">{plain(first.text)}</div>
-          {meta.replies.length > 1 && <div className="hint">{t.moreReplies(meta.replies.length - 1)}</div>}
+        <div className="truncate text-xs text-muted">
+          <span className="mono text-ok">{whoAddress(first.agentId, agents, meta)}</span>：{preview}
+          {meta.replies.length > 1 && <span> · {t.moreReplies(meta.replies.length - 1)}</span>}
         </div>
       )}
-      {bucket === "unanswered" && meta.declines.length > 0 && (
-        <div className="well flex flex-col gap-1.5 px-3.5 py-3">
-          {meta.declines.map((d) => (
-            <div key={d.agentId} className="text-sm">
-              <span className="mono text-danger">{d.address ?? whoAddress(d.agentId, agents, meta)}</span>
-              <span className="text-muted"> — {d.reason}</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {bucket !== "active" && (
-        <div>
-          <button type="button" className="linkbtn" onClick={open}>
-            {t.openConv}
-          </button>
-        </div>
-      )}
+      {bucket === "unanswered" && preview && <div className="truncate text-xs text-muted">{preview}</div>}
     </article>
   );
 }

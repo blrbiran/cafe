@@ -72,8 +72,8 @@ Internal `host`, `agentId` and Address never change, so old Threads/statistics s
 
 - **Claude Code / Codex (MCP recommended)**: `cafe mcp install` registers `cafe mcp` at user scope (`--dry-run` only prints the commands, `--client claude|codex` installs one). Tools: `cafe_agents`, `cafe_ask`, `cafe_wait`, `cafe_cancel`. It registers absolute node + cafe.js paths; reinstall after changing Node versions or moving the repo.
 - **skill**: `cafe skill install` symlinks `~/.claude/skills/cafe` and `~/.agents/skills/cafe`. Codex references it as `$cafe`, pi as `/skill:cafe`.
-- **CLI**: `cafe ask "..."`, `cafe ask --to billing "..."`, `cafe ask --thread <id> "follow-up"`, `cafe inbox`, `cafe thread <id>`.
-- **Web**: open `http://127.0.0.1:4777/`, or click "Ask" on the Agents page.
+- **CLI**: `cafe ask "..."`, `cafe ask --to billing "..."`, `cafe ask --thread <id> "follow-up"`, `cafe inbox`, `cafe thread <id>`, `cafe tail` (every routed / delivered / acked / replied / closed event; `--json` for JSONL, `--host` / `--type` / `--thread` to filter, heartbeats hidden by default).
+- **Web**: open `http://127.0.0.1:4777/`. The nav stays fixed and the content scrolls independently. Click a conversation to open it in a side drawer; the nav's Agents item expands to show the registered agents; Settings changes display names/aliases, the routing model and supervised Baristas; Live is the network-wide event stream.
 
 ## As a Barista
 
@@ -109,6 +109,7 @@ cafe barista start --dir ~/code/billing --agent claude   # claude -p, one proces
 cafe claude install            # install cafe's Claude Code plugin (--dry-run first)
                                # Claude Code sessions opened in a dir with .cafe then answer questions
                                # in the session: /cafe shows the address, /cafe off pauses, /cafe on resumes
+                               # if you already have a /cafe command, the plugin uses /cafe-barista instead
 cafe barista start --dir ~/code/billing --agent codex --tui   # questions go to the most recently active Codex session in that dir
 ```
 

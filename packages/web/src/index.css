@@ -138,3 +138,60 @@
 @utility answer { color: var(--text-strong); font-size: var(--text-md); line-height: 1.65; overflow-wrap: anywhere; }
 @utility clamp3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; }
 @utility prose-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+
+/* v3-3 workbench: fixed shell, compact cards, detail drawer, live rows. */
+.navitem {
+  all: unset; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-height: 40px; padding: 0 12px; border-radius: var(--radius-sm); color: var(--text); cursor: pointer; text-decoration: none;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.navitem:hover { background: var(--bg-hover); color: var(--text-strong); }
+.navitem.is-current { background: var(--bg-hover); color: var(--text-strong); box-shadow: inset 3px 0 0 var(--accent); }
+.navitem:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nav-count {
+  min-width: 20px; padding: 0 6px; border-radius: 999px; background: var(--border); color: var(--text);
+  font-size: var(--text-xs); line-height: 18px; text-align: center; font-variant-numeric: tabular-nums;
+}
+.nav-count[data-live="true"] { background: var(--accent-subtle); color: var(--text-strong); }
+.nav-live { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-subtle); }
+.chev { display: inline-block; color: var(--muted); transition: transform var(--dur) var(--ease); }
+.chev.open { transform: rotate(90deg); }
+.nav-sublist { display: flex; flex-direction: column; gap: 1px; margin: 2px 0 4px 12px; padding-left: 8px; border-left: 1px solid var(--border); }
+.nav-sublist[hidden] { display: none; }
+.nav-subagent { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 1px 7px; align-items: center; padding: 5px 7px; border-radius: 6px; font-size: var(--text-xs); }
+.nav-subagent:hover { background: var(--bg-hover); }
+.nav-subagent .dot { grid-column: 1; grid-row: 1; }
+.nav-subagent > .min-w-0 { grid-column: 2; grid-row: 1; }
+.nav-subagent > .text-\[10px\] { grid-column: 3; grid-row: 1; }
+.nav-sublink { color: var(--accent); font-size: var(--text-xs); padding: 5px 7px; border-radius: 6px; text-decoration: none; }
+.nav-sublink:hover { background: var(--bg-hover); text-decoration: underline; }
+
+.scrim { position: fixed; inset: 0; z-index: 30; background: rgba(0, 0, 0, 0.28); opacity: 0; pointer-events: none; transition: opacity 160ms var(--ease); }
+.app.settings-open .scrim { opacity: 1; pointer-events: auto; }
+.app.detail-open .scrim { opacity: 1; pointer-events: auto; }
+
+.thread-body { display: block; }
+.thread-rail { display: none; }
+.clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+
+@media (min-width: 1600px) {
+  .app.detail-open .scrim { opacity: 0; pointer-events: none; }
+  .app.detail-open.settings-open .scrim { opacity: 1; pointer-events: auto; }
+  .app.detail-open main { padding-right: calc(100vw - var(--nav-width) - 680px); }
+  .app.detail-open .thread-drawer { width: calc(100vw - var(--nav-width) - 680px); box-shadow: none; }
+  .thread-drawer .thread-main { width: 100%; max-width: 820px; margin: 0 auto; }
+}
+@media (min-width: 2200px) {
+  .thread-body { display: grid; grid-template-columns: minmax(0, 820px) 280px; justify-content: center; gap: 28px; align-items: start; }
+  .thread-main { width: 100%; max-width: none; margin: 0; }
+  .thread-rail { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 0; }
+}
+@media (max-width: 760px) {
+  .navitem { min-height: 34px; padding: 0 10px; font-size: var(--text-sm); white-space: nowrap; }
+  .navitem.is-current { box-shadow: inset 0 -3px 0 var(--accent); }
+  .nav-count { display: none; }
+  .nav-sublist {
+    position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, 90vw); margin: 0; padding: 8px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-pop); z-index: 30;
+  }
+}

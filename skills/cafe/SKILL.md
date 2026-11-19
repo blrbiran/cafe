@@ -42,6 +42,7 @@ cafe ask --notice "deploy finished"          # one-way notice, no reply expected
 cafe daemon status        # host, root online?, router (llm|rules), agent and thread counts
 cafe threads [--status failed]
 cafe thread <threadId>    # full event log: routed → delivered → acked → replied/declined → closed
+cafe tail                 # every event across the network (add --json, --host, --type, --thread; heartbeats hidden)
 cafe inbox                # threads started from the CLI
 cafe barista list         # headless Baristas supervised by this daemon
 ```

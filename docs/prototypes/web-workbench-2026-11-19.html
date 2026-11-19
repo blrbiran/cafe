@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cafe 工作台 · 设计原型</title>
+<style>
+/* ---- tokens: copied from packages/web/src/styles.css so the prototype matches the app ---- */
+:root {
+  color-scheme: dark;
+  --bg: #0e0f11; --bg-elevated: #1f2125; --well: #212327; --field: var(--bg-hover);
+  --bg-hover: #282a2f; --card: #1b1c1f; --border: #393b41; --border-strong: #4b4e55;
+  --text: #d6d7da; --text-strong: #f7f7f8; --muted: #a6a8ae;
+  --accent: #60a5fa; --accent-subtle: rgba(96,165,250,.22); --accent-hover: #93c5fd; --on-accent: #0b1220;
+  --ok: #22c55e; --ok-subtle: rgba(34,197,94,.08);
+  --warn: #f59e0b; --warn-subtle: rgba(245,158,11,.08);
+  --danger: #f87171; --danger-subtle: rgba(248,113,113,.08);
+  --info: #60a5fa; --info-subtle: rgba(96,165,250,.08);
+  --shadow: 0 1px 2px rgba(0,0,0,.25);
+  --shadow-pop: 0 8px 24px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --text-xs: 12px; --text-sm: 13px; --text-md: 14px; --text-lg: 16px;
+  --radius-xs: 4px; --radius-sm: 6px; --radius: 10px;
+  --dur: 140ms; --ease: cubic-bezier(.2,0,0,1);
+  --nav-width: 240px; --detail-width: min(780px, calc(100vw - 180px)); --settings-width: 430px;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f4ef; --bg-elevated: #fffdf9; --bg-hover: #eeeae2; --card: #fffdf9; --well: var(--bg); --field: var(--bg);
+  --border: #e3ddd1; --border-strong: #cfc7b8; --text: #3d3830; --text-strong: #1c1915; --muted: #6a645a;
+  --accent: #1d4ed8; --accent-subtle: rgba(29,78,216,.1); --on-accent: #fff; --accent-hover: #1e40af;
+  --ok: #15803d; --warn: #b45309; --danger: #b91c1c; --info: #1d4ed8;
+  --ok-subtle: rgba(21,128,61,.08); --warn-subtle: rgba(180,83,9,.08); --danger-subtle: rgba(185,28,28,.08); --info-subtle: rgba(29,78,216,.08);
+  --shadow: 0 1px 2px rgba(28,26,23,.08);
+  --shadow-pop: 0 8px 24px rgba(28,26,23,.12), 0 1px 3px rgba(28,26,23,.08);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: var(--text-md)/1.55 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+a { color: var(--accent); }
+code, pre, .mono { font-family: var(--mono); }
+::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); color: var(--text-strong); }
+
+/* ---- shell ---- */
+.app { display: flex; height: 100dvh; overflow: hidden; }
+.nav {
+  width: var(--nav-width); flex: none; display: flex; flex-direction: column; gap: 16px;
+  padding: 18px 12px 16px; border-right: 1px solid var(--border); background: var(--card);
+  overflow-y: auto;
+}
+.brand { display: flex; align-items: center; gap: 8px; padding: 0 4px; color: var(--text-strong); }
+.brand svg { flex: none; }
+.brand b { font-size: 18px; letter-spacing: .01em; }
+.proto {
+  margin-left: auto; font-size: 9px; letter-spacing: .12em; font-weight: 700; color: var(--muted);
+  border: 1px solid var(--border-strong); border-radius: 999px; padding: 1px 7px;
+}
+.machine { border: 1px solid var(--border); border-radius: 8px; background: var(--well); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.machine .cap { font-size: var(--text-xs); color: var(--muted); }
+.machine .name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.machine .name b { font-family: var(--mono); font-size: var(--text-sm); color: var(--text-strong); }
+.machine .live { display: flex; align-items: center; gap: 6px; font-size: var(--text-xs); color: var(--muted); }
+.navlist { display: flex; flex-direction: column; gap: 2px; }
+.navitem {
+  all: unset; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-height: 40px; padding: 0 12px; border-radius: var(--radius-sm); color: var(--text); cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.navitem:hover { background: var(--bg-hover); color: var(--text-strong); }
+.navitem[aria-current="page"] { background: var(--bg-hover); color: var(--text-strong); box-shadow: inset 3px 0 0 var(--accent); }
+.navitem:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.navitem .count {
+  min-width: 20px; padding: 0 6px; border-radius: 999px; background: var(--border); color: var(--text);
+  font-size: var(--text-xs); line-height: 18px; text-align: center; font-variant-numeric: tabular-nums;
+}
+.navitem .count.hot { background: var(--accent-subtle); color: var(--text-strong); }
+.navitem .count.live { background: var(--ok-subtle); color: var(--ok); }
+.navgroup { display: flex; flex-direction: column; gap: 2px; }
+.chev { color: var(--muted); transition: transform var(--dur) var(--ease); }
+.navitem[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.sublist {
+  display: flex; flex-direction: column; gap: 1px; margin: 2px 0 4px 12px; padding-left: 8px;
+  border-left: 1px solid var(--border); animation: subin 140ms var(--ease);
+}
+.sublist[hidden] { display: none; }
+@keyframes subin { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+.subagent {
+  display: grid; grid-template-columns: 8px 1fr auto; grid-template-areas: "dot id state" ". addr addr";
+  align-items: center; gap: 1px 7px; padding: 5px 7px; border-radius: 6px; font-size: var(--text-xs);
+}
+.subagent:hover { background: var(--bg-hover); }
+.subagent .dot { grid-area: dot; }
+.sub-id { grid-area: id; display: flex; align-items: center; gap: 5px; min-width: 0; }
+.sub-name { color: var(--text-strong); font-weight: 600; font-size: var(--text-sm); }
+.subagent .kind { font-size: 9px; padding: 0 5px; line-height: 1.6; }
+.sub-addr { grid-area: addr; font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub-state { grid-area: state; font-size: 10px; color: var(--ok); white-space: nowrap; }
+.sub-state.busy { color: var(--info); }
+.sublink {
+  all: unset; box-sizing: border-box; cursor: pointer; margin-top: 3px; padding: 5px 7px; border-radius: 6px;
+  color: var(--accent); font-size: var(--text-xs);
+}
+.sublink:hover { background: var(--bg-hover); }
+.sublink:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.spacer { flex: 1; }
+.navfoot { display: flex; flex-direction: column; gap: 10px; padding: 0 4px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.row .cap { font-size: var(--text-xs); color: var(--muted); letter-spacing: .02em; }
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); overflow: hidden; }
+.seg button { all: unset; box-sizing: border-box; min-height: 28px; padding: 0 10px; font-size: var(--text-xs); color: var(--muted); cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--bg-hover); color: var(--text-strong); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.main { flex: 1; min-width: 0; overflow-y: auto; scroll-behavior: smooth; }
+.content { max-width: 1180px; margin: 0 auto; padding: 26px 32px 90px; }
+.pagehead { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.pagehead h1 { margin: 0; font-size: 22px; line-height: 1.25; color: var(--text-strong); letter-spacing: -.01em; }
+.pagehead .sub { margin-top: 3px; color: var(--muted); font-size: var(--text-sm); }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; padding: 0 13px;
+  border-radius: var(--radius-sm); border: 1px solid var(--border-strong); background: var(--bg-elevated);
+  color: var(--text-strong); font-size: var(--text-sm); font-weight: 500; box-shadow: var(--shadow);
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.btn:hover { background: var(--bg-hover); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.sm { min-height: 28px; padding: 0 10px; font-size: var(--text-xs); }
+.btn.quiet { background: transparent; border-color: transparent; box-shadow: none; color: var(--text); }
+.btn.quiet:hover { background: var(--bg-hover); }
+.btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border-strong)); }
+.iconbtn {
+  all: unset; box-sizing: border-box; width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm); color: var(--muted); cursor: pointer;
+}
+.iconbtn:hover { background: var(--bg-hover); color: var(--text-strong); }
+.iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; min-height: 30px; padding: 0 12px; border-radius: 16px;
+  border: 1px solid var(--border-strong); background: transparent; color: var(--text); font-size: var(--text-sm);
+}
+.chip:hover { background: var(--bg-hover); }
+.chip[aria-pressed="true"] { background: var(--text-strong); color: var(--bg); border-color: var(--text-strong); }
+.search { position: relative; flex: 1 1 220px; min-width: 160px; }
+.search svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+.search input {
+  width: 100%; min-height: 32px; padding: 6px 10px 6px 32px; border-radius: 8px;
+  border: 1px solid var(--border-strong); background: var(--field); color: var(--text-strong); font-size: var(--text-sm);
+}
+.search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+.section-lab { display: flex; align-items: center; gap: 8px; margin: 20px 0 8px; }
+.section-lab h2 { margin: 0; font-size: var(--text-xs); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.section-lab .n { font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); }
+
+/* ---- compact thread card ---- */
+.list { display: flex; flex-direction: column; gap: 8px; }
+.tcard {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 13px; text-align: left;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--card);
+  box-shadow: var(--shadow); cursor: pointer; transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.tcard:hover { border-color: var(--border-strong); background: color-mix(in srgb, var(--card) 88%, var(--bg-hover)); }
+.tcard:active { transform: translateY(1px); }
+.tcard:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tcard.active { border-color: color-mix(in srgb, var(--info) 45%, var(--border)); }
+.tmeta { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: var(--text-xs); color: var(--muted); }
+.twho { display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.twho .addr { font-family: var(--mono); color: var(--text); }
+.tstat { display: flex; align-items: center; gap: 7px; flex: none; }
+.ttl { font-size: 15px; font-weight: 600; line-height: 1.35; color: var(--text-strong); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.tprev { font-size: var(--text-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tprev .who { font-family: var(--mono); color: var(--ok); }
+.tprev .more { color: var(--muted); }
+.tcard .why { display: none; }
+.tcard.expanded .why { display: block; font-size: var(--text-xs); color: var(--muted); }
+
+/* ---- pills / dots ---- */
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 12px;
+  border: 1px solid var(--border-strong); background: var(--well); color: var(--muted);
+  font-size: var(--text-xs); line-height: 1.5; white-space: nowrap;
+}
+.pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); background: var(--ok-subtle); }
+.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); background: var(--warn-subtle); }
+.pill.info { color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, var(--border)); background: var(--info-subtle); }
+.pill.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); background: var(--danger-subtle); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); opacity: .6; flex: none; }
+.dot.ok { background: var(--ok); opacity: 1; }
+.dot.info { background: var(--info); opacity: 1; animation: pulse 1.6s infinite; }
+.dot.warn { background: var(--warn); opacity: 1; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--info) 55%, transparent); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+.hint { font-size: var(--text-xs); color: var(--muted); }
+.mono { font-family: var(--mono); }
+
+/* ---- detail drawer ---- */
+.scrim {
+  position: fixed; inset: 0; background: rgba(0,0,0,.28); opacity: 0; pointer-events: none;
+  transition: opacity var(--dur) var(--ease); z-index: 20;
+}
+.scrim.on { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; right: 0; height: 100dvh; display: flex; flex-direction: column;
+  background: var(--bg); border-left: 1px solid var(--border); box-shadow: var(--shadow-pop); z-index: 30;
+  transform: translateX(102%); transition: transform 180ms var(--ease); visibility: hidden;
+}
+.drawer.open { transform: translateX(0); visibility: visible; }
+.drawer.detail { width: min(var(--detail-width), 100vw); }
+.drawer.settings { width: min(var(--settings-width), 100vw); }
+.drawer-head {
+  flex: none; display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+  border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 86%, var(--card));
+  backdrop-filter: blur(8px);
+}
+.drawer-head .title { font-size: var(--text-sm); font-weight: 600; color: var(--text-strong); }
+.drawer-head .sub { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 20px 28px; }
+.drawer-body.narrow { padding: 16px 16px 24px; }
+.drawer-foot { flex: none; border-top: 1px solid var(--border); padding: 12px 16px; background: var(--card); }
+
+.ctx {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px 14px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--well); margin-bottom: 16px;
+}
+.ctx .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.ctx .v { font-size: var(--text-sm); color: var(--text-strong); }
+.thread-h { margin: 0 0 4px; font-size: 20px; line-height: 1.35; letter-spacing: -.01em; color: var(--text-strong); }
+.thread-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--text-xs); color: var(--muted); margin-bottom: 16px; }
+.turn { display: flex; flex-direction: column; gap: 10px; margin-bottom: 22px; }
+.turn-q { display: flex; flex-direction: column; gap: 7px; padding: 13px 15px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); }
+.turn-q .who { display: flex; align-items: center; gap: 8px; font-size: var(--text-xs); color: var(--muted); }
+.turn-q .who .addr { font-family: var(--mono); color: var(--text); }
+.turn-q .body { color: var(--text-strong); font-size: var(--text-md); line-height: 1.6; white-space: pre-wrap; }
+.turn-q .body h3 { margin: 0 0 4px; font-size: var(--text-md); }
+.answer-card { display: flex; flex-direction: column; gap: 8px; padding: 13px 15px; border: 1px solid color-mix(in srgb, var(--ok) 26%, var(--border)); border-radius: var(--radius); background: color-mix(in srgb, var(--ok-subtle) 55%, var(--card)); }
+.answer-card .who { display: flex; align-items: center; gap: 8px; font-size: var(--text-xs); color: var(--muted); }
+.answer-card .who .addr { font-family: var(--mono); color: var(--ok); }
+.answer-card .body { font-size: var(--text-md); line-height: 1.65; color: var(--text-strong); }
+.answer-card .body p { margin: 0 0 8px; }
+.answer-card .body p:last-child { margin-bottom: 0; }
+.answer-card .body ul { margin: 4px 0 8px; padding-left: 20px; }
+.answer-card .body li { margin: 2px 0; }
+.answer-card .body pre { margin: 8px 0; padding: 9px 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; overflow-x: auto; font-size: 12px; line-height: 1.5; }
+.answer-card .body code { font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+.answer-card .body pre code { border: 0; padding: 0; background: transparent; }
+.routing { display: flex; flex-direction: column; gap: 6px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--well); }
+.routing .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.routing .v { font-size: var(--text-sm); color: var(--text-strong); }
+.routing .v .addr { font-family: var(--mono); }
+.routing .why { font-size: var(--text-xs); color: var(--muted); }
+.kind { display: inline-flex; align-items: center; font-size: 10px; font-weight: 600; letter-spacing: .02em; padding: 0 6px; border-radius: 5px; border: 1px solid var(--border-strong); background: var(--well); color: var(--text); line-height: 1.7; }
+.disclosure { border: 1px solid var(--border); border-radius: 8px; background: var(--card); overflow: hidden; }
+.disclosure summary { list-style: none; cursor: pointer; padding: 9px 12px; font-size: var(--text-xs); color: var(--muted); }
+.disclosure summary::-webkit-details-marker { display: none; }
+.disclosure summary:hover { background: var(--bg-hover); color: var(--text); }
+.disclosure .log { padding: 4px 12px 10px; display: flex; flex-direction: column; gap: 6px; }
+.logrow { display: flex; align-items: baseline; gap: 10px; font-size: var(--text-xs); }
+.logrow .t { font-family: var(--mono); color: var(--muted); width: 72px; flex: none; }
+.composer { display: flex; flex-direction: column; gap: 8px; }
+.composer textarea { width: 100%; min-height: 64px; resize: vertical; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border-strong); background: var(--field); color: var(--text-strong); font-size: var(--text-sm); line-height: 1.5; }
+.composer textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+.composer .foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.detail-rail { display: none; }
+.rail-card { display: flex; flex-direction: column; gap: 8px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+.rail-card > .k { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.rail-kv { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: var(--text-xs); }
+.rail-kv .k { color: var(--muted); flex: none; }
+.rail-kv .v { color: var(--text-strong); text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-kv .v.mono { font-family: var(--mono); }
+
+/* ---- settings ---- */
+.set-group { border-bottom: 1px solid var(--border); padding: 4px 0 16px; margin-bottom: 16px; }
+.set-group:last-child { border-bottom: 0; }
+.set-group h3 { margin: 0 0 3px; font-size: var(--text-sm); color: var(--text-strong); }
+.set-group .desc { margin-bottom: 10px; font-size: var(--text-xs); color: var(--muted); }
+.setrow { display: flex; align-items: flex-end; gap: 8px; }
+.setrow label { flex: 1; display: flex; flex-direction: column; gap: 4px; font-size: var(--text-xs); color: var(--muted); }
+.setrow input, .setrow select {
+  width: 100%; min-height: 32px; padding: 5px 9px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--field); color: var(--text-strong); font-size: var(--text-sm);
+}
+.setrow input:focus-visible, .setrow select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+.tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.tag { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--well); font-size: 11px; color: var(--text); }
+.tag button { all: unset; cursor: pointer; color: var(--muted); font-size: 12px; line-height: 1; }
+.tag button:hover { color: var(--danger); }
+.agent-row, .barista-row, .daemon-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--border); }
+.agent-row:first-of-type, .barista-row:first-of-type, .daemon-row:first-of-type { border-top: 0; }
+.agent-row .id { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.agent-row .id b { font-size: var(--text-sm); color: var(--text-strong); }
+.agent-row .id span { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-row .acts { display: flex; gap: 6px; flex: none; }
+.statusline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; font-size: var(--text-xs); color: var(--muted); }
+.statusline .mono { color: var(--text-strong); }
+.note { font-size: var(--text-xs); color: var(--muted); }
+.note.warn { color: var(--warn); }
+
+/* ---- live ---- */
+.livebar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+.livebar .spacer { flex: 1; }
+.livefeed { margin-top: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); overflow: hidden; }
+.lerow { display: grid; grid-template-columns: 72px 92px 1fr; gap: 10px; padding: 9px 13px; border-bottom: 1px solid var(--border); align-items: baseline; }
+.lerow:last-child { border-bottom: 0; }
+.lerow:hover { background: color-mix(in srgb, var(--bg-hover) 55%, transparent); }
+.lerow .t { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.lerow .msg { font-size: var(--text-sm); color: var(--text); }
+.lerow .msg .th { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.lerow .msg .who { font-family: var(--mono); color: var(--text-strong); }
+.ltag { justify-self: start; font-size: 10px; font-weight: 600; letter-spacing: .02em; padding: 1px 7px; border-radius: 5px; border: 1px solid var(--border-strong); background: var(--well); color: var(--muted); }
+.ltag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); background: var(--ok-subtle); }
+.ltag.info { color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, var(--border)); background: var(--info-subtle); }
+.ltag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); background: var(--warn-subtle); }
+
+/* ---- agents / network ---- */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 16px; }
+.acard { display: flex; flex-direction: column; gap: 9px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); box-shadow: var(--shadow); }
+.acard .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.acard .nm { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: var(--text-lg); font-weight: 600; color: var(--text-strong); }
+.acard .addr { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.acard .desc { font-size: var(--text-sm); color: var(--text); }
+.facts { display: grid; grid-template-columns: 64px 1fr; gap: 4px 10px; font-size: var(--text-xs); }
+.facts .k { color: var(--muted); }
+.facts .v { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.empty { color: var(--muted); border: 1px dashed var(--border-strong); border-radius: var(--radius); padding: 22px; text-align: center; font-size: var(--text-sm); }
+
+/* ---- responsive ---- */
+@media (min-width: 1600px) {
+  :root { --list-pane: 680px; --detail-width: calc(100vw - var(--nav-width) - var(--list-pane)); }
+  .app.detail-open .main { padding-right: var(--detail-width); transition: padding-right 180ms var(--ease); }
+  .app.detail-open .content { max-width: calc(var(--list-pane) - 64px); margin: 0; }
+  .app.detail-open .drawer.detail { width: var(--detail-width); box-shadow: none; }
+  .app.detail-open .drawer.detail .drawer-body { width: 100%; max-width: 820px; margin: 0 auto; }
+  .app.detail-open .drawer.detail .drawer-head { padding-left: 24px; }
+  .app.detail-open .scrim { opacity: 0; pointer-events: none; }
+  .app.settings-open .scrim { opacity: 1; pointer-events: auto; }
+  .content { max-width: 1360px; }
+}
+@media (min-width: 2000px) {
+  .content { max-width: 1560px; }
+}
+@media (min-width: 2200px) {
+  .app.detail-open .drawer.detail .drawer-body {
+    display: grid; grid-template-columns: minmax(0, 820px) 280px; gap: 28px;
+    justify-content: center; align-items: start; max-width: 1160px;
+  }
+  .detail-main { min-width: 0; }
+  .detail-main .ctx { display: none; }
+  .detail-rail { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 0; }
+}
+@media (max-width: 900px) {
+  .content { padding: 20px 18px 80px; }
+  .tcard { padding: 9px 11px; }
+}
+@media (max-width: 760px) {
+  .app { display: block; height: auto; overflow: visible; }
+  .nav {
+    width: auto; height: auto; position: sticky; top: 0; z-index: 15; flex-direction: row; align-items: center;
+    padding: 9px 12px; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; overflow-y: hidden;
+    background: color-mix(in srgb, var(--card) 94%, transparent); backdrop-filter: blur(8px);
+  }
+  .brand { padding: 0; flex: none; }
+  .brand b { font-size: var(--text-lg); }
+  .proto, .machine, .spacer, .navfoot { display: none; }
+  .navlist { flex-direction: row; flex: none; gap: 2px; }
+  .navgroup { position: relative; }
+  .sublist {
+    position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, 90vw); margin: 0; padding: 8px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-pop); z-index: 30;
+  }
+  .navitem { min-height: 34px; padding: 0 10px; font-size: var(--text-sm); white-space: nowrap; }
+  .navitem[aria-current="page"] { box-shadow: inset 0 -3px 0 var(--accent); }
+  .navitem .count { display: none; }
+  .main { overflow: visible; }
+  .content { padding: 16px 14px 72px; }
+  .drawer { width: 100%; }
+  .app.detail-open .main { padding-right: 0; }
+  .scrim.on { opacity: 1; pointer-events: auto; }
+  .lerow { grid-template-columns: 60px 1fr; }
+  .lerow .msg { grid-column: 2; }
+  .lerow .ltag { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .01ms !important; animation: none !important; scroll-behavior: auto !important; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app" data-view="feed">
+
+  <!-- ================= nav ================= -->
+  <aside class="nav">
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 9h12v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V9z"/><path d="M16 10h1.5a2.5 2.5 0 0 1 0 5H16"/><path d="M8 3c0 1.5 1 1.5 1 3M12 3c0 1.5 1 1.5 1 3"/>
+      </svg>
+      <b>cafe</b>
+      <span class="proto">PROTOTYPE</span>
+    </div>
+
+    <div class="machine">
+      <div class="cap">本机</div>
+      <div class="name">
+        <b>biran-mac</b>
+        <span class="pill info" style="padding:0 7px;font-size:10px">中心节点</span>
+      </div>
+      <div class="live"><span class="dot ok"></span>实时更新中</div>
+    </div>
+
+    <nav class="navlist" aria-label="cafe">
+      <button class="navitem" data-view="feed" aria-current="page">问答 <span class="count hot">2</span></button>
+      <div class="navgroup">
+        <button class="navitem" id="agents-toggle" aria-expanded="false" aria-controls="agents-sub">
+          <span>Agents</span>
+          <span style="display:flex;align-items:center;gap:6px">
+            <span class="count">5</span>
+            <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </span>
+        </button>
+        <div class="sublist" id="agents-sub" hidden>
+          <div class="subagent">
+            <span class="dot ok"></span>
+            <div class="sub-id"><span class="sub-name">cafe</span><span class="kind">Claude Code</span></div>
+            <span class="sub-addr">cafe#1@biran-mac</span>
+            <span class="sub-state">空闲</span>
+          </div>
+          <div class="subagent">
+            <span class="dot info"></span>
+            <div class="sub-id"><span class="sub-name">billing</span><span class="kind">Codex</span></div>
+            <span class="sub-addr">billing#1@biran-mac</span>
+            <span class="sub-state busy">忙碌</span>
+          </div>
+          <div class="subagent">
+            <span class="dot ok"></span>
+            <div class="sub-id"><span class="sub-name">ssh1</span><span class="kind">pi</span></div>
+            <span class="sub-addr">ssh1#1@ssh1</span>
+            <span class="sub-state">空闲</span>
+          </div>
+          <div class="subagent">
+            <span class="dot ok"></span>
+            <div class="sub-id"><span class="sub-name">web</span><span class="kind">Claude Code</span></div>
+            <span class="sub-addr">web#1@biran-mac</span>
+            <span class="sub-state">空闲</span>
+          </div>
+          <div class="subagent">
+            <span class="dot ok"></span>
+            <div class="sub-id"><span class="sub-name">ops</span><span class="kind">pi</span></div>
+            <span class="sub-addr">ops#1@ssh1</span>
+            <span class="sub-state">空闲</span>
+          </div>
+          <button class="sublink" data-view="agents">查看全部 Agents →</button>
+        </div>
+      </div>
+      <button class="navitem" data-view="network">网络 <span class="count">3</span></button>
+      <button class="navitem" data-view="live">实况 <span class="count live">●</span></button>
+    </nav>
+
+    <div class="spacer"></div>
+
+    <button class="navitem" id="open-settings">
+      <span style="display:flex;align-items:center;gap:8px">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-.44-1.16 1.7 1.7 0 0 0-1.87-.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.16-.44 1.7 1.7 0 0 0 .34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 .44 1.16 1.7 1.7 0 0 0 1.87.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.25.37.63.63 1.06.72H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5.88z"/></svg>
+        设置
+      </span>
+    </button>
+
+    <div class="navfoot">
+      <div class="row">
+        <span class="cap">语言</span>
+        <div class="seg" role="group" aria-label="语言">
+          <button aria-pressed="true">中文</button>
+          <button aria-pressed="false">EN</button>
+        </div>
+      </div>
+      <div class="row">
+        <span class="cap">主题</span>
+        <div class="seg" role="group" aria-label="主题">
+          <button data-theme-set="dark" aria-pressed="true">深色</button>
+          <button data-theme-set="light" aria-pressed="false">浅色</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ================= main ================= -->
+  <main class="main" id="main">
+    <div class="content">
+
+      <!-- ---------- feed ---------- -->
+      <section data-page="feed">
+        <div class="pagehead">
+          <div>
+            <h1>问答</h1>
+            <div class="sub">发到网络上的每个问题，谁在处理、谁回答了、答了什么。</div>
+          </div>
+          <button class="btn primary">＋ 提问</button>
+        </div>
+
+        <div class="toolbar">
+          <div class="chips" role="group" aria-label="筛选">
+            <button class="chip" aria-pressed="true">全部</button>
+            <button class="chip" aria-pressed="false">进行中</button>
+            <button class="chip" aria-pressed="false">已回答</button>
+            <button class="chip" aria-pressed="false">没人能答</button>
+          </div>
+          <div class="search">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input type="search" placeholder="搜索问题和回答…" aria-label="搜索会话">
+          </div>
+        </div>
+
+        <div class="section-lab"><h2>进行中</h2><span class="n">2</span></div>
+        <div class="list">
+          <article class="tcard active" tabindex="0" data-open-detail data-title="多机 Docker 里 knownDaemons 被写成 172.17 内网地址" data-from="ssh1#1@ssh1" data-turns="2 轮对话" data-status="working" data-status-text="ssh1#1 正在处理 · 已 48s" data-prev="cafe#1：我先看 child 上报的 url 和 root 侧的探活顺序。">
+            <div class="tmeta">
+              <span class="twho"><span class="addr">ssh1#1@ssh1</span><span>提问</span><span>· 2 分钟前</span><span>· 2 轮对话</span></span>
+              <span class="tstat"><span class="pill info"><span class="dot info"></span>处理中</span><span class="mono">48s</span></span>
+            </div>
+            <div class="ttl">多机 Docker 里 knownDaemons 被写成 172.17 内网地址</div>
+            <div class="tprev"><span class="who">cafe#1</span>：我先看 child 上报的 url 和 root 侧的探活顺序。</div>
+          </article>
+
+          <article class="tcard active" tabindex="0" data-open-detail data-title="LLM 路由开启后切换模型不生效，帮我看看 initRouter 的 early-return" data-from="biran#1@biran-mac" data-turns="3 轮对话" data-status="working" data-status-text="cafe#1 正在处理 · 已 1m 12s" data-prev="cafe#1：current model 还是旧的，我先确认 initRouter 的返回分支。">
+            <div class="tmeta">
+              <span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 4 分钟前</span><span>· 3 轮对话</span></span>
+              <span class="tstat"><span class="pill info"><span class="dot info"></span>处理中</span><span class="mono">1m 12s</span></span>
+            </div>
+            <div class="ttl">LLM 路由开启后切换模型不生效，帮我看看 initRouter 的 early-return</div>
+            <div class="tprev"><span class="who">cafe#1</span>：current model 还是旧的，我先确认 initRouter 的返回分支。</div>
+          </article>
+        </div>
+
+        <div class="section-lab"><h2>最近</h2><span class="n">10</span></div>
+        <div class="list">
+          <article class="tcard" tabindex="0" data-open-detail data-title="pi 扩展在 ~/.cafe 目录下报 EISDIR，扩展直接没加载" data-from="biran#1@biran-mac" data-turns="3 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 8s" data-prev="cafe#1：findCafeFile 把目录也当成了 .cafe，修法是只接受普通文件。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 6 分钟前</span><span>· 3 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">8s</span></span></div>
+            <div class="ttl">pi 扩展在 ~/.cafe 目录下报 EISDIR，扩展直接没加载</div>
+            <div class="tprev"><span class="who">cafe#1</span>：findCafeFile 把目录也当成了 .cafe，修法是只接受普通文件。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="Conversation 卡片标题被截成 codex ap，看起来像 agent 转述" data-from="biran#1@biran-mac" data-turns="1 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 21s" data-prev="cafe#1：summary 是首轮 body 的硬截断；现在按词边界截断并更新到最新一轮。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 9 分钟前</span><span>· 1 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">21s</span></span></div>
+            <div class="ttl">Conversation 卡片标题被截成 codex ap，看起来像 agent 转述</div>
+            <div class="tprev"><span class="who">cafe#1</span>：summary 是首轮 body 的硬截断；现在按词边界截断并更新到最新一轮。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="Web 左侧导航在长对话时被推到页面底部，语言和主题找不到" data-from="biran#1@biran-mac" data-turns="2 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 34s" data-prev="cafe#1：Shell 现在是 min-h-screen，改成 h-screen + main 独立滚动就行。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 14 分钟前</span><span>· 2 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">34s</span></span></div>
+            <div class="ttl">Web 左侧导航在长对话时被推到页面底部，语言和主题找不到</div>
+            <div class="tprev"><span class="who">cafe#1</span>：Shell 现在是 min-h-screen，改成 h-screen + main 独立滚动就行。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="cafe_ask 在 Codex 里没有触发，只能本地 grep" data-from="codex#1@biran-mac" data-turns="4 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 12s" data-prev="cafe#1：skill 第一段改成 MANDATORY，先跑 cafe agents，再决定本地还是委派。">
+            <div class="tmeta"><span class="twho"><span class="addr">codex#1@biran-mac</span><span>提问</span><span>· 18 分钟前</span><span>· 4 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">12s</span></span></div>
+            <div class="ttl">cafe_ask 在 Codex 里没有触发，只能本地 grep</div>
+            <div class="tprev"><span class="who">cafe#1</span>：skill 第一段改成 MANDATORY，先跑 cafe agents，再决定本地还是委派。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="把 model 从 qwen 换成 never-stuck 需要重启 daemon 吗？" data-from="biran#1@biran-mac" data-turns="1 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 6s" data-prev="cafe#1：不用，router set 会写入并重建；失败会回滚到旧模型。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 24 分钟前</span><span>· 1 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">6s</span></span></div>
+            <div class="ttl">把 model 从 qwen 换成 never-stuck 需要重启 daemon 吗？</div>
+            <div class="tprev"><span class="who">cafe#1</span>：不用，router set 会写入并重建；失败会回滚到旧模型。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="怎么在局域网里再加一台机器？需要手改 config 吗？" data-from="biran#1@biran-mac" data-turns="2 轮对话" data-status="ok" data-status-text="ssh1#1 已回答 · 用时 1m 3s" data-prev="ssh1#1：cafe connect 一次写入 root、token 和 mode，再 daemon restart。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 31 分钟前</span><span>· 2 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">1m 3s</span></span></div>
+            <div class="ttl">怎么在局域网里再加一台机器？需要手改 config 吗？</div>
+            <div class="tprev"><span class="who">ssh1#1</span>：cafe connect 一次写入 root、token 和 mode，再 daemon restart。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="routing hints 为什么没有影响这次选择？" data-from="biran#1@biran-mac" data-turns="1 轮对话" data-status="warn" data-status-text="没人能答 · 2 个 agent 都表示不归自己管" data-prev="cafe#1：婉拒记录只是弱提示，不会压过更匹配的 description。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 42 分钟前</span><span>· 1 轮对话</span></span><span class="tstat"><span class="pill warn"><span class="dot warn"></span>没人能答</span><span class="mono">—</span></span></div>
+            <div class="ttl">routing hints 为什么没有影响这次选择？</div>
+            <div class="tprev"><span class="who">cafe#1</span>：婉拒记录只是弱提示，不会压过更匹配的 description。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="Thread 事件多了以后打开很慢，详情页要等好几秒" data-from="biran#1@biran-mac" data-turns="2 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 2m 4s" data-prev="cafe#1：先给详情加分页和 Last-Event-ID，别每次全量回放。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 1 小时前</span><span>· 2 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">2m 4s</span></span></div>
+            <div class="ttl">Thread 事件多了以后打开很慢，详情页要等好几秒</div>
+            <div class="tprev"><span class="who">cafe#1</span>：先给详情加分页和 Last-Event-ID，别每次全量回放。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="cafe mcp 和 skill 应该装哪个？两个都要吗？" data-from="biran#1@biran-mac" data-turns="1 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 5s" data-prev="cafe#1：Customer 用 mcp 或 CLI 都行；skill 是给 Claude Code / Codex 的说明书。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 1 小时前</span><span>· 1 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">5s</span></span></div>
+            <div class="ttl">cafe mcp 和 skill 应该装哪个？两个都要吗？</div>
+            <div class="tprev"><span class="who">cafe#1</span>：Customer 用 mcp 或 CLI 都行；skill 是给 Claude Code / Codex 的说明书。</div>
+          </article>
+
+          <article class="tcard" tabindex="0" data-open-detail data-title="daemon 重启后 Barista 会自动重连吗？" data-from="biran#1@biran-mac" data-turns="1 轮对话" data-status="ok" data-status-text="cafe#1 已回答 · 用时 9s" data-prev="cafe#1：会。pi 扩展和 Bridge 都会重连，正在跑的 Order 会恢复或明确失败。">
+            <div class="tmeta"><span class="twho"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 1 小时前</span><span>· 1 轮对话</span></span><span class="tstat"><span class="pill ok"><span class="dot ok"></span>已回答</span><span class="mono">9s</span></span></div>
+            <div class="ttl">daemon 重启后 Barista 会自动重连吗？</div>
+            <div class="tprev"><span class="who">cafe#1</span>：会。pi 扩展和 Bridge 都会重连，正在跑的 Order 会恢复或明确失败。</div>
+          </article>
+        </div>
+
+        <div style="display:flex;justify-content:center;padding-top:14px">
+          <button class="btn">加载更早的会话</button>
+        </div>
+      </section>
+
+      <!-- ---------- agents ---------- -->
+      <section data-page="agents" hidden>
+        <div class="pagehead">
+          <div><h1>Agents</h1><div class="sub">网络上能回答问题的 agent，按所在机器分组。</div></div>
+        </div>
+        <div class="section-lab"><h2>biran-mac</h2><span class="n">中心节点 · 本机</span></div>
+        <div class="grid">
+          <article class="acard">
+            <div class="top"><div><div class="nm">cafe <span class="kind">Claude Code</span></div><div class="addr">cafe#1@biran-mac</div></div><span class="pill ok"><span class="dot ok"></span>空闲</span></div>
+            <div class="desc">Owns the cafe codebase: daemon, protocol, CLI, web UI, extensions.</div>
+            <div class="facts"><span class="k">目录</span><span class="v mono">~/code/skills/orca/cafe</span><span class="k">运行方式</span><span class="v">终端里（有人在用）</span><span class="k">近 7 天</span><span class="v">回答 42 · 婉拒 3</span></div>
+            <div class="acts"><button class="btn sm">问它</button><button class="btn sm">改名</button><button class="btn sm">断开</button></div>
+          </article>
+          <article class="acard">
+            <div class="top"><div><div class="nm">billing <span class="kind">Codex</span></div><div class="addr">billing#1@biran-mac</div></div><span class="pill info"><span class="dot info"></span>忙碌</span></div>
+            <div class="desc">Owns billing: invoices, VAT, payment provider integration.</div>
+            <div class="facts"><span class="k">目录</span><span class="v mono">~/code/billing</span><span class="k">运行方式</span><span class="v">后台运行 · 只读</span><span class="k">近 7 天</span><span class="v">回答 18 · 婉拒 1</span></div>
+            <div class="acts"><button class="btn sm">问它</button><button class="btn sm">改名</button><button class="btn sm">断开</button></div>
+          </article>
+        </div>
+        <div class="section-lab"><h2>ssh1</h2><span class="n">在线</span></div>
+        <div class="grid">
+          <article class="acard">
+            <div class="top"><div><div class="nm">ssh1 <span class="kind">pi</span></div><div class="addr">ssh1#1@ssh1</div></div><span class="pill ok"><span class="dot ok"></span>空闲</span></div>
+            <div class="desc">Remote Docker host: builds, logs, network probes.</div>
+            <div class="facts"><span class="k">目录</span><span class="v mono">/workspace/ssh1</span><span class="k">运行方式</span><span class="v">后台运行</span><span class="k">近 7 天</span><span class="v">回答 11 · 婉拒 0</span></div>
+            <div class="acts"><button class="btn sm">问它</button><button class="btn sm">改名</button><button class="btn sm">断开</button></div>
+          </article>
+        </div>
+      </section>
+
+      <!-- ---------- network ---------- -->
+      <section data-page="network" hidden>
+        <div class="pagehead">
+          <div><h1>网络</h1><div class="sub">加入网络的机器，以及它们和中心节点的连接情况。</div></div>
+        </div>
+        <div class="well" style="margin-top:16px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--well);font-size:var(--text-sm)">
+          每台机器运行一个 cafe 服务，负责本机 agent 的注册和消息收发。其中一台是「中心节点」：它掌握全网 agent 名单，并转发所有问答，所以在中心节点的页面上能看到全网的对话。
+        </div>
+        <div class="grid">
+          <article class="acard">
+            <div class="top"><div><div class="nm">biran-mac <span class="pill info" style="font-size:10px">中心节点</span> <span class="pill" style="font-size:10px">本机</span></div><div class="addr">192.168.1.12:4777</div></div><span class="pill ok"><span class="dot ok"></span>在线</span></div>
+            <div class="facts"><span class="k">地址</span><span class="v mono">192.168.1.12:4777</span><span class="k">Agents</span><span class="v">2</span><span class="k">版本</span><span class="v mono">0.1.3</span></div>
+            <div class="acts"><button class="btn sm">改名</button><button class="btn sm">加别名</button><button class="btn sm">复制地址</button></div>
+          </article>
+          <article class="acard">
+            <div class="top"><div><div class="nm">ssh1</div><div class="addr">10.0.0.24:4777</div></div><span class="pill ok"><span class="dot ok"></span>在线</span></div>
+            <div class="facts"><span class="k">地址</span><span class="v mono">10.0.0.24:4777</span><span class="k">Agents</span><span class="v">1</span><span class="k">版本</span><span class="v mono">0.1.3</span></div>
+            <div class="acts"><button class="btn sm">改名</button><button class="btn sm">测试连接</button></div>
+          </article>
+        </div>
+        <details class="disclosure" style="margin-top:18px">
+          <summary>▸ 调试信息</summary>
+          <div class="log" style="padding:8px 12px 12px">
+            <div class="logrow"><span class="t">角色</span><span>root (hub)</span></div>
+            <div class="logrow"><span class="t">路由方式</span><span>llm · magpie/group/never-stuck</span></div>
+            <div class="logrow"><span class="t">注册表</span><span>v 1284</span></div>
+            <div class="logrow"><span class="t">对话文件</span><span>~/.cafe/sessions/</span></div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ---------- live ---------- -->
+      <section data-page="live" hidden>
+        <div class="pagehead">
+          <div><h1>实况</h1><div class="sub">全网正在发生的事：路由、送达、确认、回答、关闭。默认隐藏心跳。</div></div>
+        </div>
+        <div class="livebar">
+          <div class="chips" role="group" aria-label="实况筛选">
+            <button class="chip" aria-pressed="true">全部</button>
+            <button class="chip" aria-pressed="false">本机</button>
+            <button class="chip" aria-pressed="false">ssh1</button>
+            <button class="chip" aria-pressed="false">只看失败</button>
+          </div>
+          <div class="spacer"></div>
+          <span class="hint" style="display:flex;align-items:center;gap:6px"><span class="dot ok"></span>实时推送 · 最近同步 刚刚</span>
+          <button class="btn sm" id="pause-live">暂停</button>
+        </div>
+        <div class="livefeed" id="livefeed">
+          <div class="lerow"><span class="t">21:41:08</span><span class="ltag info">路由</span><span class="msg"><span class="th">01M7S0…</span> → 交给 <span class="who">cafe#1@biran-mac</span>（llm · 描述匹配 “router / 模型切换”）</span></div>
+          <div class="lerow"><span class="t">21:41:08</span><span class="ltag info">送达</span><span class="msg"><span class="th">01M7S0…</span> 已送到 <span class="who">cafe#1@biran-mac</span></span></div>
+          <div class="lerow"><span class="t">21:41:09</span><span class="ltag ok">确认</span><span class="msg"><span class="th">01M7S0…</span> <span class="who">cafe#1</span> 开始处理</span></div>
+          <div class="lerow"><span class="t">21:41:22</span><span class="ltag ok">回答</span><span class="msg"><span class="th">01M7S0…</span> <span class="who">cafe#1</span> 给出阶段性回答</span></div>
+          <div class="lerow"><span class="t">21:41:31</span><span class="ltag">关闭</span><span class="msg"><span class="th">01M7S0…</span> 对话完成（1 轮 · 23s）</span></div>
+          <div class="lerow"><span class="t">21:42:04</span><span class="ltag info">路由</span><span class="msg"><span class="th">01M7S1…</span> → 交给 <span class="who">ssh1#1@ssh1</span>（rules · scope 命中 “Docker / knownDaemons”）</span></div>
+          <div class="lerow"><span class="t">21:42:04</span><span class="ltag info">送达</span><span class="msg"><span class="th">01M7S1…</span> 经中心节点转发到 <span class="who">ssh1</span></span></div>
+          <div class="lerow"><span class="t">21:42:05</span><span class="ltag ok">确认</span><span class="msg"><span class="th">01M7S1…</span> <span class="who">ssh1#1</span> 开始处理</span></div>
+          <div class="lerow"><span class="t">21:42:32</span><span class="ltag warn">失败</span><span class="msg"><span class="th">01M7S1…</span> <span class="who">ssh1#1</span> 回答超时，改为直接连接</span></div>
+          <div class="lerow"><span class="t">21:42:49</span><span class="ltag ok">回答</span><span class="msg"><span class="th">01M7S1…</span> <span class="who">ssh1#1</span> 已回答</span></div>
+          <div class="lerow"><span class="t">21:43:10</span><span class="ltag info">路由</span><span class="msg"><span class="th">01M7S2…</span> → 广播给 3 个 agent（没有明确匹配）</span></div>
+          <div class="lerow"><span class="t">21:43:11</span><span class="ltag ok">确认</span><span class="msg"><span class="th">01M7S2…</span> <span class="who">cafe#1</span> 开始处理</span></div>
+          <div class="lerow"><span class="t">21:43:12</span><span class="ltag">婉拒</span><span class="msg"><span class="th">01M7S2…</span> <span class="who">billing#1</span> 表示不归它管</span></div>
+          <div class="lerow"><span class="t">21:43:13</span><span class="ltag">婉拒</span><span class="msg"><span class="th">01M7S2…</span> <span class="who">ssh1#1</span> 表示不归它管</span></div>
+          <div class="lerow"><span class="t">21:43:31</span><span class="ltag ok">回答</span><span class="msg"><span class="th">01M7S2…</span> <span class="who">cafe#1</span> 已回答</span></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- ================= detail drawer ================= -->
+  <aside class="drawer detail" id="detail" aria-label="对话详情">
+    <div class="drawer-head">
+      <button class="iconbtn" id="close-detail" aria-label="关闭">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+      <div style="min-width:0">
+        <div class="title">对话</div>
+        <div class="sub" id="detail-id">01M7S0FRQF1RHARQE632JBAM7Q</div>
+      </div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+        <span class="pill ok" id="detail-pill"><span class="dot ok"></span><span id="detail-pill-text">已回答</span></span>
+        <button class="btn sm quiet">复制</button>
+      </div>
+    </div>
+    <div class="drawer-body">
+      <div class="detail-main">
+      <div class="ctx">
+        <div><div class="k">状态</div><div class="v" id="ctx-status">已回答 · 用时 1m 2s</div></div>
+        <div><div class="k">参与</div><div class="v">cafe#1 · biran#1</div></div>
+        <div><div class="k">轮次</div><div class="v" id="ctx-turns">3 轮</div></div>
+        <div><div class="k">路由</div><div class="v">llm · never-stuck</div></div>
+      </div>
+
+      <h1 class="thread-h" id="detail-title">LLM 路由开启后切换模型不生效，帮我看看 initRouter 的 early-return</h1>
+      <div class="thread-meta"><span class="mono">biran#1@biran-mac</span><span>提问</span><span>· 4 分钟前</span><span>· <span id="detail-turns">3 轮对话</span></span></div>
+
+      <div class="turn">
+        <div class="turn-q">
+          <div class="who"><span class="addr">biran#1@biran-mac</span><span>提问</span><span>· 4 分钟前</span></div>
+          <div class="body">LLM 路由已经开着，我把 <code>router.model</code> 从 qwen 换成 never-stuck，<code>cafe config get</code> 显示新值，但 daemon 日志里没有重新初始化。是不是 initRouter 的 early-return 挡住了 llm → llm？</div>
+        </div>
+        <div class="routing">
+          <div class="k">交给了</div>
+          <div class="v"><span class="addr">cafe#1@biran-mac</span> <span class="kind">Claude Code</span></div>
+          <div class="why">为什么交给它：description 明确写了 router / 模型切换；唯一候选，没有调用模型。</div>
+        </div>
+        <div class="answer-card">
+          <div class="who"><span class="addr">cafe#1@biran-mac</span><span class="pill ok" style="font-size:10px;padding:0 7px"><span class="dot ok"></span>回答</span><span>· 用时 35s</span></div>
+          <div class="body">
+            <p>是。原来的分支是：</p>
+            <pre><code>if (!model || this.router.name !== "rules") return;</code></pre>
+            <p>它同时表达了“没配置”和“已经是 llm”两件事，所以只有 <code>rules → llm</code> 能发生。<code>llm → llm</code> 和 <code>llm → rules</code> 都被挡住。</p>
+            <p>修法是让 <code>initRouter()</code> 成为“按当前配置重建”：没有 model 就切回 <code>RulesRouter</code>；有 model 且和当前不同就重建；失败保留旧 router，并把错误返回给 <code>/api/reload</code>。</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="turn">
+        <div class="turn-q">
+          <div class="who"><span class="addr">biran#1@biran-mac</span><span>追问</span><span>· 2 分钟前</span></div>
+          <div class="body">那清空 <code>router.model</code> 呢？现在写空字符串好像也不会关闭 LLM。</div>
+        </div>
+        <div class="answer-card">
+          <div class="who"><span class="addr">cafe#1@biran-mac</span><span class="pill ok" style="font-size:10px;padding:0 7px"><span class="dot ok"></span>回答</span><span>· 用时 12s</span></div>
+          <div class="body"><p>同一个 early-return 挡住。清空后应该显式换成 <code>new RulesRouter()</code>，并记录 <code>router: rules</code>；<code>cafe router status</code> 里 configured 和 running 都要显示 rules。</p></div>
+        </div>
+      </div>
+
+      <div class="turn">
+        <div class="turn-q">
+          <div class="who"><span class="addr">biran#1@biran-mac</span><span>追问</span><span>· 1 分钟前</span></div>
+          <div class="body">如果新模型名字写错，配置会被写进去吗？</div>
+        </div>
+        <div class="answer-card">
+          <div class="who"><span class="addr">cafe#1@biran-mac</span><span class="pill ok" style="font-size:10px;padding:0 7px"><span class="dot ok"></span>回答</span><span>· 用时 15s</span></div>
+          <div class="body"><p>现在 <code>setAndApply()</code> 会先写、再 reload，失败时把旧值写回，CLI 非 0 退出。Web 设置里也要走同一个接口，不要只写文件。</p></div>
+        </div>
+      </div>
+
+      <details class="disclosure">
+        <summary>▸ 投递过程（排查用）</summary>
+        <div class="log">
+          <div class="logrow"><span class="t">21:37:02</span><span>已收到问题</span></div>
+          <div class="logrow"><span class="t">21:37:02</span><span>交给 cafe#1（唯一候选，没有调用模型）</span></div>
+          <div class="logrow"><span class="t">21:37:02</span><span>已送到 cafe#1</span></div>
+          <div class="logrow"><span class="t">21:37:03</span><span>cafe#1 开始处理</span></div>
+          <div class="logrow"><span class="t">21:37:37</span><span>cafe#1 回答</span></div>
+          <div class="logrow"><span class="t">21:37:38</span><span>对话完成（1 轮 · 35s）</span></div>
+        </div>
+      </details>
+      </div>
+
+      <aside class="detail-rail" aria-label="对话信息">
+        <div class="rail-card">
+          <div class="k">状态</div>
+          <div class="rail-kv"><span class="k">结果</span><span class="v" id="rail-status">已回答 · 用时 1m 2s</span></div>
+          <div class="rail-kv"><span class="k">路由</span><span class="v">llm · never-stuck</span></div>
+          <div class="rail-kv"><span class="k">轮次</span><span class="v" id="rail-turns">3 轮</span></div>
+        </div>
+        <div class="rail-card">
+          <div class="k">参与</div>
+          <div class="rail-kv"><span class="k">提问</span><span class="v mono">biran#1@biran-mac</span></div>
+          <div class="rail-kv"><span class="k">回答</span><span class="v mono">cafe#1@biran-mac</span></div>
+        </div>
+        <div class="rail-card">
+          <div class="k">对话</div>
+          <div class="rail-kv"><span class="k">Thread</span><span class="v mono" title="01M7S0FRQF1RHARQE632JBAM7Q">01M7S0F…AM7Q</span></div>
+          <div class="rail-kv"><span class="k">开始</span><span class="v">4 分钟前</span></div>
+          <div style="display:flex;gap:6px;margin-top:2px"><button class="btn sm">复制 ID</button><button class="btn sm">停止等待</button></div>
+        </div>
+        <div class="rail-card">
+          <div class="k">投递过程</div>
+          <div class="rail-kv"><span class="k">21:37:02</span><span class="v">已收到问题</span></div>
+          <div class="rail-kv"><span class="k">21:37:02</span><span class="v">交给 cafe#1</span></div>
+          <div class="rail-kv"><span class="k">21:37:03</span><span class="v">cafe#1 开始处理</span></div>
+          <div class="rail-kv"><span class="k">21:37:37</span><span class="v">cafe#1 回答</span></div>
+          <div class="rail-kv"><span class="k">21:37:38</span><span class="v">对话完成</span></div>
+        </div>
+      </aside>
+    </div>
+    <div class="drawer-foot">
+      <form class="composer" onsubmit="return false">
+        <textarea placeholder="在同一个对话里继续问…" aria-label="追问"></textarea>
+        <div class="foot">
+          <span class="hint">追问会发给这个对话里回答过的 agent，并带上之前的问答。</span>
+          <button class="btn primary" type="submit">发送</button>
+        </div>
+      </form>
+    </div>
+  </aside>
+
+  <!-- ================= settings drawer ================= -->
+  <aside class="drawer settings" id="settings" aria-label="设置">
+    <div class="drawer-head">
+      <button class="iconbtn" id="close-settings" aria-label="关闭">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+      <div><div class="title">设置</div><div class="sub">本机与网络</div></div>
+    </div>
+    <div class="drawer-body narrow">
+
+      <div class="set-group">
+        <h3>这台机器</h3>
+        <div class="desc">显示名可以随时改；内部 id 和已有对话都不会变。旧名字会保留为别名。</div>
+        <div class="setrow">
+          <label>显示名<input value="biran-mac"></label>
+          <button class="btn sm primary">保存</button>
+        </div>
+        <div class="tags">
+          <span class="tag">旧名 · biran-mac.local <button aria-label="移除别名">×</button></span>
+          <button class="btn sm quiet">＋ 加别名</button>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <h3>路由模型</h3>
+        <div class="desc">选一个 pi 能用的模型。保存后立即生效；失败会保留当前模型。</div>
+        <div class="setrow">
+          <label>模型
+            <select>
+              <option>magpie/group/never-stuck</option>
+              <option>magpie/group/smart-split</option>
+              <option>bailian-token-plan/deepseek-v4.1-flash-1017</option>
+              <option>anthropic/claude-haiku-4-5</option>
+            </select>
+          </label>
+          <button class="btn sm primary">应用</button>
+        </div>
+        <div class="statusline"><span class="dot ok"></span>运行中：<span class="mono">llm (magpie/group/never-stuck)</span><span>· 上次切换 21:31</span></div>
+        <div class="note" style="margin-top:6px">配置写错时命令会失败并把旧值写回，不会出现“配置成功但仍在跑旧模型”。</div>
+      </div>
+
+      <div class="set-group">
+        <h3>Agents</h3>
+        <div class="desc">改名只改显示名，Address 和 agentId 保持不变，旧名字自动成为别名。</div>
+        <div class="agent-row">
+          <div class="id"><b>cafe</b><span>cafe#1@biran-mac</span></div>
+          <div class="acts"><button class="btn sm">改名</button><button class="btn sm">别名</button></div>
+        </div>
+        <div class="agent-row">
+          <div class="id"><b>billing</b><span>billing#1@biran-mac</span></div>
+          <div class="acts"><button class="btn sm">改名</button><button class="btn sm">别名</button></div>
+        </div>
+        <div class="agent-row">
+          <div class="id"><b>ssh1</b><span>ssh1#1@ssh1</span></div>
+          <div class="acts"><button class="btn sm">改名</button><button class="btn sm">别名</button></div>
+        </div>
+      </div>
+
+      <div class="set-group">
+        <h3>后台 Baristas</h3>
+        <div class="desc">由 daemon 托管的进程。停止后可以重新运行 <span class="mono">cafe barista start</span> 启动。</div>
+        <div class="barista-row">
+          <div class="id"><b>~/code/billing</b><span>codex · 只读 · 运行中</span></div>
+          <button class="btn sm danger">停止</button>
+        </div>
+        <div class="barista-row">
+          <div class="id"><b>/workspace/ssh1</b><span>pi · 后台运行 · 运行中</span></div>
+          <button class="btn sm danger">停止</button>
+        </div>
+        <div class="note" style="margin-top:8px">在网页里启动新的 Barista 需要填写目录和 agent，下一版再加。</div>
+      </div>
+
+      <div class="set-group">
+        <h3>需要重启的配置</h3>
+        <div class="desc">下面这些改动不会热生效，保存后会提示执行命令。</div>
+        <div class="statusline"><span class="dot warn"></span><span class="mono">mode</span>、<span class="mono">port</span>、<span class="mono">advertise</span> 改动后：<span class="mono">cafe daemon restart</span></div>
+      </div>
+
+    </div>
+    <div class="drawer-foot" style="display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn" data-close-settings>取消</button>
+      <button class="btn primary" data-close-settings>完成</button>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim"></div>
+</div>
+
+<script>
+(function () {
+  const app = document.getElementById('app');
+  const detail = document.getElementById('detail');
+  const settings = document.getElementById('settings');
+  const scrim = document.getElementById('scrim');
+  const isWide = () => window.matchMedia('(min-width: 1600px)').matches;
+  const isMobile = () => window.matchMedia('(max-width: 760px)').matches;
+
+  function syncScrim() {
+    const open = detail.classList.contains('open') || settings.classList.contains('open');
+    // Wide screens: the detail drawer is docked, so it does not need a scrim.
+    const need = settings.classList.contains('open') || (detail.classList.contains('open') && !isWide());
+    scrim.classList.toggle('on', need && open);
+    app.classList.toggle('detail-open', detail.classList.contains('open'));
+    app.classList.toggle('settings-open', settings.classList.contains('open'));
+  }
+
+  function openDetail(card) {
+    document.querySelectorAll('.tcard').forEach((c) => c.classList.toggle('active', c === card));
+    if (card) {
+      const title = card.getAttribute('data-title');
+      const from = card.getAttribute('data-from');
+      const turns = card.getAttribute('data-turns');
+      const status = card.getAttribute('data-status');
+      const statusText = card.getAttribute('data-status-text');
+      const prev = card.getAttribute('data-prev');
+      if (title) document.getElementById('detail-title').textContent = title;
+      if (turns) { document.getElementById('detail-turns').textContent = turns; document.getElementById('ctx-turns').textContent = turns.replace('轮对话', '轮'); }
+      if (statusText) { document.getElementById('ctx-status').textContent = statusText; document.getElementById('rail-status').textContent = statusText; }
+      if (turns) document.getElementById('rail-turns').textContent = turns.replace('轮对话', '轮');
+      if (from) {
+        const who = document.querySelector('.thread-meta .mono');
+        if (who) who.textContent = from;
+      }
+      if (prev) {
+        const p = document.querySelector('.answer-card .body p');
+        if (p) p.textContent = prev.replace(/^[^：]*：/, '');
+      }
+      const pill = document.getElementById('detail-pill');
+      pill.className = 'pill ' + ({ ok: 'ok', warn: 'warn', working: 'info', danger: 'danger' }[status] || '');
+      document.getElementById('detail-pill-text').textContent =
+        status === 'ok' ? '已回答' : status === 'warn' ? '没人能答' : status === 'working' ? '处理中' : '已关闭';
+    }
+    detail.classList.add('open');
+    detail.setAttribute('aria-hidden', 'false');
+    syncScrim();
+    if (isMobile()) document.getElementById('main').scrollTop = 0;
+  }
+  function closeDetail() {
+    detail.classList.remove('open');
+    detail.setAttribute('aria-hidden', 'true');
+    document.querySelectorAll('.tcard').forEach((c) => c.classList.remove('active'));
+    syncScrim();
+  }
+  function openSettings() {
+    settings.classList.add('open');
+    settings.setAttribute('aria-hidden', 'false');
+    syncScrim();
+  }
+  function closeSettings() {
+    settings.classList.remove('open');
+    settings.setAttribute('aria-hidden', 'true');
+    syncScrim();
+  }
+
+  document.querySelectorAll('[data-open-detail]').forEach((card) => {
+    card.addEventListener('click', () => openDetail(card));
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(card); }
+    });
+  });
+  document.getElementById('close-detail').addEventListener('click', closeDetail);
+  document.getElementById('open-settings').addEventListener('click', openSettings);
+  document.getElementById('close-settings').addEventListener('click', closeSettings);
+  document.querySelectorAll('[data-close-settings]').forEach((b) => b.addEventListener('click', closeSettings));
+  scrim.addEventListener('click', () => { closeDetail(); closeSettings(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { closeDetail(); closeSettings(); }
+  });
+
+  // nav: views
+  const pages = document.querySelectorAll('[data-page]');
+  const agentsToggle = document.getElementById('agents-toggle');
+  const agentsSub = document.getElementById('agents-sub');
+  agentsToggle.addEventListener('click', () => {
+    const open = agentsToggle.getAttribute('aria-expanded') === 'true';
+    agentsToggle.setAttribute('aria-expanded', String(!open));
+    agentsSub.hidden = open;
+  });
+  document.querySelectorAll('.navitem[data-view], .sublink[data-view]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const view = btn.getAttribute('data-view');
+      document.querySelectorAll('.navitem[data-view]').forEach((b) => b.removeAttribute('aria-current'));
+      if (view !== 'agents') btn.setAttribute('aria-current', 'page');
+      if (view === 'agents') {
+        agentsToggle.setAttribute('aria-expanded', 'false');
+        agentsSub.hidden = true;
+      }
+      app.setAttribute('data-view', view);
+      pages.forEach((p) => { p.hidden = p.getAttribute('data-page') !== view; });
+      document.getElementById('main').scrollTop = 0;
+    });
+  });
+
+  // feed filter chips: visual only in the prototype
+  document.querySelectorAll('.chip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const group = chip.parentElement;
+      group.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-pressed', 'false'));
+      chip.setAttribute('aria-pressed', 'true');
+    });
+  });
+
+  // theme
+  document.querySelectorAll('[data-theme-set]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const theme = b.getAttribute('data-theme-set');
+      document.documentElement.setAttribute('data-theme', theme);
+      b.parentElement.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+    });
+  });
+
+  // live pause
+  const pause = document.getElementById('pause-live');
+  if (pause) pause.addEventListener('click', () => {
+    const paused = pause.textContent === '暂停';
+    pause.textContent = paused ? '继续' : '暂停';
+    document.getElementById('livefeed').style.opacity = paused ? '.55' : '1';
+  });
+
+  // open the detail by default so the first screen shows the whole workbench
+  const first = document.querySelector('.tcard');
+  if (first && isWide()) openDetail(first);
+  syncScrim();
+  window.addEventListener('resize', syncScrim);
+})();
+</script>
+</body>
+</html>

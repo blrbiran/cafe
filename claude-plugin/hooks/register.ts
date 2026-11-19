@@ -102,31 +102,57 @@ async function host($: EngineInterface, cwd: string) {
   status($)
 }
 
-export const register: Register = on => {
-  on('session.start', async ($, e, next) => {
-    const started = await next(e)
-    // Only a session someone is using in a terminal; `-p` runs and SDK hosts stay out of the network.
-    if (!e.isInteractive) return started
-    await $.command.register({
-      name: 'cafe',
-      description: 'cafe network: show this session\'s address, or stop / resume answering questions',
-      argumentHint: '[on|off]',
-    })
-    void host($, e.cwd)
-    return started
-  })
+/** The person may already own `/cafe`; a refused registration must not stop the Barista. */
+const COMMANDS = ['cafe', 'cafe-barista'] as const
+let commandName: string | undefined
 
-  on('command.run', { command: 'cafe' }, async ($, e) => {
+async function registerCommand($: EngineInterface) {
+  for (const name of COMMANDS) {
+    try {
+      await $.command.register({
+        name,
+        description: 'cafe network: show this session\'s address, or stop / resume answering questions',
+        argumentHint: '[on|off]',
+      })
+      commandName = name
+      return
+    } catch (err) {
+      $.ui.log(`cafe: /${name} is not available: ${(err as Error).message}`, { to: 'debug' })
+    }
+  }
+  $.ui.log('cafe: no slash command registered; the cafe tools and status still work', { to: 'debug' })
+}
+
+async function cafeCommand($: EngineInterface, e: { args: string }) {
+  try {
     const arg = e.args.trim()
     if (!socket) return { text: 'This directory has no .cafe Barista identity, or the cafe session-host is not running.' }
     if (arg === 'off' || arg === 'on') {
       const r = await post($, '/pause', { paused: arg === 'off' })
       if (r?.ok) paused = arg === 'off'
       status($)
-      return { text: paused ? `${address} stopped taking questions (/cafe on to resume).` : `${address} is taking questions again.` }
+      return { text: paused ? `${address} stopped taking questions (/${commandName ?? 'cafe'} on to resume).` : `${address} is taking questions again.` }
     }
-    return { text: `This session answers as ${address}${paused ? ' (paused)' : ''}. /cafe off stops taking questions, /cafe on resumes.` }
+    return { text: `This session answers as ${address}${paused ? ' (paused)' : ''}. /${commandName ?? 'cafe'} off stops taking questions, /${commandName ?? 'cafe'} on resumes.` }
+  } catch (err) {
+    // A command handler must not reject: the person gets the message instead.
+    return { text: `cafe: ${(err as Error).message}` }
+  }
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    // Only a session someone is using in a terminal; `-p` runs and SDK hosts stay out of the network.
+    if (!e.isInteractive) return started
+    // Registration is best effort: a user-owned /cafe must not abort the session or the Barista.
+    await registerCommand($).catch((err) => $.ui.log(`cafe: command registration failed: ${(err as Error).message}`, { to: 'debug' }))
+    void host($, e.cwd)
+    return started
   })
+
+  on('command.run', { command: 'cafe' }, cafeCommand)
+  on('command.run', { command: 'cafe-barista' }, cafeCommand)
 
   // The turn that starts with our Order's marker is the Order's turn.
   on('turn.start', ($, e, next) => {
