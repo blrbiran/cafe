@@ -3,7 +3,7 @@ import type { AgentRecord, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, T
 import { api, ApiError } from "../api.ts";
 import { ago, useT, type Dict } from "../i18n.ts";
 import { useNow } from "../format.ts";
-import { whoAddress, whoName, whyText } from "../outcome.ts";
+import { askerOf, whoAddress, whoName, whyText } from "../outcome.ts";
 import { hashFor } from "../route.ts";
 import { isActive, useStore } from "../store.ts";
 import { Disclosure, KindTag, Pill, type Tone } from "../ui/bits.tsx";
@@ -167,7 +167,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
         const active = threadActive && turn === last;
         const o = turnOutcome(t, turn, active, agents, meta, now);
         const isFirst = i === 0;
-        const asker = turn.order?.from.address ?? meta.from.address;
+        const asker = askerOf(t, turn.order ?? meta, !isFirst);
         const why = whyText(t, turn.decision, agents, meta);
         const targets = turn.decision?.targets ?? [];
         return (
@@ -179,8 +179,8 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
                     {t.turnLabel(turn.order?.turn ?? i + 1)}
                   </Pill>
                 )}
-                <span className="mono text-fg">{asker}</span>
-                <span>{isFirst ? t.askedVerb : t.followUpLabel}</span>
+                <span className="mono text-fg">{asker.who}</span>
+                <span>{asker.verb}</span>
                 <span>· {ago(t, turn.startedAt, now)}</span>
               </div>
               {isFirst ? (
@@ -284,10 +284,10 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
             ✕
           </button>
           <div className="min-w-0">
-            <div className="text-sm font-semibold text-fg-strong">{t.navFeed}</div>
+            <div className="truncate text-sm font-semibold text-fg-strong">{first?.order?.body ?? meta.summary}</div>
             <div className="mono truncate text-[11px] text-muted">{meta.threadId}</div>
           </div>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex shrink-0 items-center gap-2">
             {lastOutcome && <Pill tone={lastOutcome.tone}>{lastOutcome.text}</Pill>}
             <button type="button" className="btn-sm whitespace-nowrap max-md:hidden" onClick={copy}>
               {copied ? t.copied : t.copyId}

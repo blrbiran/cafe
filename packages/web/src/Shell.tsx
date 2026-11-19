@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { isActive, useStore } from "./store.ts";
 import { hashFor, type Route } from "./route.ts";
 import { setLang, useLang, useT } from "./i18n.ts";
@@ -25,14 +25,28 @@ function GearIcon() {
   );
 }
 
+const AGENTS_OPEN_KEY = "cafe.nav.agentsOpen";
+
+function readAgentsOpen(): boolean {
+  try {
+    const saved = localStorage.getItem(AGENTS_OPEN_KEY);
+    if (saved !== null) return saved === "1";
+  } catch {
+    // ignore
+  }
+  return typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches;
+}
+
 export function Shell({
   route,
   children,
   detail,
   detailOpen,
   settingsOpen,
+  settingsClosing,
   onOpenSettings,
   onCloseSettings,
+  onBlankClick,
   onScrim,
 }: {
   route: Route;
@@ -40,8 +54,10 @@ export function Shell({
   detail?: ReactNode;
   detailOpen: boolean;
   settingsOpen: boolean;
+  settingsClosing: boolean;
   onOpenSettings: () => void;
   onCloseSettings: () => void;
+  onBlankClick: (e: ReactMouseEvent<HTMLElement>) => void;
   onScrim: () => void;
 }) {
   const t = useT();
@@ -54,7 +70,19 @@ export function Shell({
   const threads = useStore((s) => s.threads);
   const daemons = useStore((s) => s.daemons);
   const [theme, setTheme] = useState<Theme>(readTheme);
-  const [agentsOpen, setAgentsOpen] = useState(false);
+  // Open by default on desktop so the registered Baristas are visible at a glance;
+  // on a narrow screen it would cover the page, so it starts collapsed there.
+  const [agentsOpen, setAgentsOpen] = useState(readAgentsOpen);
+  const toggleAgents = () =>
+    setAgentsOpen((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(AGENTS_OPEN_KEY, next ? "1" : "0");
+      } catch {
+        // private mode / storage disabled: the toggle still works for this visit
+      }
+      return next;
+    });
 
   const active = threads.filter((x) => isActive(x.status)).length;
   const baristas = Object.values(agents)
@@ -113,7 +141,7 @@ export function Shell({
           ))}
 
           <div className="flex flex-col gap-1 max-md:relative max-md:flex-row">
-            <button type="button" className="navitem" aria-expanded={agentsOpen} aria-controls="agents-sub" onClick={() => setAgentsOpen((v) => !v)}>
+            <button type="button" className="navitem" aria-expanded={agentsOpen} aria-controls="agents-sub" onClick={toggleAgents}>
               <span>{t.navAgents}</span>
               <span className="flex items-center gap-1.5">
                 <span className="nav-count">{baristas.length}</span>
@@ -140,7 +168,8 @@ export function Shell({
                 </div>
               ))}
               <a className="nav-sublink" href={hashFor({ page: "agents" })} onClick={() => setAgentsOpen(false)}>
-                {t.agentsAll}
+                <span>{t.agentsAll}</span>
+                <span aria-hidden="true">→</span>
               </a>
             </div>
           </div>
@@ -206,12 +235,12 @@ export function Shell({
         </div>
       </nav>
 
-      <main className="box-border min-w-0 flex-1 overflow-y-auto px-8 pt-7 pb-12 max-md:overflow-visible max-md:px-4 max-md:pb-16">
+      <main onClick={onBlankClick} className="box-border min-w-0 flex-1 overflow-y-auto px-8 pt-7 pb-12 max-md:overflow-visible max-md:px-4 max-md:pb-16">
         <div className="mx-auto flex max-w-[1180px] flex-col gap-5 min-[1600px]:max-w-[1360px] min-[2000px]:max-w-[1560px]">{children}</div>
       </main>
 
       {detail}
-      {settingsOpen && <SettingsDrawer onClose={onCloseSettings} />}
+      {settingsOpen && <SettingsDrawer closing={settingsClosing} onClose={onCloseSettings} />}
       <div className="scrim" onClick={onScrim} aria-hidden="true" />
     </div>
   );

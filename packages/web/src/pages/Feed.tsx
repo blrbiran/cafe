@@ -3,7 +3,7 @@ import type { ThreadMeta } from "@cafe/protocol";
 import { api } from "../api.ts";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
-import { bucketOf, outcome, whoAddress, whyText } from "../outcome.ts";
+import { bucketOf, outcome, askerOf, whoAddress, whyText } from "../outcome.ts";
 import { navigate, type Filter } from "../route.ts";
 import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setSearch, useStore, type SearchResult } from "../store.ts";
 import { Empty, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
@@ -72,15 +72,19 @@ export function FeedPage({ filter }: { filter: Filter }) {
       {showActive && (
         <section className="flex flex-col gap-2.5">
           <h2 className="section-cap">{t.inProgress}</h2>
-          {active.map((m) => (
-            <ThreadCard key={m.threadId} meta={m} filter={filter} />
-          ))}
+          <div className="feed-grid flex flex-col gap-2.5">
+            {active.map((m) => (
+              <ThreadCard key={m.threadId} meta={m} filter={filter} />
+            ))}
+          </div>
         </section>
       )}
       {showDone && threads.length > 0 && (
         <section className="flex flex-col gap-2.5">
           <h2 className="section-cap">{t.recent}</h2>
-          {done.length === 0 ? <Empty>{t.emptyFilter}</Empty> : done.map((m) => <ThreadCard key={m.threadId} meta={m} filter={filter} />)}
+          <div className="feed-grid flex flex-col gap-2.5">
+            {done.length === 0 ? <Empty>{t.emptyFilter}</Empty> : done.map((m) => <ThreadCard key={m.threadId} meta={m} filter={filter} />)}
+          </div>
           {!older.done ? (
             <div className="flex justify-center pt-1">
               <button type="button" onClick={() => void loadOlder()} disabled={older.loading} aria-busy={older.loading}>
@@ -113,12 +117,13 @@ function SearchResults({ filter }: { filter: Filter }) {
       <h2 className="section-cap">{t.searchFound(rows.length)}</h2>
       {rows.map(({ meta, hits }) => {
         const o = outcome(t, meta, agents, undefined, now);
+        const ask = askerOf(t, meta);
         const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter });
         return (
           <article key={meta.threadId} className="card flex flex-col gap-2.5 px-4.5 py-4">
             <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
-              <span className="mono text-fg">{meta.from.address}</span>
-              <span>{t.askedVerb}</span>
+              <span className="mono text-fg">{ask.who}</span>
+              <span>{ask.verb}</span>
               <span>· {ago(t, meta.createdAt, now)}</span>
             </div>
             <button type="button" className="qbtn" onClick={open}>
@@ -185,6 +190,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
   }, [bucket, meta.threadId]);
   const why = bucket === "active" ? whyText(t, live, agents, meta) : undefined;
   const first = meta.replies[0];
+  const ask = askerOf(t, meta);
   const started = live?.startedAt ?? meta.turnStartedAt ?? (meta.turns <= 1 ? meta.createdAt : undefined);
   const end = bucket === "answered" ? (first?.at ?? meta.closedAt) : undefined;
   const timing =
@@ -227,8 +233,8 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
     >
       <div className="flex items-center justify-between gap-3 text-xs">
         <div className="flex min-w-0 items-center gap-1.5 text-muted">
-          <span className="mono truncate text-fg">{meta.from.address}</span>
-          <span>{t.askedVerb}</span>
+          <span className="mono truncate text-fg">{ask.who}</span>
+          <span>{ask.verb}</span>
           <span>· {ago(t, meta.createdAt, now)}</span>
           {meta.turns > 1 && <span>· {t.turns(meta.turns)}</span>}
         </div>

@@ -83,7 +83,7 @@ export const api = {
   thread: (id: string) => call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}`),
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
   createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string }) =>
-    call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web" }),
+    call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),
   agentStats: (since: number) => call<Record<string, AgentStats>>("GET", `/api/agents/stats?since=${since}`),
@@ -100,7 +100,12 @@ export const api = {
   renameAgent: (address: string, displayName: string) => call<unknown>("POST", "/api/agents/rename", { address, displayName }),
   aliasAgent: (address: string, alias: string) => call<unknown>("POST", "/api/agents/rename", { address, alias }),
   baristas: () => call<BaristaInfo[]>("GET", "/api/baristas"),
+  /** Start a supervised Barista. `bin` picks pi (default) or omp; `agent` picks codex or claude. */
+  startBarista: (p: { dir: string; bin?: "pi" | "omp"; agent?: "codex" | "claude"; access?: "read-only" | "workspace-write" }) =>
+    call<BaristaInfo[]>("POST", "/api/baristas", p),
   stopBarista: (dir: string) => call<{ stopped: boolean }>("DELETE", `/api/baristas?dir=${encodeURIComponent(dir)}`),
+  /** Root and a masked token for the Settings panel; never the full secret. */
+  settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean }>("GET", "/api/settings"),
 };
 
 export function wsUrl(): string {

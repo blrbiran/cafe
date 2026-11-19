@@ -1,49 +1,17 @@
 import { describe, expect, it } from "vitest";
-import type { AgentRecord, Order, RoutingHint } from "@cafe/protocol";
+import type { RoutingHint } from "@cafe/protocol";
 import { RulesRouter } from "../packages/daemon/src/router.ts";
 import { computeHints, identityOf, orderKeywords, type OutcomeRow } from "../packages/daemon/src/hints.ts";
+import { EVAL_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
 
 /**
  * Routing eval: a fixed set of Baristas and Orders with the expected receiver.
  * Compares the rules router without and with routing hints built from a replayed
- * decline history. Rules only: no model calls.
+ * decline history. Rules only: no model calls. The same fixtures feed
+ * `npm run routing:eval` (scripts/router-eval.ts), which can call a real model.
  */
 
-function rec(name: string, tags: string[], description: string): AgentRecord {
-  return { agentId: `id-${name}`, address: `${name}#1@h`, host: "h", name, tags, description, scope: [], role: "barista", concurrency: 1, mode: "headless", cwd: "/tmp", status: "idle", registeredAt: 0, lastSeenAt: 0, aliases: [] };
-}
-
-const BARISTAS = [
-  rec("mobile", ["ios", "android"], "mobile app, react native screens and hooks"),
-  rec("web", ["frontend"], "web frontend: react hooks, css, pages"),
-  rec("billing", ["invoice", "payment"], "billing service: invoices, refunds, payment gateway"),
-  rec("search", ["elasticsearch"], "search indexing and ranking"),
-  rec("db", ["数据库", "sql"], "数据库 schema、迁移和 postgres 查询"),
-  rec("infra", ["deploy", "k8s"], "deployment, kubernetes, ci pipelines, docker"),
-];
-
-/** [order, expected receiver, clear?] — "clear" cases are decided by the description alone. */
-const CASES: [string, string, boolean][] = [
-  ["the invoice total is wrong after a refund", "billing", true],
-  ["payment gateway returns 502", "billing", true],
-  ["elasticsearch ranking looks off", "search", true],
-  ["reindex the elasticsearch cluster", "search", true],
-  ["这个 sql 查询太慢了", "db", true],
-  ["数据库迁移失败了", "db", true],
-  ["postgres schema change for users", "db", true],
-  ["deploy to staging is stuck", "infra", true],
-  ["k8s pod keeps restarting", "infra", true],
-  ["docker build fails in ci", "infra", true],
-  ["ios build crashes on launch", "mobile", true],
-  ["android screens render blank", "mobile", true],
-  ["frontend css of the pricing pages", "web", true],
-  ["css grid on the landing pages", "web", true],
-  ["refunds are not showing on invoices", "billing", true],
-  // Ambiguous: web and mobile both describe "react hooks". History says mobile keeps declining these.
-  ["react hooks rerender loop", "web", false],
-  ["custom react hooks for forms", "web", false],
-  ["which react hooks should we use for data fetching", "web", false],
-];
+const BARISTAS = agentRecords("h");
 
 /** Mobile declined web-style react hooks questions recently; web answered them. */
 function history(now: number): OutcomeRow[] {
@@ -56,22 +24,28 @@ function history(now: number): OutcomeRow[] {
   ]);
 }
 
-function order(body: string): Order {
-  return { orderId: "o", threadId: "t", kind: "order", body, from: { address: "eval@h" }, chain: [], depth: 0, createdAt: 0, turn: 1, history: [] } as unknown as Order;
-}
-
 async function run(hints?: Map<string, RoutingHint>) {
   const router = new RulesRouter();
-  const out: { body: string; expected: string; got: string; clear: boolean }[] = [];
-  for (const [body, expected, clear] of CASES) {
-    const d = await router.decide({ order: order(body), candidates: BARISTAS, hints });
+  const out: { body: string; expected: string[]; mode: string; got: string; clear: boolean }[] = [];
+  for (const c of EVAL_CASES) {
+    const d = await router.decide({ order: evalOrder(c.q), candidates: BARISTAS, hints });
     const got = d.mode === "unicast" ? BARISTAS.find((b) => b.agentId === d.targets[0])!.name : d.mode;
-    out.push({ body, expected, got, clear });
+    out.push({ body: c.q, expected: c.expect, mode: c.mode ?? "unicast", got, clear: !!c.clear });
   }
   return out;
 }
 
+const acc = (rs: Awaited<ReturnType<typeof run>>) => rs.filter((r) => (r.mode === "broadcast" ? r.got === "broadcast" : r.got === r.expected[0])).length;
+
 describe("routing eval (rules)", () => {
+  it("decides every clear case from the description", async () => {
+    const rows = await run();
+    for (const r of rows) {
+      if (!r.clear) continue;
+      expect(r.got, r.body).toBe(r.expected[0]);
+    }
+  });
+
   it("hints never hurt and fix ambiguous cases", async () => {
     const now = Date.now();
     const byIdentity = computeHints(history(now), now);
@@ -79,17 +53,14 @@ describe("routing eval (rules)", () => {
 
     const before = await run();
     const after = await run(hints);
-    const acc = (rs: typeof before) => rs.filter((r) => r.got === r.expected).length;
-    console.log(`routing eval: ${acc(before)}/${CASES.length} without hints → ${acc(after)}/${CASES.length} with hints`);
-    for (const r of after) if (r.got !== r.expected) console.log(`  miss: "${r.body}" → ${r.got} (expected ${r.expected})`);
+    console.log(`routing eval: ${acc(before)}/${EVAL_CASES.length} without hints → ${acc(after)}/${EVAL_CASES.length} with hints`);
+    for (const r of after) if (r.got !== r.expected[0] && r.mode !== "broadcast") console.log(`  miss: "${r.body}" → ${r.got} (expected ${r.expected[0]})`);
 
-    // Every clear case is right either way, and history does not change it.
-    for (let i = 0; i < CASES.length; i++) {
+    for (let i = 0; i < EVAL_CASES.length; i++) {
       if (!before[i]!.clear) continue;
-      expect(before[i]!.got, before[i]!.body).toBe(before[i]!.expected);
       expect(after[i]!.got, after[i]!.body).toBe(before[i]!.got);
     }
     expect(acc(after)).toBeGreaterThanOrEqual(acc(before));
-    expect(after.filter((r) => !r.clear).every((r) => r.got === r.expected)).toBe(true);
+    expect(after.filter((r) => !r.clear).every((r) => (r.mode === "broadcast" ? r.got === "broadcast" : r.got === r.expected[0]))).toBe(true);
   });
 });

@@ -23,6 +23,7 @@ cafe is an agent network. A message (an **Order**) is routed to the agent or age
 - Display names: `cafe host rename|alias`, `cafe agent rename|alias`, `cafe daemon rename` (Root). Internal `host` / `agentId` / Address never change; old names become aliases (ADR-0007). `knownDaemons` is written only after the Root can reach the child (prevents Docker-internal IPs).
 - Routing control: `cafe router models|set|status|apply`; `router.model` can be switched and cleared on a running daemon, unknown models are rejected and rolled back. `router.timeoutMs` (10 s) and `router.concurrency` (2) bound the LLM. `cafe daemon restart` applies restart-required config; `cafe config set` says whether a change was applied or needs a restart.
 - A Thread holds several turns. A Barista can decline ("不归我管"); operational declines (timeout, abort, shutdown, command failure) carry `unavailable` and do not count against a topic. An acknowledged Order has no overall timeout, because heartbeats keep it alive.
+- **Provenance**: an Order records `origin: human | agent` and, for relays, `via: { id?, address, name? }`. Web sends `human`; MCP sends `agent`; the CLI defaults to `human` with `--origin agent [--via <address>]`; a registered Agent asking over RPC is `agent` automatically. The Thread title stays on the **first** question; `summaryTurn` no longer follows follow-ups. Threads created before this batch have no `origin`/`via` (the UI shows nothing).
 
 ## 2. Code map
 
@@ -30,7 +31,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 
 | Path | What it does |
 |---|---|
-| `packages/protocol/src/index.ts` | zod wire types: Order, ThreadEvent, ThreadMeta (v3-2 display fields, `summaryTurn`), AgentRecord (`displayName`, `aliases`), DaemonRecord (`hostId`, `displayName`, `aliases`), RoutingDecision (`demoted`, `llmError`), RoutingHint, ClientKind (`agent/daemon/ui/peer`), the method list (incl. `agent/session/get|set`, `agent/rename`, `host/identity`) |
+| `packages/protocol/src/index.ts` | zod wire types: Order (`origin`, `via` provenance), ThreadEvent, ThreadMeta (`origin`, `via`, `summaryTurn`), AgentRecord (`displayName`, `aliases`), DaemonRecord (`hostId`, `displayName`, `aliases`), RoutingDecision (`demoted`, `llmError`), RoutingHint, ClientKind (`agent/daemon/ui/peer`), the method list (incl. `agent/session/get|set`, `agent/rename`, `host/identity`) |
 | `packages/protocol/src/peer.ts` | Symmetric RPC over a socket (codex app-server style, no `jsonrpc` field) |
 | `packages/protocol/src/version.ts` | Dependency-free `PROTOCOL_VERSION`, `DEFAULT_PORT`, `onlineVersions()` — the web UI imports only this (`@cafe/protocol/version`), never the zod index |
 | `packages/protocol/src/client.ts` | `CafeClient`: register (resumes agentId), `onOrder`, `onCancel`, `ask`, `keepAlive`, `decline(reason, {unavailable})`, `getSession` / `setSession`; reconnect handles `error` and `close`, waits at most 5 s for a local daemon, 30 s for a remote one |
@@ -40,8 +41,9 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `packages/daemon/src/discovery.ts` | mDNS advertise (Root) / discover (`multicast-dns`) |
 | `packages/daemon/src/store.ts` | SQLite: thread metadata, registry cache (upsert instead of delete+insert), `agent_events` (+ `identity`, `tokens`), `agent_sessions`, `kv`. `readEventsTail` / `openThreads` for long Threads and recovery. Thread contents are JSONL under `~/.cafe/sessions/<date>/` (ADR-0003) |
 | `packages/daemon/src/summary.ts` | Faithful list titles: word/sentence-boundary truncation with `…` |
-| `packages/daemon/src/server.ts` | One port (4777): HTTP API, `/ws`, static web UI. New: `/api/host`, `/api/hosts/rename`, `/api/agents/rename`, `/api/router/models`, `POST /api/router`, `GET /api/events` (SSE), structured `/api/reload` (`ok/router/model/error`) |
-| `packages/daemon/src/events.ts` | Global event filters for `GET /api/events` / `cafe tail` (host, type, thread, heartbeats hidden by default) |
+| `packages/daemon/src/server.ts` | One port (4777): HTTP API, `/ws`, static web UI. New: `/api/host`, `/api/hosts/rename`, `/api/agents/rename`, `/api/router/models`, `POST /api/router`, `POST /api/baristas` (start), `GET /api/settings` (root + masked token), `GET /api/events` (SSE with `id:` lines and `Last-Event-ID` replay from a 500-event ring), structured `/api/reload` (`ok/router/model/error`) |
+| `packages/daemon/src/events.ts` | Global event filters for `GET /api/events` / `cafe tail` (host, type, thread, heartbeats hidden by default); `replayAfter()` for SSE resume |
+| `scripts/router-eval.ts` | `npm run routing:eval`: offline rules eval over 53 labelled cases (`tests/routing-fixtures.ts`); `--model provider/model [--repeat N] [--json] [--out file]` for a real-model sample (costs money, never in `npm test`) |
 | `packages/daemon/src/supervisor.ts`, `proc/` | Headless workers under a guard that dies with the Daemon; per-Barista `bin` (pi / omp) or `agent` (codex / claude → `node <defaultCliBin()> barista run`), `access`, `model`, `tui` + `thread` (codex only; one worker whatever the concurrency) |
 | `packages/daemon/src/index.ts` | `runDaemon()`, lock, discovery start/stop |
 | `packages/cli/src/main.ts` | The `cafe` command. New: `init`, `doctor`, `extension install|status|uninstall`, `router models|set|status|apply`, `host rename|alias`, `agent rename|alias`, `daemon rename|restart`, `connect`, `root test`, `tail`; help has a Quick start; unknown commands fail even with `--help` |
@@ -56,9 +58,9 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `claude-plugin/` | The cafe Claude Code plugin (not an npm workspace, not in the root tsconfig): `hooks/register.ts` (the mod: spawns `cafe session-host`, `$.prompt.submit`, matches `turn.start` by `[cafe order <id>]`, answers from `turn.complete`, `$.turn.abort`, `/cafe on|off`), `tests/register.test.ts` (`npm run test:claude-plugin`). Shipped in the release package |
 | `packages/cli/src/mcp.ts` | `cafe mcp`: hand-written JSON-RPC 2.0 over stdio (no MCP SDK); `mcpInstallCommands()` |
 | `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below |
-| `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore`; fixed Shell, compact feed with whole-card click, right detail drawer / three-pane at ≥1600, right info rail at ≥2200, nav Agents dropdown, Settings drawer (rename/alias, router, Baristas), Live page; feed has "load older" and full-text search |
+| `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore`; fixed Shell, compact feed with whole-card click and 2-column list at ≥1800 (drawer closed), right detail drawer / three-pane at ≥1600, info rail at ≥1920, nav Agents sublist (open by default on desktop, remembered), Settings drawer (machines + remote rename, start/stop Baristas, routing, connection root/token hint), Live page, drawer open/close animation and click-outside close; feed has "load older" and full-text search; cards show `你`/`代问` provenance |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
-| `tests/` | vitest, **155 tests** (+5 mod tests via `npm run test:claude-plugin`): identity/display names/aliases (`identity.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), global event filters (`events.test.ts`), CLI init/help/config/errors (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), plus session host, Codex TUI, e2e, follow-up/recovery, pi extension, serve, supervisor, routing hints/eval, direct links, discovery, service files, retention/search, client reconnect, versions, Bridges, MCP |
+| `tests/` | vitest, **160 tests** (+5 mod tests via `npm run test:claude-plugin`): identity/display names/aliases (`identity.test.ts`), provenance (`provenance.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), rules eval + hints (`routing-eval.test.ts` over `routing-fixtures.ts`, 53 cases), global event filters and SSE resume (`events.test.ts`), CLI init/help/config/errors (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), plus session host, Codex TUI, e2e, follow-up/recovery, pi extension, serve, supervisor, routing hints, direct links, discovery, service files, retention/search, client reconnect, versions, Bridges, MCP |
 
 **pi extension behaviour**
 - Orders queue (FIFO), are acked and heartbeated on arrival, and are injected only when idle with `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
@@ -73,7 +75,8 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 155 must pass (run twice: earlier flakes were unhandled rejections)
+npm test                   # vitest; all 160 must pass (flakes are timing-sensitive: run twice)
+npm run routing:eval       # offline rules eval, 53 cases, no model, no cost
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
 npm run test:release       # only when packaging/paths changed; ~1 min, no model
@@ -98,11 +101,26 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - Every running instance is its own Agent, including two in the same directory.
 - Injected Orders start immediately. `accept: confirm` was **removed at the user's request**; do not bring it back. `followUp` (not `steer`, not omp `aside`).
 - Routing: descriptions are primary. History is auxiliary: penalty < 1, never excludes, never beats a better description match, only declines count (no bonus for answering). Operational declines do not count against topics.
-- Web UI: conversation-first, plain language, no protocol jargon, internals collapsed, zh/en; **prototype and get approval before UI changes**.
+- Web UI: conversation-first, plain language, no protocol jargon, internals collapsed, zh/en; **prototype and get approval before UI changes** (the 2026-11-19 night batch's drawer/nav changes were requested directly by the user).
+- **A Thread is titled by its first question.** Follow-ups no longer overwrite `summary`/`summaryTurn`; the card shows `N 轮` instead. Do not reintroduce "title follows the latest turn".
+- **Provenance is recorded, not inferred**: `origin` (human/agent) and `via` (relaying Agent) come from the caller (Web/MCP/CLI flag/registered peer). Do not try to guess it from the text.
 - Routing LLM: routing only; the Order text passes through unmodified; rules fallback must work without an LLM.
 - Data safety: nothing is deleted automatically unless the user sets `retention.days`; `cafe prune` is a dry run unless `--yes`.
 
 ## 5. Waiting on the user (start the next session here)
+
+**Done on 2026-11-19 in the night batch (Q108 A, Q109 "full provenance, no migration", Q110 "start Barista + machines", Q111 "#20 spec first"), committed as `feat: order provenance, settings admin, SSE resume, and wide-screen UI`:**
+1. Web polish (user-requested): drawer closes on blank-page click in both overlay and docked modes; 180ms slide-in / 150ms slide-out with `prefers-reduced-motion` honoured; Agents sublist open by default on desktop and remembered; "All Agents" is a quiet nav row instead of a blue link; the drawer header shows the Thread's first question instead of the nav name.
+2. #36 provenance: `Order.origin` / `Order.via` + `ThreadMeta` copies; Web = human, MCP = agent, CLI `--origin agent [--via addr]`, registered Agents over RPC = agent automatically. Web shows `你` for web questions and `代问` for relays. Thread titles now stay on the **first** question (`summaryTurn` stays 1); old Threads are not migrated.
+3. #10/#18: Settings drawer has "Machines" (Root can rename remote Hosts through the existing API), "Start a Barista" (directory + pi/omp/codex/claude, write toggle for native), and a Connection section (`/api/settings`: Root + masked token + restart hint).
+4. #19: `GET /api/events` now writes `id:` lines and replays from a 500-event ring on `Last-Event-ID`; `cafe tail` reconnects with the last id. `replayAfter()` is unit-tested; no full-CLI reconnect test yet.
+5. #30: info rail moved from ≥2200px to ≥1920px (`minmax(0,1fr) 260px`); Feed is two columns at ≥1800px while the drawer is closed. Verified with screenshots at 1440/1920 (`output/playwright/`).
+6. #6: `untilClosed` timeout raised 5s → 12s; `npm test` ran **5× green** (160/160 each) and `npm run test:claude-plugin` passed (5/5). Combined with the earlier fixes this closes the observed flake; watch it if it returns.
+7. #14: `npm run routing:eval` + `tests/routing-fixtures.ts` (53 labelled cases, 8 Baristas). Rules baseline is 53/53. `--model <provider/model> --repeat N --json --out <file>` runs a real sample and reports accuracy / p50 / p95 / fallbacks / misses; it is **not** in `npm test`. **No real-model sample has been run yet — needs its own approval.**
+8. #20: spec drafted at `docs/specs/v4-1-attachments.md` with Q1–Q4 waiting for the user.
+9. Verification: `npm run typecheck`, web `check` + `build:web`, 160 tests (5 consecutive runs green), 5 mod tests, and `npm run test:release` (packed tarball smoke test) all pass; the user's launchd daemon was restarted and serves the new UI. Committed as one batch; review it with `git show`.
+
+**Not done in this batch (candidates for next):** real-model routing-eval sample (needs approval); pi/omp `/cafe` command (#11); #31/#34 server-scale pass (snapshot summary DTO, thread pagination, recover index, FTS); #21 config diff/apply and stale-web-build banner; #16 cross-model behaviour regression; #27/#28 specs.
 
 Done and approved earlier: v2 defaults; Q60–Q70; omp real Q&A; `cafe daemon install` on the Mac; web load-older + search; **Q71 A (Network page versions) approved**; the user restarted their daemon. The user published 0.1.0 and 0.1.1 themselves. Q72–Q79 answered as recommended; Q80 = C (no side work, focus on v3-1).
 
@@ -114,12 +132,12 @@ Done on 2026-11-19 while the user was away (asked to finish phase 2), **reviewed
 3. Findings worth knowing: after Esc in the terminal, both Claude (mod prompts refused) and Codex (queue dispatch paused) take no cafe questions until the person sends a message; a Codex turn that has started cannot be interrupted from outside, so cancel only withdraws queued questions; the user's cmux `codex` wrapper forces the TUI's embedded app-server, which the design handles (no shared daemon needed).
 4. Commits: `feat: running Claude Code sessions as Baristas …`, `feat: a running Codex session as a Barista …`, and the handoff.
 
-Waiting on the user:
-1. **Run the two approved paid real-model runs** (Q88, approved but not yet executed): a running Claude Code session and a running Codex session (`cafe barista start --dir <dir> --agent codex --tui` next to a `codex` in that dir), each: answer, follow-up, cancel. Every new paid run still needs its own approval.
-2. **Web workbench prototype** (#18/#22/#23/#24/#26/#30): needs a claude.ai login (Artifact is refused under `ANTHROPIC_AUTH_TOKEN`). Prototype first, get approval, then implement; #35's card line-clamp rides along.
-3. Optionally run `cafe extension install` on the user's machine (pi/omp currently have no persistent cafe extension; `cafe extension status` shows both missing). It writes `~/.pi/agent/settings.json` and links omp — ask first.
-4. `pi update` (local pi 1.5.0, extension targets 1.5.2). Reinstall autostart (`cafe daemon install`), `cafe mcp install` and `cafe claude install` after changing Node version or moving the repo (all register absolute node + cafe.js paths).
-5. Nothing is pushed; the user pushes when they want.
+Waiting on the user / next session:
+1. **Run the two approved paid real-model runs** (Q88, approved but not yet executed): a running Claude Code session and a running Codex session (`cafe barista start --dir <dir> --agent codex --tui` next to a `codex` in that dir), each: answer, follow-up, cancel. Every new paid run still needs its own approval. Same for a real-model routing sample: `npm run routing:eval -- --model <provider/model> --repeat 2 --out routing-eval.json`.
+2. Optionally run `cafe extension install` on the user's machine (pi/omp currently have no persistent cafe extension; `cafe extension status` shows both missing). It writes `~/.pi/agent/settings.json` and links omp — ask first.
+3. `pi update` (local pi 1.5.0, extension targets 1.5.2). Reinstall autostart (`cafe daemon install`), `cafe mcp install` and `cafe claude install` after changing Node version or moving the repo (all register absolute node + cafe.js paths). The user reran `cafe claude install` after the v3-3 plugin fix.
+4. Nothing is pushed; the user pushes when they want. Publishing to npm stays with the user.
+5. Next backlog: #14 offline LLM eval harness (Q107 A), #20 attachments / #28 connector SDK / #27 update-rollback (need specs), full #31/#34 server-scale work, #11 pi/omp slash commands. The v3-3 Web workbench is done and committed.
 
 Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, rest as recommended), **reviewed, committed and shipped in 0.1.3** (four commits: daemon/protocol, CLI onboarding, web perf, docs; then a bilingual-README commit):
 - Correctness/UX: `.cafe` directories are skipped (no more `EISDIR` from `~/.cafe`), broken `.cafe` errors name the file/field and show a template; pi extension reports why it is unavailable; CLI does not repeat `EISDIR`; `config get` prints `(not set)` / fails unknown keys; thread summaries cut at word boundaries with `…` and follow the latest turn; skill text now has a mandatory `$cafe` workflow.
@@ -128,12 +146,12 @@ Done on 2026-11-19 in the dogfooding batch (Q89–Q97; user chose Q90 B, Q93 B, 
 - Multi-machine: child addresses are probed before entering `knownDaemons`; `cafe connect`, `root test`, `daemon restart`, restart-required config reporting, clearer `unauthorized`.
 - Identity (ADR-0007): `displayName`/`aliases` for Hosts and Agents, local and Root-relayed rename; internal ids/Addresses never change, so no history migration.
 - Performance (targeted): debounced meta writes, tail-only follow-up history, recovery query, registry upsert, parallel `announceRoot`; web store single set, O(1) duplicate check, linear merge, memoized Feed/Conversation, coarser `useNow` in cards.
-- No Web layout redesign yet: the artifact tool refused this session (authenticated with `ANTHROPIC_AUTH_TOKEN`), and UI changes still need an approved prototype (#18/#22/#23/#24/#30).
+- No Web layout redesign yet at that point: the artifact tool refused that session (authenticated with `ANTHROPIC_AUTH_TOKEN`), and UI changes still needed an approved prototype (#18/#22/#23/#24/#30). Superseded by the v3-3 batch below.
 
-Done on 2026-11-19 in the **v3-3 Web workbench** batch (Q101–Q107; Q101 A, Q102 A, Q103 A, Q104 A, Q105 A, Q106 B, Q107 A), **implemented and browser-checked but not committed yet**:
+Done on 2026-11-19 in the **v3-3 Web workbench** batch (Q101–Q107; Q101 A, Q102 A, Q103 A, Q104 A, Q105 A, Q106 B, Q107 A), **committed** (see `git log`: `feat: Web workbench, settings drawer, live tail, and Claude plugin /cafe fallback`):
 - Web: fixed full-height Shell with independent scrolling; compact Feed cards (whole card clickable, 2-line title, one-line answer, status + timing, no "Open conversation" link); thread detail as a right drawer at 900–1599 and a docked three-pane at ≥1600; a 280px info rail at ≥2200; nav Agents expands into a registered-agent sublist; Settings drawer (host/agent rename + aliases, routing model with live state, supervised Barista list/stop); Live page; `useNow` only ticks fast for active turns. Prototype: `docs/prototypes/web-workbench-2026-11-19.html`; screenshots in `output/playwright/` (390 / 1440 / 1920 / 3440, light, settings, live).
 - Daemon/CLI: `GET /api/router/models` (60s cache), `POST /api/router` (set/clear with config rollback), `GET /api/events` SSE with host/type/thread filters and heartbeats hidden; `cafe tail` (human + `--json`, same filters).
-- Claude Code plugin: a user-owned `/cafe` no longer aborts `session.start`; registration falls back to `/cafe-barista` and the session-host still starts. Added a mod test for it. **The user must rerun `cafe claude install`** so the installed marketplace copy picks up the fix; the repo change alone does not update it.
+- Claude Code plugin: a user-owned `/cafe` no longer aborts `session.start`; registration falls back to `/cafe-barista` and the session-host still starts. Added a mod test for it. The user reran `cafe claude install`; the installed marketplace copy was verified to contain the fix. New sessions get it; already-running sessions need a restart.
 - Verification: typecheck, web check + build, 155 tests ×5, 5 mod tests. The user's launchd daemon was restarted and serves the new UI (`cafe daemon status`: 0.1.3, llm `magpie/group/smart`). The #6 flake did not reproduce in 5 full runs.
 - Not done this batch: #14 offline LLM eval harness (Q107 A), full #31/#34 server-scale work, #20/#28 specs, #27 update/rollback, #11 pi/omp slash commands.
 
@@ -156,12 +174,13 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 ## 7. Backlog after v2
 
 - Multi-level Daemon hierarchy (codex `parent`/AgentPath idea) — not started; only two levels exist.
-- Web workbench (dogfooding #18/#22/#23/#24/#26/#30): fixed-height nav, compact cards, right drawer, responsive widths, settings/admin actions. Needs an approved prototype.
-- LLM routing eval harness with 50+ cases, repeat runs and latency (dogfooding #14); full router status/health details.
-- Full event store (SQLite/FTS) and web virtualization (dogfooding #31/#33/#34) — only targeted fixes are in.
-- Global `cafe tail` (#19), attachments (#20), self-update/rollback (#27), connector SDK (#28), slash commands (#11).
+- **Attachments (#20)**: spec is `docs/specs/v4-1-attachments.md`; Q1–Q4 need answers before implementation.
+- LLM routing eval harness: offline harness and 53 fixtures are in (`npm run routing:eval`); a real-model baseline and CI threshold are still open.
+- Full event store (SQLite/FTS) and web virtualization (dogfooding #31/#33/#34) — only targeted fixes are in; #31/#34 remain the big server-scale batch.
+- pi/omp `/cafe` slash commands (#11), config diff/apply and stale-Web-build banner (#21).
+- Update/rollback (#27) and connector SDK (#28) — need specs.
 - Phase 2 follow-ups: the web UI could show "paused" for a Claude session (`/cafe off` currently just leaves the network); a Codex `--tui` Barista could prefer the shared app-server daemon's live events when the TUI uses it (today it always polls `thread/turns/list`, ~1 s).
-- CI (GitHub Actions: typecheck, test, build:web, test:release) — suggested, not started.
+- CI (GitHub Actions: typecheck, test, build:web, test:release, `routing:eval`) — suggested, not started.
 - LAN security (token is plain text over HTTP/WS; TLS or tailnet-only) — needs a spec.
 - SQLite FTS if `cafe search` gets slow (it scans JSONL files).
 - Web: maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
@@ -200,6 +219,9 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - Mod test kit: `$.http.fetch` hooks get `{url, init}`; every `$.ui.*` call needs a test hook (`{ value: undefined }`); `$` may only be passed to functions declared outside `register`.
 - Codex seen from another process: a turn still running in the TUI reads `interrupted` with `completedAt: null`; `turn/interrupt` on a thread loaded elsewhere fails with `thread not found`; after an Esc interrupt the queue is not dispatched until the next completed turn (`ext/queue/src/service.rs` `on_thread_idle`).
 - Tests that share JSON state files with a fake process must write atomically (temp file + rename), or the fake reads half a file and dies.
+- `tests/helpers.untilClosed` now waits 12 s (was 5 s): a full parallel run can start fake Codex/Claude slowly. Five consecutive `npm test` runs were green after the change.
+- `GET /api/events` resumes from an in-memory 500-event ring. An id older than the ring gets no replay by design (the Web UI re-syncs with `/api/snapshot`); `cafe tail` reconnects with the last id it saw.
+- `npm run routing:eval` is free without flags. `--model` calls the real model per case per repeat and costs money; never put it in `npm test`.
 - `cafe daemon start` polls `/api/health` for only ~5 s. With an LLM router configured, `initRouter()` (ModelRuntime + ResourceLoader) can take ~1 min before the server listens, so the CLI may report "did not start" while launchd is still bringing it up. Check `cafe daemon status` / the log before treating it as a failure; widen the wait when autostart is installed.
 - npm publish to a scoped package returns **E404** when unauthenticated (not E401); `npm whoami` first. A successful publish may return 202 "being processed" and take a few minutes to appear in `npm view`.
 - Artifacts are unavailable when the session authenticates with `ANTHROPIC_AUTH_TOKEN`: every Artifact call is refused. UI prototypes need a claude.ai login; otherwise write a local HTML file.
@@ -211,10 +233,10 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 
 ## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q107**; nothing open).
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q111**; #20 spec Q1–Q4 are open).
 - New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
 - Commit when asked (or at the end of an away batch they asked to hand off), with a stat or diff shown first; messages end with the Co-Authored-By line.
 - Restart their daemon yourself after daemon / web changes (section 8). Publishing to npm and changing their Claude / Codex config stay with them.
 - UI prototypes are Claude artifacts: v1 https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK, routing-history display https://claude.ai/artifact/JJit3GCxiQZUypYVWZFxFg (approved: Q51–Q53 as recommended), older threads + search https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ (approved: Q67–Q68 as recommended), versions https://claude.ai/artifact/SVLEJhirFrxq7ugMipjeiZ (Q71 A, implemented), agent kinds https://claude.ai/artifact/X3F3dx2PtBQf3R5HwsiRL5 (Q81–Q83 as recommended, implemented). Artifacts are unavailable under `ANTHROPIC_AUTH_TOKEN`; the v3-3 workbench used a local prototype instead: [`docs/prototypes/web-workbench-2026-11-19.html`](../prototypes/web-workbench-2026-11-19.html) (Q101–Q107, implemented).
 
-**Suggested skills for the next agent** (call via the Skill tool): `superpowers:brainstorming` before designing the Web workbench; `artifact-design` when building its prototype (needs a claude.ai login); `superpowers:writing-plans` / `superpowers:executing-plans` for the remaining backlog; `superpowers:test-driven-development` for every fix; `superpowers:systematic-debugging` for the paid phase-2 runs and any flake; the `cafe` skill when debugging the network itself.
+**Suggested skills for the next agent** (call via the Skill tool): `superpowers:brainstorming` before specifying #20 attachments / #28 connector SDK / #27 update-rollback; `superpowers:writing-plans` / `superpowers:executing-plans` for the remaining backlog; `superpowers:test-driven-development` for every fix; `superpowers:systematic-debugging` for the paid phase-2 runs and any flake; the `cafe` skill when debugging the network itself; `playwright` for real-browser UI checks. `artifact-design` only if a claude.ai login is available (Artifacts are refused under `ANTHROPIC_AUTH_TOKEN`; use a local HTML prototype instead).

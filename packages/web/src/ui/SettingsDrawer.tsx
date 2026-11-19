@@ -4,7 +4,7 @@ import { useT } from "../i18n.ts";
 import { refreshStore, useStore } from "../store.ts";
 import { Pill } from "./bits.tsx";
 
-export function SettingsDrawer({ onClose }: { onClose: () => void }) {
+export function SettingsDrawer({ onClose, closing = false }: { onClose: () => void; closing?: boolean }) {
   const t = useT();
   const host = useStore((s) => s.host);
   const isRoot = useStore((s) => s.isRoot);
@@ -20,6 +20,11 @@ export function SettingsDrawer({ onClose }: { onClose: () => void }) {
   const [router, setRouter] = useState<{ router: string; model?: string; error?: string }>();
   const [baristas, setBaristas] = useState<BaristaInfo[]>();
   const [edits, setEdits] = useState<Record<string, string>>({});
+  const [hostEdits, setHostEdits] = useState<Record<string, string>>({});
+  const [dir, setDir] = useState("");
+  const [agentKind, setAgentKind] = useState("pi");
+  const [write, setWrite] = useState(false);
+  const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean }>();
   const [busy, setBusy] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [error, setError] = useState<string>();
@@ -45,6 +50,10 @@ export function SettingsDrawer({ onClose }: { onClose: () => void }) {
       .baristas()
       .then((b) => setBaristas(b))
       .catch(() => setBaristas([]));
+    api
+      .settings()
+      .then(setConn)
+      .catch(() => setConn(undefined));
   }, []);
 
   const run = async (key: string, fn: () => Promise<string | void>) => {
@@ -93,11 +102,31 @@ export function SettingsDrawer({ onClose }: { onClose: () => void }) {
       return t.settingsSaved;
     });
 
+  const startBarista = () =>
+    void run("startBarista", async () => {
+      const target = dir.trim();
+      if (!target) return;
+      if (agentKind === "pi") await api.startBarista({ dir: target });
+      else if (agentKind === "omp") await api.startBarista({ dir: target, bin: "omp" });
+      else await api.startBarista({ dir: target, agent: agentKind as "codex" | "claude", ...(write ? { access: "workspace-write" as const } : {}) });
+      setBaristas(await api.baristas());
+      return t.settingsStarted;
+    });
+
+  const renameHost = (host: string) =>
+    void run(`host:${host}`, async () => {
+      const value = (hostEdits[host] ?? "").trim();
+      if (!value) return;
+      await api.renameHost(host, value);
+      setHostEdits((x) => ({ ...x, [host]: "" }));
+      return t.settingsSaved;
+    });
+
   const agentList = Object.values(agents).sort((a, b) => a.address.localeCompare(b.address));
   const routerText = router ? `${router.router}${router.model ? ` (${router.model})` : ""}` : "…";
 
   return (
-    <aside aria-label={t.settingsTitle} className="fixed inset-y-0 right-0 z-40 flex w-[min(430px,100vw)] flex-col border-l border-line bg-page shadow-float">
+    <aside aria-label={t.settingsTitle} className={`settings-drawer fixed inset-y-0 right-0 z-40 flex w-[min(430px,100vw)] flex-col border-l border-line bg-page shadow-float ${closing ? "is-closing" : ""}`}>
       <div className="flex items-center gap-2 border-b border-line px-4 py-3">
         <button type="button" className="iconbtn" aria-label={t.settingsTitle} onClick={onClose}>
           ✕
@@ -166,6 +195,71 @@ export function SettingsDrawer({ onClose }: { onClose: () => void }) {
               {t.settingsAddAlias}
             </button>
           </div>
+        </section>
+
+        <section className="mb-5 border-b border-line pb-4">
+          <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsMachines}</h3>
+          <p className="mt-1 mb-2.5 text-xs text-muted">{t.settingsMachinesDesc}</p>
+          {daemons.map((d) => (
+            <div key={d.host} className="flex flex-col gap-1.5 border-t border-line py-2 first:border-t-0">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 flex-col">
+                  <b className="truncate text-sm text-fg-strong">{d.displayName ?? d.host}</b>
+                  <span className="mono truncate text-[11px] text-muted">{d.host}</span>
+                </div>
+                <span className={`text-[11px] ${d.online ? "text-ok" : "text-muted"}`}>{d.online ? t.online : t.mOffline}</span>
+              </div>
+              {d.host !== host && isRoot && (
+                <div className="flex items-center gap-1.5">
+                  <input
+                    className="!min-h-0 min-w-0 flex-1 !py-1 !text-xs"
+                    placeholder={t.settingsNewName}
+                    value={hostEdits[d.host] ?? ""}
+                    onChange={(e) => setHostEdits((x) => ({ ...x, [d.host]: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        renameHost(d.host);
+                      }
+                    }}
+                  />
+                  <button type="button" className="btn-sm" aria-busy={busy === `host:${d.host}`} disabled={!(hostEdits[d.host] ?? "").trim()} onClick={() => renameHost(d.host)}>
+                    {t.settingsRename}
+                  </button>
+                </div>
+              )}
+              {d.host !== host && !isRoot && <span className="hint">{t.settingsRootOnly}</span>}
+            </div>
+          ))}
+        </section>
+
+        <section className="mb-5 border-b border-line pb-4">
+          <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsStartBarista}</h3>
+          <p className="mt-1 mb-2.5 text-xs text-muted">{t.settingsStartDesc}</p>
+          <div className="flex items-end gap-2">
+            <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs text-muted">
+              {t.settingsDir}
+              <input value={dir} placeholder={t.settingsDirPh} onChange={(e) => setDir(e.target.value)} />
+            </label>
+            <label className="flex w-24 flex-col gap-1 text-xs text-muted">
+              {t.settingsAgent}
+              <select value={agentKind} onChange={(e) => setAgentKind(e.target.value)}>
+                <option value="pi">pi</option>
+                <option value="omp">omp</option>
+                <option value="codex">codex</option>
+                <option value="claude">claude</option>
+              </select>
+            </label>
+            <button type="button" className="btn-sm" aria-busy={busy === "startBarista"} disabled={!dir.trim()} onClick={startBarista}>
+              {t.settingsStart}
+            </button>
+          </div>
+          {(agentKind === "codex" || agentKind === "claude") && (
+            <label className="mt-2 flex items-center gap-2 text-xs text-muted">
+              <input type="checkbox" className="!min-h-0" checked={write} onChange={(e) => setWrite(e.target.checked)} />
+              {t.settingsAllowWrite}
+            </label>
+          )}
         </section>
 
         <section className="mb-5 border-b border-line pb-4">
@@ -257,9 +351,19 @@ export function SettingsDrawer({ onClose }: { onClose: () => void }) {
         </section>
 
         <section>
-          <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsRestart}</h3>
+          <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsConnection}</h3>
           <p className="mt-1 mb-2 text-xs text-muted">{t.settingsRestartDesc}</p>
-          <div className="mono text-xs text-warn">cafe daemon restart</div>
+          <div className="well flex flex-col gap-1.5 text-xs">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted">{t.settingsRoot}</span>
+              <span className="mono truncate text-fg-strong">{conn ? (isRoot ? "self" : (conn.root ?? "mDNS")) : t.settingsLoading}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted">{t.settingsToken}</span>
+              <span className="mono truncate text-fg-strong">{conn ? (conn.tokenSet ? conn.tokenHint : t.settingsTokenNotSet) : t.settingsLoading}</span>
+            </div>
+          </div>
+          <div className="mono mt-2 text-xs text-warn">cafe daemon restart</div>
         </section>
       </div>
 

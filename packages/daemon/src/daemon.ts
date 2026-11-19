@@ -569,6 +569,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       threadId: prior?.threadId ?? ulid(),
       kind: p.kind,
       from,
+      // A registered Agent asking through the protocol is relaying on someone's behalf.
+      origin: p.origin ?? (peer?.meta.party ? "agent" : "human"),
+      via: p.via ?? (peer?.meta.party ? { id: peer.meta.party.id, address: peer.meta.party.address } : undefined),
       to: p.to,
       body: p.body,
       parentOrderId: p.parentOrderId,
@@ -1123,6 +1126,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         orderId: env.orderId,
         kind: ev.order.kind,
         from: ev.order.from,
+        ...(ev.order.origin ? { origin: ev.order.origin } : {}),
+        ...(ev.order.via ? { via: ev.order.via } : {}),
         targets: [],
         status: "routing",
         summary: summarize(ev.order.body),
@@ -1139,12 +1144,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const addr = (id: string) => this.registry.get(id)?.address;
     if (ev.type === "order.created") {
       this.knownOrders.set(ev.order.orderId, ev.order);
-      // A new turn: the Thread now reflects this Order.
+      // A new turn: the Thread now reflects this Order. The title stays on the
+      // first question so a multi-turn Thread is still recognisable in list views.
       if (ev.order.orderId !== meta.orderId || meta.turns === 0) {
+        const firstTurn = meta.turns === 0;
         meta.orderId = ev.order.orderId;
         meta.turns = Math.max(meta.turns + 1, ev.order.turn);
-        meta.summary = summarize(ev.order.body);
-        meta.summaryTurn = ev.order.turn;
+        if (firstTurn) {
+          meta.summary = summarize(ev.order.body);
+          meta.summaryTurn = ev.order.turn;
+        }
         meta.turnStartedAt = ev.order.createdAt;
         meta.reason = undefined;
         meta.router = undefined;

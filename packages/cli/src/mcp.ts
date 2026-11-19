@@ -163,7 +163,14 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const body = str(args.question, "question", true)!;
         const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[] } }>("/api/orders", {
           method: "POST",
-          body: JSON.stringify({ body, to: str(args.to, "to"), threadId: str(args.threadId, "threadId"), as: customer ?? "mcp" }),
+          body: JSON.stringify({
+            body,
+            to: str(args.to, "to"),
+            threadId: str(args.threadId, "threadId"),
+            as: customer ?? "mcp",
+            origin: "agent",
+            ...(process.env.CAFE_VIA ? { via: { address: process.env.CAFE_VIA } } : {}),
+          }),
         });
         return waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
       }

@@ -37,7 +37,7 @@ describe("thread summary", () => {
     expect(meta.summary.at(-2)).not.toBe(" ");
   });
 
-  it("follows the latest turn", async () => {
+  it("keeps the title on the first question across follow-ups", async () => {
     const root = await startDaemon("root", { mode: "root" });
     cleanup.push(root.stop);
     const b = await barista(root.addr, identity("widgets"));
@@ -51,7 +51,7 @@ describe("thread summary", () => {
     await untilClosed(c, second.threadId);
     const meta = root.daemon.thread(first.threadId)!.meta;
     expect(meta.turns).toBe(2);
-    expect(meta.summary).toBe("and the second question");
-    expect(meta.summaryTurn).toBe(2);
+    expect(meta.summary).toBe("the first question");
+    expect(meta.summaryTurn).toBe(1);
   });
 });

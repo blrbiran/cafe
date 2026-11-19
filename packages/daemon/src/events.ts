@@ -11,6 +11,13 @@ export interface EventFilter {
   includeHeartbeat?: boolean;
 }
 
+/** Events in the ring that came after `lastId`; empty when the id is unknown (too old). */
+export function replayAfter(recent: ThreadEnvelope[], lastId?: string): ThreadEnvelope[] {
+  if (!lastId) return [];
+  const at = recent.findIndex((e) => e.eventId === lastId);
+  return at >= 0 ? recent.slice(at + 1) : [];
+}
+
 export function parseEventFilter(url: URL): EventFilter {
   const types = (url.searchParams.get("type") ?? "")
     .split(",")

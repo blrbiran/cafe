@@ -102,11 +102,26 @@ export const Party = z.object({
 });
 export type Party = z.infer<typeof Party>;
 
+/** Who actually asked: a person, or an Agent relaying the person's request. */
+export const OrderOrigin = z.enum(["human", "agent"]);
+export type OrderOrigin = z.infer<typeof OrderOrigin>;
+
+/** The Agent that relayed the question (the person's words may differ from `body`). */
+export const OrderVia = z.object({
+  id: z.string().optional(),
+  address: z.string(),
+  name: z.string().optional(),
+});
+export type OrderVia = z.infer<typeof OrderVia>;
+
 export const Order = z.object({
   orderId: z.string(),
   threadId: z.string(),
   kind: OrderKind,
   from: Party,
+  /** Absent on Threads created before provenance existed. */
+  origin: OrderOrigin.optional(),
+  via: OrderVia.optional(),
   /** Explicit Address requested by the Customer; skips LLM routing. */
   to: z.string().optional(),
   body: z.string(),
@@ -184,11 +199,14 @@ export const ThreadMeta = z.object({
   orderId: z.string(),
   kind: OrderKind,
   from: Party,
+  /** Provenance of the first question; absent on older Threads. */
+  origin: OrderOrigin.optional(),
+  via: OrderVia.optional(),
   targets: z.array(z.string()),
   mode: DeliveryMode.optional(),
   status: ThreadStatus,
   summary: z.string(),
-  /** Turn (question) the summary shows; follow-ups update it. */
+  /** Turn (question) the summary shows; the title stays on the first question. */
   summaryTurn: z.number().int().default(1),
   createdAt: z.number(),
   firstReplyAt: z.number().optional(),
@@ -251,6 +269,9 @@ export const CreateOrderParams = z.object({
   deadlineMs: z.number().int().optional(),
   /** Customer identity for callers that are not registered Agents (CLI, web). */
   as: z.string().optional(),
+  /** `agent` when an Agent relays the person's request; defaults to `human`. */
+  origin: OrderOrigin.optional(),
+  via: OrderVia.optional(),
 });
 export type CreateOrderParams = z.infer<typeof CreateOrderParams>;
 

@@ -43,8 +43,9 @@ export async function customer(addr: string) {
   return c;
 }
 
-/** Collect thread events until `order.closed`. */
-export function untilClosed(c: CafeClient, threadId: string, timeoutMs = 5000): Promise<ThreadEnvelope[]> {
+/** Collect thread events until `order.closed`. 12 s, not 5 s: under a full parallel
+ * run the fake Codex/Claude processes can be slow to start and 5 s flaked. */
+export function untilClosed(c: CafeClient, threadId: string, timeoutMs = 12_000): Promise<ThreadEnvelope[]> {
   return new Promise((resolve, reject) => {
     const events: ThreadEnvelope[] = [];
     const t = setTimeout(() => reject(new Error(`thread ${threadId} not closed; got ${events.map((e) => e.event.type).join(",")}`)), timeoutMs);

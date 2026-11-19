@@ -25,6 +25,20 @@ export function whoAddress(id: string, agents: Record<string, AgentRecord>, meta
 }
 
 /**
+ * Who asked, in plain words: "you" for this web UI, or the relaying Agent's
+ * address when an Agent asked on the person's behalf.
+ */
+export function askerOf(
+  t: Dict,
+  source: { from: { address: string }; origin?: "human" | "agent"; via?: { address: string } },
+  followUp = false,
+): { who: string; verb: string } {
+  if (source.origin === "agent") return { who: source.via?.address ?? source.from.address, verb: t.relayedVerb };
+  if (source.from.address.startsWith("web@")) return { who: t.you, verb: followUp ? t.followUpLabel : t.askedVerb };
+  return { who: source.from.address, verb: followUp ? t.followUpLabel : t.askedVerb };
+}
+
+/**
  * The one-line outcome of a Thread's latest turn, in plain language.
  * `live` supplies the turn start (for follow-ups) and the current targets.
  */

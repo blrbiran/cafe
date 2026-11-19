@@ -348,11 +348,23 @@ program
   .option("--notice", "send a Notice (no reply expected)")
   .option("--deadline <ms>", "broadcast collection deadline", Number)
   .option("--as <name>", "customer name shown to others", "cli")
+  .option("--origin <kind>", "human (default) or agent: who actually asked", "human")
+  .option("--via <address>", "with --origin agent: the Agent relaying the request")
   .action(async (words: string[], o) => {
+    if (o.origin !== "human" && o.origin !== "agent") throw new Error("--origin must be human or agent");
     await ensureDaemon();
     const res = await api("/api/orders", {
       method: "POST",
-      body: JSON.stringify({ body: words.join(" "), to: o.to, threadId: o.thread, kind: o.notice ? "notice" : "order", deadlineMs: o.deadline, as: o.as }),
+      body: JSON.stringify({
+        body: words.join(" "),
+        to: o.to,
+        threadId: o.thread,
+        kind: o.notice ? "notice" : "order",
+        deadlineMs: o.deadline,
+        as: o.as,
+        origin: o.origin,
+        ...(o.via ? { via: { address: o.via } } : {}),
+      }),
     });
     if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision.mode}: ${res.decision.reason}`, res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
@@ -384,28 +396,47 @@ program
     if (o.type) params.set("type", o.type);
     if (o.thread) params.set("thread", o.thread);
     if (o.verbose) params.set("verbose", "1");
-    const res = await fetch(`${base()}/api/events?${params}`, {
-      headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
-    });
-    if (!res.ok || !res.body) throw new Error(`cannot stream events: ${res.status}`);
-    const decoder = new TextDecoder();
-    let buf = "";
-    for await (const chunk of res.body as any as AsyncIterable<Uint8Array>) {
-      buf += decoder.decode(chunk, { stream: true });
-      let i: number;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const block = buf.slice(0, i);
-        buf = buf.slice(i + 2);
-        const data = block.split("\n").find((l) => l.startsWith("data: "));
-        if (!data) continue;
-        const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
-        if (JSON_OUT) {
-          console.log(JSON.stringify(env));
-          continue;
-        }
-        const line = describe(env, agents);
-        if (line) console.log(`${time(env.at)} ${env.threadId.slice(-6)} ${line}`);
+    let lastId: string | undefined;
+    for (;;) {
+      const headers: Record<string, string> = {};
+      if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
+      // Ask the daemon to replay what we missed after a dropped connection.
+      if (lastId) headers["last-event-id"] = lastId;
+      let res: Response;
+      try {
+        res = await fetch(`${base()}/api/events?${params}`, { headers });
+      } catch {
+        await new Promise((r) => setTimeout(r, 800));
+        continue;
       }
+      if (!res.ok || !res.body) {
+        if (res.status === 401) throw new Error(`cannot stream events: ${res.status}`);
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      const decoder = new TextDecoder();
+      let buf = "";
+      for await (const chunk of res.body as any as AsyncIterable<Uint8Array>) {
+        buf += decoder.decode(chunk, { stream: true });
+        let i: number;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const id = block.split("\n").find((l) => l.startsWith("id: "));
+          if (id) lastId = id.slice(4);
+          const data = block.split("\n").find((l) => l.startsWith("data: "));
+          if (!data) continue;
+          const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
+          if (JSON_OUT) {
+            console.log(JSON.stringify(env));
+            continue;
+          }
+          const line = describe(env, agents);
+          if (line) console.log(`${time(env.at)} ${env.threadId.slice(-6)} ${line}`);
+        }
+      }
+      // The stream ended (daemon restart or network drop): reconnect with the last id.
+      await new Promise((r) => setTimeout(r, 400));
     }
   });
 

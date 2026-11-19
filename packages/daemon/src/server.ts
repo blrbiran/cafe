@@ -7,7 +7,7 @@ import { CreateOrderParams, Methods, type ThreadEnvelope } from "@cafe/protocol"
 import { RpcError } from "@cafe/protocol/peer";
 import type { Daemon } from "./daemon.ts";
 import { loadConfig } from "./config.ts";
-import { eventMatches, parseEventFilter } from "./events.ts";
+import { eventMatches, parseEventFilter, replayAfter } from "./events.ts";
 import { listRouterModels } from "./router.ts";
 
 /** pi's model catalogue is expensive to build; settings can ask for it repeatedly. */
@@ -81,6 +81,9 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/** Ring of recent events per daemon, for SSE Last-Event-ID resumption. */
+const recentEvents = new WeakMap<Daemon, ThreadEnvelope[]>();
+
 export interface ServerHandle {
   close(): Promise<void>;
   port: number;
@@ -90,6 +93,15 @@ export interface ServerHandle {
 export function startServer(daemon: Daemon, opts: { port: number; bind?: string; webDist?: string }): Promise<ServerHandle> {
   const statics = loadStatic(opts.webDist ?? defaultWebDist());
   const wss = new WebSocketServer({ noServer: true });
+  // A short ring of recent events, so an SSE client that reconnects with
+  // Last-Event-ID resumes where it stopped instead of losing the gap.
+  const recent: ThreadEnvelope[] = [];
+  recentEvents.set(daemon, recent);
+  const remember = (env: ThreadEnvelope) => {
+    recent.push(env);
+    if (recent.length > 500) recent.splice(0, recent.length - 500);
+  };
+  daemon.on("thread", remember);
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://x");
@@ -132,6 +144,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         port: typeof addr === "object" && addr ? addr.port : opts.port,
         close: () =>
           new Promise<void>((r) => {
+            daemon.off("thread", remember);
             for (const c of wss.clients) c.terminate();
             wss.close();
             server.closeAllConnections();
@@ -156,7 +169,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (model !== null && model !== undefined && typeof model !== "string") throw new RpcError("bad_request", "model must be a string or null");
     return send(res, 200, await daemon.setRouterModel(model ?? null));
   }
-  if (m === "GET" && path === "/api/events") return eventStream(daemon, url, req, res);
+  if (m === "GET" && path === "/api/events") return eventStream(daemon, url, req, res, recentEvents.get(daemon) ?? []);
   if (m === "GET" && path === "/api/snapshot") return send(res, 200, daemon.snapshot());
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {
@@ -182,6 +195,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   }
   if (m === "GET" && path === "/api/routing/hints") return send(res, 200, { learn: daemon.config.router.learn, hints: daemon.routingHints() });
   if (m === "GET" && path === "/api/daemons") return send(res, 200, daemon.daemons());
+  if (m === "GET" && path === "/api/settings") {
+    const token = daemon.config.token ?? "";
+    return send(res, 200, {
+      root: daemon.config.root,
+      tokenSet: !!token,
+      ...(token ? { tokenHint: `${"•".repeat(Math.max(0, token.length - 4))}${token.slice(-4)}` } : {}),
+    });
+  }
   if (m === "GET" && path === "/api/threads") {
     const before = url.searchParams.get("before");
     return send(res, 200, daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined, before ? Number(before) : undefined));
@@ -276,14 +297,20 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
 }
 
 /** SSE: every Thread event on the network, filtered. Heartbeats are hidden unless asked for. */
-function eventStream(daemon: Daemon, url: URL, req: IncomingMessage, res: ServerResponse): void {
+function eventStream(daemon: Daemon, url: URL, req: IncomingMessage, res: ServerResponse, recent: ThreadEnvelope[]): void {
   const filter = parseEventFilter(url);
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   res.write(": connected\n\n");
-  const onEvent = (env: ThreadEnvelope) => {
+  const write = (env: ThreadEnvelope) => {
     if (!eventMatches(env, filter)) return;
-    res.write(`data: ${JSON.stringify(env)}\n\n`);
+    res.write(`id: ${env.eventId}\ndata: ${JSON.stringify(env)}\n\n`);
   };
+  // Resume after the last event the client saw; an id too old for the ring
+  // replays nothing and the client re-syncs (the Web UI uses snapshots).
+  const header = req.headers["last-event-id"];
+  const lastId = Array.isArray(header) ? header[0] : (header ?? url.searchParams.get("lastEventId") ?? undefined);
+  for (const env of replayAfter(recent, lastId)) write(env);
+  const onEvent = (env: ThreadEnvelope) => write(env);
   daemon.on("thread", onEvent);
   const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
   const done = () => {
