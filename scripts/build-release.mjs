@@ -12,6 +12,7 @@
 //   dist/proc/guard.mjs    worker guard, copied as is
 //   web/                   built web UI
 //   skills/cafe/           the cafe skill
+//   claude-plugin/         the cafe Claude Code plugin (a mod), installed by `cafe claude install`
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -62,6 +63,7 @@ await build({
 cpSync(join(root, "packages/daemon/src/proc/guard.mjs"), join(out, "dist/proc/guard.mjs"));
 cpSync(join(root, "packages/web/dist"), join(out, "web"), { recursive: true });
 cpSync(join(root, "skills/cafe"), join(out, "skills/cafe"), { recursive: true });
+for (const part of [".claude-plugin/plugin.json", "hooks"]) cpSync(join(root, "claude-plugin", part), join(out, "claude-plugin", part), { recursive: true });
 cpSync(join(root, "README.md"), join(out, "README.md"));
 if (existsSync(join(root, "LICENSE"))) cpSync(join(root, "LICENSE"), join(out, "LICENSE"));
 
@@ -86,7 +88,7 @@ const pkg = {
   description: "cafe: a DNS-like network of coding agents — ask a question, the right agent answers",
   type: "module",
   bin: { cafe: "bin/cafe.js" },
-  files: ["bin", "dist", "web", "skills", "README.md", ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])],
+  files: ["bin", "dist", "web", "skills", "claude-plugin", "README.md", ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])],
   engines: rootPkg.engines,
   // Model-based routing (router.model) only; rules routing works without it.
   optionalDependencies: { "@earendil-works/pi-coding-agent": `^${piVersion}` },

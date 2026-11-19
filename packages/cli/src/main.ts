@@ -9,6 +9,8 @@ import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, 
 import { cafeHome, defaultExtensionPath, discoverRoots, loadConfig, runDaemon, setConfigValue } from "@cafe/daemon";
 import { PRESETS, serve } from "./serve.ts";
 import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
+import { runSessionHost, type HostMessage } from "./bridge/session-host.ts";
+import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
 import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
 
@@ -497,6 +499,47 @@ barista
     process.on("SIGTERM", quit);
   });
 
+program
+  .command("session-host", { hidden: true })
+  .description("serve Orders to a running interactive session (run by the cafe Claude Code plugin); JSON lines on stdout")
+  .requiredOption("--agent <name>", "which agent hosts the session, e.g. claude")
+  .option("--dir <dir>", "the session's working directory", process.cwd())
+  .option("--pid <pid>", "pid of the session (default: the parent process)")
+  .action(async (o) => {
+    const send = (m: HostMessage) => {
+      try {
+        process.stdout.write(JSON.stringify(m) + "\n");
+      } catch {
+        void quit();
+      }
+    };
+    let stop: (() => Promise<void>) | undefined;
+    let quitting = false;
+    const quit = async () => {
+      if (quitting) return;
+      quitting = true;
+      await stop?.().catch(() => {});
+      process.exit(0);
+    };
+    process.on("SIGINT", quit);
+    process.on("SIGTERM", quit);
+    process.stdout.on("error", () => void quit()); // the session went away
+    // The session that started us exited (we were re-parented): leave the network.
+    const parent = process.ppid;
+    setInterval(() => {
+      if (process.ppid !== parent) void quit();
+    }, 2000).unref();
+    if (!process.env.CAFE_DAEMON) await ensureDaemon();
+    ({ stop } = await runSessionHost({
+      agent: o.agent,
+      dir: o.dir,
+      daemon: base().replace(/^http:\/\//, ""),
+      token: process.env.CAFE_TOKEN,
+      pid: o.pid ? Number(o.pid) : parent,
+      send,
+    }));
+  });
+
 const mcp = program
   .command("mcp")
   .description("run cafe as an MCP server on stdio (tools: cafe_agents, cafe_ask, cafe_wait, cafe_cancel)")
@@ -526,6 +569,41 @@ mcp
       results.push({ client: c, command: shown, status });
     }
     out(results.map((r) => `${r.client}: ${r.status}\n  ${r.command}`).join("\n"), results);
+  });
+
+const claudeCmd = program.command("claude").description("the cafe Claude Code plugin: running Claude Code sessions answer questions for their directory's .cafe");
+claudeCmd
+  .command("install")
+  .description("install the cafe plugin into Claude Code (user scope, from a local marketplace in CAFE_HOME)")
+  .option("--dry-run", "print what would be written and run")
+  .action((o) => {
+    const plan = claudePluginPlan(cafeHome(), [process.execPath, join(here, "..", "bin", "cafe.js")]);
+    const shown = plan.commands.map((c) => c.join(" "));
+    if (o.dryRun) return out([`write ${plan.marketplace} (plugin from ${pluginSource()}, cafe.json argv ${plan.argv.join(" ")})`, ...shown].join("\n"), { ...plan, dryRun: true });
+    writeClaudePlugin(plan);
+    const results: string[] = [`wrote ${plan.marketplace}`];
+    for (const cmd of plan.commands) {
+      const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
+      const msg = (r.stderr || r.stdout || "").trim().split("\n").at(-1) ?? "";
+      if (r.error) throw new Error(`${cmd[0]} not found; install Claude Code first`);
+      results.push(`${r.status === 0 ? "ok" : /already/i.test(msg) ? "ok (already)" : `failed: ${msg}`}  ${cmd.join(" ")}`);
+    }
+    results.push("New Claude Code sessions in a directory with a Barista .cafe now answer cafe questions; in open sessions run /reload-plugins. /cafe off pauses a session.");
+    out(results.join("\n"), { ...plan, results });
+  });
+claudeCmd
+  .command("uninstall")
+  .description("remove the cafe plugin from Claude Code")
+  .action(() => {
+    const results: string[] = [];
+    for (const cmd of [
+      ["claude", "plugin", "uninstall", `${CLAUDE_PLUGIN}@${CLAUDE_MARKETPLACE}`],
+      ["claude", "plugin", "marketplace", "remove", CLAUDE_MARKETPLACE],
+    ]) {
+      const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
+      results.push(`${r.status === 0 ? "ok" : `failed: ${(r.stderr || r.stdout || String(r.error)).trim().split("\n").at(-1)}`}  ${cmd.join(" ")}`);
+    }
+    out(results.join("\n"), results);
   });
 
 program

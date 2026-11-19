@@ -29,6 +29,15 @@ function check(name, fn) {
     results.push(`FAIL  ${name}: ${err.message.split("\n")[0]}`);
   }
 }
+async function checkAsync(name, fn) {
+  try {
+    const note = await fn();
+    results.push(`ok    ${name}${note ? ` (${note})` : ""}`);
+  } catch (err) {
+    failed = true;
+    results.push(`FAIL  ${name}: ${err.message.split("\n")[0]}`);
+  }
+}
 const assert = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
@@ -51,9 +60,10 @@ try {
   const tgz = join(packDir, readdirSync(packDir).find((f) => f.endsWith(".tgz")));
   const files = execFileSync("tar", ["tzf", tgz], { encoding: "utf8" }).split("\n").filter(Boolean);
   check("tarball contents", () => {
-    for (const f of ["bin/cafe.js", "dist/cli.js", "dist/pi-extension.js", "dist/proc/guard.mjs", "web/index.html", "skills/cafe/SKILL.md", "README.md", "LICENSE"])
+    for (const f of ["bin/cafe.js", "dist/cli.js", "dist/pi-extension.js", "dist/proc/guard.mjs", "web/index.html", "skills/cafe/SKILL.md", "claude-plugin/.claude-plugin/plugin.json", "claude-plugin/hooks/hooks.json", "claude-plugin/hooks/register.ts", "README.md", "LICENSE"])
       assert(files.includes(`package/${f}`), `missing ${f}`);
-    const stray = files.filter((f) => /\.ts$|node_modules|\.map$/.test(f));
+    // The Claude Code mod is TypeScript that Claude Code loads itself; nothing else ships as .ts.
+    const stray = files.filter((f) => /\.ts$|node_modules|\.map$/.test(f) && f !== "package/claude-plugin/hooks/register.ts");
     assert(stray.length === 0, `unexpected files: ${stray.join(", ")}`);
     return `${files.length} files`;
   });
@@ -113,6 +123,19 @@ try {
     const r = JSON.parse(line.trim().split("\n")[0]);
     assert(r.result?.serverInfo?.name === "cafe", line.slice(0, 200));
     return `version ${r.result.serverInfo.version}`;
+  });
+
+  check("claude install --dry-run finds the packaged Claude Code plugin", () => {
+    const outText = execFileSync(cafeBin, ["claude", "install", "--dry-run"], { env, encoding: "utf8" });
+    assert(outText.includes(join("cafe", "claude-plugin")) && outText.includes("claude plugin install cafe@cafe-local"), outText);
+  });
+
+  await checkAsync("session-host registers a Claude Code session and says ready", async () => {
+    const host = spawn(cafeBin, ["session-host", "--agent", "claude", "--dir", baristaDir], { env, stdio: ["ignore", "pipe", "ignore"] });
+    const first = await new Promise((ok) => host.stdout.once("data", (d) => ok(String(d))));
+    host.kill();
+    const m = JSON.parse(first.split("\n")[0]);
+    assert(m.type === "ready" && m.address.startsWith("echo#"), first);
   });
 
   const codexDir = join(work, "codexdir");

@@ -1,0 +1,7 @@
+{
+  "name": "cafe",
+  "version": "0.1.0",
+  "description": "cafe agent network: this Claude Code session answers questions routed to its directory's .cafe identity",
+  "author": { "name": "cafe" },
+  "network": { "hosts": ["localhost"] }
+}
