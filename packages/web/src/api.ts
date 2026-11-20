@@ -176,6 +176,9 @@ export const api = {
       xhr.send(file);
     }),
   attachmentUrl: (id: string) => withToken(`/api/artifacts/${encodeURIComponent(id)}`),
+  /** Controlled-update state left by `cafe update` (v4-2). */
+  update: () =>
+    call<{ current?: string; lastGood?: string; pending?: string; running?: { version?: string }; log?: Array<{ at: number; action: string; ok: boolean; error?: string }> }>("GET", "/api/update"),
 };
 
 export function wsUrl(): string {

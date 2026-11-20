@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
@@ -20,6 +21,7 @@ import { claudeCommandPath, claudeCommandState, commandsStatus, installClaudeCom
 import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
 import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
+import { applyUpdate, checkUpdate, rollbackUpdate, updateStatus } from "./update.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAIN = fileURLToPath(import.meta.url);
@@ -263,6 +265,78 @@ program
     out(lines.join("\n"), { running: true, health: h, threads: snap.threads.length, agents: snap.agents.length, machines: snap.daemons.length, pending, webStale: !!snap.webStale });
   });
 
+const update = program.command("update").description("controlled upgrade and rollback of this machine's cafe (v4-2)");
+update
+  .command("status")
+  .description("current / lastGood / pending release and the running daemon")
+  .action(async () => {
+    const s = await updateStatus(cafeHome(), base());
+    const lines = [
+      `current:  ${s.current ?? "(none)"}${s.currentTarget ? ` -> ${s.currentTarget}` : ""}`,
+      `lastGood: ${s.lastGood ?? "(none)"}`,
+      `pending:  ${s.pending ?? "(none)"}`,
+      `running:  ${s.running ? `${s.running.version} (pid ${s.running.pid})${s.running.draining ? " [draining]" : ""}` : "not running"}`,
+      ...(s.log.length ? [`last:     ${s.log.at(-1)!.action} ${s.log.at(-1)!.ok ? "ok" : `failed: ${s.log.at(-1)!.error ?? ""}`}`] : []),
+    ];
+    out(lines.join("\n"), s);
+  });
+update
+  .command("check")
+  .description("running version vs the latest published version")
+  .action(async () => {
+    const c = await checkUpdate(base());
+    out(`running: ${c.running ?? "not running"}\nlatest:  ${c.latest ?? "(npm unreachable)"}\n${c.upToDate ? "up to date" : c.latest ? "an update is available: cafe update apply --version " + c.latest : ""}`, c);
+  });
+update
+  .command("apply")
+  .description("stage a release, drain, switch current, start and health-check; rolls back on failure")
+  .option("--file <tgz>", "local release tarball (offline)")
+  .option("--version <version>", "download this version from npm, then apply it")
+  .option("--sha256 <hex>", "expected sha256 of the tarball (optional; warns when absent)")
+  .option("--timeout <s>", "drain timeout in seconds", Number, 30)
+  .action(async (o) => {
+    let file: string | undefined = o.file;
+    let tmp: string | undefined;
+    if (!file && o.version) {
+      tmp = mkdtempSync(join(tmpdir(), "cafe-update-"));
+      execFileSync("npm", ["pack", `@blrbiran/cafe@${o.version}`, "--pack-destination", tmp], { stdio: "pipe" });
+      const tgz = readdirSync(tmp).find((f) => f.endsWith(".tgz"));
+      if (!tgz) throw new Error(`npm pack produced no tarball for ${o.version}`);
+      file = join(tmp, tgz);
+    }
+    if (!file) throw new Error("give --file <tgz> or --version <x>");
+    try {
+      const r = await applyUpdate({ home: cafeHome(), base: base(), file, sha256: o.sha256, drainTimeoutMs: Math.max(0, o.timeout) * 1000 });
+      const svc = serviceFile({ platform: process.platform, node: process.execPath, bin: "", cafeHome: cafeHome(), path: "" });
+      const serviceNote =
+        r.ok && existsSync(svc.file) && !readFileSync(svc.file, "utf8").includes(join(cafeHome(), "current", "bin", "cafe.js"))
+          ? "\nautostart still points at the old entry; run `cafe daemon install` to point it at current"
+          : "";
+      out(
+        `update ${r.ok ? "ok" : "FAILED"}: ${r.from ?? "?"} → ${r.to}${r.rolledBack ? " (rolled back)" : ""}\nhealth: ${r.health.ok ? r.health.version : r.health.error}${r.warning ? `\n${r.warning}` : ""}${serviceNote}`,
+        r,
+      );
+      if (!r.ok) process.exitCode = 1;
+    } finally {
+      if (tmp) rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+update
+  .command("rollback")
+  .description("switch back to the last-known-good release and restart")
+  .action(async () => {
+    const r = await rollbackUpdate({ home: cafeHome(), base: base() });
+    out(`rollback ${r.ok ? "ok" : "FAILED"}: → ${r.to}\nhealth: ${r.health.ok ? r.health.version : r.health.error}`, r);
+    if (!r.ok) process.exitCode = 1;
+  });
+
+program
+  .command("protocol-version")
+  .description("print the wire protocol version (used by the updater's compatibility check)")
+  .action(() => {
+    out(String(PROTOCOL_VERSION), { protocolVersion: PROTOCOL_VERSION });
+  });
+
 const daemon = program.command("daemon").description("manage the local daemon");
 daemon
   .command("run")
@@ -310,6 +384,21 @@ daemon
     out(`cafe daemon restarted on ${base()} (host ${h.host}${h.isRoot ? ", root" : ""}, pid ${h.pid})`, h);
   });
 daemon
+  .command("drain")
+  .description("stop accepting new Orders and wait for open ones (for a controlled update); stays drained until restart")
+  .option("--timeout <s>", "how long to wait for open Orders", Number, 30)
+  .action(async (o) => {
+    await ensureDaemon();
+    const r = await api<{ waitedMs: number; openThreads: number; retryable: string[] }>("/api/drain", {
+      method: "POST",
+      body: JSON.stringify({ timeoutMs: Math.max(0, o.timeout) * 1000 }),
+    });
+    out(
+      `drained in ${r.waitedMs}ms; ${r.openThreads} open thread(s)${r.retryable.length ? `; retryable: ${r.retryable.join(", ")}` : ""}\nnext: cafe daemon restart (or cafe update apply) to accept Orders again`,
+      r,
+    );
+  });
+daemon
   .command("rename")
   .argument("<host>")
   .argument("<name>")
@@ -324,10 +413,13 @@ daemon
   .option("--root", "run as the Root Daemon (persisted to config)")
   .option("--dry-run", "print the service file and commands without installing")
   .action(async (o) => {
+    // After a controlled update, `current` is the release the service should run;
+    // before any update there is no `current`, so use this CLI's own entry.
+    const currentBin = join(cafeHome(), "current", "bin", "cafe.js");
     const f = serviceFile({
       platform: process.platform,
       node: process.execPath,
-      bin: join(here, "..", "bin", "cafe.js"),
+      bin: existsSync(currentBin) ? currentBin : join(here, "..", "bin", "cafe.js"),
       cafeHome: cafeHome(),
       path: servicePath(process.env.PATH),
     });

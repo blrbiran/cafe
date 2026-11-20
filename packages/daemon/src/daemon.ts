@@ -149,6 +149,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private reconnectDelay = 0;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private stopped = false;
+  /** Set by `drain` for a controlled update: new Orders are refused until restart. */
+  private draining = false;
   private rootHost?: string;
   /** cafe release of the Root, from the last handshake. */
   private rootVersion?: string;
@@ -725,6 +727,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // -------------------------------------------------------------------------
 
   async createOrder(p: CreateOrderParams, peer?: Peer): Promise<{ orderId: string; threadId: string; decision: RoutingDecision }> {
+    if (this.draining) throw new RpcError("daemon_draining", "the daemon is draining for an update; retry after it restarts");
     const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
     const parent = p.parentOrderId ? this.knownOrders.get(p.parentOrderId) : undefined;
     const depth = parent ? parent.depth + 1 : 0;
@@ -1182,6 +1185,25 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.emitEvent(t.order, { type: "order.cancelled", by });
     this.close(t, "cancelled");
     return {};
+  }
+
+  /**
+   * Controlled-update drain (#27): refuse new Orders and wait for the Orders
+   * this daemon originated to finish. Whatever is still open after `timeoutMs`
+   * is returned as retryable, never silently dropped. The daemon stays drained
+   * until it restarts.
+   */
+  async drain(timeoutMs = 30_000): Promise<{ waitedMs: number; openThreads: number; retryable: string[] }> {
+    this.draining = true;
+    const start = Date.now();
+    const open = () => [...this.tracking.values()].filter((t) => t.status === "open");
+    while (Date.now() - start < timeoutMs && open().length) await new Promise((r) => setTimeout(r, 200));
+    const still = open();
+    return { waitedMs: Date.now() - start, openThreads: still.length, retryable: [...new Set(still.map((t) => t.order.threadId))] };
+  }
+
+  get isDraining(): boolean {
+    return this.draining;
   }
 
   /**

@@ -33,6 +33,7 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [advertise, setAdvertise] = useState("");
   const [retention, setRetention] = useState("");
   const [checks, setChecks] = useState<DoctorCheck[]>();
+  const [upd, setUpd] = useState<Awaited<ReturnType<typeof api.update>>>();
   const [busy, setBusy] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [error, setError] = useState<string>();
@@ -75,6 +76,10 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
       .doctor()
       .then((d) => setChecks(d.checks))
       .catch(() => setChecks(undefined));
+    api
+      .update()
+      .then(setUpd)
+      .catch(() => setUpd(undefined));
   }, []);
 
   const run = async (key: string, fn: () => Promise<string | void>) => {
@@ -322,6 +327,23 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
               {d.host !== host && !isRoot && <span className="hint">{t.settingsRootOnly}</span>}
             </div>
           ))}
+        </section>
+
+        <section className="mb-5 border-b border-line pb-4">
+          <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsUpdate}</h3>
+          <p className="mt-1 mb-2.5 text-xs text-muted">{t.settingsUpdateDesc}</p>
+          <div className="well flex flex-col gap-1 p-2 text-xs">
+            <div>{t.updateCurrent}: {upd?.current ?? "—"}</div>
+            <div>{t.updateLastGood}: {upd?.lastGood ?? "—"}</div>
+            <div>{t.updatePending}: {upd?.pending ?? "—"}</div>
+            <div>running: {upd?.running?.version ?? "—"}</div>
+            {upd?.log?.length ? (
+              <div className={upd.log.at(-1)!.ok ? "text-ok" : "text-danger"}>
+                last: {upd.log.at(-1)!.action} {upd.log.at(-1)!.ok ? "ok" : (upd.log.at(-1)!.error ?? "failed")}
+              </div>
+            ) : null}
+            <div className="hint">cafe update status · cafe update apply --file &lt;tgz&gt; · cafe update rollback</div>
+          </div>
         </section>
 
         <section className="mb-5 border-b border-line pb-4">

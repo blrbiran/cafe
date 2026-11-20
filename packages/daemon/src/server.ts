@@ -243,7 +243,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
 
-  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, ...daemon.routerStatus() });
+  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus() });
   if (m === "GET" && path === "/api/router/models") {
     return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });
   }
@@ -317,6 +317,12 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     });
   }
   if (m === "GET" && path === "/api/config") return send(res, 200, daemon.runtimeConfig());
+  if (m === "GET" && path === "/api/update") {
+    // The updater is CLI-side; the daemon only reports the state file it left behind.
+    const file = join(daemon.store.home, "update.json");
+    const state = existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>) : { updatedAt: 0, log: [] };
+    return send(res, 200, { ...state, running: { version: daemon.version } });
+  }
   if (m === "POST" && path === "/api/config") {
     // A small whitelist: these are restart-required values the Web Settings may edit.
     const { advertise, retentionDays } = await readJson(req);
@@ -447,6 +453,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     send(res, 200, { ok: true });
     setTimeout(() => process.kill(process.pid, "SIGTERM"), 50);
     return;
+  }
+  if (m === "POST" && path === "/api/drain") {
+    const { timeoutMs } = await readJson(req).catch(() => ({}) as { timeoutMs?: number });
+    return send(res, 200, await daemon.drain(typeof timeoutMs === "number" ? timeoutMs : 30_000));
   }
   send(res, 404, { error: "not_found" });
 }

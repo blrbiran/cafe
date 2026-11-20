@@ -1,6 +1,6 @@
 # v4-2 受控升级、重启与回滚
 
-状态（2026-11-19）：spec 草案，来源 dogfooding #27。**只写 spec，不实现。** 待用户确认 Q1–Q5 后进入实现。
+状态（2026-11-21）：**MVP 已实现**（CLI + daemon drain + Web 状态显示）。来源 dogfooding #27。Q1–Q5 已确认。
 
 ## 为什么
 
@@ -152,4 +152,11 @@ cafe daemon restart                # 已有；升级 apply 内部复用它
 - **Q4**：第一阶段只做 CLI；Web 只显示版本和 `update status`。
 - **Q5**：失败后自动回滚并重启，结果写入 `update.json` 和日志。
 
-实现状态：**未实现**（spec 已定稿，可作为下一轮的 implementation plan 输入）。
+实现状态（2026-11-21）：**MVP 已实现**。
+
+- `cafe update status|check|apply|rollback`、`cafe daemon drain`、`cafe protocol-version`。
+- `apply --file <tgz>`（`--version <x>` 先 `npm pack` 再走同一路径）：取锁 → 校验包名/版本/文件清单 → 可选 `--sha256`（缺省警告）→ 解包到 `releases/.staging-*` → 用包内 CLI 核对 `--version` 与 `--protocol-version` → rename 到 `releases/<version>` → drain + stop → 原子切换 `current` 符号链接 → 启动 → 轮询 `/api/health`（版本必须等于目标）+ `/api/snapshot` → 成功记 `lastGood`，失败切回旧 release 并重启。
+- 状态在 `CAFE_HOME/update.json`（current/lastGood/pending/log），并发锁 `update.lock`；`GET /api/update` 与 Settings 的“升级与回滚”区块只读展示。
+- `cafe daemon install` 在 `current` 存在时让服务指向 `current/bin/cafe.js`；`apply` 成功后若已安装服务仍指向旧入口会提示重跑 `cafe daemon install`。
+- 测试：`tests/update.test.ts` 用假 release（其 `bin/cafe.js` 只实现 updater 需要的命令）覆盖成功升级、健康检查失败自动回滚、手动回滚、包名/checksum/协议校验，以及 drain 拒绝新 Order 并报告 retryable。
+- 仍未做：全网广播/canary/分批编排、签名、Web 触发升级（按 Q4 只做 CLI）、升级期间 Barista 侧 Order 的跨 daemon 重试协调。

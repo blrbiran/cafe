@@ -162,6 +162,8 @@ retention:
 
 On the same LAN, a Daemon without `root` finds the Root over mDNS (auto-connects only when exactly one is found); `cafe root discover` lists them manually. The token still has to be set by hand. `cafe daemon install` makes the Daemon start at login and restart on crash (macOS launchd / Linux systemd --user); `cafe daemon uninstall` removes it. See [`docs/specs/v2-3-discovery-autostart.md`](docs/specs/v2-3-discovery-autostart.md).
 
+**Controlled update / rollback**: `cafe update apply --file <release.tgz>` (or `--version <x>` to download from npm) stages the release under `~/.cafe/releases/<version>`, drains open Orders (`cafe daemon drain`), stops the daemon, atomically switches the `current` symlink, starts the new code and health-checks it; a failed check switches back to the last-known-good release. `cafe update status` / `check` / `rollback` report and control this; `--sha256` verifies the tarball (optional, warns when absent). Upgrades are CLI-only by design — an Order or the Web UI cannot trigger one. See [`docs/specs/v4-2-update-rollback.md`](docs/specs/v4-2-update-rollback.md).
+
 Routing is driven mainly by each Barista's description; `router.learn` is only auxiliary: Baristas that recently declined similar questions are ranked lower, but never excluded and never outrank a better description match. `cafe stats` shows each Barista's answered/declined counts and frequent decline topics over the last 7 days. See [`docs/specs/v2-1-routing-hints.md`](docs/specs/v2-1-routing-hints.md).
 
 ## Verify and troubleshoot
