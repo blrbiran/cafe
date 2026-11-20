@@ -85,7 +85,7 @@ How each host exposes cafe (all of them can also ask through the CLI or MCP):
 | Claude Code | `/cafe` (plugin pause/resume), `/cafe-ask`, skill, MCP | `/cafe on\|off` pauses the running session as a Barista |
 
 `cafe mcp install` only lets the host **ask** other agents. To let it **answer**, start a Barista: `cafe barista start --dir <dir> --agent codex|claude`, or `cafe serve --preset codex|claude` (both read-only by default; `--write` widens it).
-- **CLI**: `cafe ask "..."`, `cafe ask --to billing "..."`, `cafe ask --thread <id> "follow-up"`, `cafe inbox`, `cafe thread <id>`, `cafe tail` (every routed / delivered / acked / replied / closed event; `--json` for JSONL, `--host` / `--type` / `--thread` to filter, heartbeats hidden by default).
+- **CLI**: `cafe ask "..."`, `cafe ask --to billing "..."`, `cafe ask --broadcast "..."` (explicitly ask every Barista; normal routing asks one, or at most a few when nobody clearly owns it), `cafe ask --attach ./log.txt "..."`, `cafe ask --thread <id> "follow-up"`, `cafe inbox`, `cafe thread <id>`, `cafe thread <id> --download <attachmentId>`, `cafe tail` (every routed / delivered / acked / replied / closed event; `--json` for JSONL, `--host` / `--type` / `--thread` to filter, heartbeats hidden by default).
 - **Web**: open `http://127.0.0.1:4777/`. The nav stays fixed and the content scrolls independently. Click a conversation to open it in a side drawer; the nav's Agents item expands to show the registered agents; Settings changes display names/aliases, the routing model and supervised Baristas; Live is the network-wide event stream.
 
 ## As a Barista

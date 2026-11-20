@@ -25,6 +25,8 @@ cafe stats                                   # last 7 days per barista: answered
 cafe search <text>                           # find past questions/answers containing the text
 cafe ask "How does the billing service compute VAT?"          # routed by the daemon; waits for replies
 cafe ask --to billing "..."                  # explicit address: name | name@host | name#2@host
+cafe ask --broadcast "..."                   # ask every eligible agent; normal routing picks one, or at most a few when unsure
+cafe ask --attach ./serial.log "..."         # attach local files; the Barista gets local paths, not contents
 cafe ask --thread <threadId> "and what about X?"   # follow-up: goes to whoever answered, with the earlier turns attached
 cafe ask --async "..."                       # prints the thread id and returns immediately
 cafe wait <threadId>                         # follow a thread until it closes
