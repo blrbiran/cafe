@@ -478,27 +478,34 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     rec.aliases = this.hostAliases;
     rec.legacyAliases = this.hostLegacyAliases;
     this.emitDaemons();
-    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases });
+    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases, removeAliases, legacyAliases: this.hostLegacyAliases });
     this.log(`renamed host to ${this.displayName}${this.hostAliases.length ? ` (aliases: ${this.hostAliases.join(", ")})` : ""}`);
     return rec;
   }
 
   /** Root: rename another Daemon. Works while it is offline (the alias is applied on reconnect). */
-  renameHost(host: string, displayName: string): DaemonRecord {
+  renameHost(host: string, displayName: string, opts: { aliases?: string[]; removeAliases?: string[] } = {}): DaemonRecord {
     if (!this.isRoot) throw new RpcError("not_root", "only the Root can rename another Host");
     const rec = this.daemonRecords.get(host);
     if (!rec) throw new RpcError("not_found", `no daemon '${host}'`);
-    this.assertHostNameFree(displayName, host);
-    const name = displayName.trim();
+    const name = displayName.trim() || rec.displayName || host;
+    if (name !== (rec.displayName ?? rec.host)) this.assertHostNameFree(name, host);
+    const add = (opts.aliases ?? []).map((a) => a.trim()).filter(Boolean);
+    for (const a of add) this.assertHostNameFree(a, host);
+    const remove = new Set((opts.removeAliases ?? []).map((a) => a.trim()).filter(Boolean));
+    for (const a of remove) {
+      if (a === host || a === name || (rec.legacyAliases ?? []).includes(a))
+        throw new RpcError("bad_request", `'${a}' is kept for routing and cannot be removed (only user-added aliases can)`);
+    }
     const prev = rec.displayName ?? rec.host;
     const legacy = [...new Set([...(rec.legacyAliases ?? []), ...(prev !== name ? [prev] : []), host])];
-    const aliases = (rec.aliases ?? []).filter((a) => a !== name && !legacy.includes(a));
+    const aliases = [...new Set([...(rec.aliases ?? []), ...add])].filter((a) => a !== name && !legacy.includes(a) && !remove.has(a));
     rec.displayName = name;
     rec.aliases = aliases;
     rec.legacyAliases = legacy;
     this.config.hostNames[host] = { displayName: name, aliases, legacyAliases: legacy };
     saveConfig(this.config, this.store.home);
-    this.children.get(host)?.notify(Methods.hostIdentity, { displayName: name, aliases, legacyAliases: legacy });
+    this.children.get(host)?.notify(Methods.hostIdentity, { displayName: name, aliases, removeAliases: [...remove], legacyAliases: legacy });
     this.emitDaemons();
     return rec;
   }
@@ -562,7 +569,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const rec = this.daemonRecords.get(this.host)!;
     rec.aliases = this.hostAliases;
     this.emitDaemons();
-    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases });
+    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases, removeAliases: [a], legacyAliases: this.hostLegacyAliases });
     return rec;
   }
 
@@ -1440,10 +1447,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
     if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
     if (p.url) void this.rememberChildUrl(host, p.url);
-    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; legacyAliases?: string[] }) => {
+    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; removeAliases?: string[]; legacyAliases?: string[] }) => {
       const rec = this.daemonRecords.get(host);
       if (rec) {
         if (x.displayName) rec.displayName = x.displayName;
+        if (x.removeAliases?.length) rec.aliases = rec.aliases.filter((a) => !x.removeAliases!.includes(a));
         if (x.aliases) rec.aliases = [...new Set([...rec.aliases, ...x.aliases])];
         if (x.legacyAliases) rec.legacyAliases = [...new Set([...(rec.legacyAliases ?? []), ...x.legacyAliases])];
         this.emitDaemons();
@@ -1583,10 +1591,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
-    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; legacyAliases?: string[] }) => {
+    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; removeAliases?: string[]; legacyAliases?: string[] }) => {
       if (x.displayName) {
         this.displayName = x.displayName;
         this.config.displayName = x.displayName;
+      }
+      if (x.removeAliases?.length) {
+        this.hostAliases = this.hostAliases.filter((a) => !x.removeAliases!.includes(a));
+        this.config.aliases = this.hostAliases;
       }
       if (x.aliases) {
         this.hostAliases = [...new Set([...this.hostAliases, ...x.aliases])];

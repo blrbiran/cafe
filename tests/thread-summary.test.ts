@@ -29,7 +29,7 @@ describe("thread summary", () => {
 
     const body = `${"z".repeat(210)} codex app-server`;
     const res = await c.ask({ body });
-    await untilClosed(c, res.threadId);
+    await untilClosed(c, res.threadId, res.orderId);
     const meta = root.daemon.thread(res.threadId)!.meta;
     expect(meta.summary.endsWith("…")).toBe(true);
     expect(meta.summary.length).toBeLessThan(body.length);
@@ -46,9 +46,9 @@ describe("thread summary", () => {
     cleanup.push(() => c.close());
 
     const first = await c.ask({ body: "the first question" });
-    await untilClosed(c, first.threadId);
+    await untilClosed(c, first.threadId, first.orderId);
     const second = await c.ask({ body: "and the second question", threadId: first.threadId });
-    await untilClosed(c, second.threadId);
+    await untilClosed(c, second.threadId, second.orderId);
     const meta = root.daemon.thread(first.threadId)!.meta;
     expect(meta.turns).toBe(2);
     expect(meta.summary).toBe("the first question");

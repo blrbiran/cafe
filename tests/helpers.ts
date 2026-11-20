@@ -52,23 +52,37 @@ export async function customer(addr: string) {
 }
 
 /** Collect thread events until `order.closed`. 12 s, not 5 s: under a full parallel
- * run the fake Codex/Claude processes can be slow to start and 5 s flaked. */
-export function untilClosed(c: CafeClient, threadId: string, timeoutMs = 12_000): Promise<ThreadEnvelope[]> {
+ * run the fake Codex/Claude processes can be slow to start and 5 s flaked.
+ *
+ * Pass `orderId` for a follow-up: the `ask()` response can beat the WebSocket
+ * broadcast of the new `order.created`, and without the id the helper would
+ * treat the previous turn's close as this turn's end (#6). */
+export function untilClosed(
+  c: CafeClient,
+  threadId: string,
+  orderIdOrTimeout?: string | number,
+  timeoutMs = 12_000,
+): Promise<ThreadEnvelope[]> {
+  const orderId = typeof orderIdOrTimeout === "string" ? orderIdOrTimeout : undefined;
+  if (typeof orderIdOrTimeout === "number") timeoutMs = orderIdOrTimeout;
   return new Promise((resolve, reject) => {
     // Start from what the client already saw: a fast Barista can close the
-    // Thread between `ask()` resolving and this listener being attached. For a
-    // follow-up, only the latest turn counts.
+    // Thread between `ask()` resolving and this listener being attached.
     const all = c.recentEvents(threadId);
-    const turnStart = all.map((e) => e.event.type).lastIndexOf("order.created");
-    const events = turnStart >= 0 ? all.slice(turnStart) : all;
+    const turnStart = orderId
+      ? all.findIndex((e) => e.event.type === "order.created" && e.orderId === orderId)
+      : all.map((e) => e.event.type).lastIndexOf("order.created");
+    // With an orderId that has not arrived yet, collect nothing from older turns.
+    const events = turnStart >= 0 ? all.slice(turnStart) : [];
+    const done = (env: ThreadEnvelope) => env.event.type === "order.closed" && (!orderId || env.orderId === orderId);
     const seen = new Set(events.map((e) => e.eventId));
-    if (events.some((e) => e.event.type === "order.closed")) return resolve(events);
+    if (events.some(done)) return resolve(events);
     const t = setTimeout(() => reject(new Error(`thread ${threadId} not closed; got ${events.map((e) => e.event.type).join(",")}`)), timeoutMs);
     const off = c.onThreadEvent((env) => {
       if (env.threadId !== threadId || seen.has(env.eventId)) return;
       seen.add(env.eventId);
       events.push(env);
-      if (env.event.type === "order.closed") {
+      if (done(env)) {
         clearTimeout(t);
         off();
         resolve(events);

@@ -75,6 +75,26 @@ export class CodexTuiEngine implements Engine {
     return rows[0]?.id;
   }
 
+  /**
+   * Startup preflight (#40): a TUI Barista is only useful next to a running
+   * Codex session. Without this, `barista start` registers an agent that looks
+   * idle but declines every Order.
+   */
+  async probe(): Promise<{ ok: true; threadId: string } | { ok: false; error: string }> {
+    try {
+      const server = await this.start();
+      const threadId = await this.findThread(server);
+      if (!threadId) {
+        await this.close();
+        return { ok: false, error: `no Codex session in ${this.opts.dir}` };
+      }
+      return { ok: true, threadId };
+    } catch (err) {
+      await this.close();
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
   async run(req: TurnRequest): Promise<TurnResult> {
     const injectTimeoutMs = this.opts.injectTimeoutMs ?? (Number(process.env.CAFE_INJECT_TIMEOUT_MS) || 120_000);
     const maxTurnMs = this.opts.maxTurnMs ?? (Number(process.env.CAFE_CODEX_TUI_MAX_MS) || 3_600_000);

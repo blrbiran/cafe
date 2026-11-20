@@ -16,7 +16,7 @@ describe("order provenance", () => {
     cleanup.push(() => a.client.close());
 
     const res = await a.client.ask({ body: "please check the deploy", to: b.rec.address });
-    await untilClosed(a.client, res.threadId);
+    await untilClosed(a.client, res.threadId, res.orderId);
     const meta = root.daemon.thread(res.threadId)!.meta;
     expect(meta.origin).toBe("agent");
     expect(meta.via?.address).toBe(a.rec.address);
@@ -32,7 +32,7 @@ describe("order provenance", () => {
     cleanup.push(() => c.close());
 
     const res = await c.ask({ body: "relayed with a name", origin: "agent", via: { address: "claude#1@mac" } });
-    await untilClosed(c, res.threadId);
+    await untilClosed(c, res.threadId, res.orderId);
     const meta = root.daemon.thread(res.threadId)!.meta;
     expect(meta.origin).toBe("agent");
     expect(meta.via).toEqual({ address: "claude#1@mac" });

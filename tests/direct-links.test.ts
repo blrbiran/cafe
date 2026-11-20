@@ -67,7 +67,7 @@ describe("direct links while the Root is offline (ADR-0004)", () => {
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "do the work please" });
     expect(res.decision.targets).toEqual([worker.rec.agentId]);
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ agentId: worker.rec.agentId, text: "worker says: do the work please" });
     expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "done" });
 
@@ -96,10 +96,10 @@ describe("direct links while the Root is offline (ADR-0004)", () => {
     const c = await customer(a.addr);
     cleanup.push(() => c.close());
     const first = await c.ask({ body: "first question", to: "worker" });
-    await untilClosed(c, first.threadId);
+    await untilClosed(c, first.threadId, first.orderId);
     const follow = await c.ask({ body: "and a follow-up", threadId: first.threadId });
     expect(follow.decision.router).toBe("followup");
-    const evs = await untilClosed(c, first.threadId);
+    const evs = await untilClosed(c, first.threadId, follow.orderId);
     expect(evs.some((e) => e.event.type === "order.replied")).toBe(true);
 
     let cancelled = false;
@@ -119,7 +119,7 @@ describe("direct links while the Root is offline (ADR-0004)", () => {
     const c = await customer(a.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "anyone?", to: "worker" });
-    const events = await untilClosed(c, res.threadId, 5000);
+    const events = await untilClosed(c, res.threadId, res.orderId, 5000);
     expect(events.some((e) => e.event.type === "order.failed" && e.event.reason === "root_unreachable")).toBe(true);
     expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "failed" });
   });

@@ -95,7 +95,7 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     expect(tui.queue("old")).toEqual([]);
     const item = tui.take();
     expect(item.text).toContain("Question:\nwhat is x");
-    const done = untilClosed(c, a.threadId);
+    const done = untilClosed(c, a.threadId, a.orderId);
     // Still running in the TUI: another process reads it as interrupted without completedAt.
     tui.turn(item, { status: "interrupted" });
     await new Promise((r) => setTimeout(r, 150));
@@ -107,7 +107,7 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     await waitFor(() => tui.queue().length === 1);
     const fItem = tui.take();
     expect(fItem.text.startsWith("Follow-up from")).toBe(true);
-    const fDone = untilClosed(c, f.threadId);
+    const fDone = untilClosed(c, f.threadId, f.orderId);
     tui.turn(fItem, { status: "completed", answer: "y is 7", completedAt: 2 });
     expect(replyOf(await fDone)).toBe("y is 7");
   });
@@ -115,7 +115,7 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
   it("a question the session does not pick up in time is withdrawn and declined as unavailable", async () => {
     const { tui, c, ask } = await setup({ injectTimeoutMs: 200 });
     const a = await ask("anyone?");
-    const events = await untilClosed(c, a.threadId);
+    const events = await untilClosed(c, a.threadId, a.orderId);
     expect(declineOf(events)).toMatchObject({ unavailable: true });
     expect(declineOf(events)?.reason).toContain("did not take the question");
     expect(tui.queue()).toEqual([]);
@@ -136,7 +136,7 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     const cQ = await ask("third");
     await waitFor(() => tui.queue().length === 1);
     const cItem = tui.take();
-    const cDone = untilClosed(c, cQ.threadId);
+    const cDone = untilClosed(c, cQ.threadId, cQ.orderId);
     tui.turn(cItem, { status: "completed", answer: "third answer", completedAt: 3 });
     expect(replyOf(await cDone)).toBe("third answer");
   });
@@ -146,14 +146,14 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     const a = await ask("long");
     await waitFor(() => tui.queue().length === 1);
     const aItem = tui.take();
-    const aDone = untilClosed(c, a.threadId);
+    const aDone = untilClosed(c, a.threadId, a.orderId);
     tui.turn(aItem, { status: "interrupted", completedAt: 5 });
     expect(declineOf(await aDone)).toMatchObject({ unavailable: true });
 
     const b = await ask("billing?");
     await waitFor(() => tui.queue().length === 1);
     const bItem = tui.take();
-    const bDone = untilClosed(c, b.threadId);
+    const bDone = untilClosed(c, b.threadId, b.orderId);
     tui.turn(bItem, { status: "completed", answer: "CAFE_DECLINE: billing is not mine", completedAt: 6 });
     expect(declineOf(await bDone)).toMatchObject({ reason: "billing is not mine" });
   });
@@ -164,17 +164,13 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     await waitFor(() => pinned.tui.queue("old").length === 1);
     expect(pinned.tui.queue("live")).toEqual([]);
     const item = pinned.tui.take("old");
-    const done = untilClosed(pinned.c, a.threadId);
+    const done = untilClosed(pinned.c, a.threadId, a.orderId);
     pinned.tui.turn(item, { status: "completed", answer: "from old", completedAt: 1 }, "old");
     expect(replyOf(await done)).toBe("from old");
   });
 
-  it("with no Codex session in its directory it declines as unavailable", async () => {
-    const { c, ask } = await setup({ threads: () => [] });
-    const a = await ask("hello?");
-    const events = await untilClosed(c, a.threadId);
-    expect(declineOf(events)).toMatchObject({ unavailable: true });
-    expect(declineOf(events)?.reason).toContain("no Codex session");
+  it("refuses to start when there is no Codex session in its directory", async () => {
+    await expect(setup({ threads: () => [] })).rejects.toThrow(/no Codex session/);
   });
 });
 
@@ -186,7 +182,8 @@ describe("supervised Codex TUI Barista", () => {
     mkdirSync(dir);
     mkdirSync(state);
     writeFileSync(join(dir, ".cafe"), "name: tuicoder\ndescription: answers in the running codex session\nconcurrency: 3\n");
-    writeFileSync(join(state, "threads.json"), "[]");
+    // A TUI Barista now preflights the directory (#40), so give it a session to find.
+    writeFileSync(join(state, "threads.json"), JSON.stringify([{ id: "live", cwd: dir, updatedAt: 1, ephemeral: false }]));
     process.env.CAFE_CODEX_BIN = FAKE;
     process.env.FAKE_CODEX_STATE = state;
     const root = await startDaemon("root", { mode: "root", noSupervisor: false });

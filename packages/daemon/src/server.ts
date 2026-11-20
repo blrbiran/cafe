@@ -278,9 +278,11 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     );
   }
   if (m === "POST" && path === "/api/hosts/rename") {
-    const { host, displayName } = await readJson(req);
-    if (typeof host !== "string" || typeof displayName !== "string" || !displayName.trim()) throw new RpcError("bad_request", "host and displayName are required");
-    return send(res, 200, daemon.renameHost(host, displayName.trim()));
+    const { host, displayName, aliases, removeAliases } = await readJson(req);
+    if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host is required");
+    if (displayName !== undefined && typeof displayName !== "string") throw new RpcError("bad_request", "displayName must be a string");
+    const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && !!x) : []);
+    return send(res, 200, daemon.renameHost(host, typeof displayName === "string" ? displayName : "", { aliases: list(aliases), removeAliases: list(removeAliases) }));
   }
   if (m === "POST" && path === "/api/hosts/test") {
     const { host } = await readJson(req);
@@ -455,9 +457,17 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   // Follow one Order (default: the Thread's latest) until it closes; earlier turns are replayed for context.
   const until = orderId ?? thread.meta.orderId;
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  // A follow-up Thread keeps events after an earlier turn's close, and a late
+  // broadcast can arrive after the response ended: never write then (#54).
+  let finished = false;
+  let ping: ReturnType<typeof setInterval> | undefined;
   const write = (env: ThreadEnvelope) => {
+    if (finished || res.writableEnded || res.destroyed) return;
     res.write(`data: ${JSON.stringify(env)}\n\n`);
-    if (env.event.type === "order.closed" && (!until || env.orderId === until)) res.end();
+    if (env.event.type === "order.closed" && (!until || env.orderId === until)) {
+      done();
+      res.end();
+    }
   };
   const seen = new Set<string>();
   const onEvent = (env: ThreadEnvelope) => {
@@ -466,17 +476,23 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
     write(env);
   };
   daemon.on("thread", onEvent);
+  const done = () => {
+    if (finished) return;
+    finished = true;
+    if (ping) clearInterval(ping);
+    daemon.off("thread", onEvent);
+  };
+  // Register cleanup before the replay: the replay itself can end the response.
+  req.on("close", done);
+  res.on("close", done);
+  const pingMs = Number(process.env.CAFE_SSE_PING_MS) || 15_000;
+  ping = setInterval(() => {
+    if (!finished && !res.writableEnded && !res.destroyed) res.write(": ping\n\n");
+  }, pingMs);
   const after = new URL(req.url ?? "/", "http://x").searchParams.get("after");
   const replay = thread.events;
   const from = after ? replay.findIndex((e) => e.eventId === after) + 1 : 0;
   for (const env of replay.slice(Math.max(0, from))) onEvent(env);
-  const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
-  const done = () => {
-    clearInterval(ping);
-    daemon.off("thread", onEvent);
-  };
-  req.on("close", done);
-  res.on("close", done);
 }
 
 /** SSE: every Thread event on the network, filtered. Heartbeats are hidden unless asked for. */
@@ -484,7 +500,10 @@ function eventStream(daemon: Daemon, url: URL, req: IncomingMessage, res: Server
   const filter = parseEventFilter(url);
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   res.write(": connected\n\n");
+  let finished = false;
+  let ping: ReturnType<typeof setInterval> | undefined;
   const write = (env: ThreadEnvelope) => {
+    if (finished || res.writableEnded || res.destroyed) return;
     if (!eventMatches(env, filter)) return;
     res.write(`id: ${env.eventId}\ndata: ${JSON.stringify(env)}\n\n`);
   };
@@ -495,13 +514,18 @@ function eventStream(daemon: Daemon, url: URL, req: IncomingMessage, res: Server
   for (const env of replayAfter(recent, lastId)) write(env);
   const onEvent = (env: ThreadEnvelope) => write(env);
   daemon.on("thread", onEvent);
-  const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
   const done = () => {
-    clearInterval(ping);
+    if (finished) return;
+    finished = true;
+    if (ping) clearInterval(ping);
     daemon.off("thread", onEvent);
   };
   req.on("close", done);
   res.on("close", done);
+  const pingMs = Number(process.env.CAFE_SSE_PING_MS) || 15_000;
+  ping = setInterval(() => {
+    if (!finished && !res.writableEnded && !res.destroyed) res.write(": ping\n\n");
+  }, pingMs);
 }
 
 export { Methods };

@@ -24,6 +24,7 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [baristas, setBaristas] = useState<BaristaInfo[]>();
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [hostEdits, setHostEdits] = useState<Record<string, string>>({});
+  const [remoteAliases, setRemoteAliases] = useState<Record<string, string>>({});
   const [dir, setDir] = useState("");
   const [agentKind, setAgentKind] = useState("pi");
   const [write, setWrite] = useState(false);
@@ -117,6 +118,21 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const removeAgentAlias = (address: string, a: string) =>
     void run(`agent:${address}`, async () => {
       await api.removeAgentAlias(address, a);
+      return t.settingsSaved;
+    });
+
+  const addRemoteHostAlias = (d: { host: string; displayName?: string }, a: string) =>
+    void run(`host:${d.host}`, async () => {
+      const x = a.trim();
+      if (!x) return;
+      await api.renameHost(d.host, d.displayName ?? d.host, [x]);
+      setRemoteAliases((m) => ({ ...m, [d.host]: "" }));
+      return t.settingsSaved;
+    });
+
+  const removeRemoteHostAlias = (d: { host: string; displayName?: string }, a: string) =>
+    void run(`host:${d.host}`, async () => {
+      await api.renameHost(d.host, d.displayName ?? d.host, [], [a]);
       return t.settingsSaved;
     });
 
@@ -268,6 +284,38 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
                   />
                   <button type="button" className="btn-sm" aria-busy={busy === `host:${d.host}`} disabled={!(hostEdits[d.host] ?? "").trim()} onClick={() => renameHost(d.host)}>
                     {t.settingsRename}
+                  </button>
+                </div>
+              )}
+              {d.host !== host && isRoot && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {removableHostAliases(d).map((a) => (
+                    <span key={a} className="kind-tag">
+                      {a}
+                      <button type="button" className="ml-1 text-muted" aria-label={`${t.removeAlias} ${a}`} disabled={busy === `host:${d.host}`} onClick={() => removeRemoteHostAlias(d, a)}>
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  <input
+                    className="!min-h-0 w-24 !py-0.5 !text-xs"
+                    placeholder={t.settingsAliasPh}
+                    value={remoteAliases[d.host] ?? ""}
+                    onChange={(e) => setRemoteAliases((m) => ({ ...m, [d.host]: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (remoteAliases[d.host] ?? "").trim()) {
+                        e.preventDefault();
+                        addRemoteHostAlias(d, remoteAliases[d.host] ?? "");
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={!(remoteAliases[d.host] ?? "").trim() || busy === `host:${d.host}`}
+                    onClick={() => addRemoteHostAlias(d, remoteAliases[d.host] ?? "")}
+                  >
+                    {t.settingsAddAlias}
                   </button>
                 </div>
               )}

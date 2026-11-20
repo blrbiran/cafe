@@ -28,13 +28,13 @@ describe("follow-ups", () => {
     cleanup.push(() => c.close());
 
     const first = await c.ask({ body: "what is the vat rate?" });
-    await untilClosed(c, first.threadId);
+    await untilClosed(c, first.threadId, first.orderId);
 
     // The follow-up mentions "rounding" but must still go to billing, who answered.
     const follow = await c.ask({ body: "and how is rounding done?", threadId: first.threadId });
     expect(follow.threadId).toBe(first.threadId);
     expect(follow.decision).toMatchObject({ router: "followup", targets: [billing.rec.agentId] });
-    const events = await untilClosed(c, first.threadId);
+    const events = await untilClosed(c, first.threadId, follow.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "Rounding is half-even" });
 
     expect(seen[1]).toMatchObject({
@@ -73,7 +73,7 @@ describe("follow-ups", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "x", to: "nope" });
-    await untilClosed(c, res.threadId);
+    await untilClosed(c, res.threadId, res.orderId);
     expect(root.daemon.thread(res.threadId)!.meta).toMatchObject({ status: "failed", declines: [{ agentId: b.rec.agentId, reason: "not my area" }] });
   });
 });

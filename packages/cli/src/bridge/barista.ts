@@ -128,6 +128,16 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
   });
 
   // A TUI session works under the person's own permissions and approvals: no access level of ours to report.
+  if (opts.tui) {
+    // Don't register an agent that would decline every Order: a TUI Barista needs
+    // a Codex session in its directory (#40).
+    const probe = await (engine as CodexTuiEngine).probe();
+    if (!probe.ok) {
+      throw new Error(
+        `cannot start a Codex TUI barista: ${probe.error}\nnext: start codex in ${dir} (or pass --thread <id>) and run this command again`,
+      );
+    }
+  }
   const rec = await client.connect(
     opts.tui
       ? { ...cafe, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }

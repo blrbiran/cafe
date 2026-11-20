@@ -131,7 +131,7 @@ describe("pi extension", () => {
     const injected = pi.sent.find((s) => s.message.customType === "cafe-order")!;
     expect(injected.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
     expect(injected.message.content).toContain("how many widgets?");
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     await runTurn(pi, "42 widgets");
     const events = await closed;
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "42 widgets", final: true });
@@ -147,7 +147,7 @@ describe("pi extension", () => {
     // The human's own run settles: the queued Order is injected now.
     await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
     await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-order"));
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     await runTurn(pi, "done later");
     expect((await closed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "done later" });
   });
@@ -156,7 +156,7 @@ describe("pi extension", () => {
     const { pi, c } = await setup();
     const res = await c.ask({ body: "widgets?", to: "widgets@root" });
     await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-order"));
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     await pi.fire("agent_start", { type: "agent_start" }, dir);
     await pi.fire("message_end", { type: "message_end", message: asCustom(orders(pi).at(-1)!) }, dir);
     await pi.tools.get("cafe_decline").execute("t1", { reason: "not mine" });
@@ -196,7 +196,7 @@ describe("pi extension", () => {
     await run(pi, [user("refactor foo"), assistant("refactored foo")]);
     await new Promise((r) => setTimeout(r, 100));
     expect(replied).toBe(false);
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     // Then the run containing the Order.
     await runTurn(pi, "7 widgets");
     const events = await closed;
@@ -207,7 +207,7 @@ describe("pi extension", () => {
     const { pi, c } = await setup();
     const res = await c.ask({ body: "widgets?", to: "widgets@root" });
     await waitFor(() => orders(pi).length === 1);
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     await run(pi, [asCustom(orders(pi)[0]!), assistant("order answer"), user("now do my thing"), assistant("human answer")]);
     expect((await closed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "order answer" });
   });
@@ -216,7 +216,7 @@ describe("pi extension", () => {
     const { pi, c } = await setup();
     const res = await c.ask({ body: "widgets?", to: "widgets@root" });
     await waitFor(() => orders(pi).length === 1);
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     // Human prompt first, our followUp message delivered later in the same run.
     await run(pi, [user("hi"), assistant("hello human"), asCustom(orders(pi)[0]!), assistant("order answer")]);
     expect((await closed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "order answer" });
@@ -226,7 +226,7 @@ describe("pi extension", () => {
     const { root, pi, c } = await setup();
     const first = await c.ask({ body: "how many widgets?", to: "widgets@root" });
     await waitFor(() => orders(pi).length === 1);
-    let closed = untilClosed(c, first.threadId);
+    let closed = untilClosed(c, first.threadId, first.orderId);
     await runTurn(pi, "42 widgets");
     await closed;
 
@@ -238,7 +238,7 @@ describe("pi extension", () => {
     expect(prompt).toContain("how many widgets?");
     expect(prompt).toContain("42 widgets");
     expect(prompt).toContain("and yesterday?");
-    closed = untilClosed(c, first.threadId);
+    closed = untilClosed(c, first.threadId, second.orderId);
     await runTurn(pi, "40 yesterday");
     expect((await closed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "40 yesterday" });
 
@@ -281,13 +281,13 @@ describe("pi extension", () => {
     const { pi, c } = await setup();
     const a = await c.ask({ body: "first", to: "widgets@root" });
     await waitFor(() => orders(pi).length === 1);
-    const aClosed = untilClosed(c, a.threadId);
+    const aClosed = untilClosed(c, a.threadId, a.orderId);
     const b = await c.ask({ body: "second", to: "widgets@root" });
     const aEvents = await aClosed;
     expect(aEvents.find((e) => e.event.type === "order.declined")?.event).toMatchObject({ reason: expect.stringMatching(/not picked up/) });
     await waitFor(() => orders(pi).length === 2);
     expect(orders(pi)[1]!.message.content).toContain("second");
-    const bClosed = untilClosed(c, b.threadId);
+    const bClosed = untilClosed(c, b.threadId, b.orderId);
     await runTurn(pi, "second answer");
     expect((await bClosed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "second answer" });
   });
@@ -311,7 +311,7 @@ describe("pi extension", () => {
     pi.setIdle(true);
     await new Promise((r) => setTimeout(r, 500));
     expect(declined).toBe(false);
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     await pi.fire("message_end", { type: "message_end", message: assistant("slow answer") }, dir);
     await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
     expect((await closed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "slow answer" });
@@ -357,7 +357,7 @@ describe("pi extension", () => {
     pi.setIdle(true);
     await pi.fire("agent_settled", { type: "agent_settled", aborted: true }, dir);
     await waitFor(() => orders(pi).length === 2);
-    const bClosed = untilClosed(c, b.threadId);
+    const bClosed = untilClosed(c, b.threadId, b.orderId);
     await runTurn(pi, "B done");
     expect((await bClosed).find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "B done" });
     expect(aEvents).not.toContain("order.replied");
@@ -401,7 +401,7 @@ describe("pi extension under oh-my-pi", () => {
 
     const res = await c.ask({ body: "how many widgets?" });
     await waitFor(() => orders(pi).length === 1);
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     const messages = [asCustom(orders(pi)[0]!), assistant("12 widgets")];
     await pi.fire("agent_start", { type: "agent_start" }, dir);
     for (const message of messages) await pi.fire("message_end", { type: "message_end", message }, dir);
@@ -417,7 +417,7 @@ describe("pi extension under oh-my-pi", () => {
     const { pi, c } = await setup();
     const res = await c.ask({ body: "long job" });
     await waitFor(() => orders(pi).length === 1);
-    const closed = untilClosed(c, res.threadId);
+    const closed = untilClosed(c, res.threadId, res.orderId);
     const messages = [asCustom(orders(pi)[0]!), { role: "assistant", content: [], stopReason: "aborted" }];
     await pi.fire("agent_start", { type: "agent_start" }, dir);
     for (const message of messages) await pi.fire("message_end", { type: "message_end", message }, dir);

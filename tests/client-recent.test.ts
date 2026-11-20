@@ -19,7 +19,7 @@ describe("client recent events", () => {
     // Let the fast barista reply and close before any listener is attached.
     await new Promise((r) => setTimeout(r, 300));
 
-    const events = await untilClosed(c, res.threadId, 1_000);
+    const events = await untilClosed(c, res.threadId, res.orderId, 1_000);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "widgets says: hello" });
     expect(events.at(-1)?.event.type).toBe("order.closed");
   });

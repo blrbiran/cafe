@@ -28,7 +28,7 @@ describe("host display names", () => {
     root.daemon.setHostIdentity("hub", ["root-alias"]);
 
     const res = await c.ask({ body: "hello", to: "widgets@root-alias" });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "widgets says: hello" });
   });
 });
@@ -49,7 +49,7 @@ describe("agent display names", () => {
     expect(root.daemon.registry.get(b.rec.agentId)?.displayName).toBe("gadget-owner");
 
     const res = await c.ask({ body: "hello", to: "gadget-owner@root" });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "widgets says: hello" });
   });
 
@@ -155,6 +155,24 @@ describe("remote host rename", () => {
     await waitFor(() => child.daemon.snapshot().displayName === "pc-one");
     expect(child.daemon.snapshot().host).toBe("pc1");
   });
+
+  it("adds and removes a remote Host alias from the Root", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline);
+    await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1"));
+
+    root.daemon.renameHost("pc1", "pc-one", { aliases: ["pc-alias"] });
+    const host = () => root.daemon.daemons().find((d) => d.host === "pc1")!;
+    expect(host().aliases).toContain("pc-alias");
+    await waitFor(() => child.daemon.snapshot().aliases.includes("pc-alias"));
+
+    root.daemon.renameHost("pc1", "pc-one", { removeAliases: ["pc-alias"] });
+    expect(host().aliases).not.toContain("pc-alias");
+    await waitFor(() => !child.daemon.snapshot().aliases.includes("pc-alias"));
+  });
 });
 
 describe("explicit aliases and legacy names", () => {
@@ -176,9 +194,9 @@ describe("explicit aliases and legacy names", () => {
     const removed = root.daemon.removeAgentAlias(aliased.agentId, "widgets-help");
     expect(removed.aliases).not.toContain("widgets-help");
     const r1 = await c.ask({ body: "one", to: "widget-owner@hub" });
-    expect((await untilClosed(c, r1.threadId)).some((e) => e.event.type === "order.replied")).toBe(true);
+    expect((await untilClosed(c, r1.threadId, r1.orderId)).some((e) => e.event.type === "order.replied")).toBe(true);
     const r2 = await c.ask({ body: "two", to: "widgets@root" });
-    expect((await untilClosed(c, r2.threadId)).some((e) => e.event.type === "order.replied")).toBe(true);
+    expect((await untilClosed(c, r2.threadId, r2.orderId)).some((e) => e.event.type === "order.replied")).toBe(true);
     expect(() => root.daemon.removeAgentAlias(aliased.agentId, "widgets")).toThrow(/legacy/);
   });
 

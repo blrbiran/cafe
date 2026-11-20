@@ -44,7 +44,7 @@ async function setup(agent: AgentKind, access?: Access) {
   cleanup.push(() => c.close());
   const ask = async (body: string, threadId?: string, to = "coder") => {
     const res = await c.ask({ body, to, threadId });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     if (process.env.BRIDGE_DEBUG) console.log(JSON.stringify(events.map((e) => e.event)));
     return { ...res, events: events.filter((e) => e.orderId === res.orderId) };
   };
@@ -186,7 +186,7 @@ describe("supervised native barista", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "hello", to: "supcoder" });
-    const events = await untilClosed(c, res.threadId, 10_000);
+    const events = await untilClosed(c, res.threadId, res.orderId, 10_000);
     expect(replyOf(events)).toBe("turn=1 kind=fresh q=hello");
     expect(JSON.parse(readFileSync(join(root.home, "baristas.json"), "utf8"))).toMatchObject([{ dir, agent: "codex" }]);
   }, 30_000);

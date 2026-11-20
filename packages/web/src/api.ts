@@ -140,7 +140,8 @@ export const api = {
   /** Local Host display name and its aliases; internal ids never change. */
   setHostIdentity: (displayName: string, aliases: string[], removeAliases: string[] = []) =>
     call<{ host: string; displayName?: string; aliases: string[]; legacyAliases?: string[] }>("POST", "/api/host", { displayName, aliases, removeAliases }),
-  renameHost: (host: string, displayName: string) => call<unknown>("POST", "/api/hosts/rename", { host, displayName }),
+  renameHost: (host: string, displayName: string, aliases: string[] = [], removeAliases: string[] = []) =>
+    call<unknown>("POST", "/api/hosts/rename", { host, displayName, aliases, removeAliases }),
   testHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/test", { host }),
   reconnectHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/reconnect", { host }),
   renameAgent: (address: string, displayName: string) => call<unknown>("POST", "/api/agents/rename", { address, displayName }),

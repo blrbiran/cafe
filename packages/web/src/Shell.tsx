@@ -1,5 +1,7 @@
 import { useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
-import { isActive, useStore } from "./store.ts";
+import type { AgentRecord, DaemonRecord } from "@cafe/protocol";
+import { api } from "./api.ts";
+import { isActive, refreshStore, useStore } from "./store.ts";
 import { agentAddress, agentLabel, hostLabel } from "./display.ts";
 import { hashFor, type Route } from "./route.ts";
 import { setLang, useLang, useT } from "./i18n.ts";
@@ -36,6 +38,67 @@ function readAgentsOpen(): boolean {
     // ignore
   }
   return typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches;
+}
+
+/** One Agent in the nav sublist, with the same actions as its card on the Agents page (#45). */
+function NavAgent({ a, daemons }: { a: AgentRecord; daemons: DaemonRecord[] }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const [err, setErr] = useState<string>();
+  const act = async (fn: () => Promise<unknown>) => {
+    setErr(undefined);
+    try {
+      await fn();
+      await refreshStore();
+      setOpen(false);
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  };
+  const rename = () => {
+    setOpen(false);
+    const v = prompt(t.settingsNewName, a.displayName ?? a.name);
+    if (v?.trim()) void act(() => api.renameAgent(a.address, v.trim()));
+  };
+  const addAlias = () => {
+    setOpen(false);
+    const v = prompt(t.settingsAliasPh);
+    if (v?.trim()) void act(() => api.aliasAgent(a.address, v.trim()));
+  };
+  return (
+    <div className="nav-subagent relative" onContextMenu={(e) => { e.preventDefault(); setOpen(true); }}>
+      <Dot tone={a.status === "offline" ? undefined : a.status === "busy" ? "info" : "ok"} />
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-sm font-semibold text-fg-strong">{agentLabel(a, daemons)}</span>
+          <KindTag a={a} />
+        </div>
+        <div className="mono truncate text-[10px] text-muted" title={a.address}>
+          {agentAddress(a, daemons)}
+        </div>
+      </div>
+      <span className={`text-[10px] ${a.status === "offline" ? "text-muted" : a.status === "busy" ? "text-info" : "text-ok"}`}>
+        {a.status === "offline" ? t.offline : a.status === "busy" ? t.busy : t.idle}
+      </span>
+      <button type="button" className="btn-sm !px-1 !py-0 text-[11px]" aria-label={t.actions} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        ⋯
+      </button>
+      {open && (
+        <div className="well absolute right-1 top-full z-20 flex min-w-32 flex-col gap-1 p-1 text-xs shadow-lg">
+          <button type="button" className="btn-sm text-left" onClick={rename}>
+            {t.rename}
+          </button>
+          <button type="button" className="btn-sm text-left" onClick={addAlias}>
+            {t.addAlias}
+          </button>
+          <button type="button" className="btn-sm text-left" onClick={() => void navigator.clipboard?.writeText(a.address).catch(() => {})}>
+            {t.copyAddress}
+          </button>
+        </div>
+      )}
+      {err && <div className="absolute right-1 top-full z-20 mt-24 w-48 rounded bg-danger/10 p-1 text-[10px] text-danger">{err}</div>}
+    </div>
+  );
 }
 
 export function Shell({
@@ -157,21 +220,7 @@ export function Shell({
             <div id="agents-sub" className="nav-sublist" hidden={!agentsOpen}>
               {baristas.length === 0 && <div className="hint px-2 py-1">{t.agentsEmpty}</div>}
               {baristas.map((a) => (
-                <div key={a.agentId} className="nav-subagent">
-                  <Dot tone={a.status === "offline" ? undefined : a.status === "busy" ? "info" : "ok"} />
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <span className="truncate text-sm font-semibold text-fg-strong">{agentLabel(a, daemons)}</span>
-                      <KindTag a={a} />
-                    </div>
-                    <div className="mono truncate text-[10px] text-muted" title={a.address}>
-                      {agentAddress(a, daemons)}
-                    </div>
-                  </div>
-                  <span className={`text-[10px] ${a.status === "offline" ? "text-muted" : a.status === "busy" ? "text-info" : "text-ok"}`}>
-                    {a.status === "offline" ? t.offline : a.status === "busy" ? t.busy : t.idle}
-                  </span>
-                </div>
+                <NavAgent key={a.agentId} a={a} daemons={daemons} />
               ))}
               <a className="nav-sublink" href={hashFor({ page: "agents" })} aria-current={current === "agents" ? "page" : undefined}>
                 <span>{t.agentsAll}</span>

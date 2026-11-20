@@ -54,7 +54,7 @@ describe("event history endpoint", () => {
     const c = await customer(d.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "hello" });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     const first = events[0]!.eventId;
 
     const body = (await (await fetch(`http://${d.addr}/api/events/history?after=${first}`)).json()) as { events: ThreadEnvelope[]; gap: boolean };
@@ -64,5 +64,45 @@ describe("event history endpoint", () => {
 
     const tooOld = (await (await fetch(`http://${d.addr}/api/events/history?after=gone`)).json()) as { events: ThreadEnvelope[]; gap: boolean };
     expect(tooOld).toEqual({ events: [], gap: true });
+  });
+});
+
+describe("thread stream close (#54)", () => {
+  it("does not write to a response that already ended", async () => {
+    // The old 15 s ping made this race hard to hit in a test; the interval is
+    // overridable so the regression is deterministic.
+    process.env.CAFE_SSE_PING_MS = "20";
+    try {
+      const d = await startDaemon("sse1", { mode: "root" });
+      cleanup.push(d.stop);
+      const b = await barista(d.addr, identity("widgets"));
+      cleanup.push(() => b.client.close());
+      const c = await customer(d.addr);
+      cleanup.push(() => c.close());
+      const res = await c.ask({ body: "hi" });
+      await untilClosed(c, res.threadId, res.orderId);
+      const follow = await c.ask({ body: "again", threadId: res.threadId });
+      await untilClosed(c, res.threadId, follow.orderId);
+
+      // Follow one earlier turn: the replay ends at that turn's order.closed and
+      // then keeps walking the rest of the Thread.
+      const body = await (await fetch(`http://${d.addr}/api/threads/${res.threadId}/stream?orderId=${res.orderId}`)).text();
+      expect(body).toContain("order.closed");
+
+      // Anything emitted after the stream ended must not hit the response.
+      d.daemon.emit("thread", {
+        eventId: "late",
+        threadId: res.threadId,
+        orderId: res.orderId,
+        host: "sse1",
+        at: Date.now(),
+        event: { type: "order.heartbeat", agentId: b.rec.agentId },
+      }, undefined);
+      // The old code left its listener attached and its ping running, so this
+      // window produced ERR_STREAM_WRITE_AFTER_END.
+      await new Promise((r) => setTimeout(r, 120));
+    } finally {
+      delete process.env.CAFE_SSE_PING_MS;
+    }
   });
 });

@@ -18,7 +18,7 @@ async function setup(reply: string) {
   const c = await customer(d.addr);
   cleanup.push(() => c.close());
   const res = await c.ask({ body: "hello" });
-  const events = await untilClosed(c, res.threadId);
+  const events = await untilClosed(c, res.threadId, res.orderId);
   return { d, threadId: res.threadId, events };
 }
 

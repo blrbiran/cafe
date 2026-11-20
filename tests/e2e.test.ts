@@ -29,7 +29,7 @@ describe("single root", () => {
     const res = await c.ask({ body: "why is the invoice total wrong?" });
     expect(res.decision.mode).toBe("unicast");
     expect(res.decision.targets).toEqual([a.rec.agentId]);
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     const reply = events.find((e) => e.event.type === "order.replied");
     expect(reply?.event).toMatchObject({ agentId: a.rec.agentId, text: "billing says: why is the invoice total wrong?" });
     expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "done" });
@@ -49,7 +49,7 @@ describe("single root", () => {
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "anyone know zzz?" });
     expect(res.decision.mode).toBe("broadcast");
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     const types = events.map((e) => e.event.type);
     expect(types).toContain("order.replied");
     expect(types).toContain("order.declined");
@@ -67,7 +67,7 @@ describe("single root", () => {
     const res = await c.ask({ body: "postgres question" });
     expect(res.decision.targets).toEqual([mute.rec.agentId]);
     expect(res.decision.candidates).toContain(ok.rec.agentId);
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.failed")?.event).toMatchObject({ agentId: mute.rec.agentId, reason: "no ack" });
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ agentId: ok.rec.agentId });
   });
@@ -88,7 +88,7 @@ describe("single root", () => {
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "take your time", to: "slow@root" });
     expect(res.decision.router).toBe("explicit");
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "finally" });
   });
 
@@ -106,7 +106,7 @@ describe("single root", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "slowly please", to: "slowish@root" });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "still here" });
     expect(events.find((e) => e.event.type === "order.failed")).toBeUndefined();
   });
@@ -147,7 +147,7 @@ describe("root + child daemon", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "frontend bug" });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ agentId: b.rec.agentId });
     // Both daemons persisted the thread.
     await waitFor(() => child.daemon.thread(res.threadId)?.meta.status === "done");
@@ -162,7 +162,7 @@ describe("root + child daemon", () => {
     const c = await customer(child.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "x1 please" });
-    await untilClosed(c, res.threadId);
+    await untilClosed(c, res.threadId, res.orderId);
     await waitFor(() => root.daemon.thread(res.threadId)?.meta.status === "done");
   });
 
@@ -180,7 +180,7 @@ describe("root + child daemon", () => {
     const c = await customer(child.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "offline question" });
-    const events = await untilClosed(c, res.threadId);
+    const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")).toBeTruthy();
 
     // Root comes back on the same port: the child reconnects and re-syncs its agents.

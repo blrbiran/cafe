@@ -49,7 +49,7 @@ describe("attachments", () => {
 
     const c = await customer(d.addr);
     const res = await c.ask({ body: "what does the log say?", attachments: [up.attachment] });
-    await untilClosed(c, res.threadId);
+    await untilClosed(c, res.threadId, res.orderId);
 
     expect(received?.name).toBe("serial.log");
     expect(received?.path).toBeTruthy();
@@ -81,7 +81,7 @@ describe("attachments", () => {
     const up = await upload(root.addr, "capture.pcap", "remote bytes");
     const c = await customer(root.addr);
     const res = await c.ask({ body: "inspect the capture", attachments: [up.attachment] });
-    await untilClosed(c, res.threadId);
+    await untilClosed(c, res.threadId, res.orderId);
 
     expect(received?.name).toBe("capture.pcap");
     expect(readFileSync(received!.path!, "utf8")).toBe("remote bytes");

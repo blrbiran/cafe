@@ -21,9 +21,9 @@ describe("search", () => {
   it("finds questions and answers by substring, newest first", async () => {
     const { root, c } = await setup();
     const a = await c.ask({ body: "the Purple Elephant is late" });
-    await untilClosed(c, a.threadId);
+    await untilClosed(c, a.threadId, a.orderId);
     const b = await c.ask({ body: "unrelated question" });
-    await untilClosed(c, b.threadId);
+    await untilClosed(c, b.threadId, b.orderId);
     const res = await fetch(`http://${root.addr}/api/search?q=purple%20elephant`).then((r) => r.json());
     expect(res.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
     // Both the question and the echoed answer match.
@@ -35,7 +35,7 @@ describe("prune", () => {
   it("only reports by default, deletes finished threads and stats with dryRun=false", async () => {
     const { root, c } = await setup();
     const a = await c.ask({ body: "old question" });
-    await untilClosed(c, a.threadId);
+    await untilClosed(c, a.threadId, a.orderId);
     const meta = root.daemon.thread(a.threadId)!.meta;
     // Age the thread and its stats by rewriting timestamps in the test store.
     const old = Date.now() - 40 * 24 * 3600_000;

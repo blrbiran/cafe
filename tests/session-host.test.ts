@@ -55,7 +55,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     expect(o.text.startsWith(`${o.marker}\n`)).toBe(true);
     expect(o.text).toContain("what port?");
 
-    const aDone = untilClosed(c, a.threadId);
+    const aDone = untilClosed(c, a.threadId, a.orderId);
     await post(socket, "/started", { orderId: o.orderId });
     await new Promise((r) => setTimeout(r, 50));
     expect(orders()).toHaveLength(1); // B waits for A
@@ -63,7 +63,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     expect(replyOf(await aDone)).toBe("9123");
 
     await waitFor(() => orders().length === 2);
-    const bDone = untilClosed(c, b.threadId);
+    const bDone = untilClosed(c, b.threadId, b.orderId);
     await post(socket, "/started", { orderId: orders()[1]!.orderId });
     await post(socket, "/done", { orderId: orders()[1]!.orderId, text: "BLUEBIRD" });
     expect(replyOf(await bDone)).toBe("BLUEBIRD");
@@ -73,7 +73,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     const { orders, c, socket } = await setup();
     const a = await c.ask({ body: "first question", to: "falcon" });
     await waitFor(() => orders().length === 1);
-    const done = untilClosed(c, a.threadId);
+    const done = untilClosed(c, a.threadId, a.orderId);
     await post(socket, "/done", { orderId: orders()[0]!.orderId, text: "first answer" });
     await done;
     const f = await c.ask({ body: "second question", threadId: a.threadId });
@@ -82,7 +82,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     expect(text).toContain("Follow-up from");
     expect(text).toContain("second question");
     expect(text).not.toContain("first answer");
-    const fDone = untilClosed(c, f.threadId);
+    const fDone = untilClosed(c, f.threadId, f.orderId);
     await post(socket, "/done", { orderId: orders()[1]!.orderId, text: "ok" });
     await fDone;
   });
@@ -98,7 +98,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     for (const [i, [body, check]] of cases.entries()) {
       const t = await c.ask({ body: `q${i}`, to: "falcon" });
       await waitFor(() => orders().length === i + 1);
-      const done = untilClosed(c, t.threadId);
+      const done = untilClosed(c, t.threadId, t.orderId);
       await post(socket, "/done", { orderId: orders()[i]!.orderId, ...body });
       const events = await done;
       expect(replyOf(events)).toBeUndefined();
@@ -117,7 +117,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     // The aborted turn reports back; nothing more goes to the asker, and B is handed over.
     await post(socket, "/done", { orderId: orders()[0]!.orderId, text: "partial", aborted: true });
     await waitFor(() => orders().length === 2);
-    const bDone = untilClosed(c, b.threadId);
+    const bDone = untilClosed(c, b.threadId, b.orderId);
     await post(socket, "/done", { orderId: orders()[1]!.orderId, text: "B" });
     expect(replyOf(await bDone)).toBe("B");
   });
@@ -125,7 +125,7 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
   it("an Order the session does not start in time is declined as unavailable and withdrawn", async () => {
     const { msgs, orders, c } = await setup({ injectTimeoutMs: 150 });
     const a = await c.ask({ body: "anyone there?", to: "falcon" });
-    const events = await untilClosed(c, a.threadId);
+    const events = await untilClosed(c, a.threadId, a.orderId);
     expect(declineOf(events)).toMatchObject({ unavailable: true });
     expect(msgs).toContainEqual({ type: "cancel", orderId: orders()[0]!.orderId });
   });

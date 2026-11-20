@@ -163,7 +163,7 @@ describe("hints end to end", () => {
 
     const first = await c.ask({ body: "the css of the header is broken" });
     expect(first.decision.targets).toEqual([picky.rec.agentId]);
-    const events = await untilClosed(c, first.threadId);
+    const events = await untilClosed(c, first.threadId, first.orderId);
     expect(events.some((e) => e.event.type === "order.replied" && e.event.agentId === helper.rec.agentId)).toBe(true);
 
     // Root computed the hint and pushed it to the child, which routes the next order itself.
@@ -171,7 +171,7 @@ describe("hints end to end", () => {
     const second = await c.ask({ body: "css footer looks wrong" });
     expect(second.decision.targets).toEqual([helper.rec.agentId]);
     expect(second.decision.reason).toContain("declined similar orders");
-    await untilClosed(c, second.threadId);
+    await untilClosed(c, second.threadId, second.orderId);
 
     const res = await fetch(`http://${root.addr}/api/routing/hints`).then((r) => r.json());
     expect(res.learn).toBe(true);
@@ -191,7 +191,7 @@ describe("hints end to end", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const r = await c.ask({ body: "css question" });
-    await untilClosed(c, r.threadId);
+    await untilClosed(c, r.threadId, r.orderId);
     const h = root.daemon.routingHints()["busy@root"];
     expect(h?.declined).toBe(1);
     expect(h?.declinedTopics).toEqual({});
