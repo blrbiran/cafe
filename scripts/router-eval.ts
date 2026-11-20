@@ -42,7 +42,7 @@ interface Attempt {
   ms: number;
 }
 
-const router: Router = model ? new LlmRouter(await piComplete(model), new RulesRouter(), { timeoutMs, concurrency }) : new RulesRouter();
+const router: Router = model ? new LlmRouter(await piComplete(model), new RulesRouter(), { timeoutMs, concurrency, cache: false }) : new RulesRouter();
 
 async function once(): Promise<Attempt[]> {
   const out: Attempt[] = [];

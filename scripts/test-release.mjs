@@ -80,7 +80,9 @@ try {
   const codexState = join(work, "codex-state");
   mkdirSync(codexState);
   // The fake `codex app-server` from the tests: exercises the native Codex Barista without a model.
-  const env = { ...process.env, CAFE_HOME: home, CAFE_DISCOVERY: "0", CAFE_CODEX_BIN: join(root, "tests/fixtures/fake-codex.mjs"), FAKE_CODEX_STATE: codexState };
+  // Keep pi's own config out of the real home: a developer machine may already
+// have the repo extension installed, which would load twice (tool conflicts).
+const env = { ...process.env, HOME: fakeHome, CAFE_HOME: home, CAFE_DISCOVERY: "0", CAFE_CODEX_BIN: join(root, "tests/fixtures/fake-codex.mjs"), FAKE_CODEX_STATE: codexState };
   const cafe = (...a) => execFileSync(cafeBin, a, { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
   check("cafe --version", () => {

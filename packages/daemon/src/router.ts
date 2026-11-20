@@ -118,7 +118,7 @@ export class RulesRouter implements Router {
     return {
       targets: top.map((s) => s.c.agentId),
       mode: top.length > 1 ? "multicast" : "unicast",
-      reason: top.some((s) => s.weak > 0) ? `no strong owner; asking the top ${top.length} candidates` : `no keyword match; asking the ${top.length} most available Baristas`,
+      reason: `no keyword match; asking the ${top.length} most available Baristas`,
       router: "rules",
       candidates: scored.slice(top.length).map((s) => s.c.agentId),
     };
@@ -186,13 +186,15 @@ export class LlmRouter implements Router {
   private gate: Gate;
   /** Same question + same candidate set should get the same decision, not a re-roll of the dice. */
   private cache = new Map<string, RoutingDecision>();
+  private cacheEnabled: boolean;
   private static CACHE_LIMIT = 200;
 
-  constructor(complete: CompleteFn, fallback: Router = new RulesRouter(), opts: { timeoutMs?: number; concurrency?: number } = {}) {
+  constructor(complete: CompleteFn, fallback: Router = new RulesRouter(), opts: { timeoutMs?: number; concurrency?: number; cache?: boolean } = {}) {
     this.complete = complete;
     this.fallback = fallback;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
     this.gate = new Gate(opts.concurrency ?? 2);
+    this.cacheEnabled = opts.cache ?? true;
   }
 
   async decide(input: RouteInput): Promise<RoutingDecision> {
@@ -209,7 +211,7 @@ export class LlmRouter implements Router {
       .map((c) => `${c.agentId}:${c.status}:${c.description}:${c.tags.join(",")}`)
       .sort()
       .join("|")}`;
-    const cached = this.cache.get(cacheKey);
+    const cached = this.cacheEnabled ? this.cache.get(cacheKey) : undefined;
     if (cached) return { ...cached };
     const body = tokenize(order.body);
     const list = candidates
@@ -248,8 +250,10 @@ export class LlmRouter implements Router {
         router: "llm",
         candidates: (Array.isArray(json.candidates) ? json.candidates : []).filter((t: string) => valid.has(t) && !targets.includes(t)).slice(0, TOP_K),
       };
-      this.cache.set(cacheKey, decision);
-      if (this.cache.size > LlmRouter.CACHE_LIMIT) this.cache.delete(this.cache.keys().next().value!);
+      if (this.cacheEnabled) {
+        this.cache.set(cacheKey, decision);
+        if (this.cache.size > LlmRouter.CACHE_LIMIT) this.cache.delete(this.cache.keys().next().value!);
+      }
       return { ...decision };
     } catch (err) {
       const message = ctrl.signal.aborted ? `llm timeout after ${this.timeoutMs}ms` : (err as Error).message;

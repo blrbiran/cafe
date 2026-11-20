@@ -106,6 +106,14 @@ describe("LlmRouter output policy (#39)", () => {
     await router.decide(input(three));
     expect(complete).toHaveBeenCalledTimes(1);
   });
+
+  it("can disable the cache so a stability eval re-queries the model", async () => {
+    const complete = vi.fn(async () => JSON.stringify({ targets: ["A"], mode: "unicast", reason: "ok" }));
+    const router = new LlmRouter(complete, new RulesRouter(), { cache: false });
+    await router.decide(input(three));
+    await router.decide(input(three));
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("initRouter", () => {
