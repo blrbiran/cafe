@@ -5,6 +5,7 @@ import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
+import { pushBounded } from "./bounded.ts";
 import {
   ACK_TIMEOUT_MS,
   AgentIdentity,
@@ -83,6 +84,10 @@ interface Tracking {
   timers: Map<string, ReturnType<typeof setTimeout>>;
   deadline?: ReturnType<typeof setTimeout>;
 }
+
+/** Metadata keeps only recent reply/decline summaries; the JSONL log has the full history. */
+const MAX_META_REPLIES = 50;
+const MAX_META_DECLINES = 50;
 
 type DaemonEvents = {
   thread: [ThreadEnvelope, ThreadMeta | undefined];
@@ -1358,10 +1363,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         break;
       case "order.replied":
         meta.firstReplyAt ??= env.at;
-        if (ev.final) meta.replies.push({ agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at });
+        if (ev.final) pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at }, MAX_META_REPLIES);
         break;
       case "order.declined":
-        meta.declines.push({ agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at });
+        pushBounded(meta.declines, { agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at }, MAX_META_DECLINES);
         break;
       case "order.closed":
         meta.status = ev.status;
@@ -1984,13 +1989,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   thread(threadId: string, opts: { limit?: number; before?: string } = {}) {
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) return undefined;
-    const all = this.store.readEvents(meta.file);
-    if (opts.limit === undefined && opts.before === undefined) return { meta, events: all, hasMore: false };
-    const stop = opts.before ? all.findIndex((e) => e.eventId === opts.before) : all.length;
-    if (stop < 0) return { meta, events: [], hasMore: false };
-    const limit = Math.max(1, opts.limit ?? all.length);
-    const start = Math.max(0, stop - limit);
-    return { meta, events: all.slice(start, stop), hasMore: start > 0 };
+    if (opts.limit === undefined && opts.before === undefined) return { meta, events: this.store.readEvents(meta.file), hasMore: false };
+    // Paging reads backwards from the end: opening a page no longer parses the
+    // whole JSONL (#31).
+    const limit = opts.limit === undefined ? Number.MAX_SAFE_INTEGER : Math.max(1, opts.limit);
+    return { meta, ...this.store.readEventsPage(meta.file, limit, opts.before) };
   }
 
   /** Disconnect an Agent (web UI "kick"). Remote Agents are kicked via the Root. */

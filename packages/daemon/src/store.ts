@@ -101,31 +101,64 @@ export class Store {
 
   /** The last `limit` events, read from the end so a long Thread is not parsed whole. */
   readEventsTail(file: string, limit: number): ThreadEnvelope[] {
-    if (!existsSync(file) || limit <= 0) return [];
+    return this.readEventsPage(file, limit).events;
+  }
+
+  /**
+   * A page of events read backwards from the end: the newest `limit` events, or
+   * those strictly before `before` (an eventId). The cost is proportional to the
+   * bytes scanned, not to the Thread length, and `hasMore` tells the client
+   * whether older events remain (#31).
+   */
+  readEventsPage(file: string, limit: number, before?: string): { events: ThreadEnvelope[]; hasMore: boolean } {
+    if (!existsSync(file) || limit <= 0) return { events: [], hasMore: false };
     const fd = openSync(file, "r");
     try {
       const size = fstatSync(fd).size;
       const chunk = 64 * 1024;
       let pos = size;
-      let buf = Buffer.alloc(0);
-      let newlines = 0;
-      while (pos > 0 && newlines <= limit) {
+      // The first line of a backwards chunk can be cut in half; carry it into
+      // the next (earlier) read.
+      let carry = "";
+      let skipping = !!before;
+      const newestFirst: ThreadEnvelope[] = [];
+      let hasMore = false;
+      const take = (line: string): boolean => {
+        if (!line) return false;
+        let env: ThreadEnvelope;
+        try {
+          env = JSON.parse(line) as ThreadEnvelope;
+        } catch {
+          return false;
+        }
+        if (skipping) {
+          if (env.eventId === before) skipping = false;
+          return false;
+        }
+        newestFirst.push(env);
+        if (newestFirst.length > limit) {
+          hasMore = true;
+          return true;
+        }
+        return false;
+      };
+      while (pos > 0) {
         const len = Math.min(chunk, pos);
         pos -= len;
-        const b = Buffer.alloc(len);
+        const b = Buffer.allocUnsafe(len);
         readSync(fd, b, 0, len, pos);
-        buf = Buffer.concat([b, buf]);
-        newlines = 0;
-        for (const byte of buf) if (byte === 10) newlines++;
+        const lines = (b.toString("utf8") + carry).split("\n");
+        // With bytes before this chunk, its first line is incomplete.
+        carry = pos > 0 ? (lines.shift() ?? "") : "";
+        for (let i = lines.length - 1; i >= 0; i--) if (take(lines[i]!)) break;
+        if (hasMore) break;
       }
-      const lines = buf.toString("utf8").split("\n").filter(Boolean);
-      return lines.slice(-limit).flatMap((line) => {
-        try {
-          return [JSON.parse(line) as ThreadEnvelope];
-        } catch {
-          return [];
-        }
-      });
+      if (!hasMore && carry) take(carry);
+      if (newestFirst.length > limit) {
+        newestFirst.length = limit;
+        hasMore = true;
+      }
+      return { events: newestFirst.reverse(), hasMore };
     } finally {
       closeSync(fd);
     }

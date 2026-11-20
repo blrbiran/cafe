@@ -30,6 +30,31 @@ describe("Store", () => {
     expect(tail.at(-1)?.eventId).toBe("E499");
   });
 
+  it("pages backwards from the end, before an event id, across read chunks", () => {
+    const home = temp();
+    const store = new Store(home);
+    const file = join(home, "sessions", "page.jsonl");
+    // Pad each line so the file spans several 64 KiB read chunks.
+    const big = (i: number) => JSON.stringify({ ...env(i), event: { type: "order.heartbeat", agentId: "A", note: "x".repeat(1000) } });
+    writeFileSync(file, Array.from({ length: 500 }, (_, i) => big(i)).join("\n") + "\n");
+
+    const newest = store.readEventsPage(file, 3);
+    expect(newest.events.map((e) => e.eventId)).toEqual(["E497", "E498", "E499"]);
+    expect(newest.hasMore).toBe(true);
+
+    const older = store.readEventsPage(file, 3, "E497");
+    expect(older.events.map((e) => e.eventId)).toEqual(["E494", "E495", "E496"]);
+    expect(older.hasMore).toBe(true);
+
+    const nearStart = store.readEventsPage(file, 5, "E3");
+    expect(nearStart.events.map((e) => e.eventId)).toEqual(["E0", "E1", "E2"]);
+    expect(nearStart.hasMore).toBe(false);
+
+    const unknown = store.readEventsPage(file, 5, "nope");
+    expect(unknown.events).toEqual([]);
+    expect(unknown.hasMore).toBe(false);
+  });
+
   it("returns only unfinished threads for recovery", () => {
     const store = new Store(temp());
     const meta = (id: string, status: ThreadMeta["status"]): ThreadMeta => ({
