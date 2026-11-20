@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import type { Order } from "@cafe/protocol";
+import { extractAttachments } from "./artifacts.ts";
 
 /**
  * Ready-made commands for common agent CLIs. Each reads the prompt from stdin and prints the answer on stdout.
@@ -45,7 +46,8 @@ export interface ServeOptions {
   log?: (msg: string) => void;
 }
 
-const STDOUT_REPLY = "Answer directly and concisely; your entire stdout is sent back as the reply.";
+const STDOUT_REPLY =
+  "Answer directly and concisely; your entire stdout is sent back as the reply. To send a file, print a line `CAFE_ATTACH: /absolute/path` — it is uploaded and removed from the text.";
 
 /** The text handed to the command for one Order. `replyNote` says how the answer gets back (stdout by default). */
 export function buildPrompt(
@@ -128,10 +130,13 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
         await h.decline(`command failed (exit ${result.code}${result.timedOut ? ", timed out" : ""}): ${result.stderr.trim().slice(-300) || "no output"}`, { unavailable: true });
       } else if (text.startsWith(DECLINE_MARKER)) {
         await h.decline(text.slice(DECLINE_MARKER.length).trim() || "not mine");
-      } else if (!text) {
-        await h.decline("command produced no output", { unavailable: true });
       } else {
-        await h.reply(text);
+        const parsed = await extractAttachments(`http://${opts.daemon}`, text, opts.token ?? process.env.CAFE_TOKEN);
+        if (!parsed.text && !parsed.attachments.length) {
+          await h.decline("command produced no output", { unavailable: true });
+        } else {
+          await h.reply(parsed.text, true, parsed.attachments);
+        }
       }
       log(`← ${h.order.orderId} (${result.code === 0 ? "ok" : `exit ${result.code}`})`);
     } catch (err) {

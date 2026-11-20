@@ -405,6 +405,11 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/cancel$/.exec(path))) {
     return send(res, 200, daemon.cancel(match[1]!, "cli"));
   }
+  if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/reply$/.exec(path))) {
+    const p = await readJson(req);
+    if (typeof p.agent !== "string" || !p.agent || typeof p.text !== "string") throw new RpcError("bad_request", "agent and text are required");
+    return send(res, 200, daemon.replyAs(match[1]!, p));
+  }
   if (m === "DELETE" && (match = /^\/api\/agents\/([^/]+)$/.exec(path))) {
     daemon.kick(match[1]!);
     return send(res, 200, { ok: true });

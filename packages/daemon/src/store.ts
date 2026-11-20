@@ -246,7 +246,7 @@ export class Store {
 
   putArtifact(a: StoredArtifact): void {
     this.db
-      .prepare("INSERT INTO artifacts(id, thread_id, host, name, mime, size, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id")
+      .prepare("INSERT INTO artifacts(id, thread_id, host, name, mime, size, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id, host=excluded.host, name=excluded.name, mime=excluded.mime, size=excluded.size, sha256=excluded.sha256, created_at=excluded.created_at")
       .run(a.id, a.threadId ?? null, a.host, a.name, a.mime, a.size, a.sha256, a.createdAt);
   }
 
@@ -269,6 +269,25 @@ export class Store {
       created_at: number;
     }[];
     return rows.map((row) => ({ id: row.id, ...(row.thread_id ? { threadId: row.thread_id } : {}), host: row.host, name: row.name, mime: row.mime, size: row.size, sha256: row.sha256, createdAt: row.created_at }));
+  }
+
+  /** Uploads that never became part of an Order, older than `cutoff` (orphan staging cleanup). */
+  stagedArtifacts(cutoff: number): StoredArtifact[] {
+    const rows = this.db.prepare("SELECT * FROM artifacts WHERE thread_id IS NULL AND created_at < ?").all(cutoff) as {
+      id: string;
+      thread_id: string | null;
+      host: string;
+      name: string;
+      mime: string;
+      size: number;
+      sha256: string;
+      created_at: number;
+    }[];
+    return rows.map((row) => ({ id: row.id, host: row.host, name: row.name, mime: row.mime, size: row.size, sha256: row.sha256, createdAt: row.created_at }));
+  }
+
+  deleteStagedArtifacts(cutoff: number): number {
+    return Number(this.db.prepare("DELETE FROM artifacts WHERE thread_id IS NULL AND created_at < ?").run(cutoff).changes);
   }
 
   deleteArtifactsForThread(threadId: string): StoredArtifact[] {

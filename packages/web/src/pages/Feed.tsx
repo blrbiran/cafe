@@ -269,6 +269,7 @@ function Composer({ initialTo }: { initialTo?: string }) {
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
+  const [uploading, setUploading] = useState<{ name: string; pct: number }>();
   const ref = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -288,7 +289,11 @@ function Composer({ initialTo }: { initialTo?: string }) {
     setErr(undefined);
     try {
       const attachments = [];
-      for (const file of files) attachments.push(await api.uploadAttachment(file));
+      for (const file of files) {
+        setUploading({ name: file.name, pct: 0 });
+        attachments.push(await api.uploadAttachment(file, (pct) => setUploading({ name: file.name, pct })));
+      }
+      setUploading(undefined);
       const r = await api.createOrder({ body, to: broadcast ? undefined : to || undefined, broadcast: broadcast || undefined, ...(attachments.length ? { attachments } : {}) });
       closeComposer();
       navigate({ page: "thread", threadId: r.threadId });
@@ -338,6 +343,15 @@ function Composer({ initialTo }: { initialTo?: string }) {
           }}
         />
         <div className="hint">{t.attachHint}</div>
+        {uploading && (
+          <div className="flex items-center gap-2 text-xs text-muted" role="status">
+            <span className="truncate">{uploading.name}</span>
+            <span className="h-1.5 w-24 overflow-hidden rounded bg-line">
+              <span className="block h-full bg-accent" style={{ width: `${uploading.pct}%` }} />
+            </span>
+            <span>{uploading.pct}%</span>
+          </div>
+        )}
         {files.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {files.map((f, i) => (

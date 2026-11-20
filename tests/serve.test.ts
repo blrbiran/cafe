@@ -36,6 +36,22 @@ describe("cafe serve --exec", () => {
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "GOT:echo ping" });
   });
 
+  it("CAFE_ATTACH lines on stdout become reply attachments", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cafe-attach-"));
+    cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const file = join(dir, "out.txt");
+    writeFileSync(file, "attachment body");
+    const { c, root } = await setup(`printf 'the answer\\nCAFE_ATTACH: ${file}\\n'`);
+    const res = await c.ask({ body: "x", to: "echo" });
+    const events = await untilClosed(c, res.threadId, res.orderId);
+    const ev = events.find((e) => e.event.type === "order.replied")?.event as { text: string; attachments?: Array<{ id: string; name: string }> };
+    expect(ev.text).toBe("the answer");
+    expect(ev.attachments).toMatchObject([{ name: "out.txt" }]);
+    const got = await fetch(`http://${root.addr}/api/artifacts/${ev.attachments![0]!.id}`);
+    expect(got.status).toBe(200);
+    expect(await got.text()).toBe("attachment body");
+  });
+
   it("CAFE_DECLINE: on stdout becomes a decline; non-zero exit declines with the error", async () => {
     const { c } = await setup(`echo "CAFE_DECLINE: not about echoes"`);
     const res = await c.ask({ body: "x", to: "echo" });

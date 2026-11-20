@@ -176,6 +176,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private linkSweep?: ReturnType<typeof setInterval>;
   private pruneTimer?: ReturnType<typeof setTimeout>;
   private pruneInterval?: ReturnType<typeof setInterval>;
+  /** Reply/Order attachments whose origin was unreachable: retry until pulled (v4-1 phase 2). */
+  private pendingPulls = new Map<string, { a: Attachment; threadId: string }>();
+  private pullTimer?: ReturnType<typeof setInterval>;
+  private stagingTimer?: ReturnType<typeof setInterval>;
 
   constructor(opts: DaemonOptions) {
     super();
@@ -213,6 +217,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
     this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
     this.schedulePrune();
+    this.schedulePulls();
+    this.stagingTimer = setInterval(() => {
+      try {
+        this.cleanStagedArtifacts();
+      } catch (err) {
+        this.log(`staging cleanup failed: ${(err as Error).message}`);
+      }
+    }, 24 * 3600_000);
+    this.stagingTimer.unref?.();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
       this.hintsTimer.unref?.();
@@ -1171,6 +1184,30 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return {};
   }
 
+  /**
+   * Reply on behalf of a target Barista over HTTP (v4-1 phase 2: `cafe reply`).
+   * The caller must name an agent that is actually a target of the open Order;
+   * the daemon commits any staged blobs before recording the reply.
+   */
+  replyAs(threadId: string, p: { orderId?: string; agent: string; text: string; final?: boolean; attachments?: Attachment[] }): {} {
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!meta) throw new RpcError("not_found", `unknown thread ${threadId}`);
+    const orderId = p.orderId ?? meta.orderId;
+    const t = this.tracking.get(orderId);
+    if (!t || t.status !== "open" || t.order.threadId !== threadId) throw new RpcError("not_open", `order ${orderId} is not open on this daemon`);
+    const ids = this.registry.resolve(this.normalizeAddress(p.agent)).filter((id) => t.targets.has(id));
+    if (!ids.length) throw new RpcError("bad_request", `${p.agent} is not a target of this order`);
+    const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
+    this.emitEvent(t.order, {
+      type: "order.replied",
+      agentId: ids[0]!,
+      text: p.text,
+      final: p.final ?? true,
+      ...(attachments?.length ? { attachments } : {}),
+    });
+    return {};
+  }
+
   // -------------------------------------------------------------------------
   // Events: record locally, update metadata, fan out.
   // -------------------------------------------------------------------------
@@ -1217,6 +1254,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (!a.host || a.host === this.host || this.store.getArtifact(a.id)) continue;
       this.store.putArtifact({ id: a.id, threadId: env.threadId, host: a.host, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, createdAt: env.at });
     }
+    // The Customer's own daemon pulls reply/order blobs in the background, so a
+    // download still works after the origin Host goes offline again.
+    if (meta?.from.host === this.host) for (const a of carried ?? []) this.enqueuePull(a, env.threadId);
     if (meta) {
       this.store.appendEvent(meta.file, env);
       // Thread creation / closure is durable immediately; heartbeats and interim events can wait.
@@ -1821,6 +1861,50 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.pruneInterval.unref?.();
   }
 
+  /** Pull-later queue: a Customer's daemon keeps trying until the origin Host is reachable again. */
+  private schedulePulls(): void {
+    for (const p of this.store.getKv<Array<{ a: Attachment; threadId: string }>>("pendingPulls") ?? []) {
+      this.pendingPulls.set(`${p.threadId}:${p.a.id}`, p);
+    }
+    this.pullTimer = setInterval(() => void this.sweepPulls(), 30_000);
+    this.pullTimer.unref?.();
+  }
+
+  private enqueuePull(a: Attachment, threadId: string): void {
+    if (!a.host || a.host === this.host) return;
+    const key = `${threadId}:${a.id}`;
+    if (this.pendingPulls.has(key)) return;
+    this.pendingPulls.set(key, { a, threadId });
+    this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
+  }
+
+  async sweepPulls(): Promise<void> {
+    for (const [key, p] of [...this.pendingPulls]) {
+      try {
+        await this.pullAttachment(p.a, p.threadId);
+        this.pendingPulls.delete(key);
+      } catch (err) {
+        this.log(`attachment ${p.a.id} still waiting for ${p.a.host}: ${(err as Error).message}`);
+      }
+    }
+    this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
+  }
+
+  /** Delete staged uploads that never became part of an Order (default: older than 24 h). */
+  cleanStagedArtifacts(maxAgeMs = 24 * 3600_000): number {
+    const cutoff = Date.now() - maxAgeMs;
+    let bytes = 0;
+    for (const a of this.store.stagedArtifacts(cutoff)) {
+      const path = this.artifactPath(a);
+      if (existsSync(path)) {
+        bytes += statSync(path).size;
+        rmSync(path, { force: true });
+      }
+    }
+    this.store.deleteStagedArtifacts(cutoff);
+    return bytes;
+  }
+
   // -------------------------------------------------------------------------
   // Introspection
   // -------------------------------------------------------------------------
@@ -1933,26 +2017,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Fetch missing blobs from their origin Host before the Barista is told about the Order. */
   async pullAttachments(order: Order): Promise<void> {
-    for (const a of order.attachments ?? []) {
-      if (!a.host || a.host === this.host) continue;
-      const existing = this.store.getArtifact(a.id);
-      if (existing?.threadId === order.threadId && existsSync(this.artifactPath(existing, order.threadId))) continue;
-      const base = this.artifactOrigin(a.host);
-      if (!base) throw new Error(`origin host ${a.host} is not known to this daemon`);
-      const res = await fetch(`${base}/api/artifacts/${encodeURIComponent(a.id)}`, {
-        headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!res.ok) throw new Error(`origin ${a.host} returned HTTP ${res.status}`);
-      const bytes = Buffer.from(await res.arrayBuffer());
-      if (bytes.length !== a.size) throw new Error(`attachment ${a.id}: expected ${a.size} bytes, got ${bytes.length}`);
-      const sha = createHash("sha256").update(bytes).digest("hex");
-      if (sha !== a.sha256) throw new Error(`attachment ${a.id}: sha256 mismatch`);
-      const path = this.artifactPath(a, order.threadId);
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, bytes);
-      this.store.putArtifact({ id: a.id, threadId: order.threadId, host: a.host, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, createdAt: Date.now() });
-    }
+    for (const a of order.attachments ?? []) await this.pullAttachment(a, order.threadId);
+  }
+
+  /** Pull one remote attachment into this Thread's directory (also used by the pull-later queue). */
+  async pullAttachment(a: Attachment, threadId: string): Promise<void> {
+    if (!a.host || a.host === this.host) return;
+    const existing = this.store.getArtifact(a.id);
+    if (existing?.threadId === threadId && existsSync(this.artifactPath(existing, threadId))) return;
+    const base = this.artifactOrigin(a.host);
+    if (!base) throw new Error(`origin host ${a.host} is not known to this daemon`);
+    const res = await fetch(`${base}/api/artifacts/${encodeURIComponent(a.id)}`, {
+      headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new Error(`origin ${a.host} returned HTTP ${res.status}`);
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length !== a.size) throw new Error(`attachment ${a.id}: expected ${a.size} bytes, got ${bytes.length}`);
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    if (sha !== a.sha256) throw new Error(`attachment ${a.id}: sha256 mismatch`);
+    const path = this.artifactPath(a, threadId);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes);
+    this.store.putArtifact({ id: a.id, threadId, host: a.host, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, createdAt: Date.now() });
   }
 
   /** What the running process is actually using (for `cafe config diff`); never includes the token. */
@@ -2068,6 +2155,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.linkSweep);
     clearTimeout(this.pruneTimer);
     clearInterval(this.pruneInterval);
+    clearInterval(this.pullTimer);
+    clearInterval(this.stagingTimer);
+    this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
     for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();
     for (const t of this.tracking.values()) {

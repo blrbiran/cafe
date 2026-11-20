@@ -67,7 +67,7 @@ describe("cafe mcp", () => {
     expect(init.result).toMatchObject({ protocolVersion: "2025-06-18", serverInfo: { name: "cafe" }, capabilities: { tools: {} } });
     m.notify("notifications/initialized");
     const tools = await m.request("tools/list");
-    expect(tools.result.tools.map((t: { name: string }) => t.name)).toEqual(["cafe_agents", "cafe_ask", "cafe_wait", "cafe_cancel"]);
+    expect(tools.result.tools.map((t: { name: string }) => t.name)).toEqual(["cafe_agents", "cafe_ask", "cafe_wait", "cafe_cancel", "cafe_reply"]);
     expect((await m.request("ping")).result).toEqual({});
     expect((await m.request("nope/nope")).error.code).toBe(-32601);
 

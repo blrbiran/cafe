@@ -67,6 +67,23 @@ const TOOLS = [
     description: "Cancel a question you asked that is still being worked on.",
     inputSchema: { type: "object", properties: { threadId: { type: "string" } }, required: ["threadId"], additionalProperties: false },
   },
+  {
+    name: "cafe_reply",
+    description:
+      "Reply to an open cafe Order as one of its target Baristas (by address). For a process working on an Order that is not connected as a Barista peer; attachments are local paths this server uploads.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        threadId: { type: "string" },
+        agent: { type: "string", description: "The target Barista's address (name@host)." },
+        text: { type: "string" },
+        attachments: { type: "array", items: { type: "string" }, description: "Local file paths to attach." },
+        final: { type: "boolean", description: "Default true; false sends an interim reply and keeps the Order open." },
+      },
+      required: ["threadId", "agent", "text"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 class ToolError extends Error {}
@@ -208,6 +225,19 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const threadId = str(args.threadId, "threadId", true)!;
         await api(`/api/threads/${encodeURIComponent(threadId)}/cancel`, { method: "POST" });
         return { text: `cancelled ${threadId}` };
+      }
+      case "cafe_reply": {
+        const threadId = str(args.threadId, "threadId", true)!;
+        const agent = str(args.agent, "agent", true)!;
+        const text = str(args.text, "text", true)!;
+        const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
+        const attachments: Attachment[] = [];
+        for (const file of files) attachments.push(await upload(file));
+        await api(`/api/threads/${encodeURIComponent(threadId)}/reply`, {
+          method: "POST",
+          body: JSON.stringify({ agent, text, final: args.final !== false, ...(attachments.length ? { attachments } : {}) }),
+        });
+        return { text: `replied to ${threadId}${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}` };
       }
       default:
         throw new ToolError(`unknown tool ${name}`);

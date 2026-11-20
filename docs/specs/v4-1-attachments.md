@@ -7,8 +7,12 @@
 - `OrderHandle.reply(text, final, attachments?)`：协议、客户端与 daemon 都接受 reply 附件；daemon 在发 `order.replied` 前把暂存 blob 移入 Thread 目录（限额、sha256 与 Order 附件共用一套）。
 - pi/omp 扩展的 `cafe_reply` 工具接受 `attachments: [本地路径]`，先通过 `POST /api/artifacts` 上传，再带元数据回复；模型仍可用最终文本作为无附件的答复。
 - 跨机 reply：Barista 所在 daemon 持有 blob，事件里的 `Attachment.host` 指向它；接收方 daemon 只登记元数据，Web/CLI 下载时按 host 代理（`tests/attachments.test.ts` 覆盖 Root 代理 child 的 reply 附件）。
-- Web 的回复条目已经渲染附件下载链接。
-- 仍未做：给任意外部进程的 `cafe reply` CLI 入口（当前生产入口是 pi/omp 工具）；Bridge / `cafe serve` 的模型输出没有文件入口；Customer 离线时的“上线后补拉”队列。
+- Web 的回复条目已经渲染附件下载链接；composer 上传显示进度。
+- `cafe reply <threadId> --agent <address> [--attach file] "text"` 与 MCP `cafe_reply`：任意外部进程可以以目标 Barista 的身份回复（daemon 校验该 agent 确实是该 Order 的 target）。
+- Bridge / `cafe serve` 的 stdout/最终文本支持 `CAFE_ATTACH: /abs/path` 行：上传后从文本中移除，reply 带元数据。
+- Customer 离线补拉：Customer 所在 daemon 把远端附件放进持久化队列，每 30s 重试，origin 恢复后本地可读。
+- 孤儿暂存清理：超过 24h 仍未进入 Order 的暂存 blob 每日清理。
+- 仍未做：分片/断点续传、对象存储后端、附件在线预览。
 
 ## 为什么
 

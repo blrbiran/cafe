@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import { buildFollowup, buildPrompt, DECLINE_MARKER } from "../serve.ts";
+import { extractAttachments } from "../artifacts.ts";
 import { ClaudeEngine } from "./claude.ts";
 import { CodexEngine } from "./codex.ts";
 import { CodexTuiEngine } from "./codex-tui.ts";
@@ -29,7 +30,8 @@ export interface BridgeOptions {
   log?: (msg: string) => void;
 }
 
-const REPLY_NOTE = "Answer directly and concisely; your final message is sent back as the reply.";
+const REPLY_NOTE =
+  "Answer directly and concisely; your final message is sent back as the reply. To send a file, add a line `CAFE_ATTACH: /absolute/path` — it is uploaded and removed from the text.";
 
 /**
  * A native Codex / Claude Code Barista (v3-1). Registers the `.cafe` identity of `dir`, then runs each Order as
@@ -88,7 +90,8 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
       } else if (!r.text) {
         await h.decline(`${opts.agent} produced no answer`, { unavailable: true });
       } else {
-        await h.reply(r.text);
+        const parsed = await extractAttachments(`http://${opts.daemon}`, r.text, opts.token ?? process.env.CAFE_TOKEN);
+        await h.reply(parsed.text, true, parsed.attachments);
       }
       log(`← ${h.order.orderId} (${r.status})`);
     } catch (err) {

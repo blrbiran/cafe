@@ -160,15 +160,21 @@ export const api = {
     call<{ ok: boolean; restartRequired: boolean; pending: RuntimeConfig["pending"] }>("POST", "/api/config", p),
   doctor: () => call<{ ok: boolean; checks: DoctorCheck[] }>("GET", "/api/doctor"),
   /** Upload one file before creating the Order; the returned metadata goes on the Order. */
-  uploadAttachment: async (file: File): Promise<Attachment> => {
-    const res = await fetch(withToken(`/api/artifacts?name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.type || "application/octet-stream")}`), {
-      method: "POST",
-      body: file,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new ApiError(data.error ?? String(res.status), data.message ?? data.error ?? `${res.status} ${res.statusText}`);
-    return data.attachment as Attachment;
-  },
+  uploadAttachment: (file: File, onProgress?: (pct: number) => void): Promise<Attachment> =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", withToken(`/api/artifacts?name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.type || "application/octet-stream")}`));
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+      };
+      xhr.onload = () => {
+        const data = JSON.parse(xhr.responseText || "{}") as { attachment?: Attachment; error?: string; message?: string };
+        if (xhr.status >= 200 && xhr.status < 300 && data.attachment) resolve(data.attachment);
+        else reject(new ApiError(data.error ?? String(xhr.status), data.message ?? data.error ?? `${xhr.status} ${xhr.statusText}`));
+      };
+      xhr.onerror = () => reject(new ApiError("network", "upload failed"));
+      xhr.send(file);
+    }),
   attachmentUrl: (id: string) => withToken(`/api/artifacts/${encodeURIComponent(id)}`),
 };
 

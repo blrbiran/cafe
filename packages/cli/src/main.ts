@@ -9,6 +9,7 @@ import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
+import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
 import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
 import { runSessionHost, type HostMessage } from "./bridge/session-host.ts";
@@ -50,20 +51,9 @@ async function healthy(): Promise<boolean> {
   }
 }
 
-const ATTACH_MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".txt": "text/plain", ".log": "text/plain", ".json": "application/json" };
-
 /** Upload one file to the local daemon; the returned metadata goes on the Order. */
-async function uploadAttachment(file: string): Promise<{ id: string; name: string; mime: string; size: number; sha256: string; host?: string }> {
-  const path = resolve(file);
-  if (!existsSync(path)) throw new Error(`cannot read ${file}`);
-  const name = basename(path);
-  const mime = ATTACH_MIME[extname(path).toLowerCase()] ?? "application/octet-stream";
-  const headers: Record<string, string> = { "content-type": "application/octet-stream" };
-  if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
-  const res = await fetch(`${base()}/api/artifacts?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, { method: "POST", body: readFileSync(path), headers });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`upload ${file} failed: ${formatApiError(body, res.status)}`);
-  return body.attachment;
+async function uploadAttachment(file: string) {
+  return uploadArtifact(base(), file, process.env.CAFE_TOKEN);
 }
 
 /**
@@ -436,6 +426,32 @@ program
   .action(async (id: string) => {
     const status = await follow(id);
     process.exitCode = status === "done" ? 0 : 1;
+  });
+
+program
+  .command("reply")
+  .description("reply to an open Order as one of its target Baristas (for scripts and external processes)")
+  .argument("<threadId>")
+  .argument("<text...>", "the reply text")
+  .requiredOption("--agent <address>", "the target Barista's address (name@host)")
+  .option("--order <orderId>", "a specific Order in the Thread (default: the open one)")
+  .option("--interim", "send a non-final reply; the Order stays open")
+  .option("--attach <file>", "attach a file (repeatable; uploaded before the reply)", (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .action(async (id: string, words: string[], o) => {
+    await ensureDaemon();
+    const attachments = [];
+    for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
+    const res = await api(`/api/threads/${encodeURIComponent(id)}/reply`, {
+      method: "POST",
+      body: JSON.stringify({
+        agent: o.agent,
+        orderId: o.order,
+        text: words.join(" "),
+        final: !o.interim,
+        ...(attachments.length ? { attachments } : {}),
+      }),
+    });
+    out(`replied to ${id}${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}`, res);
   });
 
 program

@@ -85,6 +85,30 @@ describe("attachments", () => {
     const got = await fetch(`http://${root.addr}/api/artifacts/${reply.attachments![0]!.id}`);
     expect(got.status).toBe(200);
     expect(await got.text()).toBe("diagnosis from pc1");
+
+    // Pull-later: the Customer's daemon copies the blob in the background, so the
+    // download keeps working after the Barista's host goes offline.
+    await root.daemon.sweepPulls();
+    expect(root.daemon.readArtifact(reply.attachments![0]!.id)).toBeTruthy();
+    await child.stop();
+    const local = await fetch(`http://${root.addr}/api/artifacts/${reply.attachments![0]!.id}`);
+    expect(local.status).toBe(200);
+    expect(await local.text()).toBe("diagnosis from pc1");
+  });
+
+  it("cleans staged uploads that never became part of an Order", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    const up = await upload(d.addr, "orphan.txt", "never attached");
+    const stored = d.daemon.store.getArtifact(up.attachment.id)!;
+    expect(stored.threadId).toBeUndefined();
+    // Age it past the cleanup window.
+    d.daemon.store.putArtifact({ ...stored, createdAt: Date.now() - 48 * 3600_000 });
+    const freed = d.daemon.cleanStagedArtifacts();
+    expect(freed).toBeGreaterThan(0);
+    expect(d.daemon.store.getArtifact(up.attachment.id)).toBeUndefined();
+    const got = await fetch(`http://${d.addr}/api/artifacts/${up.attachment.id}`);
+    expect(got.status).toBe(404);
   });
 
   it("hands a locally uploaded file to the Barista and serves it back", async () => {
