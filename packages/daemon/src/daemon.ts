@@ -58,6 +58,8 @@ export interface Timing {
   ackTimeoutMs: number;
   heartbeatIntervalMs: number;
   broadcastDeadlineMs: number;
+  /** After the first final answer in a multicast/broadcast, skip silent targets after this long (#39). */
+  graceMs: number;
   reconnectMinMs: number;
   reconnectMaxMs: number;
   /** Root: how often to recompute and push routing hints when there are new outcomes. */
@@ -83,6 +85,8 @@ interface Tracking {
   candidates: string[];
   timers: Map<string, ReturnType<typeof setTimeout>>;
   deadline?: ReturnType<typeof setTimeout>;
+  /** Multicast/broadcast: after the first final answer, when to skip silent targets. */
+  grace?: ReturnType<typeof setTimeout>;
 }
 
 /** Metadata keeps only recent reply/decline summaries; the JSONL log has the full history. */
@@ -188,6 +192,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       ackTimeoutMs: ACK_TIMEOUT_MS,
       heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
       broadcastDeadlineMs: BROADCAST_DEADLINE_MS,
+      graceMs: 2_000,
       reconnectMinMs: 500,
       reconnectMaxMs: 30_000,
       hintsIntervalMs: 30_000,
@@ -749,7 +754,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.tracking.set(order.orderId, t);
     this.emitEvent(order, { type: "order.created", order });
 
-    const decision = await this.route(order, answeredBefore);
+    const decision = await this.route(order, answeredBefore, p.broadcast ?? false);
     t.decision = decision;
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
@@ -784,7 +789,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return out.slice(-12);
   }
 
-  private async route(order: Order, answeredBefore: string[] = []): Promise<RoutingDecision> {
+  private async route(order: Order, answeredBefore: string[] = [], broadcast = false): Promise<RoutingDecision> {
     const candidates = this.eligible(order);
     if (answeredBefore.length && !order.to) {
       const answered = answeredBefore.filter((id) => candidates.some((c) => c.agentId === id));
@@ -808,9 +813,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         candidates: [],
       };
     }
+    if (broadcast) {
+      return {
+        targets: candidates.map((c) => c.agentId),
+        mode: "broadcast",
+        reason: "customer asked everyone",
+        router: "explicit",
+        candidates: [],
+      };
+    }
     if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
       try {
-        return await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId) }, 60_000);
+        return await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId), broadcast }, 60_000);
       } catch (err) {
         this.log(`root route/decide failed: ${(err as Error).message}`);
       }
@@ -1068,6 +1082,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           t.replied = true;
           this.clearTimer(t, ev.agentId);
           t.targets.set(ev.agentId, "done");
+          // In a fan-out, one good answer is enough: give the others a short
+          // grace window instead of holding the Thread to the deadline (#39).
+          if (t.decision?.mode !== "unicast" && !t.grace && this.hasPending(t)) {
+            t.grace = setTimeout(() => this.finishGrace(t), this.timing.graceMs);
+          }
           this.maybeClose(t);
         } else this.armHeartbeat(t, ev.agentId);
         break;
@@ -1101,6 +1120,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return t.replied;
   }
 
+  private hasPending(t: Tracking): boolean {
+    for (const s of t.targets.values()) if (s === "pending" || s === "acked") return true;
+    return false;
+  }
+
+  /** The grace window expired: keep the answer, mark the silent targets as skipped. */
+  private finishGrace(t: Tracking): void {
+    if (t.status !== "open") return;
+    t.grace = undefined;
+    for (const [id, s] of t.targets) {
+      if (s !== "pending" && s !== "acked") continue;
+      this.clearTimer(t, id);
+      t.targets.set(id, "done");
+      // Reuses the decline event with `unavailable`, so it is auditable and does
+      // not count against the Barista in routing hints.
+      this.emitEvent(t.order, { type: "order.declined", agentId: id, reason: "skipped: another Barista answered first", unavailable: true }, { skipTrack: true });
+    }
+    this.maybeClose(t);
+  }
+
   private finishOnDeadline(t: Tracking): void {
     if (t.status !== "open") return;
     if (t.order.kind === "notice") return this.close(t, "done");
@@ -1114,6 +1153,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const timer of t.timers.values()) clearTimeout(timer);
     t.timers.clear();
     if (t.deadline) clearTimeout(t.deadline);
+    if (t.grace) clearTimeout(t.grace);
+    t.grace = undefined;
     this.emitEvent(t.order, { type: "order.closed", status });
     // Keep closed Orders briefly for late events, then drop them.
     setTimeout(() => this.tracking.delete(t.order.orderId), 60_000).unref?.();
@@ -1491,9 +1532,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       for (const env of x.events) if (!known.has(env.eventId)) this.recordEvent(env, { from: peer, skipTrack: true });
       return {};
     });
-    peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[] }) => {
+    peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[]; broadcast?: boolean }) => {
       const cands = x.candidates.map((id) => this.registry.get(id)).filter((r): r is AgentRecord => !!r);
-      return this.router.decide({ order: x.order, candidates: cands, hints: this.hintsFor(cands) });
+      return this.router.decide({ order: x.order, candidates: cands, hints: this.hintsFor(cands), broadcast: x.broadcast });
     });
     this.emitDaemons();
     this.log(`daemon ${host} connected (${p.url})`);
@@ -2022,6 +2063,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const t of this.tracking.values()) {
       for (const timer of t.timers.values()) clearTimeout(timer);
       if (t.deadline) clearTimeout(t.deadline);
+      if (t.grace) clearTimeout(t.grace);
     }
     for (const p of this.agents.values()) p.close();
     for (const p of this.children.values()) p.close();

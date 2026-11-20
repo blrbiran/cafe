@@ -27,7 +27,8 @@ const zh = {
   qPlaceholder: "写清楚问题并附上上下文：文件路径、报错信息、你已经试过什么。对方看不到你的会话。",
   sendTo: "交给谁",
   autoPick: "自动选择（推荐）",
-  autoPickHint: "自动选择：系统会根据每个 agent 声明的职责挑最合适的一个；拿不准时会问所有人。",
+  autoPickHint: "自动选择：系统会根据每个 agent 声明的职责挑最合适的一个；拿不准时会问最相关的几个人。",
+  broadcastToggle: "问所有人（广播，跳过路由）",
   cancel: "取消",
   send: "发送",
   sending: "发送中…",
@@ -273,7 +274,7 @@ const zh = {
 
   // router labels
   router: { rules: "关键词匹配", llm: "模型判断", explicit: "指定", followup: "追问给原回答者" } as Record<string, string>,
-  askEveryone: "没有明确负责人，问了所有人。",
+  askEveryone: "按你的要求广播给了所有 agent。",
   whyRules: "问题里的关键词和它声明的职责、标签匹配（关键词匹配）。",
   whyExplicit: "提问时指定了它（指定）。",
   whyFollowup: "这是追问，发给之前回答过的 agent（追问给原回答者）。",
@@ -346,7 +347,8 @@ const en: Dict = {
   qPlaceholder: "State the question with context: file paths, error text, what you tried. The other agent cannot see your session.",
   sendTo: "Send to",
   autoPick: "Pick automatically (recommended)",
-  autoPickHint: "Automatic: cafe picks the agent whose stated responsibility fits best, and asks everyone when unsure.",
+  autoPickHint: "Automatic: cafe picks the agent whose stated responsibility fits best, and asks the most relevant few when unsure.",
+  broadcastToggle: "Ask everyone (broadcast, skips routing)",
   cancel: "Cancel",
   send: "Send",
   sending: "Sending…",
@@ -590,7 +592,7 @@ const en: Dict = {
   list: (xs) => xs.join(", "),
 
   router: { rules: "keyword match", llm: "model decision", explicit: "chosen by the asker", followup: "follow-up to the earlier answerer" },
-  askEveryone: "No clear owner, so everyone was asked.",
+  askEveryone: "Broadcast to every agent, as requested.",
   whyRules: "Keywords in the question match its stated responsibility and tags (keyword match).",
   whyExplicit: "The asker chose it (chosen by the asker).",
   whyFollowup: "This is a follow-up, so it goes to the agents that answered before.",

@@ -39,6 +39,7 @@ const TOOLS = [
       properties: {
         question: { type: "string", description: "The question or task, self-contained." },
         to: { type: "string", description: "Explicit address (name, name@host, name#n@host); skips routing." },
+        broadcast: { type: "boolean", description: "Ask every eligible agent. Only when the person explicitly wants everyone; normal questions use routing." },
         threadId: { type: "string", description: "Continue this conversation (follow-up)." },
         attachments: { type: "array", items: { type: "string" }, description: "Local file paths to attach; this MCP server reads and uploads them." },
         wait_seconds: { type: "number", description: `How long to wait for the answer (default and max ${MAX_WAIT_S}).` },
@@ -188,6 +189,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
           body: JSON.stringify({
             body,
             to: str(args.to, "to"),
+            broadcast: args.broadcast === true || undefined,
             threadId: str(args.threadId, "threadId"),
             as: customer ?? "mcp",
             origin: "agent",

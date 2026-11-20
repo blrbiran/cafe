@@ -123,7 +123,7 @@ export const api = {
     return call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}${q ? `?${q}` : ""}`);
   },
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
-  createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string; attachments?: Attachment[] }) =>
+  createOrder: (p: { body: string; to?: string; broadcast?: boolean; kind?: "order" | "notice"; threadId?: string; attachments?: Attachment[] }) =>
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),

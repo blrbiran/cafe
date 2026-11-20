@@ -30,6 +30,8 @@ export interface EvalCase {
   mode?: "unicast" | "multicast" | "broadcast";
   /** Clear by description alone; history must not move it. */
   clear?: boolean;
+  /** No clear owner: a bounded fan-out to at most TOP_K Baristas, never everyone. */
+  topK?: boolean;
 }
 
 export const EVAL_CASES: EvalCase[] = [
@@ -91,10 +93,10 @@ export const EVAL_CASES: EvalCase[] = [
   { q: "react hooks rerender loop", expect: ["web"] },
   { q: "custom react hooks for forms", expect: ["web"] },
   { q: "which react hooks should we use for data fetching", expect: ["web"] },
-  // nothing fits: broadcast to everyone
-  { q: "what is the meaning of life", expect: FIXTURE_BARISTAS.map((b) => b.name), mode: "broadcast" },
-  { q: "帮我随便看看", expect: FIXTURE_BARISTAS.map((b) => b.name), mode: "broadcast" },
-  { q: "hello", expect: FIXTURE_BARISTAS.map((b) => b.name), mode: "broadcast" },
+  // nothing fits: a bounded top-k fan-out, not everyone
+  { q: "what is the meaning of life", expect: [], mode: "multicast", topK: true },
+  { q: "帮我随便看看", expect: [], mode: "multicast", topK: true },
+  { q: "hello", expect: [], mode: "multicast", topK: true },
 ];
 
 /**
@@ -116,7 +118,7 @@ export const EXTRA_CASES: EvalCase[] = [
   // Multicast: a question that genuinely spans two owners, with a sub-task each.
   { q: "the refund page shows a hydration error and the invoice total is wrong", expect: ["web", "billing"], mode: "multicast" },
   // Unknown owner should not fan out to everyone.
-  { q: "what is the meaning of life", expect: ["no_owner"] },
+  { q: "what is the meaning of life", expect: [], mode: "multicast", topK: true },
   // Same input, repeated: the LLM run should keep the mode and target set stable.
   { q: "react hooks rerender loop", expect: ["web"] },
   { q: "react hooks rerender loop", expect: ["web"] },

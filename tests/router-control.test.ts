@@ -76,6 +76,38 @@ describe("LlmRouter", () => {
   });
 });
 
+describe("LlmRouter output policy (#39)", () => {
+  const three = [rec("A", "widgets"), rec("B", "gadgets"), rec("C", "sprockets"), rec("D", "cogs")];
+
+  it("downgrades an unrequested broadcast to a bounded top-k fan-out", async () => {
+    const complete = async () => JSON.stringify({ targets: ["A", "B", "C", "D"], mode: "broadcast", reason: "unsure" });
+    const d = await new LlmRouter(complete, new RulesRouter()).decide(input(three));
+    expect(d.mode).toBe("multicast");
+    expect(d.targets).toEqual(["A", "B", "C"]); // TOP_K, in candidate order
+  });
+
+  it("honours an explicit broadcast without calling the model", async () => {
+    const complete = vi.fn(async () => "{}");
+    const d = await new LlmRouter(complete, new RulesRouter()).decide({ ...input(three), broadcast: true });
+    expect(complete).not.toHaveBeenCalled();
+    expect(d).toMatchObject({ mode: "broadcast", targets: ["A", "B", "C", "D"] });
+  });
+
+  it("de-duplicates targets and keeps the candidate order", async () => {
+    const complete = async () => JSON.stringify({ targets: ["C", "A", "C"], mode: "multicast", reason: "two parts" });
+    const d = await new LlmRouter(complete, new RulesRouter()).decide(input(three));
+    expect(d).toMatchObject({ mode: "multicast", targets: ["A", "C"] });
+  });
+
+  it("caches a successful decision for the same question and candidates", async () => {
+    const complete = vi.fn(async () => JSON.stringify({ targets: ["A"], mode: "unicast", reason: "ok" }));
+    const router = new LlmRouter(complete, new RulesRouter());
+    await router.decide(input(three));
+    await router.decide(input(three));
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("initRouter", () => {
   it("switches rules → llm → another llm → rules, and keeps the old router on failure", async () => {
     const root = await startDaemon("root", {

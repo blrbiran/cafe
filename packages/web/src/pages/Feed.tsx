@@ -265,6 +265,7 @@ function Composer({ initialTo }: { initialTo?: string }) {
   const daemons = useStore((s) => s.daemons);
   const [body, setBody] = useState("");
   const [to, setTo] = useState(initialTo ?? "");
+  const [broadcast, setBroadcast] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
@@ -288,7 +289,7 @@ function Composer({ initialTo }: { initialTo?: string }) {
     try {
       const attachments = [];
       for (const file of files) attachments.push(await api.uploadAttachment(file));
-      const r = await api.createOrder({ body, to: to || undefined, ...(attachments.length ? { attachments } : {}) });
+      const r = await api.createOrder({ body, to: broadcast ? undefined : to || undefined, broadcast: broadcast || undefined, ...(attachments.length ? { attachments } : {}) });
       closeComposer();
       navigate({ page: "thread", threadId: r.threadId });
     } catch (e) {
@@ -355,7 +356,7 @@ function Composer({ initialTo }: { initialTo?: string }) {
           <label className="cap" htmlFor="cafe-to">
             {t.sendTo}
           </label>
-          <select id="cafe-to" className="field" value={to} onChange={(e) => setTo(e.target.value)}>
+          <select id="cafe-to" className="field" value={broadcast ? "" : to} disabled={broadcast} onChange={(e) => setTo(e.target.value)}>
             <option value="">{t.autoPick}</option>
             {!known && <option value={to}>{to}</option>}
             {choices.map((a) => (
@@ -364,6 +365,17 @@ function Composer({ initialTo }: { initialTo?: string }) {
               </option>
             ))}
           </select>
+          <label className="flex items-center gap-1.5 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={broadcast}
+              onChange={(e) => {
+                setBroadcast(e.target.checked);
+                if (e.target.checked) setTo("");
+              }}
+            />
+            {t.broadcastToggle}
+          </label>
         </div>
         <div className="flex gap-2">
           <button type="button" onClick={() => closeComposer()}>

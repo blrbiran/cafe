@@ -18,6 +18,20 @@ const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hang
 const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 
 /**
+ * A conservative English plural stem: `ledgers` → `ledger`, `policies` →
+ * `policy`, `boxes` → `box`. Both the Order and the Barista text go through
+ * the same function, so a singular tag matches a plural question (#39).
+ */
+function stem(w: string): string {
+  if (w.length <= 3) return w;
+  if (w.endsWith("ies") && w.length > 4) return `${w.slice(0, -3)}y`;
+  if (w.endsWith("sses")) return w.slice(0, -2);
+  if (/(?:ch|sh|x|z|s)es$/.test(w)) return w.slice(0, -2);
+  if (w.endsWith("s") && !w.endsWith("ss") && !w.endsWith("us") && !w.endsWith("is") && !w.endsWith("ws")) return w.slice(0, -1);
+  return w;
+}
+
+/**
  * Lower-cased word tokens (length > 1). CJK text has no spaces, so CJK runs are
  * split into overlapping bigrams; other scripts split on non-word characters.
  */
@@ -25,7 +39,8 @@ export function tokenize(s: string): Set<string> {
   const out = new Set<string>();
   for (const w of s.toLowerCase().match(WORD) ?? []) {
     if (!CJK.test(w)) {
-      if (w.length > 1) out.add(w);
+      const t = stem(w);
+      if (t.length > 1) out.add(t);
       continue;
     }
     for (const part of w.split(CJK_RUN)) if (part.length > 1) out.add(part);

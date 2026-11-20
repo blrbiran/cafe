@@ -297,6 +297,8 @@ export const CreateOrderParams = z.object({
   via: OrderVia.optional(),
   /** Already-uploaded files to attach (ids from POST /api/artifacts on the same daemon). */
   attachments: z.array(Attachment).optional(),
+  /** Ask every eligible Barista, bypassing routing (only when the customer explicitly wants it). */
+  broadcast: z.boolean().optional(),
 });
 export type CreateOrderParams = z.infer<typeof CreateOrderParams>;
 

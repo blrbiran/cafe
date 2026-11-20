@@ -394,6 +394,7 @@ program
   .description("send an Order and wait for replies")
   .argument("<body...>", "the question or task")
   .option("--to <address>", "explicit Address (name, name@host, name#n@host); skips routing")
+  .option("--broadcast", "ask every eligible Barista (skips routing; only when you mean it)")
   .option("--thread <threadId>", "follow-up in an existing thread (goes to whoever answered there)")
   .option("--async", "return the thread id immediately")
   .option("--notice", "send a Notice (no reply expected)")
@@ -412,6 +413,7 @@ program
       body: JSON.stringify({
         body: words.join(" "),
         to: o.to,
+        broadcast: o.broadcast || undefined,
         threadId: o.thread,
         kind: o.notice ? "notice" : "order",
         deadlineMs: o.deadline,

@@ -36,7 +36,7 @@ describe("single root", () => {
     expect(root.daemon.thread(res.threadId)?.meta.status).toBe("done");
   });
 
-  it("broadcasts when nobody matches and collects every reply", async () => {
+  it("fans out to the top candidates when nobody matches and collects their replies", async () => {
     const root = await startDaemon("root", { mode: "root" });
     cleanup.push(root.stop);
     const a = await barista(root.addr, identity("alpha"));
@@ -48,12 +48,27 @@ describe("single root", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "anyone know zzz?" });
-    expect(res.decision.mode).toBe("broadcast");
+    expect(res.decision.mode).toBe("multicast");
+    expect(res.decision.targets).toHaveLength(2);
     const events = await untilClosed(c, res.threadId, res.orderId);
     const types = events.map((e) => e.event.type);
     expect(types).toContain("order.replied");
     expect(types).toContain("order.declined");
     expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "done" });
+  });
+
+  it("broadcasts only when the customer asks everyone", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const a = await barista(root.addr, identity("alpha"));
+    const b = await barista(root.addr, identity("beta"));
+    cleanup.push(() => a.client.close(), () => b.client.close());
+    const c = await customer(root.addr);
+    cleanup.push(() => c.close());
+    const res = await c.ask({ body: "anyone know zzz?", broadcast: true });
+    expect(res.decision.mode).toBe("broadcast");
+    expect(res.decision.targets).toHaveLength(2);
+    await untilClosed(c, res.threadId, res.orderId);
   });
 
   it("falls back to the next candidate when the target never acks", async () => {

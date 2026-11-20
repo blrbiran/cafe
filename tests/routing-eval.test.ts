@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RoutingHint } from "@cafe/protocol";
-import { RulesRouter } from "../packages/daemon/src/router.ts";
+import { RulesRouter, TOP_K } from "../packages/daemon/src/router.ts";
 import { computeHints, identityOf, orderKeywords, type OutcomeRow } from "../packages/daemon/src/hints.ts";
 import { EVAL_CASES, EXTRA_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
 
@@ -26,22 +26,24 @@ function history(now: number): OutcomeRow[] {
 
 async function run(hints?: Map<string, RoutingHint>) {
   const router = new RulesRouter();
-  const out: { body: string; expected: string[]; mode: string; got: string; clear: boolean }[] = [];
+  const out: { body: string; expected: string[]; mode: string; got: string; count: number; clear: boolean; topK: boolean }[] = [];
   for (const c of EVAL_CASES) {
     const d = await router.decide({ order: evalOrder(c.q), candidates: BARISTAS, hints });
     const got = d.mode === "unicast" ? BARISTAS.find((b) => b.agentId === d.targets[0])!.name : d.mode;
-    out.push({ body: c.q, expected: c.expect, mode: c.mode ?? "unicast", got, clear: !!c.clear });
+    out.push({ body: c.q, expected: c.expect, mode: c.mode ?? "unicast", got, count: d.targets.length, clear: !!c.clear, topK: !!c.topK });
   }
   return out;
 }
 
-const acc = (rs: Awaited<ReturnType<typeof run>>) => rs.filter((r) => (r.mode === "broadcast" ? r.got === "broadcast" : r.got === r.expected[0])).length;
+const pass = (r: { mode: string; got: string; expected: string[]; count: number; topK: boolean }) =>
+  r.topK ? r.got === "multicast" && r.count >= 1 && r.count <= TOP_K : r.mode === "broadcast" ? r.got === "broadcast" : r.got === r.expected[0];
+const acc = (rs: Awaited<ReturnType<typeof run>>) => rs.filter(pass).length;
 
 describe("routing eval (rules)", () => {
   it("keeps the #39 overlap/morphology/multicast cases available to the eval script", () => {
     expect(EXTRA_CASES.length).toBeGreaterThanOrEqual(9);
     expect(EXTRA_CASES.some((c) => c.mode === "multicast")).toBe(true);
-    expect(EXTRA_CASES.some((c) => c.expect[0] === "no_owner")).toBe(true);
+    expect(EXTRA_CASES.some((c) => c.topK)).toBe(true);
     expect(EXTRA_CASES.some((c) => /README/.test(c.q))).toBe(true);
   });
 
@@ -68,6 +70,6 @@ describe("routing eval (rules)", () => {
       expect(after[i]!.got, after[i]!.body).toBe(before[i]!.got);
     }
     expect(acc(after)).toBeGreaterThanOrEqual(acc(before));
-    expect(after.filter((r) => !r.clear).every((r) => (r.mode === "broadcast" ? r.got === "broadcast" : r.got === r.expected[0]))).toBe(true);
+    expect(after.filter((r) => !r.clear).every(pass)).toBe(true);
   });
 });
