@@ -6,11 +6,24 @@ import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import type { Order } from "@cafe/protocol";
 
-/** Ready-made commands for common agent CLIs. Each reads the prompt from stdin and prints the answer on stdout. */
+/**
+ * Ready-made commands for common agent CLIs. Each reads the prompt from stdin and prints the answer on stdout.
+ * They pin the same read-only defaults as `cafe barista start --agent …`; `--write` widens them explicitly.
+ */
 export const PRESETS: Record<string, string> = {
-  claude: "claude -p",
-  codex: "codex exec --skip-git-repo-check -",
+  claude: "claude -p --permission-mode dontAsk --tools Read,Grep,Glob --allowedTools Read,Grep,Glob",
+  codex: "codex exec -s read-only --skip-git-repo-check -",
 };
+
+/** The preset command for an access level (the CLI never silently inherits the user's global sandbox). */
+export function presetCommand(name: string, write = false): string | undefined {
+  const preset = PRESETS[name];
+  if (!preset) return undefined;
+  if (!write) return preset;
+  if (name === "claude") return "claude -p --permission-mode dontAsk --tools Read,Grep,Glob,Edit,Write --allowedTools Read,Grep,Glob,Edit,Write";
+  if (name === "codex") return "codex exec -s workspace-write --skip-git-repo-check -";
+  return preset;
+}
 
 /** The command as shown on the Agents page (the identity field holds at most 80 characters). */
 export function commandLabel(exec: string): string {
@@ -89,7 +102,8 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
   if (cafe.role !== "barista") throw new Error(`${file} declares role "${cafe.role}"; set role: barista to receive questions`);
 
   const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log });
-  const queue: OrderHandle[] = [];
+  // An Order is acknowledged on arrival, so it needs heartbeats while it waits for a free slot.
+  const queue: Array<{ h: OrderHandle; stopBeat: () => void }> = [];
   const running = new Map<string, () => void>(); // orderId → kill
   let active = 0;
 
@@ -133,17 +147,21 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
   };
 
   const pump = () => {
-    while (active < cafe.concurrency && queue.length) void run(queue.shift()!);
+    while (active < cafe.concurrency && queue.length) {
+      const next = queue.shift()!;
+      next.stopBeat(); // `run` takes over with its own heartbeat
+      void run(next.h);
+    }
   };
 
   client.onOrder((h) => {
     void h.ack().catch(() => {});
-    queue.push(h);
+    queue.push({ h, stopBeat: keepAlive(h) });
     pump();
   });
   client.onCancel(({ orderId, by }) => {
-    const i = queue.findIndex((q) => q.order.orderId === orderId);
-    if (i >= 0) queue.splice(i, 1);
+    const i = queue.findIndex((q) => q.h.order.orderId === orderId);
+    if (i >= 0) queue.splice(i, 1)[0]!.stopBeat();
     running.get(orderId)?.();
     log(`cancelled by ${by}: ${orderId}`);
   });
@@ -153,6 +171,10 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
   return {
     client,
     stop: () => {
+      for (const q of queue.splice(0)) {
+        q.stopBeat();
+        void q.h.decline("barista is shutting down", { unavailable: true }).catch(() => {});
+      }
       for (const kill of running.values()) kill();
       client.close();
     },

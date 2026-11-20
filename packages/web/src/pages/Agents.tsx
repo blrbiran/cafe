@@ -2,9 +2,10 @@ import { useEffect, useState } from "react";
 import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
 import type { RoutingHint } from "@cafe/protocol";
 import { api } from "../api.ts";
+import { agentAddress, agentLabel, hostLabel, removableAgentAliases } from "../display.ts";
 import { useT, type Dict } from "../i18n.ts";
 import { hashFor, navigate } from "../route.ts";
-import { openComposer, useStore } from "../store.ts";
+import { openComposer, refreshStore, useStore } from "../store.ts";
 import { Dot, Empty, Facts, KindTag, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
 
 const WEEK = 7 * 24 * 3600 * 1000;
@@ -56,13 +57,13 @@ export function AgentsPage() {
           <section key={h} className="flex flex-col gap-2.5">
             <div className="flex flex-wrap items-center gap-2">
               <Dot tone={online ? "ok" : undefined} />
-              <h2 className="mono m-0 text-base text-fg-strong">{rec?.displayName ?? h}</h2>
+              <h2 className="mono m-0 text-base text-fg-strong">{hostLabel(h, daemons)}</h2>
               {rec?.displayName && rec.displayName !== h && <span className="mono text-[11px] text-muted">{h}</span>}
               {note && <span className="hint">{note}</span>}
             </div>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-3">
               {list.map((a) => (
-                <AgentCard key={a.agentId} a={a} threads={threads} recent={recent} stats={hints?.[`${a.name}@${a.host}`] ?? (hints ? { identity: "", answered: 0, declined: 0, failed: 0, declinedTopics: {} } : undefined)} t={t} />
+                <AgentCard key={a.agentId} a={a} daemons={daemons} threads={threads} recent={recent} stats={hints?.[`${a.name}@${a.host}`] ?? (hints ? { identity: "", answered: 0, declined: 0, failed: 0, declinedTopics: {} } : undefined)} t={t} />
               ))}
             </div>
           </section>
@@ -73,9 +74,33 @@ export function AgentsPage() {
   );
 }
 
-function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: ThreadMeta[]; recent: ThreadMeta[]; stats?: RoutingHint; t: Dict }) {
+function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; daemons: import("@cafe/protocol").DaemonRecord[]; threads: ThreadMeta[]; recent: ThreadMeta[]; stats?: RoutingHint; t: Dict }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
+  const [menu, setMenu] = useState(false);
+  const aliases = removableAgentAliases(a);
+  const act = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setErr(undefined);
+    try {
+      await fn();
+      await refreshStore();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const rename = () => {
+    setMenu(false);
+    const v = prompt(t.settingsNewName, a.displayName ?? a.name);
+    if (v?.trim()) void act(() => api.renameAgent(a.address, v.trim()));
+  };
+  const addAlias = () => {
+    setMenu(false);
+    const v = prompt(t.settingsAliasPh);
+    if (v?.trim()) void act(() => api.aliasAgent(a.address, v.trim()));
+  };
   const current = threads.find((m) => (m.status === "working" || m.status === "delivering") && m.targets.includes(a.agentId));
   const status: "idle" | "busy" | "offline" = a.status === "offline" ? "offline" : current || a.status === "busy" ? "busy" : "idle";
   const tone: Tone = status === "busy" ? "info" : status === "idle" ? "ok" : undefined;
@@ -99,13 +124,45 @@ function AgentCard({ a, threads, recent, stats, t }: { a: AgentRecord; threads: 
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 flex-col">
           <span className="flex flex-wrap items-center gap-2 text-lg font-semibold text-fg-strong">
-            {a.displayName ?? a.name}
+            {agentLabel(a, daemons)}
             <KindTag a={a} />
           </span>
-          <span className="mono truncate text-xs text-muted">{a.address}</span>
+          <span className="mono truncate text-xs text-muted" title={a.address}>
+            {agentAddress(a, daemons)}
+          </span>
+          {aliases.length > 0 && (
+            <span className="mt-1 flex flex-wrap items-center gap-1">
+              {aliases.map((x) => (
+                <span key={x} className="kind-tag">
+                  {x}
+                  <button type="button" className="ml-1 text-muted" aria-label={`${t.removeAlias} ${x}`} disabled={busy} onClick={() => void act(() => api.removeAgentAlias(a.address, x))}>
+                    ×
+                  </button>
+                </span>
+              ))}
+            </span>
+          )}
         </div>
-        <Pill tone={tone}>{t[status]}</Pill>
+        <div className="flex items-center gap-1.5">
+          <Pill tone={tone}>{t[status]}</Pill>
+          <button type="button" className="btn-sm" aria-label={t.actions} aria-expanded={menu} onClick={() => setMenu((v) => !v)}>
+            ⋯
+          </button>
+        </div>
       </div>
+      {menu && (
+        <div className="well flex flex-wrap gap-1.5 p-2 text-xs">
+          <button type="button" className="btn-sm" onClick={rename}>
+            {t.rename}
+          </button>
+          <button type="button" className="btn-sm" onClick={addAlias}>
+            {t.addAlias}
+          </button>
+          <button type="button" className="btn-sm" onClick={() => void navigator.clipboard?.writeText(a.address).catch(() => {})}>
+            {t.copyAddress}
+          </button>
+        </div>
+      )}
       {current && (
         <a className="well block text-sm no-underline hover:border-line-strong" href={hashFor({ page: "thread", threadId: current.threadId })}>
           <span className="text-muted">{t.nowAnswering}</span> <span className="text-fg-strong">“{current.summary.slice(0, 80)}{current.summary.length > 80 ? "…" : ""}”</span>

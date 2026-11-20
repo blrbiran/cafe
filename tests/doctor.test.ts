@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -66,6 +67,41 @@ describe("cafe doctor", () => {
     const r = await doctor(tmp, join(tmp, "cafe-home"), "127.0.0.1:9", join(tmp, "user-home"));
     expect(r.status).toBe(1);
     expect(r.stdout).toMatch(/daemon[\s\S]*fail/);
+  });
+
+  it("uses the saved config token when CAFE_TOKEN is unset (#52)", async () => {
+    const local = await startDaemon("child");
+    cleanup.push(local.stop);
+    // A fake Root that only answers with the saved token; the real root check would 401 without it.
+    const fake = createServer((req, res) => {
+      if (req.headers.authorization === "Bearer t0k") {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ host: "root", isRoot: true, version: "0.1.3" }));
+      } else {
+        res.writeHead(401, { "content-type": "application/json" }).end("{}");
+      }
+    });
+    await new Promise<void>((ok) => fake.listen(0, "127.0.0.1", () => ok()));
+    cleanup.push(() => new Promise<void>((ok) => fake.close(() => ok())));
+    const port = (fake.address() as { port: number }).port;
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const home = join(tmp, "cafe-home");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "config.yml"), `port: 0\nroot: 127.0.0.1:${port}\ntoken: t0k\n`);
+    const userHome = join(tmp, "user-home");
+    mkdirSync(userHome, { recursive: true });
+
+    const r = await new Promise<{ status: number | null; stdout: string }>((done) => {
+      const p = spawn(process.execPath, [BIN, "doctor"], {
+        cwd: tmp,
+        env: { ...process.env, HOME: userHome, CAFE_HOME: home, CAFE_DAEMON: local.addr },
+      });
+      let stdout = "";
+      p.stdout.on("data", (d) => (stdout += d));
+      p.on("close", (status) => done({ status, stdout }));
+    });
+    expect(r.status, r.stdout).toBe(0);
+    expect(r.stdout).toMatch(/ok\s+root\s+127\.0\.0\.1/);
   });
 
   it("reports a /cafe-ask command file it does not own", async () => {

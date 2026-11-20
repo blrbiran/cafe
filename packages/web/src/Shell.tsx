@@ -1,5 +1,6 @@
 import { useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { isActive, useStore } from "./store.ts";
+import { agentAddress, agentLabel, hostLabel } from "./display.ts";
 import { hashFor, type Route } from "./route.ts";
 import { setLang, useLang, useT } from "./i18n.ts";
 import { applyTheme, readTheme, type Theme } from "./theme.ts";
@@ -113,7 +114,7 @@ export function Shell({
           <div className="well flex flex-col gap-1.5 max-md:hidden">
             <div className="cap">{t.thisMachine}</div>
             <div className="flex flex-wrap items-center gap-2">
-              <span className="mono text-sm text-fg-strong">{displayName ?? (host || "…")}</span>
+              <span className="mono text-sm text-fg-strong">{host ? hostLabel(host, daemons) : displayName || "…"}</span>
               {displayName && displayName !== host && <span className="mono text-[11px] text-muted">{host}</span>}
               {isRoot && (
                 <Pill tone="info" dot={false}>
@@ -160,17 +161,19 @@ export function Shell({
                   <Dot tone={a.status === "offline" ? undefined : a.status === "busy" ? "info" : "ok"} />
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5">
-                      <span className="truncate text-sm font-semibold text-fg-strong">{a.displayName ?? a.name}</span>
+                      <span className="truncate text-sm font-semibold text-fg-strong">{agentLabel(a, daemons)}</span>
                       <KindTag a={a} />
                     </div>
-                    <div className="mono truncate text-[10px] text-muted">{a.address}</div>
+                    <div className="mono truncate text-[10px] text-muted" title={a.address}>
+                      {agentAddress(a, daemons)}
+                    </div>
                   </div>
                   <span className={`text-[10px] ${a.status === "offline" ? "text-muted" : a.status === "busy" ? "text-info" : "text-ok"}`}>
                     {a.status === "offline" ? t.offline : a.status === "busy" ? t.busy : t.idle}
                   </span>
                 </div>
               ))}
-              <a className="nav-sublink" href={hashFor({ page: "agents" })} onClick={() => setAgentsOpen(false)}>
+              <a className="nav-sublink" href={hashFor({ page: "agents" })} aria-current={current === "agents" ? "page" : undefined}>
                 <span>{t.agentsAll}</span>
                 <span aria-hidden="true">→</span>
               </a>

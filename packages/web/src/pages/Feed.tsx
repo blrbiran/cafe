@@ -4,6 +4,7 @@ import { api } from "../api.ts";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
 import { bucketOf, outcome, askerOf, whoAddress, whyText } from "../outcome.ts";
+import { agentAddress, agentLabel } from "../display.ts";
 import { navigate, type Filter } from "../route.ts";
 import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setSearch, useStore, type SearchResult } from "../store.ts";
 import { Empty, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
@@ -261,6 +262,7 @@ const ThreadCard = memo(ThreadCardImpl);
 function Composer({ initialTo }: { initialTo?: string }) {
   const t = useT();
   const agents = useStore((s) => s.agents);
+  const daemons = useStore((s) => s.daemons);
   const [body, setBody] = useState("");
   const [to, setTo] = useState(initialTo ?? "");
   const [files, setFiles] = useState<File[]>([]);
@@ -358,7 +360,7 @@ function Composer({ initialTo }: { initialTo?: string }) {
             {!known && <option value={to}>{to}</option>}
             {choices.map((a) => (
               <option key={a.agentId} value={a.address}>
-                {a.name} · {a.address}
+                {agentLabel(a, daemons)} · {agentAddress(a, daemons)}
               </option>
             ))}
           </select>

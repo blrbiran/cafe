@@ -59,17 +59,30 @@ concurrency: 1       # headless worker 进程数
 
 ```bash
 cafe host rename mac-mini-2         # 本机 Host 的展示名（热更新）
-cafe host alias old-mac-mini        # 旧名字/别名继续能用于地址
+cafe host alias old-mac-mini        # 用户别名：优先展示，可删除
+cafe host unalias old-mac-mini      # 删除用户别名（自动保留的旧名字仍可路由）
 cafe agent rename billing@mac-mini billing-owner   # Agent 展示名，Address 不变
+cafe agent alias billing@mac-mini invoices         # 用户别名（alias-first 展示）
+cafe agent unalias billing@mac-mini invoices
 cafe daemon rename ssh1 ssh1-docker # Root 上改另一台 Daemon 的展示名
 ```
 
-内部 `host`、`agentId` 和 Address 不变，旧 Thread/统计继续有效；`displayName` 只影响 UI 和 CLI 的显示。
+内部 `host`、`agentId` 和 Address 不变，旧 Thread/统计继续有效。改名不再把旧名字放进展示候选：旧名进入 `legacyAliases` 只用于路由；`aliases` 是用户显式添加的别名，展示优先级是 `alias → displayName → 稳定名`。Web 会把两类都显示为 chip，只有用户别名有删除按钮。
 
 ## 作为 Customer
 
 - **Claude Code / Codex（推荐 MCP）**：`cafe mcp install` 用户级注册 `cafe mcp`（`--dry-run` 只打印命令，`--client claude|codex` 只装一个）。工具：`cafe_agents`、`cafe_ask`、`cafe_wait`、`cafe_cancel`。注册的是绝对 node + cafe.js 路径；换了 Node 版本或移动仓库后要重装。
 - **skill**：`cafe skill install` 创建软链 `~/.claude/skills/cafe` 和 `~/.agents/skills/cafe`。Codex 用 `$cafe` 引用，pi 用 `/skill:cafe`。
+
+各宿主的 cafe 入口（都可以再用 CLI 或 MCP 提问）：
+
+| 宿主 | 自然入口 | 说明 |
+|---|---|---|
+| Codex | `$cafe` + MCP 工具 | `cafe mcp install` 让 Codex 成为 **Customer**；`cafe barista start --agent codex` 才让它成为 **Barista** |
+| pi / omp | `/cafe agents\|ask\|status\|thread\|help` + `/skill:cafe` + 扩展工具 | 扩展注册 `/cafe`，skill 仍走自己的 `/skill:cafe` 命名空间 |
+| Claude Code | `/cafe`（插件暂停/恢复）、`/cafe-ask`、skill、MCP | `/cafe on\|off` 暂停正在运行的会话作为 Barista |
+
+`cafe mcp install` 只让宿主**提问**。要让它**回答**，启动 Barista：`cafe barista start --dir <dir> --agent codex|claude`，或 `cafe serve --preset codex|claude`（默认只读，`--write` 才放开写入）。
 - **CLI**：`cafe ask "..."`、`cafe ask --to billing "..."`、`cafe ask --thread <id> "追问"`、`cafe inbox`、`cafe thread <id>`、`cafe tail`（全网 routed / delivered / acked / replied / closed 事件；`--json` 输出 JSONL，`--host` / `--type` / `--thread` 过滤，默认隐藏心跳）。
 - **Web**：打开 `http://127.0.0.1:4777/`。导航固定、内容独立滚动；点对话从右侧打开，列表位置不变；导航里的 Agents 可展开看已注册 agent；设置里改显示名/别名、路由模型和后台 Barista；实况页是全网事件流。
 
@@ -141,7 +154,7 @@ retention:
   days: 90                 # 可选；不设则永不自动清理，用 `cafe prune --older-than N [--yes]` 手动清
 ```
 
-**哪些配置会热生效**：`router.model`、`root` 会通过 `/api/reload` 应用到运行中的 Daemon；`mode`、`host`、`port`、`advertise`、`discovery` 需要重启（`cafe daemon stop && cafe daemon start`，或 `cafe daemon restart`）。`cafe config set` 目前不会替你区分，改完不确定就看 `cafe daemon status` / `cafe doctor`。
+**哪些配置会热生效**：`router.model`、`root` 会通过 `/api/reload` 应用到运行中的 Daemon；`mode`、`host`、`port`、`advertise`、`retention`、`discovery` 需要重启。`cafe config set` 会直接告诉你属于哪种（`applied` 或 `saved; restart required: cafe daemon restart`）；`cafe config diff` 列出文件与运行值的全部差异，`cafe config apply` 应用热更新项，`cafe daemon restart` 应用其余项。`cafe status` 一屏显示 daemon、router、root、流量、pending 配置和下一条命令。
 
 `cafe root set <addr>` 和 `cafe config set <k> <v>` 会同时更新文件；`cafe root set` 还会更新正在运行的连接。容器或 NAT 里的 Daemon 要把 `advertise` 设成 Root 能访问的地址，否则 Root 不会记录一个不可达的回连地址。
 
@@ -194,6 +207,26 @@ cafe barista start --dir ~/code/some-repo
 cafe ask "这个问题谁懂？"
 open http://127.0.0.1:4777/
 ```
+
+### 升级已有的源码安装
+
+Daemon 是长进程：`npm run build:web` **不会**让正在运行的 Daemon 切到新代码。更新文件后必须重启：
+
+```bash
+git pull
+source ~/.bash_profile          # Node ≥ 22.18（nvm）；直接 ssh 登录可能还是 Node 18
+npm install
+npm run build:web
+npm link --workspace @cafe/cli
+cafe daemon restart             # 必须：构建不会自动重载 daemon
+cafe extension install --agent pi
+cafe extension install --agent omp   # 可选；omp install 是 omp plugin install 的别名
+cafe daemon status              # version 应与 package.json 一致
+cafe status                     # 一屏看 daemon / router / pending 配置
+cafe doctor
+```
+
+换 Node 版本（或移动仓库）后，`cafe daemon install`、`cafe mcp install`、`cafe claude install` 记录的绝对路径会失效，需要重跑。容器或 NAT 里要把 `advertise` 设成 Root 能访问的地址。正在运行的 pi / omp 会话要重启宿主才会加载新扩展。
 
 发布（维护者）：`npm version <x.y.z>` → `npm run test:release`（打包、装到临时目录并冒烟测试，不调用模型）→ `npm publish ./release`。见 [`docs/specs/v2-7-publishing.md`](docs/specs/v2-7-publishing.md)。
 

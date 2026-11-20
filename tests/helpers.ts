@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { CafeClient, type OrderHandle } from "@cafe/protocol/client";
+import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import type { AgentIdentity, ThreadEnvelope } from "@cafe/protocol";
 import { runDaemon, type Running, type RunOptions } from "@cafe/daemon";
 
@@ -32,7 +32,15 @@ export async function barista(
   },
 ) {
   const c = new CafeClient({ daemon: addr });
-  c.onOrder((h) => void behave(h).catch(() => {}));
+  // Keep the Order alive while `behave` runs: the daemon arms its 600 ms lease on ack
+  // (FAST.heartbeatIntervalMs × HEARTBEAT_MISSES), so a slow scripted Barista would
+  // otherwise be declared lost before it replies. Heartbeats before ack are ignored.
+  c.onOrder((h) => {
+    const stopBeat = keepAlive(h, FAST.heartbeatIntervalMs);
+    void behave(h)
+      .catch(() => {})
+      .finally(stopBeat);
+  });
   const rec = await c.connect(id);
   return { client: c, rec: rec! };
 }

@@ -14,6 +14,8 @@ export const CafeConfig = z.object({
   displayName: z.string().optional(),
   /** Previous display names that still identify this Host. */
   aliases: z.array(z.string()).default([]),
+  /** Old names kept for routing only (automatic on rename); not shown as the current label. */
+  legacyAliases: z.array(z.string()).default([]),
   /** Address other Daemons should use to reach this one; defaults to first LAN IPv4. */
   advertise: z.string().optional(),
   token: z.string().default(() => randomBytes(16).toString("hex")),
@@ -47,7 +49,7 @@ export const CafeConfig = z.object({
   /** Root only: last known URLs of Daemons, for dial-back after the Root moves. */
   knownDaemons: z.record(z.string(), z.string()).default({}),
   /** Root only: display-name overrides for Daemons that may be offline when renamed. */
-  hostNames: z.record(z.string(), z.object({ displayName: z.string().optional(), aliases: z.array(z.string()).default([]) })).default({}),
+  hostNames: z.record(z.string(), z.object({ displayName: z.string().optional(), aliases: z.array(z.string()).default([]), legacyAliases: z.array(z.string()).default([]) })).default({}),
 });
 export type CafeConfig = z.infer<typeof CafeConfig>;
 

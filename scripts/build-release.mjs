@@ -69,9 +69,12 @@ if (existsSync(join(root, "README_zh.md"))) cpSync(join(root, "README_zh.md"), j
 if (existsSync(join(root, "LICENSE"))) cpSync(join(root, "LICENSE"), join(out, "LICENSE"));
 
 mkdirSync(join(out, "bin"));
+cpSync(join(root, "packages/cli/bin/node-check.mjs"), join(out, "bin/node-check.mjs"));
 writeFileSync(
   join(out, "bin/cafe.js"),
   `#!/usr/bin/env node
+import { checkNode } from "./node-check.mjs";
+checkNode();
 // Silence node:sqlite's ExperimentalWarning; keep other warnings.
 process.removeAllListeners("warning");
 process.on("warning", (w) => {

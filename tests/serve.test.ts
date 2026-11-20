@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { serve } from "@cafe/cli/serve";
+import { PRESETS, presetCommand, serve } from "@cafe/cli/serve";
 import { customer, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
 const cleanup: Array<() => Promise<void> | void> = [];
@@ -67,5 +67,16 @@ describe("cafe serve --exec", () => {
     const second = await c.ask({ body: "two", threadId: first.threadId });
     const events = await untilClosed(c, first.threadId);
     expect(events.filter((e) => e.event.type === "order.replied" && e.orderId === second.orderId).at(-1)?.event).toMatchObject({ text: "1" });
+  });
+
+  it("pins read-only preset defaults and widens them only with --write (#40)", () => {
+    expect(presetCommand("codex")).toContain("-s read-only");
+    expect(presetCommand("codex", true)).toContain("-s workspace-write");
+    expect(presetCommand("claude")).toContain("--permission-mode dontAsk");
+    expect(presetCommand("claude")).not.toContain("Edit");
+    expect(presetCommand("claude", true)).toContain("Edit");
+    expect(presetCommand("nope")).toBeUndefined();
+    // The exported table is the read-only default.
+    expect(PRESETS.codex).toContain("read-only");
   });
 });

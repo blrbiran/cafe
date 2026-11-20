@@ -62,6 +62,8 @@ export const AgentRecord = AgentIdentity.extend({
   displayName: z.string().optional(),
   /** Previous names/aliases that still resolve to this Agent. */
   aliases: z.array(z.string()).default([]),
+  /** Names kept for routing only (automatic on rename); never used as the display label. */
+  legacyAliases: z.array(z.string()).default([]),
 });
 export type AgentRecord = z.infer<typeof AgentRecord>;
 
@@ -73,6 +75,8 @@ export const DaemonRecord = z.object({
   displayName: z.string().optional(),
   /** Previous names that still identify this Host in addresses. */
   aliases: z.array(z.string()).default([]),
+  /** Names kept for routing only (automatic on rename); never used as the display label. */
+  legacyAliases: z.array(z.string()).default([]),
   url: z.string(),
   isRoot: z.boolean(),
   online: z.boolean(),
@@ -270,6 +274,7 @@ export const InitializeParams = z.object({
   /** Display name and aliases of the connecting Daemon (rename does not change `host`). */
   displayName: z.string().optional(),
   aliases: z.array(z.string()).optional(),
+  legacyAliases: z.array(z.string()).optional(),
   url: z.string().optional(),
   registryVersion: z.number().int().optional(),
   /** cafe release of the connecting side, for mismatch messages and the Network view. */

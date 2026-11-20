@@ -53,7 +53,8 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
       : new ClaudeEngine(engineOpts);
 
   const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log });
-  const queue: OrderHandle[] = [];
+  // An Order is acknowledged on arrival, so it needs heartbeats while it waits behind a long turn.
+  const queue: Array<{ h: OrderHandle; stopBeat: () => void }> = [];
   let current: { orderId: string; abort: AbortController } | undefined;
   let stopped = false;
 
@@ -103,7 +104,11 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
     if (running) return;
     running = true;
     try {
-      while (queue.length && !stopped) await handle(queue.shift()!);
+      while (queue.length && !stopped) {
+        const next = queue.shift()!;
+        next.stopBeat(); // `handle` takes over with its own heartbeat
+        await handle(next.h);
+      }
     } finally {
       running = false;
       if (!stopped) void client.setStatus("idle").catch(() => {});
@@ -112,12 +117,12 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
 
   client.onOrder((h) => {
     void h.ack().catch(() => {});
-    queue.push(h);
+    queue.push({ h, stopBeat: keepAlive(h) });
     void pump();
   });
   client.onCancel(({ orderId, by }) => {
-    const i = queue.findIndex((q) => q.order.orderId === orderId);
-    if (i >= 0) queue.splice(i, 1);
+    const i = queue.findIndex((q) => q.h.order.orderId === orderId);
+    if (i >= 0) queue.splice(i, 1)[0]!.stopBeat();
     if (current?.orderId === orderId) current.abort.abort();
     log(`cancelled by ${by}: ${orderId}`);
   });
@@ -133,7 +138,10 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
     client,
     stop: async () => {
       stopped = true;
-      for (const h of queue.splice(0)) await h.decline("barista is shutting down", { unavailable: true }).catch(() => {});
+      for (const q of queue.splice(0)) {
+        q.stopBeat();
+        await q.h.decline("barista is shutting down", { unavailable: true }).catch(() => {});
+      }
       current?.abort.abort();
       // Let the interrupted turn report back before the connection goes.
       for (let i = 0; i < 50 && current; i++) await new Promise((r) => setTimeout(r, 100));

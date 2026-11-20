@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse, stringify } from "yaml";
 import { formatApiError } from "../packages/cli/src/errors.ts";
@@ -178,7 +179,6 @@ describe("config get", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("daemon is not running");
   });
-
   it("config apply fails when no daemon is running", () => {
     const h = home();
     writeFileSync(join(h, "config.yml"), "port: 47821\n");
@@ -187,3 +187,60 @@ describe("config get", () => {
     expect(r.stderr).toContain("daemon is not running");
   });
 });
+
+describe("cafe status", () => {
+  it("summarizes the daemon, traffic and pending config in one screen", async () => {
+    const d = await startDaemon("root", { mode: "root" });
+    cleanup.push(d.stop);
+    const r = await cafeAsync(home(), d.addr, "status");
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain("daemon:");
+    expect(r.stdout).toContain("router:");
+    expect(r.stdout).toContain("traffic:");
+    expect(r.stdout).toContain("pending: none");
+  });
+});
+
+describe("config get redaction", () => {
+  it("redacts the token when printing the whole file", () => {
+    const h = home();
+    writeFileSync(join(h, "config.yml"), "port: 47821\ntoken: super-secret\n");
+    const r = cafe(h, "config", "get");
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toContain("super-secret");
+    expect(r.stdout).toContain("redacted");
+    const j = cafe(h, "config", "get", "--json");
+    expect(JSON.parse(j.stdout).token).toContain("redacted");
+  });
+
+  it("still prints the token when asked for it explicitly, and with --reveal", () => {
+    const h = home();
+    writeFileSync(join(h, "config.yml"), "port: 47821\ntoken: super-secret\n");
+    expect(cafe(h, "config", "get", "token").stdout.trim()).toBe("super-secret");
+    expect(cafe(h, "config", "get", "--reveal").stdout).toContain("super-secret");
+  });
+});
+
+describe("barista command aliases", () => {
+  it("shows the ls alias in help", () => {
+    const r = cafe(home(), "barista", "--help");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("list|ls");
+  });
+});
+
+describe("Node version precheck", () => {
+  it("prints the requirement instead of ERR_UNKNOWN_FILE_EXTENSION on an old Node", () => {
+    const url = pathToFileURL(resolve(import.meta.dirname, "../packages/cli/bin/node-check.mjs")).href;
+    const r = spawnSync(
+      process.execPath,
+      ["--input-type=module", "-e", `Object.defineProperty(process.versions, "node", { value: "18.20.8" }); const m = await import(${JSON.stringify(url)}); m.checkNode();`],
+      { encoding: "utf8" },
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("cafe requires Node >= 22.18");
+    expect(r.stderr).toContain("18.20.8");
+    expect(r.stderr).not.toContain("ERR_UNKNOWN_FILE_EXTENSION");
+  });
+});
+

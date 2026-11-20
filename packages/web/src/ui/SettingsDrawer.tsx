@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type BaristaInfo, type DoctorCheck, type RuntimeConfig } from "../api.ts";
+import { agentAddress, agentLabel, removableAgentAliases, removableHostAliases } from "../display.ts";
 import { useT } from "../i18n.ts";
 import { refreshStore, useStore } from "../store.ts";
 import { Pill } from "./bits.tsx";
@@ -15,8 +16,8 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const self = daemons.find((d) => d.host === host);
 
   const [name, setName] = useState(self?.displayName ?? host);
-  const [aliases, setAliases] = useState<string[]>(self?.aliases ?? []);
   const [alias, setAlias] = useState("");
+  const hostAliases = removableHostAliases(self);
   const [models, setModels] = useState<string[]>();
   const [model, setModel] = useState("");
   const [router, setRouter] = useState<{ router: string; model?: string; error?: string }>();
@@ -28,6 +29,8 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [write, setWrite] = useState(false);
   const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean }>();
   const [rt, setRt] = useState<RuntimeConfig>();
+  const [advertise, setAdvertise] = useState("");
+  const [retention, setRetention] = useState("");
   const [checks, setChecks] = useState<DoctorCheck[]>();
   const [busy, setBusy] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -35,8 +38,13 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
 
   useEffect(() => {
     setName(self?.displayName ?? host);
-    setAliases(self?.aliases ?? []);
-  }, [self?.displayName, self?.aliases?.join("|"), host]);
+  }, [self?.displayName, host]);
+
+  useEffect(() => {
+    if (!rt) return;
+    setAdvertise(rt.advertise ?? "");
+    setRetention(rt.retention?.days ? String(rt.retention.days) : "");
+  }, [rt?.advertise, rt?.retention?.days]);
 
   useEffect(() => {
     api
@@ -87,8 +95,37 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
 
   const saveHost = () =>
     void run("host", async () => {
-      await api.setHostIdentity(name.trim() || host, aliases);
+      await api.setHostIdentity(name.trim() || host, []);
       return t.settingsSaved;
+    });
+
+  const addHostAlias = () =>
+    void run("host", async () => {
+      const a = alias.trim();
+      if (!a) return;
+      await api.setHostIdentity(name.trim() || host, [a]);
+      setAlias("");
+      return t.settingsSaved;
+    });
+
+  const removeHostAlias = (a: string) =>
+    void run("host", async () => {
+      await api.setHostIdentity(name.trim() || host, [], [a]);
+      return t.settingsSaved;
+    });
+
+  const removeAgentAlias = (address: string, a: string) =>
+    void run(`agent:${address}`, async () => {
+      await api.removeAgentAlias(address, a);
+      return t.settingsSaved;
+    });
+
+  const saveNetwork = () =>
+    void run("config", async () => {
+      const days = retention.trim() ? Number(retention) : null;
+      if (days !== null && (!Number.isInteger(days) || days < 1)) throw new Error(t.settingsRetentionInvalid);
+      await api.saveConfig({ advertise: advertise.trim() || null, retentionDays: days });
+      return t.settingsRestartRequired;
     });
 
   const applyModel = () =>
@@ -176,10 +213,10 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
             </button>
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
-            {aliases.map((a) => (
+            {hostAliases.map((a) => (
               <span key={a} className="kind-tag">
                 {a}
-                <button type="button" className="ml-1 text-muted" aria-label={`remove ${a}`} onClick={() => setAliases((xs) => xs.filter((x) => x !== a))}>
+                <button type="button" className="ml-1 text-muted" aria-label={`${t.removeAlias} ${a}`} disabled={busy === "host"} onClick={() => removeHostAlias(a)}>
                   ×
                 </button>
               </span>
@@ -192,22 +229,14 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
               onKeyDown={(e) => {
                 if (e.key === "Enter" && alias.trim()) {
                   e.preventDefault();
-                  setAliases((xs) => [...new Set([...xs, alias.trim()])]);
-                  setAlias("");
+                  addHostAlias();
                 }
               }}
             />
-            <button
-              type="button"
-              className="btn-sm"
-              disabled={!alias.trim()}
-              onClick={() => {
-                setAliases((xs) => [...new Set([...xs, alias.trim()])]);
-                setAlias("");
-              }}
-            >
+            <button type="button" className="btn-sm" disabled={!alias.trim() || busy === "host"} onClick={addHostAlias}>
               {t.settingsAddAlias}
             </button>
+            <span className="hint w-full">{t.settingsAliasKept}</span>
           </div>
         </section>
 
@@ -350,8 +379,22 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
             <div key={a.agentId} className="flex flex-col gap-1.5 border-t border-line py-2 first:border-t-0">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 flex-col">
-                  <b className="truncate text-sm text-fg-strong">{a.displayName ?? a.name}</b>
-                  <span className="mono truncate text-[11px] text-muted">{a.address}</span>
+                  <b className="truncate text-sm text-fg-strong">{agentLabel(a, daemons)}</b>
+                  <span className="mono truncate text-[11px] text-muted" title={a.address}>
+                    {agentAddress(a, daemons)}
+                  </span>
+                  {removableAgentAliases(a).length > 0 && (
+                    <span className="mt-1 flex flex-wrap gap-1">
+                      {removableAgentAliases(a).map((x) => (
+                        <span key={x} className="kind-tag">
+                          {x}
+                          <button type="button" className="ml-1 text-muted" aria-label={`${t.removeAlias} ${x}`} disabled={busy === `agent:${a.address}`} onClick={() => removeAgentAlias(a.address, x)}>
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </span>
+                  )}
                 </div>
                 {a.host !== host && !isRoot && <span className="hint">{t.settingsRootOnly}</span>}
               </div>
@@ -401,6 +444,24 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
               </div>
             ))
           )}
+        </section>
+
+        <section className="mb-5 border-b border-line pb-4">
+          <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsNetwork}</h3>
+          <p className="mt-1 mb-2.5 text-xs text-muted">{t.settingsNetworkDesc}</p>
+          <div className="flex flex-col gap-2">
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              {t.settingsAdvertise}
+              <input value={advertise} placeholder={t.settingsAdvertisePh} onChange={(e) => setAdvertise(e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              {t.settingsRetention}
+              <input type="number" min={1} value={retention} placeholder={t.settingsRetentionPh} onChange={(e) => setRetention(e.target.value)} />
+            </label>
+            <button type="button" className="btn-sm self-start" aria-busy={busy === "config"} onClick={saveNetwork}>
+              {t.settingsSave}
+            </button>
+          </div>
         </section>
 
         <section>

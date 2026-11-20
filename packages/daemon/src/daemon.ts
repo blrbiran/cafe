@@ -113,6 +113,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** User-visible name for this Host; `host` stays the stable routing key. */
   private displayName: string;
   private hostAliases: string[];
+  private hostLegacyAliases: string[];
   private timing: Timing;
   readonly log: (msg: string) => void;
 
@@ -175,6 +176,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.host = opts.config.host;
     this.displayName = opts.config.displayName ?? opts.config.host;
     this.hostAliases = [...opts.config.aliases];
+    this.hostLegacyAliases = [...(opts.config.legacyAliases ?? [])];
     this.store = new Store(opts.home);
     this.log = opts.log ?? ((m) => console.error(`[cafe ${this.host}] ${m}`));
     this.timing = {
@@ -199,7 +201,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Replica restored from disk; the Root will resync on connect.
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
-    this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
+    this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
     this.schedulePrune();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
@@ -365,6 +367,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         registeredAt: now,
         lastSeenAt: now,
         aliases: resumable?.aliases ?? [],
+        legacyAliases: resumable?.legacyAliases ?? [],
         ...(resumable?.displayName ? { displayName: resumable.displayName } : {}),
       };
       peer.meta.agentId = record.agentId;
@@ -385,11 +388,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return {};
     });
     peer.on(Methods.agentsList, () => this.registry.all());
-    peer.on(Methods.agentRename, (x: { agentId: string; displayName?: string; alias?: string }) => {
+    peer.on(Methods.agentRename, (x: { agentId: string; displayName?: string; alias?: string; removeAlias?: string }) => {
       if (typeof x.agentId !== "string") throw new RpcError("bad_request", "agentId is required");
       if (x.displayName) return this.renameAgent(x.agentId, x.displayName);
       if (x.alias) return this.aliasAgent(x.agentId, x.alias);
-      throw new RpcError("bad_request", "displayName or alias is required");
+      if (x.removeAlias) return this.removeAgentAlias(x.agentId, x.removeAlias);
+      throw new RpcError("bad_request", "displayName, alias or removeAlias is required");
     });
     peer.on(Methods.orderCreate, (raw) => this.createOrder(CreateOrderParams.parse(raw), peer));
     peer.on(Methods.orderAck, (p: { orderId: string; threadId: string }) => this.agentEvent(peer, p, { type: "order.acked", agentId: peer.meta.agentId }));
@@ -452,23 +456,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // Identity: display names and aliases (internal host/agent ids never change)
   // -------------------------------------------------------------------------
 
-  /** Rename this Host (hot) and/or add aliases. Addresses embed the stable `host`, not this name. */
-  setHostIdentity(displayName?: string, addAliases: string[] = []): DaemonRecord {
+  /** Rename this Host (hot) and/or add/remove aliases. Addresses embed the stable `host`, not this name. */
+  setHostIdentity(displayName?: string, addAliases: string[] = [], removeAliases: string[] = []): DaemonRecord {
     if (displayName) this.assertHostNameFree(displayName);
     for (const alias of addAliases.filter(Boolean)) this.assertHostNameFree(alias);
+    for (const alias of removeAliases.filter(Boolean)) this.assertHostAliasRemovable(alias);
     if (displayName) {
-      if (this.displayName && this.displayName !== displayName) this.hostAliases = [...new Set([...this.hostAliases, this.displayName])];
-      this.displayName = displayName.trim();
+      const next = displayName.trim();
+      // The old display name stays routable but is not a display candidate any more.
+      if (this.displayName && this.displayName !== next) this.hostLegacyAliases = [...new Set([...this.hostLegacyAliases, this.displayName])];
+      this.displayName = next;
       this.config.displayName = this.displayName;
     }
+    this.hostAliases = this.hostAliases.filter((a) => !removeAliases.includes(a));
     this.hostAliases = [...new Set([...this.hostAliases, ...addAliases.map((a) => a.trim()).filter(Boolean)])];
     this.config.aliases = this.hostAliases;
+    this.config.legacyAliases = this.hostLegacyAliases;
     saveConfig(this.config, this.store.home);
     const rec = this.daemonRecords.get(this.host)!;
     rec.displayName = this.displayName;
     rec.aliases = this.hostAliases;
+    rec.legacyAliases = this.hostLegacyAliases;
     this.emitDaemons();
-    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases });
+    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases });
     this.log(`renamed host to ${this.displayName}${this.hostAliases.length ? ` (aliases: ${this.hostAliases.join(", ")})` : ""}`);
     return rec;
   }
@@ -481,24 +491,28 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.assertHostNameFree(displayName, host);
     const name = displayName.trim();
     const prev = rec.displayName ?? rec.host;
-    const aliases = [...new Set([...(rec.aliases ?? []), prev, host])];
+    const legacy = [...new Set([...(rec.legacyAliases ?? []), ...(prev !== name ? [prev] : []), host])];
+    const aliases = (rec.aliases ?? []).filter((a) => a !== name && !legacy.includes(a));
     rec.displayName = name;
     rec.aliases = aliases;
-    this.config.hostNames[host] = { displayName: name, aliases };
+    rec.legacyAliases = legacy;
+    this.config.hostNames[host] = { displayName: name, aliases, legacyAliases: legacy };
     saveConfig(this.config, this.store.home);
-    this.children.get(host)?.notify(Methods.hostIdentity, { displayName: name, aliases });
+    this.children.get(host)?.notify(Methods.hostIdentity, { displayName: name, aliases, legacyAliases: legacy });
     this.emitDaemons();
     return rec;
   }
 
-  /** Rename a local Agent: the Address (and agentId) stay stable; the old name becomes an alias. */
+  /** Rename a local Agent: the Address (and agentId) stay stable; the old name stays routable as a legacy alias. */
   renameAgent(agentId: string, displayName: string): AgentRecord {
     const rec = this.local.get(agentId);
     if (!rec) throw new RpcError("not_found", "not a local agent");
     this.assertAgentNameFree(displayName, rec.host, agentId);
     const name = displayName.trim();
-    const aliases = [...new Set([...rec.aliases, rec.displayName ?? rec.name])];
-    const next = { ...rec, displayName: name, aliases };
+    const prev = rec.displayName ?? rec.name;
+    const legacyAliases = [...new Set([...rec.legacyAliases, ...(prev !== name ? [prev] : [])])];
+    const aliases = rec.aliases.filter((a) => a !== name && !legacyAliases.includes(a));
+    const next = { ...rec, displayName: name, aliases, legacyAliases };
     this.local.set(agentId, next);
     this.publishAgents([next]);
     return next;
@@ -506,7 +520,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Local agent or, at the Root, an Agent on a connected child (relayed over `agent/rename`). */
   async renameAgentAny(address: string, displayName: string): Promise<AgentRecord> {
-    const ids = this.registry.resolve(address);
+    const ids = this.registry.resolve(this.normalizeAddress(address));
     const rec = ids.length ? this.registry.get(ids[0]!) : undefined;
     if (!rec) throw new RpcError("not_found", `no agent at '${address}'`);
     if (rec.host === this.host) return this.renameAgent(rec.agentId, displayName);
@@ -526,14 +540,57 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return next;
   }
 
+  /** Remove a user-added alias. Automatic legacy aliases stay routable and cannot be removed this way. */
+  removeAgentAlias(agentId: string, alias: string): AgentRecord {
+    const rec = this.local.get(agentId);
+    if (!rec) throw new RpcError("not_found", "not a local agent");
+    const a = alias.trim();
+    if (!rec.aliases.includes(a)) throw new RpcError("bad_request", `'${a}' is not a removable alias of ${rec.address}${rec.legacyAliases.includes(a) ? " (it is a legacy name kept for routing)" : ""}`);
+    const next = { ...rec, aliases: rec.aliases.filter((x) => x !== a) };
+    this.local.set(agentId, next);
+    this.publishAgents([next]);
+    return next;
+  }
+
+  /** Remove a user-added alias of this Host. Legacy names (and the stable host id) stay routable. */
+  removeHostAlias(alias: string): DaemonRecord {
+    const a = alias.trim();
+    this.assertHostAliasRemovable(a);
+    this.hostAliases = this.hostAliases.filter((x) => x !== a);
+    this.config.aliases = this.hostAliases;
+    saveConfig(this.config, this.store.home);
+    const rec = this.daemonRecords.get(this.host)!;
+    rec.aliases = this.hostAliases;
+    this.emitDaemons();
+    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.hostIdentity, { displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases });
+    return rec;
+  }
+
+  private assertHostAliasRemovable(alias: string): void {
+    const a = alias.trim();
+    if (a === this.host || a === this.displayName || this.hostLegacyAliases.includes(a))
+      throw new RpcError("bad_request", `'${a}' is kept for routing and cannot be removed (only user-added aliases can)`);
+    if (!this.hostAliases.includes(a)) throw new RpcError("bad_request", `'${a}' is not an alias of this Host`);
+  }
+
   async aliasAgentAny(address: string, alias: string): Promise<AgentRecord> {
-    const ids = this.registry.resolve(address);
+    const ids = this.registry.resolve(this.normalizeAddress(address));
     const rec = ids.length ? this.registry.get(ids[0]!) : undefined;
     if (!rec) throw new RpcError("not_found", `no agent at '${address}'`);
     if (rec.host === this.host) return this.aliasAgent(rec.agentId, alias);
     const child = this.children.get(rec.host);
     if (!child) throw new RpcError("unreachable", `${rec.host} is not connected to the Root`);
     return child.request<AgentRecord>(Methods.agentRename, { agentId: rec.agentId, alias });
+  }
+
+  async removeAgentAliasAny(address: string, alias: string): Promise<AgentRecord> {
+    const ids = this.registry.resolve(this.normalizeAddress(address));
+    const rec = ids.length ? this.registry.get(ids[0]!) : undefined;
+    if (!rec) throw new RpcError("not_found", `no agent at '${address}'`);
+    if (rec.host === this.host) return this.removeAgentAlias(rec.agentId, alias);
+    const child = this.children.get(rec.host);
+    if (!child) throw new RpcError("unreachable", `${rec.host} is not connected to the Root`);
+    return child.request<AgentRecord>(Methods.agentRename, { agentId: rec.agentId, removeAlias: alias });
   }
 
   /** Reachability check from this machine to another Host's HTTP API (Web "Test"). */
@@ -584,7 +641,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private normalizeAddress(address: string): string {
     const a = parseAddress(address);
     if (!a?.host) return address;
-    const rec = this.daemons().find((d) => d.host === a.host || d.displayName === a.host || d.aliases.includes(a.host!));
+    const rec = this.daemons().find((d) => d.host === a.host || d.displayName === a.host || d.aliases.includes(a.host!) || (d.legacyAliases ?? []).includes(a.host!));
     if (!rec || rec.host === a.host) return address;
     return `${a.name}${a.n === undefined ? "" : `#${a.n}`}@${rec.host}`;
   }
@@ -602,7 +659,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const n = this.cleanName(name, "host name");
     for (const d of this.daemons()) {
       if (d.host === exceptHost) continue;
-      if (d.host === n || d.displayName === n || (d.aliases ?? []).includes(n))
+      if (d.host === n || d.displayName === n || (d.aliases ?? []).includes(n) || (d.legacyAliases ?? []).includes(n))
         throw new RpcError("conflict", `host name '${n}' is already used by ${d.host}`);
     }
   }
@@ -615,7 +672,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const r of this.local.values()) seen.set(r.agentId, r);
     for (const r of seen.values()) {
       if (r.host !== host || r.agentId === exceptAgentId) continue;
-      if (r.name === n || r.displayName === n || r.aliases.includes(n))
+      if (r.name === n || r.displayName === n || r.aliases.includes(n) || r.legacyAliases.includes(n))
         throw new RpcError("conflict", `agent name '${n}' is already used by ${r.address}`);
     }
   }
@@ -1379,14 +1436,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const override = this.config.hostNames[host];
     const displayName = override?.displayName ?? p.displayName ?? host;
     const aliases = [...new Set([...(p.aliases ?? []), ...(override?.aliases ?? [])])];
-    this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
+    const legacyAliases = [...new Set([...(p.legacyAliases ?? []), ...(override?.legacyAliases ?? [])])];
+    this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
     if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
     if (p.url) void this.rememberChildUrl(host, p.url);
-    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[] }) => {
+    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; legacyAliases?: string[] }) => {
       const rec = this.daemonRecords.get(host);
       if (rec) {
         if (x.displayName) rec.displayName = x.displayName;
         if (x.aliases) rec.aliases = [...new Set([...rec.aliases, ...x.aliases])];
+        if (x.legacyAliases) rec.legacyAliases = [...new Set([...(rec.legacyAliases ?? []), ...x.legacyAliases])];
         this.emitDaemons();
       }
       return {};
@@ -1524,7 +1583,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
-    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[] }) => {
+    peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; legacyAliases?: string[] }) => {
       if (x.displayName) {
         this.displayName = x.displayName;
         this.config.displayName = x.displayName;
@@ -1533,11 +1592,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.hostAliases = [...new Set([...this.hostAliases, ...x.aliases])];
         this.config.aliases = this.hostAliases;
       }
+      if (x.legacyAliases) {
+        this.hostLegacyAliases = [...new Set([...this.hostLegacyAliases, ...x.legacyAliases])];
+        this.config.legacyAliases = this.hostLegacyAliases;
+      }
       saveConfig(this.config, this.store.home);
       const self = this.daemonRecords.get(this.host);
       if (self) {
         self.displayName = this.displayName;
         self.aliases = this.hostAliases;
+        self.legacyAliases = this.hostLegacyAliases;
       }
       this.emitDaemons();
       return {};
@@ -1575,7 +1639,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private setRootOnline(online: boolean): void {
-    const rec: DaemonRecord = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", hostId: this.rootHost, aliases: [], url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
+    const rec: DaemonRecord = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", hostId: this.rootHost, aliases: [], legacyAliases: [], url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
     rec.online = online;
     if (this.rootHost) rec.host = this.rootHost;
     if (this.rootDisplayName) rec.displayName = this.rootDisplayName;
@@ -1651,6 +1715,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Plain substring search over questions and answers, newest threads first. Scans the JSONL files. */
   search(q: string, limit = 20): { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] {
+    if (!Number.isFinite(limit) || limit <= 0) return [];
     const needle = q.toLowerCase();
     const out: { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] = [];
     for (const meta of this.store.allThreads()) {

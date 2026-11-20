@@ -25,6 +25,7 @@ const rec = (id: string, name: string): AgentRecord => ({
   registeredAt: 0,
   lastSeenAt: 0,
   aliases: [],
+  legacyAliases: [],
 });
 
 const order: Order = {

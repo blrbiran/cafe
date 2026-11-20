@@ -10,7 +10,7 @@ import { WebSocketServer } from "ws";
 import { CreateOrderParams, Methods, type ThreadEnvelope } from "@cafe/protocol";
 import { RpcError } from "@cafe/protocol/peer";
 import type { Daemon } from "./daemon.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, saveConfig } from "./config.ts";
 import { eventMatches, parseEventFilter, replayAfter } from "./events.ts";
 import { listRouterModels } from "./router.ts";
 
@@ -83,6 +83,31 @@ async function readJson(req: IncomingMessage): Promise<any> {
 function send(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+const MAX_LIMIT = 1000;
+const THREAD_STATUSES = ["routing", "delivering", "working", "done", "failed", "cancelled"];
+
+/** A page-size query parameter. SQLite treats LIMIT -1 as "no limit", so nothing invalid may reach it. */
+function parseLimit(raw: string | null, def: number, opts: { zeroOk?: boolean } = {}): number {
+  if (raw === null || raw === "") return def;
+  const n = Number(raw);
+  const min = opts.zeroOk ? 0 : 1;
+  if (!Number.isInteger(n) || n < min || n > MAX_LIMIT) throw new RpcError("bad_request", `invalid limit: expected integer in ${min}..${MAX_LIMIT}`);
+  return n;
+}
+
+function parseBefore(raw: string | null): number | undefined {
+  if (raw === null || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new RpcError("bad_request", "invalid before: expected a positive timestamp");
+  return n;
+}
+
+function parseStatus(raw: string | null): string | undefined {
+  if (raw === null || raw === "") return undefined;
+  if (!THREAD_STATUSES.includes(raw)) throw new RpcError("bad_request", `invalid status: expected ${THREAD_STATUSES.join("|")}`);
+  return raw;
 }
 
 /** Stream an upload to disk while hashing; never buffer the whole file. */
@@ -240,9 +265,17 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   }
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {
-    const { displayName, aliases } = await readJson(req);
+    const { displayName, aliases, removeAliases } = await readJson(req);
     if (displayName !== undefined && (typeof displayName !== "string" || !displayName.trim())) throw new RpcError("bad_request", "displayName must be a non-empty string");
-    return send(res, 200, daemon.setHostIdentity(typeof displayName === "string" ? displayName.trim() : undefined, Array.isArray(aliases) ? aliases.filter((a: unknown): a is string => typeof a === "string" && !!a) : []));
+    return send(
+      res,
+      200,
+      daemon.setHostIdentity(
+        typeof displayName === "string" ? displayName.trim() : undefined,
+        Array.isArray(aliases) ? aliases.filter((a: unknown): a is string => typeof a === "string" && !!a) : [],
+        Array.isArray(removeAliases) ? removeAliases.filter((a: unknown): a is string => typeof a === "string" && !!a) : [],
+      ),
+    );
   }
   if (m === "POST" && path === "/api/hosts/rename") {
     const { host, displayName } = await readJson(req);
@@ -260,11 +293,12 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, await daemon.reconnectHost(host));
   }
   if (m === "POST" && path === "/api/agents/rename") {
-    const { address, displayName, alias } = await readJson(req);
+    const { address, displayName, alias, removeAlias } = await readJson(req);
     if (typeof address !== "string" || !address) throw new RpcError("bad_request", "address is required");
     if (typeof displayName === "string" && displayName.trim()) return send(res, 200, await daemon.renameAgentAny(address, displayName.trim()));
     if (typeof alias === "string" && alias.trim()) return send(res, 200, await daemon.aliasAgentAny(address, alias.trim()));
-    throw new RpcError("bad_request", "displayName or alias is required");
+    if (typeof removeAlias === "string" && removeAlias.trim()) return send(res, 200, await daemon.removeAgentAliasAny(address, removeAlias.trim()));
+    throw new RpcError("bad_request", "displayName, alias or removeAlias is required");
   }
   if (m === "GET" && path === "/api/agents/stats") {
     const since = Number(url.searchParams.get("since") ?? Date.now() - 24 * 3600_000);
@@ -281,6 +315,23 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     });
   }
   if (m === "GET" && path === "/api/config") return send(res, 200, daemon.runtimeConfig());
+  if (m === "POST" && path === "/api/config") {
+    // A small whitelist: these are restart-required values the Web Settings may edit.
+    const { advertise, retentionDays } = await readJson(req);
+    if (advertise !== undefined && advertise !== null && (typeof advertise !== "string" || !advertise.trim())) throw new RpcError("bad_request", "advertise must be a non-empty string or null");
+    if (retentionDays !== undefined && retentionDays !== null && (typeof retentionDays !== "number" || !Number.isInteger(retentionDays) || retentionDays < 1)) throw new RpcError("bad_request", "retentionDays must be a positive integer or null");
+    const cfg = loadConfig(daemon.store.home);
+    if (advertise !== undefined) {
+      if (advertise === null) delete cfg.advertise;
+      else cfg.advertise = advertise.trim();
+    }
+    if (retentionDays !== undefined) {
+      if (retentionDays === null) delete cfg.retention.days;
+      else cfg.retention.days = retentionDays;
+    }
+    saveConfig(cfg, daemon.store.home);
+    return send(res, 200, { ok: true, restartRequired: true, pending: daemon.runtimeConfig().pending });
+  }
   if (m === "GET" && path === "/api/doctor") return send(res, 200, daemon.doctor(webStale()));
   if (m === "POST" && path === "/api/artifacts") {
     const name = (url.searchParams.get("name") ?? "file").slice(0, 200);
@@ -324,14 +375,13 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return;
   }
   if (m === "GET" && path === "/api/threads") {
-    const before = url.searchParams.get("before");
-    const rows = daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined, before ? Number(before) : undefined);
+    const rows = daemon.store.listThreads(parseLimit(url.searchParams.get("limit"), 200), parseStatus(url.searchParams.get("status")), parseBefore(url.searchParams.get("before")));
     return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
   }
   if (m === "GET" && path === "/api/search") {
     const q = url.searchParams.get("q") ?? "";
     if (!q.trim()) throw new RpcError("bad_request", "q required");
-    return send(res, 200, daemon.search(q, Number(url.searchParams.get("limit") ?? 20)));
+    return send(res, 200, daemon.search(q, parseLimit(url.searchParams.get("limit"), 20, { zeroOk: true })));
   }
   if (m === "POST" && path === "/api/prune") {
     const { olderThanDays, dryRun } = await readJson(req);
@@ -339,10 +389,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, daemon.prune(olderThanDays, dryRun !== false));
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)$/.exec(path))) {
-    const rawLimit = Number(url.searchParams.get("limit"));
-    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+    const rawLimit = url.searchParams.get("limit");
+    const limit = rawLimit === null ? undefined : parseLimit(rawLimit, 200);
     const before = url.searchParams.get("before") ?? undefined;
-    const t = daemon.thread(match[1]!, { ...(limit ? { limit } : {}), ...(before ? { before } : {}) });
+    const t = daemon.thread(match[1]!, { ...(limit !== undefined ? { limit } : {}), ...(before ? { before } : {}) });
     return t ? send(res, 200, t) : send(res, 404, { error: "not_found" });
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
@@ -396,8 +446,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
 
 /** SSE: replay the Thread so far, then follow live events until it closes. */
 function stream(daemon: Daemon, threadId: string, orderId: string | undefined, req: IncomingMessage, res: ServerResponse): void {
+  const thread = daemon.thread(threadId);
+  if (!thread) {
+    // Without this, SSE opens a 200 stream that never closes: `cafe wait <typo>` hangs forever.
+    send(res, 404, { error: "not_found", message: `no thread '${threadId}'` });
+    return;
+  }
   // Follow one Order (default: the Thread's latest) until it closes; earlier turns are replayed for context.
-  const until = orderId ?? daemon.thread(threadId)?.meta.orderId;
+  const until = orderId ?? thread.meta.orderId;
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   const write = (env: ThreadEnvelope) => {
     res.write(`data: ${JSON.stringify(env)}\n\n`);
@@ -411,7 +467,7 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   };
   daemon.on("thread", onEvent);
   const after = new URL(req.url ?? "/", "http://x").searchParams.get("after");
-  const replay = daemon.thread(threadId)?.events ?? [];
+  const replay = thread.events;
   const from = after ? replay.findIndex((e) => e.eventId === after) + 1 : 0;
   for (const env of replay.slice(Math.max(0, from))) onEvent(env);
   const ping = setInterval(() => res.write(": ping\n\n"), 15_000);

@@ -55,19 +55,31 @@ cafe barista list         # headless Baristas supervised by this daemon
 ## Configure
 
 ```bash
+cafe status                                           # daemon / router / root / traffic / pending config / next command
+cafe doctor                                           # daemon, identity, extension, skill, Claude command, router, root
 cafe root set 192.168.1.10:4777                       # Root moved; updates config and the live connection
 cafe config set router.model anthropic/claude-haiku-4-5  # LLM routing via pi auth; unset = keyword rules
+cafe config diff                                      # config.yml vs the running daemon (hot vs restart-required)
+cafe config apply                                     # apply hot keys; restart for the rest
 cafe daemon start --root                              # make this machine the Root
+cafe host rename mac-mini-2                           # this Host's display name (hot)
+cafe host alias old-mac-mini                          # user alias (shown first); cafe host unalias removes it
+cafe agent rename billing@mac-mini billing-owner      # Agent display name; Address stays stable
+cafe agent alias billing@mac-mini invoices            # user alias; cafe agent unalias removes it
+cafe extension install --agent pi                     # persistent pi extension (--agent omp / all)
 cafe barista start --dir ~/code/billing               # run a headless pi Barista for that directory
 cafe barista start --dir ~/code/billing --agent codex # a Codex Barista (codex app-server); --agent claude for Claude Code
 cafe barista start --dir ~/code/billing --agent codex --tui  # answer in the Codex session already running there
 cafe claude install                                   # running Claude Code sessions in a dir with .cafe answer questions (/cafe off pauses)
                                                       # read-only by default; --write lets it edit files in --dir
-cafe mcp install                                      # register `cafe mcp` (tools cafe_ask / cafe_wait / …) with Claude Code and Codex
+cafe mcp install                                      # Customer only: register `cafe mcp` (cafe_ask / cafe_wait / …)
 cafe serve --preset claude --dir ~/code/billing       # one `claude -p` per question, no session (or --preset codex)
+                                                      # presets are read-only by default; --write widens them
 cafe serve --exec "./answer.sh" --dir .               # any command: prompt on stdin (or {prompt_file}), answer on stdout;
                                                       # print `CAFE_DECLINE: <reason>` to decline
 ```
+
+`cafe mcp install` makes a host a **Customer** (it can ask). A **Barista** (it can answer) is `cafe barista start --agent …`, `cafe serve --preset …`, or a running pi / omp / Claude Code session with the extension or plugin loaded.
 
 A `.cafe` file in a directory gives agents started there an identity:
 

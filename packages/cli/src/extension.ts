@@ -73,11 +73,23 @@ export interface OmpExtensionState {
   available: boolean;
   installed: boolean;
   detail: string;
+  exitCode?: number;
+}
+
+/** The useful first line of a crashed tool's output; stack frames and runtime banners are noise. */
+export function summarizeProcessError(stderr: string, stdout = ""): string {
+  const lines = `${stderr}\n${stdout}`
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const useful = lines.find((l) => !/^at\s/.test(l) && !/^Bun v/.test(l) && !/^Node\.js v/.test(l) && !/^node:internal/.test(l) && !/^loader-state/.test(l));
+  return (useful ?? lines[0] ?? "failed").slice(0, 240);
 }
 
 export function ompExtensionState(source: string): OmpExtensionState {
   const r = spawnSync("omp", ["plugin", "list", "--json"], { encoding: "utf8", timeout: 3000 });
-  if (r.error || r.status !== 0) return { available: false, installed: false, detail: r.error ? "omp not found on PATH" : (r.stderr || "omp plugin list failed").trim() };
+  if (r.error) return { available: false, installed: false, detail: "omp not found on PATH" };
+  if (r.status !== 0) return { available: false, installed: false, detail: `omp exited ${r.status}: ${summarizeProcessError(r.stderr ?? "", r.stdout ?? "")}`, exitCode: r.status ?? undefined };
   const text = r.stdout;
   const installed = text.includes(source) || text.includes("@cafe/pi-extension");
   return { available: true, installed, detail: installed ? "listed by omp plugin list" : "not listed by omp plugin list" };

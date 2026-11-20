@@ -64,6 +64,20 @@ describe("runtime config endpoint", () => {
   });
 });
 
+describe("config write API", () => {
+  it("saves advertise and retention and reports them as pending", async () => {
+    const d = await startDaemon("pc1", { mode: "root" });
+    cleanup.push(d.stop);
+    const res = await fetch(`http://${d.addr}/api/config`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ advertise: "10.0.0.9", retentionDays: 14 }) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { restartRequired: boolean; pending: Array<{ key: string }> };
+    expect(body.restartRequired).toBe(true);
+    expect(body.pending.map((p) => p.key)).toEqual(expect.arrayContaining(["advertise", "retention.days"]));
+    const bad = await fetch(`http://${d.addr}/api/config`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ retentionDays: 0 }) });
+    expect(bad.status).toBe(400);
+  });
+});
+
 describe("web build freshness", () => {
   it("marks the snapshot after the built UI changes on disk", async () => {
     const dist = mkdtempSync(join(tmpdir(), "cafe-web-"));

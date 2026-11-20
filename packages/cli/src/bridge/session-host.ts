@@ -65,7 +65,8 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
   const injectTimeoutMs = opts.injectTimeoutMs ?? (Number(process.env.CAFE_INJECT_TIMEOUT_MS) || 120_000);
 
   const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log });
-  const queue: OrderHandle[] = [];
+  // An Order is acknowledged on arrival, so it needs heartbeats while it waits for the session's current turn.
+  const queue: Array<{ h: OrderHandle; stopBeat: () => void }> = [];
   /** Threads this session has answered in: their follow-ups need no repeated history. */
   const answered = new Set<string>();
   let current: { h: OrderHandle; started: boolean; cancelled: boolean; timer?: NodeJS.Timeout; stopBeat: () => void } | undefined;
@@ -87,8 +88,10 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
 
   const pump = () => {
     if (current || paused || stopped) return;
-    const h = queue.shift();
-    if (!h) return;
+    const next = queue.shift();
+    if (!next) return;
+    next.stopBeat(); // `current` takes over with its own heartbeat
+    const h = next.h;
     const self = { address: client.record?.address ?? cafe.name, description: cafe.description };
     const body = answered.has(h.order.threadId) ? buildFollowup(h.order) : buildPrompt(h.order, self, REPLY_NOTE);
     const marker = orderMarker(h.order.orderId);
@@ -132,7 +135,10 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     paused = p;
     if (p) {
       // Leave the network: queued Orders go back unanswered, the running one finishes.
-      for (const h of queue.splice(0)) await h.decline("the session stopped taking questions", { unavailable: true }).catch(() => {});
+      for (const q of queue.splice(0)) {
+        q.stopBeat();
+        await q.h.decline("the session stopped taking questions", { unavailable: true }).catch(() => {});
+      }
       if (!current) client.close();
     } else {
       await client.connect(identity());
@@ -146,12 +152,12 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
       void h.decline("the session stopped taking questions", { unavailable: true }).catch(() => {});
       return;
     }
-    queue.push(h);
+    queue.push({ h, stopBeat: keepAlive(h) });
     pump();
   });
   client.onCancel(({ orderId, by }) => {
-    const i = queue.findIndex((q) => q.order.orderId === orderId);
-    if (i >= 0) queue.splice(i, 1);
+    const i = queue.findIndex((q) => q.h.order.orderId === orderId);
+    if (i >= 0) queue.splice(i, 1)[0]!.stopBeat();
     if (current?.h.order.orderId === orderId) {
       current.cancelled = true;
       opts.send({ type: "cancel", orderId });
@@ -203,7 +209,10 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     stop: async () => {
       if (stopped) return;
       stopped = true;
-      for (const h of queue.splice(0)) await h.decline("the session closed", { unavailable: true }).catch(() => {});
+      for (const q of queue.splice(0)) {
+        q.stopBeat();
+        await q.h.decline("the session closed", { unavailable: true }).catch(() => {});
+      }
       if (current && !current.cancelled) await current.h.decline("the session closed", { unavailable: true }).catch(() => {});
       if (current) finish();
       server.close();

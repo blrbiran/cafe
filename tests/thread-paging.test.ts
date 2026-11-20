@@ -43,6 +43,34 @@ describe("thread detail pagination", () => {
   });
 });
 
+describe("limit validation", () => {
+  it("rejects negative, zero and non-numeric page sizes instead of leaking SQLite errors", async () => {
+    const { d, threadId } = await setup("ok");
+    const code = async (path: string) => (await fetch(`http://${d.addr}${path}`)).status;
+    expect(await code("/api/threads?limit=-1")).toBe(400);
+    expect(await code("/api/threads?limit=nope")).toBe(400);
+    expect(await code("/api/threads?limit=0")).toBe(400);
+    expect(await code("/api/threads?limit=1001")).toBe(400);
+    expect(await code("/api/threads?status=bogus")).toBe(400);
+    expect(await code("/api/threads?before=nope")).toBe(400);
+    expect(await code(`/api/threads/${threadId}?limit=-1`)).toBe(400);
+    expect(await code("/api/search?q=hello&limit=nope")).toBe(400);
+    expect(await code("/api/search?q=hello&limit=-1")).toBe(400);
+    const zero = (await (await fetch(`http://${d.addr}/api/search?q=hello&limit=0`)).json()) as unknown[];
+    expect(zero).toEqual([]);
+  });
+});
+
+describe("thread stream", () => {
+  it("returns 404 for an unknown Thread instead of an SSE stream that never closes", async () => {
+    const d = await startDaemon("pc1", { mode: "root" });
+    cleanup.push(d.stop);
+    const res = await fetch(`http://${d.addr}/api/threads/nosuch/stream`);
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("not_found");
+  });
+});
+
 describe("snapshot summaries", () => {
   it("tolerates old thread metadata without replies/declines arrays", async () => {
     const d = await startDaemon("pc1", { mode: "root" });

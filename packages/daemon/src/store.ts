@@ -151,9 +151,12 @@ export class Store {
 
   /** Newest first. `before`: only threads created before this time (paging to older threads). */
   listThreads(limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER): ThreadMeta[] {
+    // Defensive: SQLite reads LIMIT -1 as "all rows", and NaN binds as a datatype error.
+    const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 200;
+    const at = Number.isFinite(before) ? before : Number.MAX_SAFE_INTEGER;
     const rows = (status
-      ? this.db.prepare("SELECT meta FROM threads WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(status, before, limit)
-      : this.db.prepare("SELECT meta FROM threads WHERE created_at < ? ORDER BY created_at DESC LIMIT ?").all(before, limit)) as { meta: string }[];
+      ? this.db.prepare("SELECT meta FROM threads WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(status, at, n)
+      : this.db.prepare("SELECT meta FROM threads WHERE created_at < ? ORDER BY created_at DESC LIMIT ?").all(at, n)) as { meta: string }[];
     return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 

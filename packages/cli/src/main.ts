@@ -9,11 +9,11 @@ import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
-import { PRESETS, serve } from "./serve.ts";
+import { PRESETS, presetCommand, serve } from "./serve.ts";
 import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
 import { runSessionHost, type HostMessage } from "./bridge/session-host.ts";
 import { runInit } from "./init.ts";
-import { extensionPackageDir, installPiExtension, ompExtensionCommand, ompExtensionState, piExtensionState, removePiExtension } from "./extension.ts";
+import { extensionPackageDir, installPiExtension, ompExtensionCommand, ompExtensionState, piExtensionState, removePiExtension, summarizeProcessError } from "./extension.ts";
 import { runDoctor } from "./doctor.ts";
 import { claudeCommandPath, claudeCommandState, commandsStatus, installClaudeCommand, uninstallClaudeCommand } from "./commands.ts";
 import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
@@ -246,6 +246,33 @@ program
     out(`created ${res.file}\n\nnext:\n${res.next.map((s) => `  ${s}`).join("\n")}`, res);
   });
 
+program
+  .command("status")
+  .description("one screen: daemon, version, router, root, traffic, pending config and the next command")
+  .action(async () => {
+    if (!(await healthy())) {
+      out(`cafe daemon is not running\nnext: cafe daemon start`, { running: false, base: base() });
+      process.exitCode = 1;
+      return;
+    }
+    const [h, snap, cfg] = await Promise.all([api<any>("/api/health"), api<any>("/api/snapshot"), api<any>("/api/config").catch(() => undefined)]);
+    const pending: Array<{ key: string; mode: string }> = cfg?.pending ?? [];
+    const lines = [
+      `daemon:  ${h.host}${h.isRoot ? " (root)" : ""} at ${base()}, cafe ${h.version}`,
+      `router:  ${h.router}${h.model ? ` (${h.model})` : ""}${h.error ? ` — ${h.error}` : ""}`,
+      `root:    ${h.isRoot ? "this machine is the hub" : `${h.root ?? "none"}${h.rootOnline ? " (online)" : " (offline)"}`}`,
+      `traffic: ${snap.threads.length} recent thread(s), ${snap.agents.length} agent(s), ${snap.daemons.length} machine(s)`,
+    ];
+    if (pending.length) {
+      lines.push(`pending: ${pending.map((p) => `${p.key} (${p.mode})`).join(", ")}`);
+      lines.push("next:    cafe config apply (hot keys) or cafe daemon restart");
+    } else {
+      lines.push("pending: none; config.yml and the running daemon agree");
+    }
+    if (snap.webStale) lines.push("web:     the built UI on disk is newer; cafe daemon restart");
+    out(lines.join("\n"), { running: true, health: h, threads: snap.threads.length, agents: snap.agents.length, machines: snap.daemons.length, pending, webStale: !!snap.webStale });
+  });
+
 const daemon = program.command("daemon").description("manage the local daemon");
 daemon
   .command("run")
@@ -474,15 +501,30 @@ program
   .argument("<threadId>")
   .action(async (id: string) => out(`cancelled ${id}`, await api(`/api/threads/${id}/cancel`, { method: "POST" })));
 
+/** User-added aliases only (legacy names and the stable id are not display candidates). */
+function explicitAliases(aliases: string[] | undefined, hide: Array<string | undefined>): string[] {
+  const blocked = new Set(hide.filter(Boolean) as string[]);
+  return (aliases ?? []).filter((a) => a && !blocked.has(a));
+}
+
+/** `name#n@<host label>`: stable name/ordinal, current Host label (alias-first). */
+function displayAddress(a: AgentRecord, daemons: DaemonRecord[]): string {
+  const d = daemons.find((x) => x.host === a.host);
+  const host = d ? (explicitAliases(d.aliases, [d.host, d.displayName]).at(-1) ?? d.displayName ?? d.host) : a.host;
+  const at = a.address.indexOf("@");
+  const namePart = at >= 0 ? a.address.slice(0, at) : a.name;
+  return `${namePart}@${host}`;
+}
+
 program
   .command("agents")
   .description("list registered agents")
   .action(async () => {
     await ensureDaemon();
-    const list = await api<AgentRecord[]>("/api/agents");
+    const [list, snap] = await Promise.all([api<AgentRecord[]>("/api/agents"), api<{ daemons: DaemonRecord[] }>("/api/snapshot")]);
     const lines = list
       .sort((a, b) => a.address.localeCompare(b.address))
-      .map((a) => `${a.status.padEnd(7)} ${a.role.padEnd(8)} ${runsAs(a).padEnd(12)} ${a.address.padEnd(28)} ${a.description}${a.scope.length ? ` [${a.scope.join(", ")}]` : ""}`);
+      .map((a) => `${a.status.padEnd(7)} ${a.role.padEnd(8)} ${runsAs(a).padEnd(12)} ${displayAddress(a, snap.daemons).padEnd(28)} ${a.description}${a.scope.length ? ` [${a.scope.join(", ")}]` : ""}`);
     out(lines.join("\n") || "(no agents)", list);
   });
 
@@ -644,6 +686,16 @@ host
     }
   });
 
+host
+  .command("unalias")
+  .argument("<alias>")
+  .description("remove a user-added Host alias (legacy names stay routable)")
+  .action(async (alias: string) => {
+    if (!(await healthy())) throw new Error("cafe daemon is not running");
+    const rec = await api<DaemonRecord>("/api/host", { method: "POST", body: JSON.stringify({ removeAliases: [alias] }) });
+    out(`aliases: ${rec.aliases.join(", ") || "(none)"}`, rec);
+  });
+
 const agent = program.command("agent").description("display names and aliases for Agents (agentId and Address stay stable)");
 agent
   .command("rename")
@@ -661,6 +713,15 @@ agent
   .description("add another name that resolves to this Agent")
   .action(async (address: string, alias: string) => {
     const rec = await api<AgentRecord>("/api/agents/rename", { method: "POST", body: JSON.stringify({ address, alias }) });
+    out(`aliases: ${rec.aliases.join(", ") || "(none)"}`, rec);
+  });
+agent
+  .command("unalias")
+  .argument("<address>")
+  .argument("<alias>")
+  .description("remove a user-added Agent alias (legacy names stay routable)")
+  .action(async (address: string, alias: string) => {
+    const rec = await api<AgentRecord>("/api/agents/rename", { method: "POST", body: JSON.stringify({ address, removeAlias: alias }) });
     out(`aliases: ${rec.aliases.join(", ") || "(none)"}`, rec);
   });
 
@@ -716,11 +777,14 @@ const config = program.command("config").description("~/.cafe/config.yml");
 config
   .command("get")
   .argument("[key]")
-  .description("print one value (no key: the whole file); an unset value prints (not set)")
-  .action((key?: string) => {
+  .option("--reveal", "with no key: print the whole file, including the token")
+  .description("print one value (no key: the whole file, token redacted); an unset value prints (not set)")
+  .action((key: string | undefined, o: { reveal?: boolean }) => {
     const c = loadConfig() as Record<string, any>;
     if (!key) {
-      out(JSON.stringify(c, null, 2), c);
+      // The token is a full-access credential: showing the whole config must not leak it by default.
+      const shown = o.reveal ? c : { ...c, ...(typeof c.token === "string" ? { token: "<redacted; `cafe config get token` or --reveal to show>" } : {}) };
+      out(JSON.stringify(shown, null, 2), shown);
       return;
     }
     if (!CONFIG_KEYS.includes(key)) throw new Error(`unknown config key '${key}'`);
@@ -841,11 +905,18 @@ barista
   .action(async (o) => out("stopped", await api(`/api/baristas?dir=${encodeURIComponent(resolve(o.dir))}`, { method: "DELETE" })));
 barista
   .command("list")
-  .description("list the Baristas this daemon supervises")
+  .alias("ls")
+  .description("list supervised headless workers (not all agents; see `cafe agents`)")
   .action(async () => {
-  const ws = await api<any[]>("/api/baristas");
-  out(ws.map((w) => `${w.running ? "running" : "waiting"} ${String(w.agent ?? "pi").padEnd(6)} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n") || "(none)", ws);
-});
+    const ws = await api<any[]>("/api/baristas");
+    if (ws.length) {
+      out(ws.map((w) => `${w.running ? "running" : "waiting"} ${String(w.agent ?? "pi").padEnd(6)} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n"), ws);
+      return;
+    }
+    // A TUI / session-host Agent is registered directly, not supervised: say so instead of a bare (none).
+    const registered = await api<any[]>("/api/agents").then((as) => as.filter((a) => a.role === "barista").length).catch(() => 0);
+    out(`(no supervised workers)${registered ? `\n${registered} registered barista(s) are connected; run \`cafe agents\` to list them` : ""}`, ws);
+  });
 barista
   .command("run")
   .description("run a Codex / Claude Code Barista in the foreground (what `barista start --agent codex|claude` supervises)")
@@ -990,11 +1061,13 @@ program
   .command("serve")
   .description("be a Barista by running a command per question (prompt on stdin, answer on stdout)")
   .option("--exec <cmd>", "shell command; use {prompt_file} to get the prompt as a file instead of stdin")
-  .option("--preset <name>", `ready-made command: ${Object.keys(PRESETS).join(", ")}`)
+  .option("--preset <name>", `ready-made command: ${Object.keys(PRESETS).join(", ")} (read-only unless --write)`)
   .option("--dir <dir>", "directory whose .cafe gives the identity (and where the command runs)", process.cwd())
+  .option("--write", "with --preset: let the agent edit files in --dir (default: read-only)")
   .option("--timeout <ms>", "kill the command after this long (default: no limit)", Number)
   .action(async (o) => {
-    const cmd = o.exec ?? (o.preset ? PRESETS[o.preset] : undefined);
+    if (o.write && !o.preset) throw new Error("--write is for --preset; a custom --exec command defines its own access");
+    const cmd = o.exec ?? (o.preset ? presetCommand(o.preset, !!o.write) : undefined);
     if (!cmd) throw new Error(`pass --exec "<cmd>" or --preset ${Object.keys(PRESETS).join("|")}`);
     await ensureDaemon();
     const { stop } = await serve({ exec: cmd, dir: o.dir, daemon: base().replace(/^http:\/\//, ""), token: process.env.CAFE_TOKEN, timeoutMs: o.timeout });
@@ -1035,7 +1108,7 @@ extension
           continue;
         }
         const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
-        results.push(`omp: ${r.error ? "omp not found on PATH" : r.status === 0 ? "installed" : `failed: ${(r.stderr || r.stdout).trim().split("\n").at(-1)}`}`);
+        results.push(`omp: ${r.error ? "omp not found on PATH" : r.status === 0 ? "installed" : `failed: ${summarizeProcessError(r.stderr ?? "", r.stdout ?? "")}`}`);
       }
     }
     out(results.join("\n"), results);
@@ -1049,7 +1122,8 @@ extension
     const omp = ompExtensionState(source);
     const lines = [
       `pi:  ${pi.installed ? "installed" : "not installed"} (${pi.settingsPath})`,
-      `omp: ${omp.available ? (omp.installed ? "installed" : "not installed") : omp.detail}`,
+      `omp: ${omp.available ? (omp.installed ? "installed" : "not installed") : `unavailable (${omp.detail})`}`,
+      ...(omp.available ? [] : ["     next: run `omp --version`; reinstall @oh-my-pi/pi-coding-agent"]),
     ];
     out(lines.join("\n"), { source, pi, omp });
   });
@@ -1120,7 +1194,7 @@ program
   .command("doctor")
   .description("check daemon, identity, extension, skill and root; print the next command")
   .action(async () => {
-    const res = await runDoctor({ base: base(), home: cafeHome(), cwd: process.cwd(), token: process.env.CAFE_TOKEN });
+    const res = await runDoctor({ base: base(), home: cafeHome(), cwd: process.cwd(), token: process.env.CAFE_TOKEN ?? loadConfig().token });
     const lines = res.checks.map((c) => `${c.level.padEnd(4)} ${c.name.padEnd(9)} ${c.detail}${c.next ? `\n     next: ${c.next}` : ""}`);
     if (res.ok) lines.push("all checks passed");
     out(lines.join("\n"), { ok: res.ok, checks: res.checks });

@@ -138,12 +138,14 @@ export const api = {
   /** Apply a model, or clear to rules with null. A bad model is rolled back by the daemon. */
   setRouterModel: (model: string | null) => call<RouterState>("POST", "/api/router", { model }),
   /** Local Host display name and its aliases; internal ids never change. */
-  setHostIdentity: (displayName: string, aliases: string[]) => call<{ host: string; displayName?: string; aliases: string[] }>("POST", "/api/host", { displayName, aliases }),
+  setHostIdentity: (displayName: string, aliases: string[], removeAliases: string[] = []) =>
+    call<{ host: string; displayName?: string; aliases: string[]; legacyAliases?: string[] }>("POST", "/api/host", { displayName, aliases, removeAliases }),
   renameHost: (host: string, displayName: string) => call<unknown>("POST", "/api/hosts/rename", { host, displayName }),
   testHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/test", { host }),
   reconnectHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/reconnect", { host }),
   renameAgent: (address: string, displayName: string) => call<unknown>("POST", "/api/agents/rename", { address, displayName }),
   aliasAgent: (address: string, alias: string) => call<unknown>("POST", "/api/agents/rename", { address, alias }),
+  removeAgentAlias: (address: string, removeAlias: string) => call<unknown>("POST", "/api/agents/rename", { address, removeAlias }),
   baristas: () => call<BaristaInfo[]>("GET", "/api/baristas"),
   /** Start a supervised Barista. `bin` picks pi (default) or omp; `agent` picks codex or claude. */
   startBarista: (p: { dir: string; bin?: "pi" | "omp"; agent?: "codex" | "claude"; access?: "read-only" | "workspace-write" }) =>
@@ -153,6 +155,8 @@ export const api = {
   settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean }>("GET", "/api/settings"),
   /** What the daemon is running plus config.yml changes it has not applied yet. */
   config: () => call<RuntimeConfig>("GET", "/api/config"),
+  saveConfig: (p: { advertise?: string | null; retentionDays?: number | null }) =>
+    call<{ ok: boolean; restartRequired: boolean; pending: RuntimeConfig["pending"] }>("POST", "/api/config", p),
   doctor: () => call<{ ok: boolean; checks: DoctorCheck[] }>("GET", "/api/doctor"),
   /** Upload one file before creating the Order; the returned metadata goes on the Order. */
   uploadAttachment: async (file: File): Promise<Attachment> => {

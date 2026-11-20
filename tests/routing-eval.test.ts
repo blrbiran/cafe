@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RoutingHint } from "@cafe/protocol";
 import { RulesRouter } from "../packages/daemon/src/router.ts";
 import { computeHints, identityOf, orderKeywords, type OutcomeRow } from "../packages/daemon/src/hints.ts";
-import { EVAL_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
+import { EVAL_CASES, EXTRA_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
 
 /**
  * Routing eval: a fixed set of Baristas and Orders with the expected receiver.
@@ -38,6 +38,13 @@ async function run(hints?: Map<string, RoutingHint>) {
 const acc = (rs: Awaited<ReturnType<typeof run>>) => rs.filter((r) => (r.mode === "broadcast" ? r.got === "broadcast" : r.got === r.expected[0])).length;
 
 describe("routing eval (rules)", () => {
+  it("keeps the #39 overlap/morphology/multicast cases available to the eval script", () => {
+    expect(EXTRA_CASES.length).toBeGreaterThanOrEqual(9);
+    expect(EXTRA_CASES.some((c) => c.mode === "multicast")).toBe(true);
+    expect(EXTRA_CASES.some((c) => c.expect[0] === "no_owner")).toBe(true);
+    expect(EXTRA_CASES.some((c) => /README/.test(c.q))).toBe(true);
+  });
+
   it("decides every clear case from the description", async () => {
     const rows = await run();
     for (const r of rows) {

@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { defaultExtensionPath, loadConfig } from "@cafe/daemon";
 import { ompExtensionState, piExtensionState } from "./extension.ts";
@@ -56,6 +57,20 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
   const omp = ompExtensionState(source);
   if (omp.available && !omp.installed) checks.push({ name: "omp", level: "warn", detail: `omp: ${omp.detail}`, next: "cafe extension install --agent omp" });
 
+  // Native Barista runtimes (optional unless you use --agent codex / claude).
+  for (const [bin, flag] of [
+    ["codex", "--agent codex"],
+    ["claude", "--agent claude"],
+  ] as const) {
+    const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 3000 });
+    if (r.error || r.status !== 0) {
+      checks.push({ name: bin, level: "warn", detail: `${bin} not on PATH (needed for ${flag})`, next: `install ${bin} and sign in` });
+    } else {
+      const line = (r.stdout || r.stderr || "").trim().split("\n")[0] ?? "";
+      checks.push({ name: bin, level: "ok", detail: line.slice(0, 120) });
+    }
+  }
+
   const skillLinks = [join(userHome, ".claude/skills/cafe"), join(userHome, ".agents/skills/cafe")].filter((p) => existsSync(p));
   checks.push(
     skillLinks.length
@@ -95,11 +110,21 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
   } else {
     try {
       const res = await get(`http://${cfg.root}/api/health`, { signal: AbortSignal.timeout(1500), headers });
-      if (!res.ok) throw new Error(res.status === 401 ? "unauthorized (check token)" : `HTTP ${res.status}`);
+      if (!res.ok) {
+        throw new Error(
+          res.status === 401
+            ? cfg.token
+              ? "unauthorized (token mismatch; compare `cafe config get token` on both hosts)"
+              : "unauthorized (no token configured; run `cafe connect <root> --token <token>`)"
+            : `HTTP ${res.status}`,
+        );
+      }
       const info: any = await res.json();
       checks.push({ name: "root", level: "ok", detail: `${cfg.root} online${info.version ? ` (cafe ${info.version})` : ""}` });
     } catch (err) {
-      checks.push({ name: "root", level: "fail", detail: `${cfg.root}: ${(err as Error).message}`, next: `cafe root set ${cfg.root}` });
+      const msg = (err as Error).message;
+      const next = msg.startsWith("unauthorized") && cfg.token ? "cafe config get token" : msg.startsWith("unauthorized") ? `cafe connect ${cfg.root} --token <token>` : `cafe root set ${cfg.root}`;
+      checks.push({ name: "root", level: "fail", detail: `${cfg.root}: ${msg}`, next });
     }
   }
 

@@ -12,7 +12,7 @@
 import { writeFileSync } from "node:fs";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "../packages/daemon/src/router.ts";
 import type { RoutingDecision } from "@cafe/protocol";
-import { EVAL_CASES, agentRecords, evalOrder } from "../tests/routing-fixtures.ts";
+import { EVAL_CASES, EXTRA_CASES, agentRecords, evalOrder } from "../tests/routing-fixtures.ts";
 
 const args = process.argv.slice(2);
 const flag = (name: string): string | undefined => {
@@ -29,7 +29,7 @@ const timeoutMs = Number(flag("--timeout") ?? 15_000);
 const concurrency = Math.max(1, Number(flag("--concurrency") ?? 2));
 
 const baristas = agentRecords("eval");
-const cases = EVAL_CASES;
+const cases = [...EVAL_CASES, ...EXTRA_CASES];
 
 interface Attempt {
   q: string;

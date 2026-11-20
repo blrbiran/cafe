@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { installPiExtension, ompExtensionCommand, piExtensionState, removePiExtension } from "../packages/cli/src/extension.ts";
+import { installPiExtension, ompExtensionCommand, piExtensionState, removePiExtension, summarizeProcessError } from "../packages/cli/src/extension.ts";
 
 const dirs: string[] = [];
 function temp(): string {
@@ -60,5 +60,15 @@ describe("omp extension", () => {
       "--json",
     ]);
     expect(ompExtensionCommand("uninstall", "/repo/ext.js", {})).toEqual(["omp", "uninstall", "/repo/ext.js", "--json"]);
+  });
+
+  it("summarizes a crashed host's stderr in one actionable line (#53)", () => {
+    const stderr = [
+      "    at process.<anonymous> (file:///repo/loader-state.js:10:3)",
+      "Error: Failed to load pi_natives native addon",
+      "    at load (file:///repo/native.js:42:1)",
+      "Bun v1.4.4",
+    ].join("\n");
+    expect(summarizeProcessError(stderr)).toBe("Error: Failed to load pi_natives native addon");
   });
 });

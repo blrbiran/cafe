@@ -61,17 +61,30 @@ Renaming and aliases (routing keys and history are untouched; see [ADR-0007](doc
 
 ```bash
 cafe host rename mac-mini-2         # this Host's display name (hot)
-cafe host alias old-mac-mini        # old names/aliases still work in addresses
+cafe host alias old-mac-mini        # a user alias; shown first, removable
+cafe host unalias old-mac-mini      # remove a user alias (automatic old names stay routable)
 cafe agent rename billing@mac-mini billing-owner   # Agent display name; Address unchanged
+cafe agent alias billing@mac-mini invoices         # user alias (alias-first display)
+cafe agent unalias billing@mac-mini invoices
 cafe daemon rename ssh1 ssh1-docker # from the Root: rename another Daemon's display name
 ```
 
-Internal `host`, `agentId` and Address never change, so old Threads/statistics stay valid; `displayName` only affects what the UI and CLI show.
+Internal `host`, `agentId` and Address never change, so old Threads/statistics stay valid. Renaming no longer adds the old name to the display candidates: it goes into `legacyAliases` and keeps routing, while `aliases` are user-added and are shown first (`alias → displayName → stable name`). The Web shows both as chips; only user aliases have a remove button.
 
 ## As a Customer
 
 - **Claude Code / Codex (MCP recommended)**: `cafe mcp install` registers `cafe mcp` at user scope (`--dry-run` only prints the commands, `--client claude|codex` installs one). Tools: `cafe_agents`, `cafe_ask`, `cafe_wait`, `cafe_cancel`. It registers absolute node + cafe.js paths; reinstall after changing Node versions or moving the repo.
 - **skill**: `cafe skill install` symlinks `~/.claude/skills/cafe` and `~/.agents/skills/cafe`. Codex references it as `$cafe`, pi as `/skill:cafe`.
+
+How each host exposes cafe (all of them can also ask through the CLI or MCP):
+
+| Host | Natural entry | Notes |
+|---|---|---|
+| Codex | `$cafe` + MCP tools | `cafe mcp install` makes Codex a **Customer**; `cafe barista start --agent codex` makes it a **Barista** |
+| pi / omp | `/cafe agents\|ask\|status\|thread\|help` + `/skill:cafe` + extension tools | the extension registers `/cafe`; the skill keeps its own `/skill:cafe` namespace |
+| Claude Code | `/cafe` (plugin pause/resume), `/cafe-ask`, skill, MCP | `/cafe on\|off` pauses the running session as a Barista |
+
+`cafe mcp install` only lets the host **ask** other agents. To let it **answer**, start a Barista: `cafe barista start --dir <dir> --agent codex|claude`, or `cafe serve --preset codex|claude` (both read-only by default; `--write` widens it).
 - **CLI**: `cafe ask "..."`, `cafe ask --to billing "..."`, `cafe ask --thread <id> "follow-up"`, `cafe inbox`, `cafe thread <id>`, `cafe tail` (every routed / delivered / acked / replied / closed event; `--json` for JSONL, `--host` / `--type` / `--thread` to filter, heartbeats hidden by default).
 - **Web**: open `http://127.0.0.1:4777/`. The nav stays fixed and the content scrolls independently. Click a conversation to open it in a side drawer; the nav's Agents item expands to show the registered agents; Settings changes display names/aliases, the routing model and supervised Baristas; Live is the network-wide event stream.
 
@@ -143,7 +156,7 @@ retention:
   days: 90                 # optional; unset = never auto-prune, use `cafe prune --older-than N [--yes]`
 ```
 
-**What applies hot**: `router.model` and `root` are applied to the running Daemon through `/api/reload`; `mode`, `host`, `port`, `advertise` and `discovery` need a restart (`cafe daemon stop && cafe daemon start`, or `cafe daemon restart`). `cafe config set` does not yet distinguish them for you; when unsure, check `cafe daemon status` / `cafe doctor`.
+**What applies hot**: `router.model` and `root` are applied to the running Daemon through `/api/reload`; `mode`, `host`, `port`, `advertise`, `retention` and `discovery` need a restart. `cafe config set` now says which case applies (`applied` vs `saved; restart required: cafe daemon restart`), `cafe config diff` lists every file-vs-running difference, `cafe config apply` applies the hot keys, and `cafe daemon restart` applies the rest. `cafe status` shows daemon, router, root, traffic, pending config and the next command in one screen.
 
 `cafe root set <addr>` and `cafe config set <k> <v>` both update the file; `cafe root set` also updates the live connection. A Daemon in a container or behind NAT must set `advertise` to an address the Root can reach, otherwise the Root will not record an unreachable dial-back address.
 
@@ -198,6 +211,26 @@ open http://127.0.0.1:4777/
 ```
 
 Publishing (maintainers): `npm version <x.y.z>` → `npm run test:release` (pack, install into a temp prefix and smoke-test, no model calls) → `npm publish ./release`. See [`docs/specs/v2-7-publishing.md`](docs/specs/v2-7-publishing.md).
+
+### Upgrade an existing source install
+
+The Daemon is a long-running process: `npm run build:web` does **not** switch a running Daemon to new code. Update the files, then restart it:
+
+```bash
+git pull
+source ~/.bash_profile          # Node ≥ 22.18 (nvm); a bare ssh login may still be Node 18
+npm install
+npm run build:web
+npm link --workspace @cafe/cli
+cafe daemon restart             # required: builds do not reload the daemon
+cafe extension install --agent pi
+cafe extension install --agent omp   # optional; omp install is an alias of omp plugin install
+cafe daemon status              # version should now match package.json
+cafe status                     # daemon / router / pending config in one screen
+cafe doctor
+```
+
+Changing the Node version (or moving the repo) invalidates the absolute paths recorded by `cafe daemon install`, `cafe mcp install` and `cafe claude install`; run them again. In a container or behind NAT, set `advertise` to an address the Root can reach. Running pi / omp sessions keep their old extension until the host restarts.
 
 ## oh-my-pi
 

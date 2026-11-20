@@ -3,6 +3,7 @@ import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
 import { api } from "../api.ts";
+import { hostLabel } from "../display.ts";
 import { refreshStore, useStore } from "../store.ts";
 import { Disclosure, Empty, Facts, PageHeader, Pill } from "../ui/bits.tsx";
 
@@ -94,7 +95,7 @@ export function NetworkPage() {
           {sorted.map((d) => {
             const isThis = d.host === host;
             // A child daemon only knows the hub as a synthetic "root" record.
-            const name = !isThis && d.isRoot && d.host === "root" ? t.hub : (d.displayName ?? d.host);
+            const name = !isThis && d.isRoot && d.host === "root" ? t.hub : hostLabel(d.host, daemons);
             const badges = [d.isRoot || (isThis && isRoot) ? t.hub : undefined, isThis ? t.thisMachine : undefined].filter(Boolean) as string[];
             return (
               <article key={`${d.host}-${d.isRoot}`} className="card flex flex-col gap-2.5 p-4">

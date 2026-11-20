@@ -4,6 +4,7 @@ import { ago, useT, type Dict } from "../i18n.ts";
 import { clock, useNow } from "../format.ts";
 import { navigate } from "../route.ts";
 import { useStore } from "../store.ts";
+import { hostLabel as displayHost } from "../display.ts";
 import { Empty, PageHeader } from "../ui/bits.tsx";
 
 const FAILED = new Set(["order.failed", "order.declined"]);
@@ -61,7 +62,7 @@ export function LivePage() {
   const rows = shown.filter((e) => (!host || e.host === host) && (!failedOnly || FAILED.has(e.event.type)));
   const latest = shown[0]?.at;
   const hosts = [...new Set(daemons.map((d) => d.host))].sort();
-  const hostLabel = (h: string) => daemons.find((d) => d.host === h)?.displayName ?? h;
+  const hostLabel = (h: string) => displayHost(h, daemons);
 
   const togglePause = () => {
     if (!paused) setFrozen(events);

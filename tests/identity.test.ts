@@ -13,7 +13,8 @@ describe("host display names", () => {
     const rec = root.daemon.setHostIdentity("hub");
     expect(rec.host).toBe("root");
     expect(rec.displayName).toBe("hub");
-    expect(rec.aliases).toContain("root");
+    expect(rec.legacyAliases).toContain("root");
+    expect(rec.aliases).not.toContain("root");
     expect(root.daemon.snapshot()).toMatchObject({ host: "root", displayName: "hub" });
   });
 
@@ -43,7 +44,8 @@ describe("agent display names", () => {
 
     const renamed = await root.daemon.renameAgentAny("widgets@root", "gadget-owner");
     expect(renamed).toMatchObject({ name: "widgets", displayName: "gadget-owner", address: "widgets#1@root" });
-    expect(renamed.aliases).toContain("widgets");
+    expect(renamed.legacyAliases).toContain("widgets");
+    expect(renamed.aliases).not.toContain("widgets");
     expect(root.daemon.registry.get(b.rec.agentId)?.displayName).toBe("gadget-owner");
 
     const res = await c.ask({ body: "hello", to: "gadget-owner@root" });
@@ -148,8 +150,43 @@ describe("remote host rename", () => {
 
     const rec = root.daemon.renameHost("pc1", "pc-one");
     expect(rec).toMatchObject({ host: "pc1", displayName: "pc-one" });
-    expect(rec.aliases).toContain("pc1");
+    expect(rec.legacyAliases).toContain("pc1");
+    expect(rec.aliases).not.toContain("pc1");
     await waitFor(() => child.daemon.snapshot().displayName === "pc-one");
     expect(child.daemon.snapshot().host).toBe("pc1");
+  });
+});
+
+describe("explicit aliases and legacy names", () => {
+  it("adds and removes a user alias, while the old name stays routable", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const b = await barista(root.addr, identity("widgets"));
+    cleanup.push(() => b.client.close());
+    const c = await customer(root.addr);
+    cleanup.push(() => c.close());
+    root.daemon.setHostIdentity("hub");
+
+    const aliased = await root.daemon.renameAgentAny("widgets@hub", "widget-owner");
+    const withAlias = root.daemon.aliasAgent(aliased.agentId, "widgets-help");
+    expect(withAlias.aliases).toContain("widgets-help");
+    expect(withAlias.legacyAliases).toContain("widgets");
+
+    // The removed alias stops resolving; the automatic legacy name still does.
+    const removed = root.daemon.removeAgentAlias(aliased.agentId, "widgets-help");
+    expect(removed.aliases).not.toContain("widgets-help");
+    const r1 = await c.ask({ body: "one", to: "widget-owner@hub" });
+    expect((await untilClosed(c, r1.threadId)).some((e) => e.event.type === "order.replied")).toBe(true);
+    const r2 = await c.ask({ body: "two", to: "widgets@root" });
+    expect((await untilClosed(c, r2.threadId)).some((e) => e.event.type === "order.replied")).toBe(true);
+    expect(() => root.daemon.removeAgentAlias(aliased.agentId, "widgets")).toThrow(/legacy/);
+  });
+
+  it("removes a Host alias but refuses to remove the stable id", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    root.daemon.setHostIdentity("hub", ["hub-alias"]);
+    expect(root.daemon.removeHostAlias("hub-alias").aliases).not.toContain("hub-alias");
+    expect(() => root.daemon.removeHostAlias("root")).toThrow(/routing/);
   });
 });

@@ -92,6 +92,25 @@ describe("single root", () => {
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "finally" });
   });
 
+  it("keeps a slow, already-acked Order alive through the helper heartbeat (#6)", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const slow = await barista(root.addr, identity("slowish"), async (h) => {
+      await h.ack();
+      // Longer than FAST's 600 ms lease (200 ms interval × 3 misses): no manual heartbeat here,
+      // so this fails if the helper does not keep the queued/running Order alive.
+      await new Promise((r) => setTimeout(r, 900));
+      await h.reply("still here");
+    });
+    cleanup.push(() => slow.client.close());
+    const c = await customer(root.addr);
+    cleanup.push(() => c.close());
+    const res = await c.ask({ body: "slowly please", to: "slowish@root" });
+    const events = await untilClosed(c, res.threadId);
+    expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "still here" });
+    expect(events.find((e) => e.event.type === "order.failed")).toBeUndefined();
+  });
+
   it("uses an injected LLM router", async () => {
     const llm: Router = {
       name: "llm",
