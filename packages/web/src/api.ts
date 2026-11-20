@@ -1,4 +1,4 @@
-import type { AgentRecord, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import type { AgentRecord, Attachment, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 
 export interface Snapshot {
   host: string;
@@ -73,6 +73,35 @@ export interface RouterState {
   error?: string;
 }
 
+/** A saved config.yml value the running daemon has not applied yet. */
+export interface ConfigDiffRow {
+  key: string;
+  file: unknown;
+  running: unknown;
+  mode: "hot" | "restart-required";
+}
+
+/** Machine-level checks shared with the CLI doctor. */
+export interface DoctorCheck {
+  name: string;
+  level: "ok" | "warn" | "fail";
+  detail: string;
+  next?: string;
+}
+
+export interface RuntimeConfig {
+  mode: "root" | "daemon";
+  host: string;
+  displayName?: string;
+  port: number;
+  advertise?: string;
+  root?: string;
+  router: { model?: string; fallback?: string; learn?: boolean; timeoutMs?: number; concurrency?: number };
+  retention?: { days?: number };
+  discovery?: boolean;
+  pending: ConfigDiffRow[];
+}
+
 export interface SearchHit {
   orderId: string;
   who: string;
@@ -94,7 +123,7 @@ export const api = {
     return call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}${q ? `?${q}` : ""}`);
   },
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
-  createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string }) =>
+  createOrder: (p: { body: string; to?: string; kind?: "order" | "notice"; threadId?: string; attachments?: Attachment[] }) =>
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),
@@ -122,6 +151,20 @@ export const api = {
   stopBarista: (dir: string) => call<{ stopped: boolean }>("DELETE", `/api/baristas?dir=${encodeURIComponent(dir)}`),
   /** Root and a masked token for the Settings panel; never the full secret. */
   settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean }>("GET", "/api/settings"),
+  /** What the daemon is running plus config.yml changes it has not applied yet. */
+  config: () => call<RuntimeConfig>("GET", "/api/config"),
+  doctor: () => call<{ ok: boolean; checks: DoctorCheck[] }>("GET", "/api/doctor"),
+  /** Upload one file before creating the Order; the returned metadata goes on the Order. */
+  uploadAttachment: async (file: File): Promise<Attachment> => {
+    const res = await fetch(withToken(`/api/artifacts?name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.type || "application/octet-stream")}`), {
+      method: "POST",
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new ApiError(data.error ?? String(res.status), data.message ?? data.error ?? `${res.status} ${res.statusText}`);
+    return data.attachment as Attachment;
+  },
+  attachmentUrl: (id: string) => withToken(`/api/artifacts/${encodeURIComponent(id)}`),
 };
 
 export function wsUrl(): string {

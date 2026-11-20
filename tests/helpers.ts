@@ -10,7 +10,7 @@ export const FAST = { ackTimeoutMs: 300, heartbeatIntervalMs: 200, broadcastDead
 
 export async function startDaemon(host: string, opts: Partial<RunOptions> & { config?: Record<string, unknown> } = {}): Promise<Running & { home: string; addr: string }> {
   const home = mkdtempSync(join(tmpdir(), `cafe-${host}-`));
-  writeFileSync(join(home, "config.yml"), stringify({ host, token: "t0k", port: 0, advertise: "127.0.0.1", ...opts.config }));
+  writeFileSync(join(home, "config.yml"), stringify({ host, token: "t0k", port: 0, advertise: "127.0.0.1", ...(opts.mode ? { mode: opts.mode } : {}), ...opts.config }));
   const r = await runDaemon({ home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "no-web"), ...opts });
   const addr = `127.0.0.1:${r.server.port}`;
   const stop = r.stop;

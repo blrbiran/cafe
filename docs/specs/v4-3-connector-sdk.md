@@ -182,9 +182,11 @@ connector 的 `entry` 默认导出 `defineConnector(...)` 的结果；`cafe conn
 - `cafe connector remove` 只删除 cafe 自己的文件，不影响用户目录。
 - 至少一个真实平台（Discord 或 Slack）端到端验证；钉钉/飞书按同一契约接入。
 
-## 待用户确认
+## 已确认（2026-11-19，用户拍板）
 
-- **Q1**：命令命名用 `cafe connector`、保留 `cafe extension` 给 pi/omp，是否同意？（建议：同意。）
-- **Q2**：第一阶段只做 out-of-process sidecar，不做 daemon 内插件，是否同意？（建议：同意。）
-- **Q3**：第一个真实平台选 Discord 还是 Slack？（建议：Slack，webhook/Events API 更稳定、文档更完整；Discord 作为第二个。）
-- **Q4**：是否现在就在 `/api/orders` 加 `idempotencyKey`，还是先让 connector 自己保证？（建议：加，字段可选，daemon 做短窗口去重。）
+- **Q1**：命名用 `cafe connector`；`cafe extension` 只负责 pi/omp 扩展。
+- **Q2**：第一阶段只做进程外 sidecar，不做 daemon 内插件。
+- **Q3**：第一个真实平台选 **Discord**（不是 Slack）；Slack/钉钉/飞书按同一契约后续接入。
+- **Q4**：现在就在 `/api/orders` 加可选 `idempotencyKey`，daemon 做短窗口去重。
+
+实现状态：**未实现**。真实 Discord 端到端需要用户的 bot token；可先用 mock connector 验证生命周期与幂等。

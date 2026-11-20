@@ -35,12 +35,21 @@ export interface ServeOptions {
 const STDOUT_REPLY = "Answer directly and concisely; your entire stdout is sent back as the reply.";
 
 /** The text handed to the command for one Order. `replyNote` says how the answer gets back (stdout by default). */
-export function buildPrompt(order: Order, self: { address: string; description: string }, replyNote = STDOUT_REPLY): string {
+export function buildPrompt(
+  order: Order,
+  self: { address: string; description: string },
+  replyNote = STDOUT_REPLY,
+  attachments?: Array<{ name: string; mime: string; size: number; path?: string }>,
+): string {
   const lines = [
     `You are ${self.address} on the cafe agent network. Another agent or person sent you this question.`,
     `Your declared responsibility: ${self.description || "(none declared)"}`,
     `From: ${order.from.address}`,
   ];
+  if (attachments?.length) {
+    lines.push("", "Attachments on this machine:");
+    for (const a of attachments) lines.push(`- ${a.name} (${a.mime}, ${a.size} bytes)${a.path ? `: ${a.path}` : ""}`);
+  }
   if (order.turn > 1 && order.history.length) {
     lines.push("", `This is a follow-up (turn ${order.turn}). Earlier in this conversation:`);
     for (const h of order.history) lines.push(`[${h.role === "customer" ? "asked" : "answered"} by ${h.from}]`, h.text.slice(0, 1500), "");
@@ -57,11 +66,12 @@ export function buildPrompt(order: Order, self: { address: string; description: 
 }
 
 /** A Follow-up sent into an agent session that already holds the earlier turns (bridged Codex / Claude Baristas). */
-export function buildFollowup(order: Order): string {
+export function buildFollowup(order: Order, attachments?: Array<{ name: string; mime: string; size: number; path?: string }>): string {
   return [
     `Follow-up from ${order.from.address} (turn ${order.turn}) in the same cafe conversation:`,
     "",
     order.body,
+    ...(attachments?.length ? ["", "Attachments on this machine:", ...attachments.map((a) => `- ${a.name} (${a.mime}, ${a.size} bytes)${a.path ? `: ${a.path}` : ""}`)] : []),
     "",
     `Answer as before. If this is clearly outside your responsibility, reply with a single line \`${DECLINE_MARKER} <short reason>\` instead.`,
   ].join("\n");
@@ -87,7 +97,7 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
     active++;
     void client.setStatus("busy").catch(() => {});
     const stopBeat = keepAlive(h);
-    const prompt = buildPrompt(h.order, { address: client.record?.address ?? cafe.name, description: cafe.description });
+    const prompt = buildPrompt(h.order, { address: client.record?.address ?? cafe.name, description: cafe.description }, undefined, h.attachments);
     let tmp: string | undefined;
     let cmd = opts.exec;
     if (cmd.includes("{prompt_file}")) {

@@ -114,6 +114,20 @@ export const OrderVia = z.object({
 });
 export type OrderVia = z.infer<typeof OrderVia>;
 
+/** A file carried by an Order. Blobs live on the origin Host; the wire only carries metadata. */
+export const Attachment = z.object({
+  id: z.string(),
+  name: z.string(),
+  mime: z.string().default("application/octet-stream"),
+  size: z.number().int(),
+  sha256: z.string(),
+  /** Host whose daemon holds the blob; absent on Threads older than attachments. */
+  host: z.string().optional(),
+  /** Who uploaded it (web / cli / mcp or an Agent), for display and audit. */
+  uploader: Party.optional(),
+});
+export type Attachment = z.infer<typeof Attachment>;
+
 export const Order = z.object({
   orderId: z.string(),
   threadId: z.string(),
@@ -125,6 +139,8 @@ export const Order = z.object({
   /** Explicit Address requested by the Customer; skips LLM routing. */
   to: z.string().optional(),
   body: z.string(),
+  /** Files attached to this Order; the blobs stay on their origin Host. */
+  attachments: z.array(Attachment).optional(),
   parentOrderId: z.string().optional(),
   /** Agent ids already involved upstream in this call chain. */
   chain: z.array(z.string()).default([]),
@@ -173,7 +189,7 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.delivered"), agentId: z.string() }),
   z.object({ type: z.literal("order.acked"), agentId: z.string() }),
   z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), note: z.string().optional() }),
-  z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean() }),
+  z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), attachments: z.array(Attachment).optional() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
   z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional() }),
   z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string() }),
@@ -216,6 +232,8 @@ export const ThreadMeta = z.object({
   turns: z.number().int().default(1),
   /** When the latest Order (turn) was created. */
   turnStartedAt: z.number().optional(),
+  /** Files on the first question, so list views can show "2 attachments". */
+  attachments: z.array(Attachment).optional(),
   /** Routing Decision of the latest Order. */
   reason: z.string().optional(),
   router: z.enum(["explicit", "followup", "llm", "rules"]).optional(),
@@ -272,6 +290,8 @@ export const CreateOrderParams = z.object({
   /** `agent` when an Agent relays the person's request; defaults to `human`. */
   origin: OrderOrigin.optional(),
   via: OrderVia.optional(),
+  /** Already-uploaded files to attach (ids from POST /api/artifacts on the same daemon). */
+  attachments: z.array(Attachment).optional(),
 });
 export type CreateOrderParams = z.infer<typeof CreateOrderParams>;
 

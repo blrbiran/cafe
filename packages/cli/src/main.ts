@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
@@ -14,6 +15,7 @@ import { runSessionHost, type HostMessage } from "./bridge/session-host.ts";
 import { runInit } from "./init.ts";
 import { extensionPackageDir, installPiExtension, ompExtensionCommand, ompExtensionState, piExtensionState, removePiExtension } from "./extension.ts";
 import { runDoctor } from "./doctor.ts";
+import { claudeCommandPath, claudeCommandState, commandsStatus, installClaudeCommand, uninstallClaudeCommand } from "./commands.ts";
 import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
 import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
@@ -46,6 +48,22 @@ async function healthy(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+const ATTACH_MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".txt": "text/plain", ".log": "text/plain", ".json": "application/json" };
+
+/** Upload one file to the local daemon; the returned metadata goes on the Order. */
+async function uploadAttachment(file: string): Promise<{ id: string; name: string; mime: string; size: number; sha256: string; host?: string }> {
+  const path = resolve(file);
+  if (!existsSync(path)) throw new Error(`cannot read ${file}`);
+  const name = basename(path);
+  const mime = ATTACH_MIME[extname(path).toLowerCase()] ?? "application/octet-stream";
+  const headers: Record<string, string> = { "content-type": "application/octet-stream" };
+  if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
+  const res = await fetch(`${base()}/api/artifacts?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, { method: "POST", body: readFileSync(path), headers });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`upload ${file} failed: ${formatApiError(body, res.status)}`);
+  return body.attachment;
 }
 
 /**
@@ -321,6 +339,9 @@ daemon
     if (!(await healthy())) return out("cafe daemon is not running", { running: false });
     const s = await api("/api/snapshot");
     const h = await api("/api/health");
+    const cfg = await api<{ pending?: { key: string; file: unknown; running: unknown; mode: "hot" | "restart-required" }[] }>("/api/config");
+    const pending = cfg.pending ?? [];
+    const fmt = (v: unknown) => (v === undefined ? "(not set)" : typeof v === "string" ? v : JSON.stringify(v));
     out(
       [
         `host:      ${s.host}${s.isRoot ? " (root)" : ""}`,
@@ -332,9 +353,12 @@ daemon
         `router:    ${h.router}${h.model ? ` (${h.model})` : ""}`,
         `agents:    ${s.agents.length} (registry v${s.registryVersion})`,
         `threads:   ${s.threads.length}`,
+        ...(pending.length
+          ? [`pending:   ${pending.map((p) => `${p.key}: ${fmt(p.running)} -> ${fmt(p.file)} (${p.mode})`).join(", ")}; ${pending.some((p) => p.mode === "hot") ? "run `cafe config apply` and/or `cafe daemon restart`" : "run `cafe daemon restart`"}`]
+          : []),
         ...versionLines(s.daemons),
       ].join("\n"),
-      { running: true, ...s, threads: s.threads.length, routerModel: h.model, routerError: h.error },
+      { running: true, ...s, threads: s.threads.length, routerModel: h.model, routerError: h.error, pendingConfig: pending },
     );
   });
 
@@ -350,9 +374,12 @@ program
   .option("--as <name>", "customer name shown to others", "cli")
   .option("--origin <kind>", "human (default) or agent: who actually asked", "human")
   .option("--via <address>", "with --origin agent: the Agent relaying the request")
+  .option("--attach <file>", "attach a file (repeatable; uploaded before the Order)", (v: string, acc: string[]) => [...acc, v], [] as string[])
   .action(async (words: string[], o) => {
     if (o.origin !== "human" && o.origin !== "agent") throw new Error("--origin must be human or agent");
     await ensureDaemon();
+    const attachments = [];
+    for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
     const res = await api("/api/orders", {
       method: "POST",
       body: JSON.stringify({
@@ -364,6 +391,7 @@ program
         as: o.as,
         origin: o.origin,
         ...(o.via ? { via: { address: o.via } } : {}),
+        ...(attachments.length ? { attachments } : {}),
       }),
     });
     if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision.mode}: ${res.decision.reason}`, res);
@@ -542,12 +570,35 @@ program
 
 program
   .command("thread")
-  .description("show a thread's full event log")
+  .description("show a thread's full event log, or download one of its attachments")
   .argument("<threadId>")
-  .action(async (id: string) => {
+  .option("--download <attachmentId>", "download this attachment")
+  .option("--out <dir>", "download directory", ".")
+  .action(async (id: string, o) => {
+    if (o.download) {
+      const headers: Record<string, string> = {};
+      if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
+      const res = await fetch(`${base()}/api/artifacts/${encodeURIComponent(o.download)}`, { headers });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(`download failed: ${formatApiError(body, res.status)}`);
+      }
+      const bytes = Buffer.from(await res.arrayBuffer());
+      const sha = res.headers.get("x-cafe-sha256");
+      if (sha && createHash("sha256").update(bytes).digest("hex") !== sha) throw new Error("downloaded file failed its sha256 check");
+      const cd = res.headers.get("content-disposition") ?? "";
+      const name = (/filename="([^"]+)"/.exec(cd)?.[1] ?? `${o.download}.bin`).replace(/[/\\]/g, "_");
+      const dir = resolve(o.out);
+      mkdirSync(dir, { recursive: true });
+      const path = join(dir, basename(name));
+      writeFileSync(path, bytes);
+      out(`downloaded ${path} (${bytes.length} bytes${sha ? `, sha256 ${sha}` : ""})`, { path, size: bytes.length, sha256: sha });
+      return;
+    }
     const t = await api<{ meta: ThreadMeta; events: ThreadEnvelope[] }>(`/api/threads/${id}`);
     const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
-    const lines = [`${t.meta.from.address}: ${t.meta.summary}`, ...t.events.map((e) => describe(e, agents)).filter(Boolean)];
+    const att = t.meta.attachments?.map((a) => `📎 ${a.name} (${a.size} bytes, id ${a.id})`) ?? [];
+    const lines = [`${t.meta.from.address}: ${t.meta.summary}`, ...att, ...t.events.map((e) => describe(e, agents)).filter(Boolean)];
     out(lines.join("\n"), t);
   });
 
@@ -1023,6 +1074,46 @@ extension
       }
     }
     out(results.join("\n"), results);
+  });
+
+const commandsCmd = program.command("commands").description("slash-command entry points for pi / omp / Claude Code / Codex");
+commandsCmd
+  .command("status")
+  .description("show each host's /cafe or $cafe entry point and whether it is installed")
+  .action(() => {
+    const rows = commandsStatus({ cafeHome: cafeHome() });
+    out(rows.map((r) => `${r.agent.padEnd(7)} ${r.entry.padEnd(10)} ${r.status.padEnd(11)} ${r.detail}`).join("\n"), rows);
+  });
+
+commandsCmd
+  .command("install")
+  .description("install the /cafe-ask command for Claude Code (pi/omp get /cafe from the extension)")
+  .requiredOption("--agent <agent>", "pi | omp | claude | codex")
+  .option("--dry-run", "print what would change")
+  .option("--force", "replace a command file cafe does not own")
+  .action((o) => {
+    if (o.agent !== "claude") {
+      const hint = o.agent === "codex" ? "Codex uses the `$cafe` skill: run `cafe skill install`." : `${o.agent} gets /cafe from the cafe extension: run \`cafe extension install --agent ${o.agent}\`.`;
+      out(hint, { agent: o.agent, manual: true });
+      return;
+    }
+    const r = installClaudeCommand(homedir(), { dryRun: o.dryRun, force: o.force });
+    const action = r.dryRun ? "would write" : "wrote";
+    const replaced = r.replaced ? `\nreplaced:\n${r.replaced}` : "";
+    out(`${action} ${r.path}${r.dryRun ? " (dry run)" : ""}${replaced}`, r);
+  });
+
+commandsCmd
+  .command("uninstall")
+  .description("remove the /cafe-ask command file (never a person's own command)")
+  .requiredOption("--agent <agent>", "pi | omp | claude | codex")
+  .action((o) => {
+    if (o.agent !== "claude") {
+      out(`${o.agent} has no cafe-managed command file; ${o.agent === "codex" ? "$cafe comes from the skill" : "/cafe comes from the extension"}.`, { agent: o.agent, removed: false });
+      return;
+    }
+    const r = uninstallClaudeCommand(homedir());
+    out(r.removed ? `removed ${r.path}` : `${r.path} was not installed`, r);
   });
 
 program

@@ -102,7 +102,7 @@ export function formatHistory(history: Order["history"]): string {
     .join("\n\n");
 }
 
-export function orderPrompt(order: Order, self?: AgentRecord): string {
+export function orderPrompt(order: Order, self?: AgentRecord, attachments?: Array<{ name: string; mime: string; size: number; path?: string }>): string {
   const to = self ? ` to you (${self.address})` : "";
   const head =
     order.turn > 1
@@ -120,6 +120,7 @@ export function orderPrompt(order: Order, self?: AgentRecord): string {
   return [
     ...head,
     order.body,
+    ...(attachments?.length ? ["", "Attachments on this machine:", ...attachments.map((a) => `- ${a.name} (${a.mime}, ${a.size} bytes)${a.path ? `: ${a.path}` : ""}`)] : []),
     "",
     "Answer this Order directly; your final reply in this turn is sent back to the asker.",
     "If it is outside your responsibility or scope, call cafe_decline with a short reason instead of answering.",
@@ -269,7 +270,7 @@ export default function cafe(pi: ExtensionAPI) {
       armWatchdog(current, injectTimeoutMs());
       void client.setStatus("busy").catch(() => {});
       pi.sendMessage(
-        { customType: "cafe-order", content: orderPrompt(next.handle.order, client.record), display: true, details: { order: next.handle.order } },
+        { customType: "cafe-order", content: orderPrompt(next.handle.order, client.record, next.handle.attachments), display: true, details: { order: next.handle.order } },
         { triggerTurn: true, deliverAs: "followUp" },
       );
     } finally {

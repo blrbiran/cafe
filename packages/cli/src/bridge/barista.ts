@@ -67,8 +67,8 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
     try {
       const resume = await client.getSession(h.order.threadId, opts.agent).catch(() => undefined);
       const r = await engine.run({
-        prompt: buildPrompt(h.order, self, REPLY_NOTE),
-        followup: buildFollowup(h.order),
+        prompt: buildPrompt(h.order, self, REPLY_NOTE, h.attachments),
+        followup: buildFollowup(h.order, h.attachments),
         resume,
         signal: abort.signal,
         onSession: (sid) => {

@@ -237,6 +237,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
           <span>{ask.verb}</span>
           <span>· {ago(t, meta.createdAt, now)}</span>
           {meta.turns > 1 && <span>· {t.turns(meta.turns)}</span>}
+          {meta.attachments?.length ? <span>· 📎 {meta.attachments.length}</span> : null}
         </div>
         <div className="flex flex-none items-center gap-2">
           <Pill tone={status.tone}>{status.text}</Pill>
@@ -262,6 +263,7 @@ function Composer({ initialTo }: { initialTo?: string }) {
   const agents = useStore((s) => s.agents);
   const [body, setBody] = useState("");
   const [to, setTo] = useState(initialTo ?? "");
+  const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -282,7 +284,9 @@ function Composer({ initialTo }: { initialTo?: string }) {
     setBusy(true);
     setErr(undefined);
     try {
-      const r = await api.createOrder({ body, to: to || undefined });
+      const attachments = [];
+      for (const file of files) attachments.push(await api.uploadAttachment(file));
+      const r = await api.createOrder({ body, to: to || undefined, ...(attachments.length ? { attachments } : {}) });
       closeComposer();
       navigate({ page: "thread", threadId: r.threadId });
     } catch (e) {
@@ -316,6 +320,34 @@ function Composer({ initialTo }: { initialTo?: string }) {
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void submit();
         }}
       />
+      <div className="flex flex-col gap-1.5">
+        <label className="cap" htmlFor="cafe-files">
+          {t.attach}
+        </label>
+        <input
+          id="cafe-files"
+          type="file"
+          multiple
+          onChange={(e) => {
+            const chosen = Array.from(e.currentTarget.files ?? []);
+            setFiles((xs) => [...xs, ...chosen]);
+            e.currentTarget.value = "";
+          }}
+        />
+        <div className="hint">{t.attachHint}</div>
+        {files.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {files.map((f, i) => (
+              <span key={`${f.name}-${i}`} className="kind-tag">
+                {f.name} ({(f.size / 1024).toFixed(1)} KB)
+                <button type="button" className="ml-1 text-muted" aria-label={t.removeAttachment(f.name)} onClick={() => setFiles((xs) => xs.filter((_, j) => j !== i))}>
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
       <div className="flex flex-wrap items-end gap-3">
         <div className="flex flex-[1_1_260px] flex-col gap-1.5">
           <label className="cap" htmlFor="cafe-to">

@@ -3,6 +3,18 @@ import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 
+export interface StoredArtifact {
+  id: string;
+  /** Unset while the blob is staged, before its Order (and Thread) exists. */
+  threadId?: string;
+  host: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  createdAt: number;
+}
+
 /**
  * Thread content lives in append-only JSONL files; SQLite keeps only metadata
  * and the Registry cache (ADR-0003).
@@ -44,6 +56,17 @@ export class Store {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (kind, cwd, thread_id)
       );
+      CREATE TABLE IF NOT EXISTS artifacts (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT,
+        host TEXT NOT NULL,
+        name TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS artifacts_thread ON artifacts(thread_id);
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
@@ -183,6 +206,39 @@ export class Store {
   deleteAgentSessions(threadIds: string[]): void {
     const del = this.db.prepare("DELETE FROM agent_sessions WHERE thread_id = ?");
     for (const id of threadIds) del.run(id);
+  }
+
+  putArtifact(a: StoredArtifact): void {
+    this.db
+      .prepare("INSERT INTO artifacts(id, thread_id, host, name, mime, size, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id")
+      .run(a.id, a.threadId ?? null, a.host, a.name, a.mime, a.size, a.sha256, a.createdAt);
+  }
+
+  getArtifact(id: string): StoredArtifact | undefined {
+    const row = this.db.prepare("SELECT * FROM artifacts WHERE id = ?").get(id) as
+      | { id: string; thread_id: string | null; host: string; name: string; mime: string; size: number; sha256: string; created_at: number }
+      | undefined;
+    return row ? { id: row.id, ...(row.thread_id ? { threadId: row.thread_id } : {}), host: row.host, name: row.name, mime: row.mime, size: row.size, sha256: row.sha256, createdAt: row.created_at } : undefined;
+  }
+
+  artifactsForThread(threadId: string): StoredArtifact[] {
+    const rows = this.db.prepare("SELECT * FROM artifacts WHERE thread_id = ? ORDER BY created_at").all(threadId) as {
+      id: string;
+      thread_id: string | null;
+      host: string;
+      name: string;
+      mime: string;
+      size: number;
+      sha256: string;
+      created_at: number;
+    }[];
+    return rows.map((row) => ({ id: row.id, ...(row.thread_id ? { threadId: row.thread_id } : {}), host: row.host, name: row.name, mime: row.mime, size: row.size, sha256: row.sha256, createdAt: row.created_at }));
+  }
+
+  deleteArtifactsForThread(threadId: string): StoredArtifact[] {
+    const rows = this.artifactsForThread(threadId);
+    this.db.prepare("DELETE FROM artifacts WHERE thread_id = ?").run(threadId);
+    return rows;
   }
 
   countAgentEventsBefore(cutoff: number): number {

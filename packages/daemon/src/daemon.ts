@@ -1,6 +1,8 @@
 import { EventEmitter } from "node:events";
-import { statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
+import { dirname, join } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
 import {
@@ -19,6 +21,7 @@ import {
   parseAddress,
   type AgentRecord,
   type AgentStatus,
+  type Attachment,
   type DaemonRecord,
   type Order,
   type Party,
@@ -29,7 +32,7 @@ import {
   type ThreadMeta,
 } from "@cafe/protocol";
 import { Peer, RpcError } from "@cafe/protocol/peer";
-import { type CafeConfig, saveConfig } from "./config.ts";
+import { type CafeConfig, diffConfig, loadConfig, saveConfig } from "./config.ts";
 import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints.ts";
 import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
@@ -646,9 +649,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         throw new RpcError("thread_busy", "the previous question in this thread is still open; wait or cancel it first");
       }
     }
+    const threadId = prior?.threadId ?? ulid();
+    // Blobs were uploaded to this daemon before the Order; move them into the Thread now.
+    const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
     const order: Order = {
       orderId: ulid(),
-      threadId: prior?.threadId ?? ulid(),
+      threadId,
       kind: p.kind,
       from,
       // A registered Agent asking through the protocol is relaying on someone's behalf.
@@ -656,6 +662,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       via: p.via ?? (peer?.meta.party ? { id: peer.meta.party.id, address: peer.meta.party.address } : undefined),
       to: p.to,
       body: p.body,
+      ...(attachments?.length ? { attachments } : {}),
       parentOrderId: p.parentOrderId,
       chain: [...(parent?.chain ?? []), ...(parent ? [parent.from.id] : [])],
       depth,
@@ -910,7 +917,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private deliverLocal(order: Order, agentId: string): void {
     const peer = this.agents.get(agentId);
     if (!peer) return this.relayFailure(order, agentId, "agent not connected");
-    peer.notify(Methods.orderDeliver, { order });
+    const foreign = (order.attachments ?? []).some((a) => a.host && a.host !== this.host);
+    if (!foreign) return this.notifyLocal(order, agentId, peer);
+    // The origin may be another Host: fetch the blobs before the Barista starts.
+    const t = this.tracking.get(order.orderId);
+    if (t) this.clearTimer(t, agentId);
+    void this.pullAndDeliver(order, agentId, peer);
+  }
+
+  private async pullAndDeliver(order: Order, agentId: string, peer: Peer): Promise<void> {
+    try {
+      await this.pullAttachments(order);
+    } catch (err) {
+      this.log(`attachment pull failed for ${order.orderId}: ${(err as Error).message}`);
+      this.relayFailure(order, agentId, `attachment_unavailable: ${(err as Error).message}`);
+      return;
+    }
+    this.notifyLocal(order, agentId, peer);
+    const t = this.tracking.get(order.orderId);
+    if (t && order.kind === "order") this.armAck(t, agentId);
+  }
+
+  private notifyLocal(order: Order, agentId: string, peer: Peer): void {
+    peer.notify(Methods.orderDeliver, { order, attachmentPaths: this.attachmentPaths(order) });
     this.emitEvent(order, { type: "order.delivered", agentId });
   }
 
@@ -1235,6 +1264,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (firstTurn) {
           meta.summary = summarize(ev.order.body);
           meta.summaryTurn = ev.order.turn;
+          if (ev.order.attachments?.length) meta.attachments = ev.order.attachments;
         }
         meta.turnStartedAt = ev.order.createdAt;
         meta.reason = undefined;
@@ -1608,7 +1638,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const bytes = this.store.deleteThreads(stale);
     this.store.deleteAgentSessions(stale.map((m) => m.threadId));
-    for (const m of stale) this.metas.delete(m.threadId);
+    for (const m of stale) {
+      this.metas.delete(m.threadId);
+      this.store.deleteArtifactsForThread(m.threadId);
+      rmSync(join(this.store.home, "artifacts", m.threadId), { recursive: true, force: true });
+    }
     const agentEvents = this.store.deleteAgentEventsBefore(cutoff);
     this.hintsDirty = true;
     this.log(`pruned ${stale.length} thread(s), ${agentEvents} stat row(s) older than ${days} day(s)`);
@@ -1677,9 +1711,120 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) for (const child of this.children.values()) child.notify(Methods.daemonsChanged, list);
   }
 
+  // -------------------------------------------------------------------------
+  // Attachments (docs/specs/v4-1-attachments.md)
+  // -------------------------------------------------------------------------
+
+  attachmentLimits() {
+    const a = this.config.attachments;
+    return { maxBytes: a.maxMb * 1024 * 1024, threadMaxBytes: a.threadMaxMb * 1024 * 1024, maxCount: a.maxCount };
+  }
+
+  /** Keep the download name filesystem-safe; only the display name keeps the original. */
+  static safeName(name: string): string {
+    const base = name.split(/[\\/]/).pop() ?? "file";
+    const safe = base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 120);
+    return safe || "file";
+  }
+
+  artifactPath(a: { id: string; name: string }, threadId?: string): string {
+    return join(this.store.home, "artifacts", threadId ?? "_staging", `${a.id}-${Daemon.safeName(a.name)}`);
+  }
+
+  ensureArtifactDir(threadId?: string): string {
+    const dir = join(this.store.home, "artifacts", threadId ?? "_staging");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /** A completed upload, before its Order exists. */
+  registerStaged(input: { id: string; name: string; mime: string; size: number; sha256: string; uploader?: Party }): Attachment {
+    const artifact: Attachment = { id: input.id, name: input.name, mime: input.mime, size: input.size, sha256: input.sha256, host: this.host };
+    this.store.putArtifact({ id: input.id, name: input.name, mime: input.mime, size: input.size, sha256: input.sha256, host: this.host, createdAt: Date.now() });
+    return input.uploader ? { ...artifact, uploader: input.uploader } : artifact;
+  }
+
+  /** Move staged blobs into the Thread's directory and return wire metadata. */
+  commitAttachments(requested: Attachment[], threadId: string): Attachment[] {
+    const limits = this.attachmentLimits();
+    if (requested.length > limits.maxCount) throw new RpcError("too_many_attachments", `at most ${limits.maxCount} attachments per Order`);
+    let total = this.store.artifactsForThread(threadId).reduce((n, a) => n + a.size, 0);
+    // Validate everything first: a rejected Order must not leave half the blobs in the Thread.
+    const staged = requested.map((req) => {
+      const stored = this.store.getArtifact(req.id);
+      if (!stored || stored.host !== this.host) throw new RpcError("bad_request", `unknown attachment ${req.id}`);
+      if (stored.threadId && stored.threadId !== threadId) throw new RpcError("bad_request", `attachment ${req.id} belongs to another thread`);
+      total += stored.size;
+      if (total > limits.threadMaxBytes) throw new RpcError("attachment_too_large", "this Thread exceeds attachments.threadMaxMb");
+      if (!stored.threadId && !existsSync(this.artifactPath(stored))) throw new RpcError("attachment_unavailable", `attachment ${req.id} is missing on this host`);
+      return stored;
+    });
+    const committed: Attachment[] = [];
+    for (const stored of staged) {
+      if (!stored.threadId) {
+        const to = this.artifactPath(stored, threadId);
+        mkdirSync(dirname(to), { recursive: true });
+        renameSync(this.artifactPath(stored), to);
+        this.store.putArtifact({ ...stored, threadId });
+      }
+      committed.push({ id: stored.id, name: stored.name, mime: stored.mime, size: stored.size, sha256: stored.sha256, host: stored.host });
+    }
+    return committed;
+  }
+
+  /** Local blob for an attachment, if this Host holds it. */
+  readArtifact(id: string): { artifact: Attachment; path: string } | undefined {
+    const stored = this.store.getArtifact(id);
+    if (!stored) return undefined;
+    const path = this.artifactPath(stored, stored.threadId);
+    if (!existsSync(path)) return undefined;
+    return { artifact: { id: stored.id, name: stored.name, mime: stored.mime, size: stored.size, sha256: stored.sha256, host: stored.host }, path };
+  }
+
+  /** Absolute path the Barista can open (same Host only). */
+  private attachmentPaths(order: Order): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const a of order.attachments ?? []) {
+      const found = this.readArtifact(a.id);
+      if (found) out[a.id] = found.path;
+    }
+    return out;
+  }
+
+  artifactOrigin(host: string): string | undefined {
+    if (host === this.host) return `http://127.0.0.1:${this.config.port}`;
+    const d = this.daemons().find((x) => x.host === host || x.displayName === host || x.aliases.includes(host));
+    const url = d?.url ?? this.peerUrls.get(host);
+    return url?.replace(/^ws(s?):\/\//, "http$1://").replace(/\/ws$/, "");
+  }
+
+  /** Fetch missing blobs from their origin Host before the Barista is told about the Order. */
+  async pullAttachments(order: Order): Promise<void> {
+    for (const a of order.attachments ?? []) {
+      if (!a.host || a.host === this.host) continue;
+      const existing = this.store.getArtifact(a.id);
+      if (existing?.threadId === order.threadId && existsSync(this.artifactPath(existing, order.threadId))) continue;
+      const base = this.artifactOrigin(a.host);
+      if (!base) throw new Error(`origin host ${a.host} is not known to this daemon`);
+      const res = await fetch(`${base}/api/artifacts/${encodeURIComponent(a.id)}`, {
+        headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) throw new Error(`origin ${a.host} returned HTTP ${res.status}`);
+      const bytes = Buffer.from(await res.arrayBuffer());
+      if (bytes.length !== a.size) throw new Error(`attachment ${a.id}: expected ${a.size} bytes, got ${bytes.length}`);
+      const sha = createHash("sha256").update(bytes).digest("hex");
+      if (sha !== a.sha256) throw new Error(`attachment ${a.id}: sha256 mismatch`);
+      const path = this.artifactPath(a, order.threadId);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, bytes);
+      this.store.putArtifact({ id: a.id, threadId: order.threadId, host: a.host, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, createdAt: Date.now() });
+    }
+  }
+
   /** What the running process is actually using (for `cafe config diff`); never includes the token. */
   runtimeConfig() {
-    return {
+    const running = {
       mode: this.isRoot ? "root" : "daemon",
       host: this.host,
       displayName: this.config.displayName,
@@ -1688,8 +1833,43 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       root: this.config.root,
       router: this.config.router,
       retention: this.config.retention,
+      attachments: this.config.attachments,
       discovery: this.config.discovery,
     };
+    // Saved-but-not-applied values, so the CLI and Web can say "restart required"
+    // without reading config.yml themselves.
+    return { ...running, pending: diffConfig(loadConfig(this.store.home), running) };
+  }
+
+  /** Machine-level checks for the Web Settings page; the CLI doctor adds extension/skill checks. */
+  doctor(webStale = false): { ok: boolean; checks: { name: string; level: "ok" | "warn" | "fail"; detail: string; next?: string }[] } {
+    const checks: { name: string; level: "ok" | "warn" | "fail"; detail: string; next?: string }[] = [];
+    checks.push({ name: "daemon", level: "ok", detail: `${this.host}${this.isRoot ? " (hub)" : ""}, ${this.daemons().length} machine(s) known` });
+
+    const configured = this.config.router.model;
+    if (!configured) checks.push({ name: "router", level: "ok", detail: "rules (no router.model configured)", next: "cafe config set router.model <provider/model>" });
+    else if (this.router.name !== "llm" || this.routerModel !== configured) {
+      checks.push({ name: "router", level: "fail", detail: `configured ${configured}, running ${this.routerModel ?? this.router.name}${this.lastRouterError ? ` (${this.lastRouterError})` : ""}`, next: `cafe router set ${configured}` });
+    } else checks.push({ name: "router", level: "ok", detail: `llm (${configured})` });
+
+    if (this.isRoot) checks.push({ name: "root", level: "ok", detail: "this machine is the hub" });
+    else if (this.rootOnline) checks.push({ name: "root", level: "ok", detail: `hub ${this.config.root ?? "discovered"} online` });
+    else checks.push({ name: "root", level: "warn", detail: "hub offline; cross-machine orders use direct links", next: "cafe root test" });
+
+    const pending = this.runtimeConfig().pending;
+    const restart = pending.filter((p) => p.mode === "restart-required");
+    const hot = pending.filter((p) => p.mode === "hot");
+    if (restart.length) checks.push({ name: "config", level: "warn", detail: `restart required: ${restart.map((p) => p.key).join(", ")}`, next: "cafe daemon restart" });
+    else if (hot.length) checks.push({ name: "config", level: "warn", detail: `hot changes not applied: ${hot.map((p) => p.key).join(", ")}`, next: "cafe config apply" });
+    else checks.push({ name: "config", level: "ok", detail: "config.yml matches the running daemon" });
+
+    if (webStale) checks.push({ name: "web", level: "warn", detail: "the build on disk is newer than the one served", next: "cafe daemon restart" });
+
+    const offline = this.daemons().filter((d) => d.host !== this.host && !d.online);
+    if (offline.length) checks.push({ name: "machines", level: "warn", detail: `offline: ${offline.map((d) => d.displayName ?? d.host).join(", ")}`, next: "cafe daemon status" });
+    else checks.push({ name: "machines", level: "ok", detail: "every known machine is online" });
+
+    return { ok: !checks.some((c) => c.level === "fail"), checks };
   }
 
   /** List views need the latest outcome, not the whole reply text. */

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { defaultExtensionPath, loadConfig } from "@cafe/daemon";
 import { ompExtensionState, piExtensionState } from "./extension.ts";
+import { claudeCommandState } from "./commands.ts";
 
 export interface DoctorCheck {
   name: string;
@@ -61,6 +62,14 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
       ? { name: "skill", level: "ok", detail: skillLinks.join(", ") }
       : { name: "skill", level: "warn", detail: "the cafe skill is not linked for Claude Code / Codex", next: "cafe skill install" },
   );
+
+  const command = claudeCommandState(userHome);
+  if (command.state === "ours") checks.push({ name: "command", level: "ok", detail: `/cafe-ask (${command.path})` });
+  else if (command.state === "foreign") {
+    checks.push({ name: "command", level: "warn", detail: `/cafe-ask at ${command.path} is not managed by cafe`, next: "cafe commands install --agent claude --force" });
+  } else {
+    checks.push({ name: "command", level: "ok", detail: "/cafe-ask is not installed (optional; the Claude plugin already provides /cafe)", next: "cafe commands install --agent claude" });
+  }
 
   const cfg = loadConfig(opts.home);
   if (cfg.router.model && daemonInfo) {

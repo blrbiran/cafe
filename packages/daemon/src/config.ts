@@ -34,6 +34,14 @@ export const CafeConfig = z.object({
     .default({}),
   /** Automatic pruning: delete finished threads and stats older than `days`. Unset = never (use `cafe prune`). */
   retention: z.object({ days: z.number().int().positive().optional() }).default({}),
+  /** Order / reply files. Blobs live under CAFE_HOME/artifacts, never in the Thread JSONL. */
+  attachments: z
+    .object({
+      maxMb: z.number().int().positive().default(25),
+      threadMaxMb: z.number().int().positive().default(100),
+      maxCount: z.number().int().positive().default(10),
+    })
+    .default({}),
   /** LAN discovery over mDNS: the Root answers, a Daemon without `root` looks for one. */
   discovery: z.boolean().default(true),
   /** Root only: last known URLs of Daemons, for dial-back after the Root moves. */
@@ -81,6 +89,9 @@ const DIFF_KEYS = [
   "router.timeoutMs",
   "router.concurrency",
   "retention.days",
+  "attachments.maxMb",
+  "attachments.threadMaxMb",
+  "attachments.maxCount",
   "discovery",
 ] as const;
 
@@ -101,6 +112,8 @@ export function diffConfig(file: unknown, running: unknown): ConfigDiff[] {
   for (const key of DIFF_KEYS) {
     const a = leaf(file, key);
     const b = leaf(running, key);
+    // port: 0 means "pick a free port"; the running daemon reports the one it got.
+    if (key === "port" && (a === 0 || a == null)) continue;
     if (JSON.stringify(a) === JSON.stringify(b)) continue;
     out.push({ key, file: a, running: b, mode: configApplyMode(key) });
   }

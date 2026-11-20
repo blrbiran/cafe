@@ -1,5 +1,7 @@
 import { createInterface } from "node:readline";
-import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { existsSync, readFileSync } from "node:fs";
+import { basename, resolve } from "node:path";
+import type { AgentRecord, Attachment, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 
 /** Below Claude Code's 2-minute auto-background and Codex's 300 s tool timeout (v3-1 Q77). */
 export const MAX_WAIT_S = 100;
@@ -38,6 +40,7 @@ const TOOLS = [
         question: { type: "string", description: "The question or task, self-contained." },
         to: { type: "string", description: "Explicit address (name, name@host, name#n@host); skips routing." },
         threadId: { type: "string", description: "Continue this conversation (follow-up)." },
+        attachments: { type: "array", items: { type: "string" }, description: "Local file paths to attach; this MCP server reads and uploads them." },
         wait_seconds: { type: "number", description: `How long to wait for the answer (default and max ${MAX_WAIT_S}).` },
       },
       required: ["question"],
@@ -95,6 +98,22 @@ export function runMcp(opts: McpOptions): Promise<void> {
   };
 
   const send = (msg: unknown) => output.write(`${JSON.stringify(msg)}\n`);
+
+  /** Attachments are local paths: the MCP server is local, so it reads and uploads them. */
+  const upload = async (file: string): Promise<Attachment> => {
+    await api("/api/health");
+    const path = resolve(file);
+    if (!existsSync(path)) throw new ToolError(`attachment not found: ${file}`);
+    const name = basename(path);
+    const res = await fetch(`${opts.base}/api/artifacts?name=${encodeURIComponent(name)}&mime=application/octet-stream`, {
+      method: "POST",
+      body: readFileSync(path),
+      headers: opts.token ? { authorization: `Bearer ${opts.token}` } : {},
+    });
+    const body = (await res.json().catch(() => ({}))) as any;
+    if (!res.ok) throw new ToolError(`upload ${file} failed: ${body.error ?? res.status}: ${body.message ?? ""}`.trim());
+    return body.attachment as Attachment;
+  };
 
   /** Follow one Order over SSE until it closes or `seconds` pass. */
   const waitOrder = async (threadId: string, orderId: string, seconds: number) => {
@@ -161,6 +180,9 @@ export function runMcp(opts: McpOptions): Promise<void> {
       }
       case "cafe_ask": {
         const body = str(args.question, "question", true)!;
+        const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
+        const attachments: Attachment[] = [];
+        for (const file of files) attachments.push(await upload(file));
         const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[] } }>("/api/orders", {
           method: "POST",
           body: JSON.stringify({
@@ -170,6 +192,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
             as: customer ?? "mcp",
             origin: "agent",
             ...(process.env.CAFE_VIA ? { via: { address: process.env.CAFE_VIA } } : {}),
+            ...(attachments.length ? { attachments } : {}),
           }),
         });
         return waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));

@@ -1,7 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream, existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { Readable } from "node:stream";
+import { finished, pipeline } from "node:stream/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ulid } from "ulid";
 import { WebSocketServer } from "ws";
 import { CreateOrderParams, Methods, type ThreadEnvelope } from "@cafe/protocol";
 import { RpcError } from "@cafe/protocol/peer";
@@ -79,6 +83,47 @@ async function readJson(req: IncomingMessage): Promise<any> {
 function send(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+/** Stream an upload to disk while hashing; never buffer the whole file. */
+async function readUpload(req: IncomingMessage, dest: string, maxBytes: number): Promise<{ size: number; sha256: string }> {
+  const out = createWriteStream(dest);
+  const hash = createHash("sha256");
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      size += buf.length;
+      if (size > maxBytes) throw new RpcError("attachment_too_large", `file exceeds ${Math.floor(maxBytes / 1024 / 1024)}MB`);
+      hash.update(buf);
+      out.write(buf);
+    }
+    out.end();
+    await finished(out);
+  } catch (err) {
+    out.destroy();
+    try {
+      unlinkSync(dest);
+    } catch {
+      // already gone
+    }
+    throw err;
+  }
+  return { size, sha256: hash.digest("hex") };
+}
+
+/** Only real raster images keep their type; everything else is an opaque download. */
+function artifactHeaders(a: { name: string; mime: string; size: number; sha256: string }): Record<string, string> {
+  const type = /^image\/(png|jpeg|webp|gif)$/.test(a.mime) ? a.mime : "application/octet-stream";
+  const name = a.name.replace(/["\r\n]/g, "_");
+  return {
+    "content-type": type,
+    "content-length": String(a.size),
+    "content-disposition": `attachment; filename="${name}"`,
+    "x-content-type-options": "nosniff",
+    "x-cafe-sha256": a.sha256,
+    "cache-control": "private, max-age=0",
+  };
 }
 
 /** Ring of recent events per daemon, for SSE Last-Event-ID resumption. */
@@ -236,6 +281,48 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     });
   }
   if (m === "GET" && path === "/api/config") return send(res, 200, daemon.runtimeConfig());
+  if (m === "GET" && path === "/api/doctor") return send(res, 200, daemon.doctor(webStale()));
+  if (m === "POST" && path === "/api/artifacts") {
+    const name = (url.searchParams.get("name") ?? "file").slice(0, 200);
+    const mime = url.searchParams.get("mime") ?? "application/octet-stream";
+    if (!name || /[\\/]/.test(name) || name.includes("..") || /[\x00-\x1f]/.test(name)) throw new RpcError("bad_request", "invalid attachment name");
+    const id = ulid();
+    const dest = daemon.artifactPath({ id, name });
+    daemon.ensureArtifactDir();
+    const { size, sha256 } = await readUpload(req, dest, daemon.attachmentLimits().maxBytes);
+    if (size === 0) {
+      try {
+        unlinkSync(dest);
+      } catch {
+        // already gone
+      }
+      throw new RpcError("bad_request", "empty files are not accepted");
+    }
+    return send(res, 200, { attachment: daemon.registerStaged({ id, name, mime, size, sha256 }) });
+  }
+  const artifactId = /^\/api\/artifacts\/([^/]+)$/.exec(path)?.[1];
+  if (m === "GET" && artifactId) {
+    const id = decodeURIComponent(artifactId);
+    const local = daemon.readArtifact(id);
+    if (local) {
+      res.writeHead(200, artifactHeaders(local.artifact));
+      createReadStream(local.path).pipe(res);
+      return;
+    }
+    const stored = daemon.store.getArtifact(id);
+    if (!stored) throw new RpcError("not_found", `unknown attachment ${id}`);
+    if (stored.host === daemon.host) throw new RpcError("not_found", `attachment ${id} is no longer on this host`);
+    const base = daemon.artifactOrigin(stored.host);
+    if (!base) throw new RpcError("attachment_unavailable", `origin host ${stored.host} is not known`);
+    const r = await fetch(`${base}/api/artifacts/${encodeURIComponent(id)}`, {
+      headers: daemon.config.token ? { authorization: `Bearer ${daemon.config.token}` } : {},
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!r.ok || !r.body) throw new RpcError("attachment_unavailable", `origin ${stored.host} returned HTTP ${r.status}`);
+    res.writeHead(200, artifactHeaders(stored));
+    await pipeline(Readable.fromWeb(r.body as import("node:stream/web").ReadableStream), res);
+    return;
+  }
   if (m === "GET" && path === "/api/threads") {
     const before = url.searchParams.get("before");
     const rows = daemon.store.listThreads(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("status") ?? undefined, before ? Number(before) : undefined);

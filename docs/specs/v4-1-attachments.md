@@ -1,6 +1,6 @@
 # v4-1 Order / Reply 附件
 
-状态（2026-11-19）：spec 草案，等用户确认 Q1–Q4 后实现。来源：dogfooding #20。
+状态（2026-11-19）：Q1–Q4 已确认，第一阶段（Customer → Barista）已实现。来源：dogfooding #20。
 
 ## 为什么
 
@@ -74,7 +74,7 @@ cafe reply <threadId> --attach ./patch.diff "补丁在这里"
 
 - `cafe ask` 先上传（每个文件一行进度），再带着附件 id 发 Order；任一大失败则整体失败，不发半个 Order。
 - `cafe thread` 显示附件名/大小；`--download` 下载到 `--out`（默认当前目录），先校验 sha256。
-- MCP：`cafe_ask` 增加 `attachments: [{name, mime?, content_base64}]`；`cafe_reply` 同样。base64 有膨胀，单文件上限按计费后的字节数校验。
+- MCP：`cafe_ask` 接受 `attachments: [localPath]`；MCP server 自己读盘并上传。base64 留给 agent 内存里生成的小内容（第二阶段），解码后上限 ≤5MB。
 - 退出码：上传失败 / 下载校验失败都非 0。
 
 ## Web
@@ -146,9 +146,36 @@ attachments:
 
 后续要记一笔（不阻塞第一阶段）：thread 配额记账的 source of truth、retention/prune 同时删 artifacts、并发上传/in-flight pull 合并、MCP schema 同步、Web 上传进度（XHR/ReadableStream）、同 Thread 同 sha 去重。
 
-## 待用户确认
+## 已确认（2026-11-19，用户拍板）
 
-- **Q1**：第一阶段是否同时支持 Barista reply 附件，还是先只做 Customer → Barista？（评审建议：协议都定，第一阶段先 Customer→Barista；reply 先同 Host。）
-- **Q2**：跨机器走 pull-from-origin（建议）还是 push-with-order？（评审建议：pull，直连 origin，不经 Root。）
-- **Q3**：默认限额 25MB / 100MB / 10 个是否合适？是否要允许按 Host 配置覆盖？（评审建议：保留，放进 config，MCP 改传路径。）
-- **Q4**：图片是否要缩略图预览，还是第一阶段全部只做下载？（评审建议：做，纯浏览器缩放。）
+- **Q1**：协议一次定好；第一阶段只做 Customer → Barista。`order.replied.attachments` 字段保留，但没有生产入口；reply 附件的跨机传输留第二阶段。
+- **Q2**：pull，直连 origin daemon，不经 Root；先拉取再投递；ack 计时在拉取期间暂停；Web/CLI 通过本地 daemon 代理下载。origin 不可达时 Order 以 `attachment_unavailable` 失败。
+- **Q3**：默认限额 25MB / 100MB / 10 个，放进 `attachments.*`；MCP 传本地路径（MCP server 自己读盘上传），不走 base64；上传流式写盘、边收边算 sha256。**附件内容不会自动塞进 agent 的 context**：提示里只给本机绝对路径，由 agent 自己按需读取。
+- **Q4**：图片缩略图由浏览器端缩放；服务端只对 png/jpeg/webp/gif 保留 MIME 并加 `nosniff`，其余一律 `application/octet-stream` + attachment。
+
+评审的 6 个 blocking 缺口已按下述实现折叠：
+
+1. `Attachment.host` 记录 blob 的 origin Host；跨机 pull/代理下载都按它寻址。
+2. 上传先落 `artifacts/_staging/<id>-<safeName>`；`order/create` 时原子移动到 `artifacts/<threadId>/`。
+3. Web/CLI 只跟本地 daemon 说话；本地 daemon 对非本机 blob 流式代理 origin。
+4. `deliverLocal` 在 `order/deliver` 前 await pull；拉取期间暂停 ack 计时，失败记 `attachment_unavailable`。
+5. 同一版本内不做字段剥离；旧 daemon 不在本阶段范围内（客户端与 daemon 同包发布）。
+6. 投递参数 `attachmentPaths: {id: path}` 只发给 Barista 侧（不写进 Order/JSONL）；pi 扩展、Bridge prompt、`cafe serve` 都会列在本机路径。
+
+## 实现状态（2026-11-19）
+
+已实现：
+
+- 协议：`Attachment`、`Order.attachments`、`order.replied.attachments`、`ThreadMeta.attachments`、`CreateOrderParams.attachments`，未升 `PROTOCOL_VERSION`。
+- Daemon：`POST /api/artifacts`（流式上传 + 限额 + 文件名校验）、`GET /api/artifacts/:id`（本机文件或代理 origin）、staging→Thread 原子移动、跨机 pull、prune 时删除附件目录、`attachments.*` 配置。
+- CLI：`cafe ask --attach <file>`（可重复）、`cafe thread --download <id> --out <dir>`（校验 sha256）。
+- MCP：`cafe_ask` 的 `attachments: [path]`。
+- Web：composer 选择多个文件、上传后再发；Thread 中问题/回复下方显示附件并下载；卡片显示附件数。
+- Barista：pi 扩展、Bridge、`cafe serve` 的 prompt 都列出本机附件路径；附件内容不自动进入 context。
+- 测试：`tests/attachments.test.ts`（本机、跨机 pull/代理、空文件/路径穿越拒绝、CLI 上传/下载）。
+
+未做（第二阶段）：
+
+- Barista reply 附件（没有 `cafe reply` / Bridge 文件入口）。
+- 断点续传、跨 Thread 去重、上传进度条、附件自动清理孤儿 staging。
+- 旧 daemon 的能力检测（发布策略绑定同版本）。

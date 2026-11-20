@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stringify } from "yaml";
 import { configApplyMode, diffConfig } from "../packages/daemon/src/config.ts";
 import { startDaemon } from "./helpers.ts";
 
@@ -37,6 +38,10 @@ describe("config diff", () => {
     const same = { host: "a", router: { model: "p/m", learn: true }, retention: { days: 7 } };
     expect(diffConfig(same, structuredClone(same))).toEqual([]);
   });
+
+  it("ignores an ephemeral port (0) that the daemon resolved to a real one", () => {
+    expect(diffConfig({ port: 0 }, { port: 57_828 })).toEqual([]);
+  });
 });
 
 describe("runtime config endpoint", () => {
@@ -48,6 +53,14 @@ describe("runtime config endpoint", () => {
     const body = await res.json();
     expect(body).toMatchObject({ host: "pc1", displayName: "desk", mode: "daemon", retention: { days: 7 }, router: { model: "p/m" } });
     expect(JSON.stringify(body)).not.toContain("t0k");
+  });
+
+  it("lists config.yml changes the running daemon has not applied", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    writeFileSync(join(d.home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0, advertise: "127.0.0.1", mode: "root" }));
+    const body = (await (await fetch(`http://${d.addr}/api/config`)).json()) as { pending: unknown[] };
+    expect(body.pending).toEqual([{ key: "mode", file: "root", running: "daemon", mode: "restart-required" }]);
   });
 });
 

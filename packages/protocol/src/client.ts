@@ -6,6 +6,7 @@ import {
   type AgentIdentity,
   type AgentRecord,
   type AgentStatus,
+  type Attachment,
   type CreateOrderParams,
   type Order,
   type RoutingDecision,
@@ -34,6 +35,8 @@ export function defaultReconnectMaxMs(daemon: string): number {
 
 export interface OrderHandle {
   order: Order;
+  /** Attachments downloaded to this Host, with the absolute path when available. */
+  attachments?: Array<Attachment & { path?: string }>;
   ack(): Promise<void>;
   heartbeat(note?: string): Promise<void>;
   reply(text: string, final?: boolean): Promise<void>;
@@ -112,8 +115,8 @@ export class CafeClient {
       peer.on(Methods.orderCancelled, (x: { orderId: string; threadId: string; by: string }) => {
         for (const fn of this.cancelListeners) fn(x);
       });
-      peer.on(Methods.orderDeliver, ({ order }: { order: Order }) => {
-        const h = this.handle(order);
+      peer.on(Methods.orderDeliver, ({ order, attachmentPaths }: { order: Order; attachmentPaths?: Record<string, string> }) => {
+        const h = this.handle(order, attachmentPaths);
         for (const fn of this.orderListeners) fn(h);
       });
       peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
@@ -167,10 +170,13 @@ export class CafeClient {
     });
   }
 
-  private handle(order: Order): OrderHandle {
+  private handle(order: Order, attachmentPaths?: Record<string, string>): OrderHandle {
     const base = { orderId: order.orderId, threadId: order.threadId };
     return {
       order,
+      ...(order.attachments?.length
+        ? { attachments: order.attachments.map((a) => ({ ...a, ...(attachmentPaths?.[a.id] ? { path: attachmentPaths[a.id] } : {}) })) }
+        : {}),
       ack: () => this.req(Methods.orderAck, base),
       heartbeat: (note) => this.req(Methods.orderHeartbeat, { ...base, note }),
       reply: (text, final = true) => this.req(Methods.orderReply, { ...base, text, final }),

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -66,5 +66,27 @@ describe("cafe doctor", () => {
     const r = await doctor(tmp, join(tmp, "cafe-home"), "127.0.0.1:9", join(tmp, "user-home"));
     expect(r.status).toBe(1);
     expect(r.stdout).toMatch(/daemon[\s\S]*fail/);
+  });
+
+  it("reports a /cafe-ask command file it does not own", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const cwd = join(tmp, "work");
+    const home = join(tmp, "cafe-home");
+    const userHome = join(tmp, "user-home");
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    mkdirSync(join(userHome, ".claude/commands"), { recursive: true });
+    writeFileSync(join(cwd, ".cafe"), "name: widgets\ndescription: answers widget questions\n");
+    const own = join(userHome, ".claude/commands/cafe-ask.md");
+    writeFileSync(own, "my command");
+
+    const r = await doctor(cwd, home, root.addr, userHome);
+    expect(r.stdout).toContain("/cafe-ask");
+    expect(r.stdout).toContain("not managed by cafe");
+    expect(r.stdout).toContain("cafe commands install --agent claude --force");
+    expect(readFileSync(own, "utf8")).toBe("my command");
   });
 });

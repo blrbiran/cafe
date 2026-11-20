@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { AgentRecord, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, ThreadStatus } from "@cafe/protocol";
+import type { AgentRecord, Attachment, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, ThreadStatus } from "@cafe/protocol";
 import { api, ApiError } from "../api.ts";
 import { ago, useT, type Dict } from "../i18n.ts";
 import { useNow } from "../format.ts";
@@ -14,7 +14,7 @@ interface Turn {
   order?: Order;
   startedAt: number;
   decision?: RoutingDecision;
-  replies: { agentId: string; text: string; final: boolean; at: number }[];
+  replies: { agentId: string; text: string; final: boolean; at: number; attachments?: Attachment[] }[];
   declines: { agentId: string; reason: string; at: number }[];
   failures: { agentId?: string; reason: string; at: number }[];
   acked: Set<string>;
@@ -45,7 +45,7 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
         turn.acked.add(ev.agentId);
         break;
       case "order.replied":
-        turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at });
+        turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at, ...(ev.attachments?.length ? { attachments: ev.attachments } : {}) });
         break;
       case "order.declined":
         turn.declines.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
@@ -200,6 +200,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
                   <Markdown text={turn.order?.body ?? ""} />
                 </div>
               )}
+              <AttachmentList items={turn.order?.attachments} />
               <div className="flex flex-wrap items-center gap-2.5">
                 <Pill tone={o.tone}>{o.text}</Pill>
                 {active && (
@@ -322,12 +323,33 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   );
 }
 
+function sizeText(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Files attached to a question or reply; clicking downloads through the local daemon. */
+function AttachmentList({ items }: { items?: Attachment[] }) {
+  const t = useT();
+  if (!items?.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {items.map((a) => (
+        <a key={a.id} href={api.attachmentUrl(a.id)} download={a.name} className="kind-tag" title={t.download}>
+          📎 {a.name} · {sizeText(a.size)} · {t.download}
+        </a>
+      ))}
+    </div>
+  );
+}
+
 function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: ThreadMeta }) {
   const t = useT();
   const agents = useStore((s) => s.agents);
   const items = [
-    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.final ? "ok" : "info") as Tone, kind: r.final ? t.kAnswer : t.kPartial, text: r.text, md: true })),
-    ...turn.declines.map((d) => ({ key: `d-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "warn" as Tone, kind: t.kDecline, text: d.reason, md: false })),
+    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.final ? "ok" : "info") as Tone, kind: r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
+    ...turn.declines.map((d) => ({ key: `d-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "warn" as Tone, kind: t.kDecline, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
   ].sort((a, b) => a.at - b.at);
   return (
     <section className="flex flex-col gap-2.5">
@@ -349,6 +371,7 @@ function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: Th
           ) : (
             <div className="answer prose-text">{r.text}</div>
           )}
+          <AttachmentList items={r.attachments} />
         </div>
       ))}
       {items.length === 0 && <div className="well hint px-4.5 py-3.5">{active ? t.noRepliesYet : t.noReplyFinal}</div>}

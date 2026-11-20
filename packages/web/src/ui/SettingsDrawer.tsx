@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import { api, type BaristaInfo } from "../api.ts";
+import { api, type BaristaInfo, type DoctorCheck, type RuntimeConfig } from "../api.ts";
 import { useT } from "../i18n.ts";
 import { refreshStore, useStore } from "../store.ts";
 import { Pill } from "./bits.tsx";
+
+const show = (v: unknown) => (v === undefined ? "(not set)" : typeof v === "string" ? v : JSON.stringify(v));
 
 export function SettingsDrawer({ onClose, closing = false }: { onClose: () => void; closing?: boolean }) {
   const t = useT();
@@ -25,6 +27,8 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [agentKind, setAgentKind] = useState("pi");
   const [write, setWrite] = useState(false);
   const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean }>();
+  const [rt, setRt] = useState<RuntimeConfig>();
+  const [checks, setChecks] = useState<DoctorCheck[]>();
   const [busy, setBusy] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [error, setError] = useState<string>();
@@ -54,6 +58,14 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
       .settings()
       .then(setConn)
       .catch(() => setConn(undefined));
+    api
+      .config()
+      .then(setRt)
+      .catch(() => setRt(undefined));
+    api
+      .doctor()
+      .then((d) => setChecks(d.checks))
+      .catch(() => setChecks(undefined));
   }, []);
 
   const run = async (key: string, fn: () => Promise<string | void>) => {
@@ -64,6 +76,8 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
       const msg = await fn();
       if (msg) setNotice(msg);
       await refreshStore();
+      api.config().then(setRt).catch(() => {});
+      api.doctor().then((d) => setChecks(d.checks)).catch(() => {});
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -289,6 +303,45 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
             {router?.error && <span className="text-warn">{t.settingsRouterError(router.error)}</span>}
           </div>
         </section>
+
+        {rt && rt.pending.length > 0 && (
+          <section className="mb-5 border-b border-line pb-4" data-testid="pending-config">
+            <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsPending}</h3>
+            <p className="mt-1 mb-2.5 text-xs text-muted">{t.settingsPendingDesc}</p>
+            <div className="well flex flex-col gap-2 text-xs">
+              {rt.pending.map((p) => (
+                <div key={p.key} className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <b className="mono text-fg-strong">{p.key}</b>
+                    <span className="mono text-muted">{t.settingsPendingValue(show(p.running), show(p.file))}</span>
+                  </div>
+                  <div className="mono text-warn">{p.mode === "hot" ? t.settingsPendingHot : t.settingsPendingRestart}</div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {checks && checks.length > 0 && (
+          <section className="mb-5 border-b border-line pb-4">
+            <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsHealth}</h3>
+            <p className="mt-1 mb-2.5 text-xs text-muted">{t.settingsHealthDesc}</p>
+            <div className="well flex flex-col gap-2 text-xs">
+              {checks.map((c) => (
+                <div key={c.name} className="flex flex-col gap-0.5 border-t border-line py-1.5 first:border-t-0 first:pt-0">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <b className="mono text-fg-strong">{c.name}</b>
+                    <Pill tone={c.level === "ok" ? "ok" : c.level === "warn" ? "warn" : "danger"}>
+                      {c.level === "ok" ? t.settingsHealthOk : c.level === "warn" ? t.settingsHealthWarn : t.settingsHealthFail}
+                    </Pill>
+                  </div>
+                  <div className="text-muted">{c.detail}</div>
+                  {c.next && <div className="mono text-warn">{c.next}</div>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
         <section className="mb-5 border-b border-line pb-4">
           <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsAgents}</h3>

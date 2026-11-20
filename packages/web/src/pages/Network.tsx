@@ -53,6 +53,10 @@ export function NetworkPage() {
       await refreshStore();
       setNote((n) => ({ ...n, [h]: { text: t.settingsSaved, ok: true } }));
     });
+  const copyCli = (h: string, self: boolean) => {
+    const cmd = self ? "cafe daemon status" : `cafe root test ${h}`;
+    void navigator.clipboard?.writeText(cmd).then(() => setNote((n) => ({ ...n, [h]: { text: `${t.copied}: ${cmd}`, ok: true } })));
+  };
 
   const sorted = [...daemons].sort((a, b) => Number(b.host === host) - Number(a.host === host) || Number(b.isRoot) - Number(a.isRoot) || a.host.localeCompare(b.host));
   const self = daemons.find((d) => d.host === host);
@@ -135,6 +139,9 @@ export function NetworkPage() {
                       {t.settingsRename}
                     </button>
                   )}
+                  <button type="button" className="btn-sm" onClick={() => copyCli(d.host, isThis)}>
+                    {t.copyCommand}
+                  </button>
                 </div>
                 {editing[d.host] !== undefined && (
                   <div className="flex items-center gap-1.5">
