@@ -160,3 +160,4 @@ cafe daemon restart                # 已有；升级 apply 内部复用它
 - `cafe daemon install` 在 `current` 存在时让服务指向 `current/bin/cafe.js`；`apply` 成功后若已安装服务仍指向旧入口会提示重跑 `cafe daemon install`。
 - 测试：`tests/update.test.ts` 用假 release（其 `bin/cafe.js` 只实现 updater 需要的命令）覆盖成功升级、健康检查失败自动回滚、手动回滚、包名/checksum/协议校验，以及 drain 拒绝新 Order 并报告 retryable。
 - 仍未做：全网广播/canary/分批编排、签名、Web 触发升级（按 Q4 只做 CLI）、升级期间 Barista 侧 Order 的跨 daemon 重试协调。
+- **服务托管机器的首次升级注意**：`apply` 通过新 release 的 `daemon start` 拉起进程；若 launchd/systemd 服务仍指向旧入口（例如源码仓库路径），`ensureDaemon` 会 kickstart 旧服务，健康检查看到旧版本而回滚。解决办法：先手动解包一个 release 并让 `current` 存在，再跑 `cafe daemon install`（现在会优先指向 `current/bin/cafe.js`），之后的 `apply` 才能正确切换。非服务托管（前台/手动 `daemon start`）与测试用的假 release 不受影响。
