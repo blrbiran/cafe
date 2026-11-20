@@ -33,6 +33,60 @@ async function upload(addr: string, name: string, body: string, mime = "text/pla
 }
 
 describe("attachments", () => {
+  it("lets a Barista reply with an attachment", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    const b = await barista(d.addr, identity("helper"), async (h) => {
+      await h.ack();
+      const up = await upload(d.addr, "answer.txt", "see the log", "text/plain");
+      await h.reply("here it is", true, [up.attachment]);
+    });
+    cleanup.push(() => b.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const res = await c.ask({ body: "hi" });
+    const events = await untilClosed(c, res.threadId, res.orderId);
+    const reply = events.find((e) => e.event.type === "order.replied")!.event as {
+      attachments?: Array<{ id: string; name: string; host?: string }>;
+    };
+    expect(reply.attachments).toMatchObject([{ name: "answer.txt", host: "pc1" }]);
+
+    const got = await fetch(`http://${d.addr}/api/artifacts/${reply.attachments![0]!.id}`);
+    expect(got.status).toBe(200);
+    expect(await got.text()).toBe("see the log");
+  });
+
+  it("proxies a reply attachment from the Barista's host", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline);
+    await waitFor(() => root.daemon.daemons().some((x) => x.host === "pc1" && x.online));
+
+    await barista(child.addr, identity("helper", { description: "diagnoses things" }), async (h) => {
+      await h.ack();
+      const up = await upload(child.addr, "diag.txt", "diagnosis from pc1", "text/plain");
+      await h.reply("see the file", true, [up.attachment]);
+    });
+    await waitFor(() => root.daemon.registry.all().some((a) => a.name === "helper" && a.status !== "offline"));
+
+    const c = await customer(root.addr);
+    cleanup.push(() => c.close());
+    const res = await c.ask({ body: "diagnose the widget" });
+    const events = await untilClosed(c, res.threadId, res.orderId);
+    const reply = events.find((e) => e.event.type === "order.replied")!.event as {
+      attachments?: Array<{ id: string; name: string; host?: string }>;
+    };
+    expect(reply.attachments).toMatchObject([{ name: "diag.txt", host: "pc1" }]);
+
+    // The Customer's daemon (the Root) does not hold the blob: it proxies pc1.
+    const got = await fetch(`http://${root.addr}/api/artifacts/${reply.attachments![0]!.id}`);
+    expect(got.status).toBe(200);
+    expect(await got.text()).toBe("diagnosis from pc1");
+  });
+
   it("hands a locally uploaded file to the Barista and serves it back", async () => {
     const d = await startDaemon("pc1");
     cleanup.push(d.stop);

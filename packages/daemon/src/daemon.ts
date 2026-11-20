@@ -410,9 +410,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.orderHeartbeat, (p: { orderId: string; threadId: string; note?: string }) =>
       this.agentEvent(peer, p, { type: "order.heartbeat", agentId: peer.meta.agentId, note: p.note }),
     );
-    peer.on(Methods.orderReply, (p: { orderId: string; threadId: string; text: string; final?: boolean }) =>
-      this.agentEvent(peer, p, { type: "order.replied", agentId: peer.meta.agentId, text: p.text, final: p.final ?? true }),
-    );
+    peer.on(Methods.orderReply, (p: { orderId: string; threadId: string; text: string; final?: boolean; attachments?: Attachment[] }) => {
+      // Reply blobs were uploaded to this daemon first; move them into the Thread
+      // so the Customer's daemon can proxy the download (v4-1 phase 2).
+      const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, p.threadId) : undefined;
+      return this.agentEvent(peer, p, { type: "order.replied", agentId: peer.meta.agentId, text: p.text, final: p.final ?? true, ...(attachments?.length ? { attachments } : {}) });
+    });
     peer.on(Methods.orderDecline, (p: { orderId: string; threadId: string; reason: string; unavailable?: boolean }) =>
       this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason, ...(p.unavailable ? { unavailable: true } : {}) }),
     );
@@ -1207,6 +1210,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
 
     const meta = this.updateMeta(env);
+    // Attachments live on their origin Host. Elsewhere they are metadata only,
+    // but the row is needed so the local Web/CLI can proxy the download.
+    const carried = env.event.type === "order.created" ? env.event.order.attachments : env.event.type === "order.replied" ? env.event.attachments : undefined;
+    for (const a of carried ?? []) {
+      if (!a.host || a.host === this.host || this.store.getArtifact(a.id)) continue;
+      this.store.putArtifact({ id: a.id, threadId: env.threadId, host: a.host, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, createdAt: env.at });
+    }
     if (meta) {
       this.store.appendEvent(meta.file, env);
       // Thread creation / closure is durable immediately; heartbeats and interim events can wait.

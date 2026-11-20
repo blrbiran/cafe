@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { DEFAULT_PORT, type AgentRecord, type Order, type ThreadEnvelope } from "@cafe/protocol";
+import { DEFAULT_PORT, type AgentRecord, type Attachment, type Order, type ThreadEnvelope } from "@cafe/protocol";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 
@@ -21,6 +22,20 @@ async function healthy(addr: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Reply attachments are uploaded to the local daemon first, then referenced by metadata (v4-1 phase 2). */
+async function uploadAttachment(path: string): Promise<Attachment> {
+  if (!existsSync(path)) throw new Error(`attachment not found: ${path}`);
+  const name = basename(path);
+  const res = await fetch(`http://${daemonAddr()}/api/artifacts?name=${encodeURIComponent(name)}&mime=application/octet-stream`, {
+    method: "POST",
+    body: readFileSync(path),
+    headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
+  });
+  const body = (await res.json().catch(() => ({}))) as { attachment?: Attachment; error?: string; message?: string };
+  if (!res.ok || !body.attachment) throw new Error(`upload ${path} failed: ${body.error ?? res.status}: ${body.message ?? ""}`.trim());
+  return body.attachment;
 }
 
 /** The `cafe` CLI entry: the installed `@cafe/cli`, else the sibling workspace package. */
@@ -665,12 +680,17 @@ export default function cafe(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cafe_reply",
     label: "cafe reply",
-    description: "Send an interim (non-final) reply for the cafe Order you are currently working on. Your final answer is sent automatically at the end of the turn.",
-    parameters: Type.Object({ text: Type.String() }),
+    description: "Send an interim (non-final) reply for the cafe Order you are currently working on, optionally with local files attached. Your final answer is sent automatically at the end of the turn.",
+    parameters: Type.Object({
+      text: Type.String(),
+      attachments: Type.Optional(Type.Array(Type.String(), { description: "Local file paths to upload and attach to this reply." })),
+    }),
     async execute(_id, params) {
       if (!current) throw new Error("no cafe Order in progress");
-      await current.handle.reply(params.text, false);
-      return text("Interim reply sent.");
+      const attachments: Attachment[] = [];
+      for (const path of params.attachments ?? []) attachments.push(await uploadAttachment(path));
+      await current.handle.reply(params.text, false, attachments);
+      return text(attachments.length ? `Interim reply sent with ${attachments.length} attachment(s).` : "Interim reply sent.");
     },
   });
 

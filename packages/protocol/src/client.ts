@@ -39,7 +39,7 @@ export interface OrderHandle {
   attachments?: Array<Attachment & { path?: string }>;
   ack(): Promise<void>;
   heartbeat(note?: string): Promise<void>;
-  reply(text: string, final?: boolean): Promise<void>;
+  reply(text: string, final?: boolean, attachments?: Attachment[]): Promise<void>;
   /** `unavailable`: declined for an operational reason (timeout, shutdown, crash), not because the topic is not ours. */
   decline(reason: string, opts?: { unavailable?: boolean }): Promise<void>;
 }
@@ -179,7 +179,7 @@ export class CafeClient {
         : {}),
       ack: () => this.req(Methods.orderAck, base),
       heartbeat: (note) => this.req(Methods.orderHeartbeat, { ...base, note }),
-      reply: (text, final = true) => this.req(Methods.orderReply, { ...base, text, final }),
+      reply: (text, final = true, attachments) => this.req(Methods.orderReply, { ...base, text, final, ...(attachments?.length ? { attachments } : {}) }),
       decline: (reason, opts) => this.req(Methods.orderDecline, { ...base, reason, ...(opts?.unavailable ? { unavailable: true } : {}) }),
     };
   }
