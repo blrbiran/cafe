@@ -79,11 +79,11 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
   );
 
   const command = claudeCommandState(userHome);
-  if (command.state === "ours") checks.push({ name: "command", level: "ok", detail: `/cafe-ask (${command.path})` });
+  if (command.state === "ours") checks.push({ name: "command", level: "ok", detail: `/cafe (${command.path})` });
   else if (command.state === "foreign") {
-    checks.push({ name: "command", level: "warn", detail: `/cafe-ask at ${command.path} is not managed by cafe`, next: "cafe commands install --agent claude --force" });
+    checks.push({ name: "command", level: "warn", detail: `/cafe at ${command.path} is not managed by cafe`, next: "cafe commands install --agent claude --force" });
   } else {
-    checks.push({ name: "command", level: "ok", detail: "/cafe-ask is not installed (optional; the Claude plugin already provides /cafe)", next: "cafe commands install --agent claude" });
+    checks.push({ name: "command", level: "ok", detail: "/cafe is not installed (optional; /cafe-barista comes from the Claude plugin)", next: "cafe commands install --agent claude" });
   }
 
   const cfg = loadConfig(opts.home);

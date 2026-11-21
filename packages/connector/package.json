@@ -1,0 +1,16 @@
+{
+  "name": "@cafe/connector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./sdk": "./src/sdk.ts",
+    "./client": "./src/client.ts",
+    "./state": "./src/state.ts",
+    "./mock": "./src/mock.ts"
+  },
+  "dependencies": {
+    "@cafe/protocol": "^0.1.0"
+  }
+}

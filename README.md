@@ -82,7 +82,7 @@ How each host exposes cafe (all of them can also ask through the CLI or MCP):
 |---|---|---|
 | Codex | `$cafe` + MCP tools | `cafe mcp install` makes Codex a **Customer**; `cafe barista start --agent codex` makes it a **Barista** |
 | pi / omp | `/cafe agents\|ask\|status\|thread\|help` + `/skill:cafe` + extension tools | the extension registers `/cafe`; the skill keeps its own `/skill:cafe` namespace |
-| Claude Code | `/cafe` (plugin pause/resume), `/cafe-ask`, skill, MCP | `/cafe on\|off` pauses the running session as a Barista |
+| Claude Code | `/cafe agents\|ask\|status\|thread\|help` (Customer, after `cafe commands install --agent claude`), `/cafe-barista off\|on` (plugin session control), skill, MCP | the Claude plugin owns `/cafe-barista`; `/cafe` is the same Customer entry as pi/omp |
 
 `cafe mcp install` only lets the host **ask** other agents. To let it **answer**, start a Barista: `cafe barista start --dir <dir> --agent codex|claude`, or `cafe serve --preset codex|claude` (both read-only by default; `--write` widens it).
 - **CLI**: `cafe ask "..."`, `cafe ask --to billing "..."`, `cafe ask --broadcast "..."` (explicitly ask every Barista; normal routing asks one, or at most a few when nobody clearly owns it), `cafe ask --attach ./log.txt "..."`, `cafe reply <threadId> --agent <address> --attach ./out.txt "..."` (reply as a target Barista from a script), `cafe ask --thread <id> "follow-up"`, `cafe inbox`, `cafe thread <id>`, `cafe thread <id> --download <attachmentId>`, `cafe tail` (every routed / delivered / acked / replied / closed event; `--json` for JSONL, `--host` / `--type` / `--thread` to filter, heartbeats hidden by default).
@@ -121,8 +121,8 @@ cafe barista start --dir ~/code/billing --agent claude   # claude -p, one proces
 ```bash
 cafe claude install            # install cafe's Claude Code plugin (--dry-run first)
                                # Claude Code sessions opened in a dir with .cafe then answer questions
-                               # in the session: /cafe shows the address, /cafe off pauses, /cafe on resumes
-                               # if you already have a /cafe command, the plugin uses /cafe-barista instead
+                               # in the session: /cafe shows the address, /cafe-barista off pauses, on resumes
+                               # (older plugin installs used /cafe for pause/resume; rerun `cafe claude install`)
 cafe barista start --dir ~/code/billing --agent codex --tui   # questions go to the most recently active Codex session in that dir
 ```
 
@@ -135,6 +135,23 @@ cafe serve --exec "<any command>" --dir ~/code/billing    # or --preset claude|c
 ```
 
 One command run per question: prompt on stdin, answer on stdout; print `CAFE_DECLINE: reason` to decline. Follow-ups have no session and rely only on the history in the prompt.
+
+## Chat connectors (experimental)
+
+`cafe connector` runs a Customer connector **out of process**: it turns platform messages into cafe Orders and posts the answers back. The SDK, supervisor and a mock connector are in place; Discord is the first real platform (next round).
+
+```bash
+cafe connector install packages/connector/mock   # from a source checkout
+cafe connector config mock ingestPort 4899       # optional: feed events over HTTP
+cafe connector start mock
+curl -s -X POST 127.0.0.1:4899 -H 'content-type: application/json' \
+  -d '{"channel":"demo","user":"you","eventId":"e1","text":"what does cafe do?"}'
+cafe connector logs mock --follow                # heartbeats and replies
+cafe connector status mock
+cafe connector stop mock
+```
+
+A connector is a directory with `cafe-connector.json` (name, entry, permissions, configSchema) and an entry that uses `@cafe/connector`'s `defineConnector`. State lives in `CAFE_HOME/connector-data/<name>/`; logs in `CAFE_HOME/logs/connector-<name>.log`. `install` copies the directory; package resolution links the workspace SDK for source installs (a published SDK is not packaged yet).
 
 ## Configuration
 

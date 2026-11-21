@@ -74,7 +74,7 @@ describe("cafe commands", () => {
   it("installs a /cafe command for Claude without overwriting a user-owned one", () => {
     const h = home();
     const u = home();
-    const cmd = join(u, ".claude/commands/cafe-ask.md");
+    const cmd = join(u, ".claude/commands/cafe.md");
     mkdirSync(dirname(cmd), { recursive: true });
     writeFileSync(cmd, "my own /cafe");
 
@@ -95,13 +95,25 @@ describe("cafe commands", () => {
     expect(existsSync(cmd)).toBe(false);
   });
 
+  it("replaces the legacy /cafe-ask file it wrote earlier", () => {
+    const h = home();
+    const u = home();
+    const legacy = join(u, ".claude/commands/cafe-ask.md");
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, "<!-- Managed by cafe: /cafe-ask -->\nold body");
+    const r = cafeEnv(h, u, "commands", "install", "--agent", "claude");
+    expect(r.status, r.stderr).toBe(0);
+    expect(existsSync(join(u, ".claude/commands/cafe.md"))).toBe(true);
+    expect(existsSync(legacy)).toBe(false);
+  });
+
   it("dry-run does not write the command file", () => {
     const h = home();
     const u = home();
     const r = cafeEnv(h, u, "commands", "install", "--agent", "claude", "--dry-run");
     expect(r.status, r.stderr).toBe(0);
-    expect(r.stdout).toContain("cafe-ask.md");
-    expect(existsSync(join(u, ".claude/commands/cafe-ask.md"))).toBe(false);
+    expect(r.stdout).toContain("cafe.md");
+    expect(existsSync(join(u, ".claude/commands/cafe.md"))).toBe(false);
   });
 });
 

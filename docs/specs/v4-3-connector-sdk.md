@@ -189,4 +189,30 @@ connector 的 `entry` 默认导出 `defineConnector(...)` 的结果；`cafe conn
 - **Q3**：第一个真实平台选 **Discord**（不是 Slack）；Slack/钉钉/飞书按同一契约后续接入。
 - **Q4**：现在就在 `/api/orders` 加可选 `idempotencyKey`，daemon 做短窗口去重。
 
-实现状态：**未实现**。真实 Discord 端到端需要用户的 bot token；可先用 mock connector 验证生命周期与幂等。
+## 实现状态（2026-11-21）
+
+已实现，mock 阶段：
+
+- **SDK**：`@cafe/connector`（`packages/connector`）提供 `defineConnector(fn)` 与 `ConnectorContext`（`cafe` HTTP/SSE 客户端、`config`、`stateDir`、`log`、`heartbeat`、`error`、`emit`）。
+- **持久化**：`stateDir/threads.json`（platformThreadId → cafeThreadId）、`seen-events.json`（事件 id 去重，默认 7 天 / 2000 条上限）、`outbox.json`（pending / sent / failed / delivered，崩溃后可重试或补发回复）。全部通过临时文件 + rename 原子写。
+- **stdout 行协议**：心跳 `{"type":"heartbeat","at":<ms>,"ok":true}`，错误 `{"type":"error","message":"…"}`；由 SDK 负责。mock 的最终回复额外写 `{"type":"reply","channel":"…","threadId":"…","text":"…","final":true}`。
+- **mock connector**：`packages/connector/mock`，stdin 读 `{"channel","user","eventId","text"}` JSON lines；按 `allowChannels` / `allowUsers` 过滤；用 `eventId` 作为 `/api/orders` 的 `idempotencyKey`；同一 eventId 只执行一次；重启后从 `threads.json` 恢复映射，follow-up 进入同一 Thread。配置 `ingestPort` 时额外启动本地 HTTP ingest（`POST /`、`GET /healthz`），方便手动试用。
+- **supervisor / CLI**：`cafe connector install|list|status|start|stop|restart|logs|config|remove`（`packages/cli/src/connector.ts`）。start 以 detached 进程启动，注入 `CAFE_DAEMON` / `CAFE_TOKEN` / `CAFE_CONNECTOR_NAME` / `CAFE_CONNECTOR_CONFIG` / `CAFE_CONNECTOR_STATE`；日志写 `CAFE_HOME/logs/connector-<name>.log`；pid/restart 状态落盘；stop 先 SIGTERM 等待，超时才 SIGKILL；remove 只删带 cafe 安装标记（`.cafe-installed.json`）的目录，否则要求 `--force`。
+- **daemon 幂等**：`POST /api/orders` 接受可选 `idempotencyKey`（协议类型同步）。daemon 在 10 分钟、最多 1000 条的窗口内返回同一个 `orderId` / `threadId`；并发重复请求共享同一个进行中的创建结果。
+- **测试**：`tests/connector.test.ts` 真实走 HTTP/SSE，覆盖事件→Order→回复→原 channel、重复 eventId、重启后 follow-up、allowlist、HTTP ingest、CLI install/status/logs/remove，以及 `/api/orders` 幂等。
+
+**真实 Discord 端到端仍待用户 bot token。** 本轮不接 Discord、不使用任何 bot token；Slack / 钉钉 / 飞书按同一契约后续接入。
+
+### 手动试用 mock
+
+```bash
+cafe connector install packages/connector/mock --force
+cafe connector config mock ingestPort 4899
+cafe connector start mock
+curl -s 127.0.0.1:4899/healthz
+curl -X POST 127.0.0.1:4899 -d '{"channel":"c1","user":"u1","eventId":"e1","text":"hello"}'
+cafe connector logs mock --follow   # 心跳、错误和最终回复都在这里
+cafe connector remove mock
+```
+
+以 stdin 驱动（测试 / 管道）仍然可用：`node <entry>` 从标准输入逐行读取同样的事件 JSON。

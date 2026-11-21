@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
 import type { RoutingHint } from "@cafe/protocol";
 import { api } from "../api.ts";
@@ -7,6 +7,7 @@ import { useT, type Dict } from "../i18n.ts";
 import { hashFor, navigate } from "../route.ts";
 import { openComposer, refreshStore, useStore } from "../store.ts";
 import { Dot, Empty, Facts, KindTag, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
+import { useDismiss } from "../ui/useDismiss.ts";
 
 const WEEK = 7 * 24 * 3600 * 1000;
 
@@ -78,6 +79,9 @@ function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
   const [menu, setMenu] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuBtnRef = useRef<HTMLButtonElement>(null);
+  useDismiss(menuRef, menu, () => setMenu(false), menuBtnRef);
   const aliases = removableAgentAliases(a);
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -145,13 +149,13 @@ function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; 
         </div>
         <div className="flex items-center gap-1.5">
           <Pill tone={tone}>{t[status]}</Pill>
-          <button type="button" className="btn-sm" aria-label={t.actions} aria-expanded={menu} onClick={() => setMenu((v) => !v)}>
+          <button ref={menuBtnRef} type="button" className="btn-sm" aria-label={t.actions} aria-expanded={menu} onClick={() => setMenu((v) => !v)}>
             ⋯
           </button>
         </div>
       </div>
       {menu && (
-        <div className="well flex flex-wrap gap-1.5 p-2 text-xs">
+        <div ref={menuRef} className="well flex flex-wrap gap-1.5 p-2 text-xs">
           <button type="button" className="btn-sm" onClick={rename}>
             {t.rename}
           </button>
@@ -171,7 +175,10 @@ function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; 
       {a.description && <div className="text-sm text-fg">{a.description}</div>}
       <Facts
         rows={[
-          [t.dir, <span className="mono" title={(a.scope.length ? a.scope : [a.cwd]).join("\n")}>{a.scope[0] ?? a.cwd}</span>],
+          [t.dir, <span className="mono" title={a.cwd}>{a.cwd}</span>],
+          ...(a.scope.length
+            ? ([[t.covers, <span className="mono" title={a.scope.join("\n")}>{a.scope.join(", ")}</span>]] as [string, ReactNode][])
+            : []),
           [t.runsAs, runsAs],
           [t.last7d, t.stats(answered, declined)],
         ]}

@@ -166,3 +166,59 @@ export function startInstalledService(cafeHome: string, platform: NodeJS.Platfor
     return false;
   }
 }
+
+/**
+ * Point an installed autostart service at `bin` (normally `current/bin/cafe.js`)
+ * and restart it. Returns false when no service is installed for this CAFE_HOME.
+ * `cafe update apply` needs this: otherwise launchd/systemd restarts the old
+ * entry and the health check sees the old version, forcing a rollback (#27).
+ */
+export function retargetInstalledService(
+  cafeHome: string,
+  bin: string,
+  opts: { platform?: NodeJS.Platform; home?: string; node?: string; path?: string; runner?: typeof run } = {},
+): boolean {
+  const platform = opts.platform ?? process.platform;
+  // Locate the installed unit first, then reuse its node/PATH when rewriting it:
+  // the updater's own PATH may not be the one headless Baristas need.
+  let probe: ServiceFile;
+  try {
+    probe = serviceFile({ platform, node: "", bin: "", cafeHome, path: "", home: opts.home });
+  } catch {
+    return false;
+  }
+  if (!existsSync(probe.file)) return false;
+  const installed = readFileSync(probe.file, "utf8");
+  const marker = platform === "darwin" ? `<key>CAFE_HOME</key><string>${xml(cafeHome)}</string>` : `CAFE_HOME=${cafeHome}"`;
+  if (!installed.includes(marker)) return false;
+  const installedNode =
+    platform === "darwin" ? /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/.exec(installed)?.[1] : /ExecStart="([^"]*)"/.exec(installed)?.[1];
+  const installedPath = platform === "darwin" ? /<key>PATH<\/key><string>([^<]*)<\/string>/.exec(installed)?.[1] : /Environment="PATH=([^"]*)"/.exec(installed)?.[1];
+  let f: ServiceFile;
+  try {
+    f = serviceFile({
+      platform,
+      node: opts.node ?? installedNode ?? process.execPath,
+      bin,
+      cafeHome,
+      path: opts.path ?? installedPath ?? servicePath(process.env.PATH),
+      home: opts.home,
+    });
+  } catch {
+    return false;
+  }
+  const runner = opts.runner ?? run;
+  try {
+    if (installed !== f.content) {
+      runner(f.unload, true);
+      writeFileSync(f.file, f.content);
+      runner(f.load);
+    } else {
+      // Already pointed at `current`: a restart is enough to load the new release.
+      runner(f.start);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}

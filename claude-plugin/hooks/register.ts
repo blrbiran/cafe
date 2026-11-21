@@ -102,8 +102,12 @@ async function host($: EngineInterface, cwd: string) {
   status($)
 }
 
-/** The person may already own `/cafe`; a refused registration must not stop the Barista. */
-const COMMANDS = ['cafe', 'cafe-barista'] as const
+/**
+ * Barista session control. `/cafe` belongs to the Customer side (installed as a
+ * Claude Code command by `cafe commands install`, same subcommands as pi/omp);
+ * the plugin's pause/resume lives on `/cafe-barista` in every session.
+ */
+const COMMANDS = ['cafe-barista'] as const
 let commandName: string | undefined
 
 async function registerCommand($: EngineInterface) {
@@ -111,7 +115,7 @@ async function registerCommand($: EngineInterface) {
     try {
       await $.command.register({
         name,
-        description: 'cafe network: show this session\'s address, or stop / resume answering questions',
+        description: 'cafe session: show this session\'s address, or stop / resume answering questions',
         argumentHint: '[on|off]',
       })
       commandName = name
@@ -120,7 +124,7 @@ async function registerCommand($: EngineInterface) {
       $.ui.log(`cafe: /${name} is not available: ${(err as Error).message}`, { to: 'debug' })
     }
   }
-  $.ui.log('cafe: no slash command registered; the cafe tools and status still work', { to: 'debug' })
+  $.ui.log('cafe: no session slash command registered; the cafe tools and status still work', { to: 'debug' })
 }
 
 async function cafeCommand($: EngineInterface, e: { args: string }) {
@@ -145,13 +149,12 @@ export const register: Register = on => {
     const started = await next(e)
     // Only a session someone is using in a terminal; `-p` runs and SDK hosts stay out of the network.
     if (!e.isInteractive) return started
-    // Registration is best effort: a user-owned /cafe must not abort the session or the Barista.
+    // Registration is best effort: a refused command must not abort the session or the Barista.
     await registerCommand($).catch((err) => $.ui.log(`cafe: command registration failed: ${(err as Error).message}`, { to: 'debug' }))
     void host($, e.cwd)
     return started
   })
 
-  on('command.run', { command: 'cafe' }, cafeCommand)
   on('command.run', { command: 'cafe-barista' }, cafeCommand)
 
   // The turn that starts with our Order's marker is the Order's turn.

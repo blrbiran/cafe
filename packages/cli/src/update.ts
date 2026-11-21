@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
+import { retargetInstalledService } from "./service.ts";
 
 /**
  * Controlled update / rollback (#27, v4-2). The updater runs in the CLI, not in
@@ -104,6 +105,16 @@ function startDaemon(dir: string, home: string): void {
     stdio: "ignore",
   });
   child.unref();
+}
+
+/**
+ * Start the release `current` points at. On a service-managed machine the unit is
+ * retargeted at `current/bin/cafe.js` first: launchd/systemd would otherwise
+ * restart the old entry and the health check would see the old version (#27).
+ */
+function startRelease(home: string, version: string): void {
+  if (retargetInstalledService(home, join(currentLink(home), "bin", "cafe.js"))) return;
+  startDaemon(join(releasesDir(home), version), home);
 }
 
 async function waitHealthy(base: string, version: string, timeoutMs: number): Promise<HealthResult> {
@@ -217,7 +228,7 @@ export async function applyUpdate(opts: ApplyOptions): Promise<ApplyResult> {
 
     writeUpdateState(home, { ...state, pending: to, updatedAt: Date.now() });
     switchCurrent(home, to);
-    startDaemon(join(releasesDir(home), to), home);
+    startRelease(home, to);
     const hr = await waitHealthy(base, to, healthTimeoutMs);
     if (hr.ok) {
       writeUpdateState(home, { current: to, lastGood: to, updatedAt: Date.now(), log: logEntry(state, { at: Date.now(), action: "apply", ok: true, from, to }) });
@@ -228,7 +239,7 @@ export async function applyUpdate(opts: ApplyOptions): Promise<ApplyResult> {
     const back = state.current ?? state.lastGood;
     if (back && existsSync(join(releasesDir(home), back))) {
       switchCurrent(home, back);
-      startDaemon(join(releasesDir(home), back), home);
+      startRelease(home, back);
       const old = await waitHealthy(base, back, healthTimeoutMs);
       writeUpdateState(home, {
         current: back,
@@ -254,7 +265,7 @@ export async function rollbackUpdate(opts: { home: string; base: string; healthT
   const before = await health(base);
   if (before) await stopDaemon(base);
   switchCurrent(home, back);
-  startDaemon(join(releasesDir(home), back), home);
+  startRelease(home, back);
   const hr = await waitHealthy(base, back, healthTimeoutMs);
   writeUpdateState(home, {
     current: back,

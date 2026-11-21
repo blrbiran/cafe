@@ -1,4 +1,4 @@
-import { useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import type { AgentRecord, DaemonRecord } from "@cafe/protocol";
 import { api } from "./api.ts";
 import { isActive, refreshStore, useStore } from "./store.ts";
@@ -8,6 +8,7 @@ import { setLang, useLang, useT } from "./i18n.ts";
 import { applyTheme, readTheme, type Theme } from "./theme.ts";
 import { Dot, KindTag, Pill } from "./ui/bits.tsx";
 import { SettingsDrawer } from "./ui/SettingsDrawer.tsx";
+import { useDismiss } from "./ui/useDismiss.ts";
 
 function CafeIcon() {
   return (
@@ -40,11 +41,17 @@ function readAgentsOpen(): boolean {
   return typeof window === "undefined" || !window.matchMedia("(max-width: 760px)").matches;
 }
 
-/** One Agent in the nav sublist, with the same actions as its card on the Agents page (#45). */
+/**
+ * One Agent in the nav sublist, with the same actions as its card on the Agents page (#45).
+ * The menu opens on right-click (or the keyboard context-menu keys); a visible ⋯ button
+ * would land on a second grid row and clutter the compact list.
+ */
 function NavAgent({ a, daemons }: { a: AgentRecord; daemons: DaemonRecord[] }) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [err, setErr] = useState<string>();
+  const menuRef = useRef<HTMLDivElement>(null);
+  useDismiss(menuRef, open, () => setOpen(false));
   const act = async (fn: () => Promise<unknown>) => {
     setErr(undefined);
     try {
@@ -66,7 +73,20 @@ function NavAgent({ a, daemons }: { a: AgentRecord; daemons: DaemonRecord[] }) {
     if (v?.trim()) void act(() => api.aliasAgent(a.address, v.trim()));
   };
   return (
-    <div className="nav-subagent relative" onContextMenu={(e) => { e.preventDefault(); setOpen(true); }}>
+    <div
+      className="nav-subagent relative"
+      tabIndex={0}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setOpen(true);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+          e.preventDefault();
+          setOpen(true);
+        }
+      }}
+    >
       <Dot tone={a.status === "offline" ? undefined : a.status === "busy" ? "info" : "ok"} />
       <div className="min-w-0">
         <div className="flex items-center gap-1.5">
@@ -80,11 +100,8 @@ function NavAgent({ a, daemons }: { a: AgentRecord; daemons: DaemonRecord[] }) {
       <span className={`text-[10px] ${a.status === "offline" ? "text-muted" : a.status === "busy" ? "text-info" : "text-ok"}`}>
         {a.status === "offline" ? t.offline : a.status === "busy" ? t.busy : t.idle}
       </span>
-      <button type="button" className="btn-sm !px-1 !py-0 text-[11px]" aria-label={t.actions} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-        ⋯
-      </button>
       {open && (
-        <div className="well absolute right-1 top-full z-20 flex min-w-32 flex-col gap-1 p-1 text-xs shadow-lg">
+        <div ref={menuRef} className="well absolute right-1 top-full z-20 flex min-w-32 flex-col gap-1 p-1 text-xs shadow-lg">
           <button type="button" className="btn-sm text-left" onClick={rename}>
             {t.rename}
           </button>

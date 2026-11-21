@@ -58,8 +58,8 @@ export class RulesRouter implements Router {
   readonly name = "rules" as const;
 
   async decide({ order, candidates, hints, broadcast }: RouteInput): Promise<RoutingDecision> {
-    if (candidates.length === 0) return { targets: [], mode: "broadcast", reason: "no eligible baristas", router: "rules", candidates: [] };
-    if (broadcast) return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "customer asked everyone", router: "rules", candidates: [] };
+    if (candidates.length === 0) return { targets: [], mode: "broadcast", reason: "no eligible baristas", router: "rules", candidates: [], confidence: 0, fanout: 0 };
+    if (broadcast) return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "customer asked everyone", router: "rules", candidates: [], confidence: 1, fanout: candidates.length };
     const body = tokenize(order.body);
     const scored = candidates
       .map((c) => {
@@ -90,12 +90,16 @@ export class RulesRouter implements Router {
       const strong = matched.filter((s) => s.score >= 3);
       if (separable && strong.length >= 2 && strong[1]!.score >= strong[0]!.score * 0.6) {
         const top = strong.slice(0, TOP_K);
+        const leftOut = matched.filter((s) => !top.includes(s)).slice(0, 3);
         return {
           targets: top.map((s) => s.c.agentId),
           mode: top.length > 1 ? "multicast" : "unicast",
           reason: `separable parts, likely ${top.map((s) => s.c.address).join(", ")}`,
           router: "rules",
-          candidates: matched.filter((s) => !top.includes(s)).map((s) => s.c.agentId),
+          candidates: leftOut.map((s) => s.c.agentId),
+          confidence: 0.6,
+          fanout: top.length,
+          ...(leftOut.length ? { whyNot: leftOut.map((s) => ({ agentId: s.c.agentId, reason: `lower description score (${s.score}) than the chosen targets` })) } : {}),
         };
       }
       // Only Baristas that tied with the target on the description were actually moved by history.
@@ -103,24 +107,37 @@ export class RulesRouter implements Router {
       const history = demoted.length
         ? `; history: ${demoted.map((s) => `${s.c.address} declined similar orders`).join(", ")}`
         : "";
+      const runnerUp = matched[1];
+      const closeCall = runnerUp !== undefined && runnerUp.score >= best.score * 0.6;
+      const whyNot = matched
+        .filter((s) => s !== best)
+        .slice(0, 3)
+        .map((s) => ({ agentId: s.c.agentId, reason: demoted.includes(s) ? "recently declined similar orders" : `description score ${s.score} < ${best.score}` }));
       return {
         targets: [best.c.agentId],
         mode: "unicast",
         reason: `keyword match (score ${best.score}) on ${best.c.address}${history}`,
         router: "rules",
         candidates: matched.slice(1).map((s) => s.c.agentId),
+        confidence: best.score >= 3 ? (closeCall ? 0.75 : 0.9) : 0.65,
+        fanout: 1,
+        ...(whyNot.length ? { whyNot } : {}),
         ...(demoted.length ? { demoted: demoted.map((s) => s.c.agentId) } : {}),
       };
     }
     // Bounded fan-out: the caller chose top-k over asking nobody and over
     // broadcasting to the whole network.
     const top = scored.slice(0, Math.min(TOP_K, scored.length));
+    const leftOut = scored.slice(top.length, top.length + 3);
     return {
       targets: top.map((s) => s.c.agentId),
       mode: top.length > 1 ? "multicast" : "unicast",
       reason: `no keyword match; asking the ${top.length} most available Baristas`,
       router: "rules",
       candidates: scored.slice(top.length).map((s) => s.c.agentId),
+      confidence: 0.3,
+      fanout: top.length,
+      ...(leftOut.length ? { whyNot: leftOut.map((s) => ({ agentId: s.c.agentId, reason: "not in the top 3 by keyword overlap" })) } : {}),
     };
   }
 }
@@ -201,11 +218,11 @@ export class LlmRouter implements Router {
     const { order, candidates, hints, broadcast } = input;
     if (broadcast) {
       // The customer explicitly asked everyone; no model call needed.
-      return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "customer asked everyone", router: "llm", candidates: [] };
+      return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "customer asked everyone", router: "llm", candidates: [], confidence: 1, fanout: candidates.length };
     }
     if (candidates.length === 0) return this.fallback.decide(input);
     if (candidates.length === 1) {
-      return { targets: [candidates[0]!.agentId], mode: "unicast", reason: "only eligible barista (no model call)", router: "llm", candidates: [] };
+      return { targets: [candidates[0]!.agentId], mode: "unicast", reason: "only eligible barista (no model call)", router: "llm", candidates: [], confidence: 1, fanout: 1 };
     }
     const cacheKey = `${order.body}\u0000${candidates
       .map((c) => `${c.agentId}:${c.status}:${c.description}:${c.tags.join(",")}`)
@@ -249,7 +266,14 @@ export class LlmRouter implements Router {
         reason: String(json.reason ?? ""),
         router: "llm",
         candidates: (Array.isArray(json.candidates) ? json.candidates : []).filter((t: string) => valid.has(t) && !targets.includes(t)).slice(0, TOP_K),
+        // Coarse and explainable: unicast from the model is usually reliable; an
+        // unrequested broadcast that got bounded is a weaker call.
+        confidence: mode === "unicast" ? (declared === "broadcast" ? 0.75 : 0.85) : 0.55,
+        fanout: targets.length,
       };
+      if (decision.candidates.length) {
+        decision.whyNot = decision.candidates.map((agentId) => ({ agentId, reason: "the model listed it as a fallback, not a target" }));
+      }
       if (this.cacheEnabled) {
         this.cache.set(cacheKey, decision);
         if (this.cache.size > LlmRouter.CACHE_LIMIT) this.cache.delete(this.cache.keys().next().value!);

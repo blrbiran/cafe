@@ -1,0 +1,14 @@
+{
+  "name": "mock",
+  "kind": "customer-connector",
+  "version": "0.1.0",
+  "entry": "./index.ts",
+  "permissions": ["orders:write", "threads:read"],
+  "configSchema": {
+    "allowChannels": { "type": "array", "items": "string", "default": [] },
+    "allowUsers": { "type": "array", "items": "string", "default": [] },
+    "address": { "type": "string", "required": false },
+    "ingestPort": { "type": "number", "default": 0 }
+  },
+  "health": { "type": "stdio", "heartbeatMs": 30000 }
+}

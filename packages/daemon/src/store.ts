@@ -81,8 +81,11 @@ export class Store {
     return join(dir, `${threadId}.jsonl`);
   }
 
-  appendEvent(file: string, env: ThreadEnvelope): void {
-    appendFileSync(file, `${JSON.stringify(env)}\n`);
+  /** Append one event line; returns the bytes written (for /api/health counters). */
+  appendEvent(file: string, env: ThreadEnvelope): number {
+    const line = `${JSON.stringify(env)}\n`;
+    appendFileSync(file, line);
+    return Buffer.byteLength(line);
   }
 
   readEvents(file: string): ThreadEnvelope[] {
@@ -171,15 +174,23 @@ export class Store {
     return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 
-  putThread(meta: ThreadMeta): void {
+  /** Upsert one Thread's metadata; returns the serialized bytes (for /api/health counters). */
+  putThread(meta: ThreadMeta): number {
+    const json = JSON.stringify(meta);
     this.db
       .prepare("INSERT INTO threads(thread_id, created_at, status, meta) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, meta=excluded.meta")
-      .run(meta.threadId, meta.createdAt, meta.status, JSON.stringify(meta));
+      .run(meta.threadId, meta.createdAt, meta.status, json);
+    return Buffer.byteLength(json);
   }
 
   getThread(threadId: string): ThreadMeta | undefined {
     const row = this.db.prepare("SELECT meta FROM threads WHERE thread_id = ?").get(threadId) as { meta: string } | undefined;
     return row ? (JSON.parse(row.meta) as ThreadMeta) : undefined;
+  }
+
+  /** Cheap count for /api/health; never loads the metadata payloads. */
+  countThreads(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM threads").get() as { n: number }).n;
   }
 
   /** Newest first. `before`: only threads created before this time (paging to older threads). */

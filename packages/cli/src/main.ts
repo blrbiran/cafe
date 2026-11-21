@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
-import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue } from "@cafe/daemon";
+import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
@@ -22,6 +22,7 @@ import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_P
 import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
 import { applyUpdate, checkUpdate, rollbackUpdate, updateStatus } from "./update.ts";
+import { addConnectorCommands } from "./connector.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAIN = fileURLToPath(import.meta.url);
@@ -656,13 +657,14 @@ program
   .action(async () => {
     await ensureDaemon();
     const { learn, hints } = await api<{ learn: boolean; hints: Record<string, RoutingHint> }>("/api/routing/hints");
+    const routing = await api<RoutingStats>("/api/routing/stats");
     const rows = Object.values(hints).sort((a, b) => b.answered + b.declined - (a.answered + a.declined) || a.identity.localeCompare(b.identity));
     const lines = rows.map((h) => {
       const topics = Object.keys(h.declinedTopics).slice(0, 6).join(", ");
       return `${h.identity.padEnd(28)} answered ${String(h.answered).padStart(3)}  declined ${String(h.declined).padStart(3)}  failed ${String(h.failed).padStart(3)}${topics ? `  declined topics: ${topics}` : ""}`;
     });
     const footer = learn ? "" : "\n(router.learn is off: routing ignores this history)";
-    out((lines.join("\n") || "(no answers or declines in the last 7 days)") + footer, { learn, hints });
+    out((lines.join("\n") || "(no answers or declines in the last 7 days)") + footer + `\n\n${formatRoutingStats(routing)}`, { learn, hints, routing });
   });
 
 program
@@ -1149,7 +1151,7 @@ claudeCmd
       if (r.error) throw new Error(`${cmd[0]} not found; install Claude Code first`);
       results.push(`${r.status === 0 ? "ok" : /already/i.test(msg) ? "ok (already)" : `failed: ${msg}`}  ${cmd.join(" ")}`);
     }
-    results.push("New Claude Code sessions in a directory with a Barista .cafe now answer cafe questions; in open sessions run /reload-plugins. /cafe off pauses a session.");
+    results.push("New Claude Code sessions in a directory with a Barista .cafe now answer cafe questions; in open sessions run /reload-plugins. /cafe-barista off pauses a session.");
     out(results.join("\n"), { ...plan, results });
   });
 claudeCmd
@@ -1271,7 +1273,7 @@ commandsCmd
 
 commandsCmd
   .command("install")
-  .description("install the /cafe-ask command for Claude Code (pi/omp get /cafe from the extension)")
+  .description("install the /cafe command for Claude Code (agents/ask/status/thread, same as pi/omp; replaces the old /cafe-ask)")
   .requiredOption("--agent <agent>", "pi | omp | claude | codex")
   .option("--dry-run", "print what would change")
   .option("--force", "replace a command file cafe does not own")
@@ -1289,7 +1291,7 @@ commandsCmd
 
 commandsCmd
   .command("uninstall")
-  .description("remove the /cafe-ask command file (never a person's own command)")
+  .description("remove the /cafe command file (never a person's own command)")
   .requiredOption("--agent <agent>", "pi | omp | claude | codex")
   .action((o) => {
     if (o.agent !== "claude") {
@@ -1344,6 +1346,10 @@ function lstatSafe(p: string) {
     return undefined;
   }
 }
+
+// Out-of-process Customer connectors live in their own namespace, separate from
+// the pi/omp Barista extensions (`cafe extension`).
+addConnectorCommands(program, out, base);
 
 // Commander falls back to the top-level help (exit 0) for `cafe <typo> --help`.
 // Check the first positional ourselves so a misspelt command always fails.

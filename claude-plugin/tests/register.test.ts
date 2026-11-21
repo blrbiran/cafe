@@ -121,12 +121,13 @@ test('a non-interactive run (claude -p, SDK) never joins the network', async ($,
   expect(host.spawned).toEqual([])
 })
 
-test('a user-owned /cafe does not abort session.start; it falls back to /cafe-barista', async ($, on) => {
+test('the plugin registers /cafe-barista and never claims the Customer /cafe', async ($, on) => {
   const host = fakeHost(on, { refuse: ['cafe'] })
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true } as any)
   await settle()
-  // The refused registration is retried under another name, and the session still becomes a Barista.
-  expect(host.registered).toEqual(['cafe', 'cafe-barista'])
+  // `/cafe` is the Customer entry installed by `cafe commands install`; the plugin's
+  // pause/resume is `/cafe-barista` in every session, even when no one owns `/cafe`.
+  expect(host.registered).toEqual(['cafe-barista'])
   expect(host.spawned).toHaveLength(1)
 
   await host.feed({ type: 'ready', address: 'w#1@mac', socket: '/tmp/s.sock' })
@@ -135,14 +136,14 @@ test('a user-owned /cafe does not abort session.start; it falls back to /cafe-ba
   host.close()
 })
 
-test('/cafe off and /cafe on pause and resume taking questions', async ($, on) => {
+test('/cafe-barista off and on pause and resume taking questions', async ($, on) => {
   const host = fakeHost(on)
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true } as any)
   await settle()
   await host.feed({ type: 'ready', address: 'w#1@mac', socket: '/tmp/s.sock' })
-  const off = await $.command.run({ command: 'cafe', args: 'off' } as any)
+  const off = await $.command.run({ command: 'cafe-barista', args: 'off' } as any)
   expect(JSON.stringify(off)).toContain('stopped taking questions')
-  const on2 = await $.command.run({ command: 'cafe', args: 'on' } as any)
+  const on2 = await $.command.run({ command: 'cafe-barista', args: 'on' } as any)
   expect(JSON.stringify(on2)).toContain('taking questions again')
   expect(host.posts.map(p => [p.path, p.body.paused])).toEqual([
     ['/pause', true],

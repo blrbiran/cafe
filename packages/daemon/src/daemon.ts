@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
+import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import {
   ACK_TIMEOUT_MS,
   AgentIdentity,
@@ -93,6 +94,21 @@ interface Tracking {
 const MAX_META_REPLIES = 50;
 const MAX_META_DECLINES = 50;
 
+/** How long `CreateOrderParams.idempotencyKey` keeps returning the first Order (v4-3 Q4). */
+const IDEMPOTENCY_WINDOW_MS = 10 * 60_000;
+const IDEMPOTENCY_MAX_ENTRIES = 1000;
+
+type CreatedOrder = { orderId: string; threadId: string; decision: RoutingDecision };
+
+/** One in-flight or completed idempotent create, keyed by the caller's idempotencyKey. */
+interface IdempotentOrder {
+  at: number;
+  expiresAt: number;
+  /** The first request is still routing: concurrent duplicates await it. */
+  pending?: Promise<CreatedOrder>;
+  result?: CreatedOrder;
+}
+
 type DaemonEvents = {
   thread: [ThreadEnvelope, ThreadMeta | undefined];
   registry: [RegistryDelta];
@@ -137,6 +153,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private uis = new Set<Peer>();
   /** Orders seen here (origin or relayed), for parent/chain lookup. */
   private knownOrders = new Map<string, Order>();
+  /** idempotencyKey → the first Order created with it (short window, bounded; v4-3 Q4). */
+  private idempotentOrders = new Map<string, IdempotentOrder>();
   /** Agents registered on this Host (authoritative local set, survives Registry snapshots). */
   private local = new Map<string, AgentRecord>();
 
@@ -193,6 +211,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.hostAliases = [...opts.config.aliases];
     this.hostLegacyAliases = [...(opts.config.legacyAliases ?? [])];
     this.store = new Store(opts.home);
+    this.startLagSampler();
     this.log = opts.log ?? ((m) => console.error(`[cafe ${this.host}] ${m}`));
     this.timing = {
       ackTimeoutMs: ACK_TIMEOUT_MS,
@@ -726,7 +745,49 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // Orders (origin side)
   // -------------------------------------------------------------------------
 
-  async createOrder(p: CreateOrderParams, peer?: Peer): Promise<{ orderId: string; threadId: string; decision: RoutingDecision }> {
+  /**
+   * Create an Order. `idempotencyKey` makes a repeated request inside a short
+   * window return the first Order/Thread; the key is the caller's (a platform
+   * event id for connectors, v4-3 Q4). Without a key nothing is deduplicated.
+   */
+  async createOrder(p: CreateOrderParams, peer?: Peer): Promise<CreatedOrder> {
+    const key = p.idempotencyKey;
+    if (!key) return this.createOrderInner(p, peer);
+    const now = Date.now();
+    this.pruneIdempotent(now);
+    const hit = this.idempotentOrders.get(key);
+    if (hit && hit.expiresAt > now) {
+      if (hit.result) return hit.result;
+      if (hit.pending) return hit.pending;
+    }
+    const entry: IdempotentOrder = { at: now, expiresAt: now + IDEMPOTENCY_WINDOW_MS };
+    this.idempotentOrders.set(key, entry);
+    entry.pending = this.createOrderInner(p, peer);
+    try {
+      const result = await entry.pending;
+      entry.result = result;
+      entry.pending = undefined;
+      return result;
+    } catch (err) {
+      // A failed create is not a result: let the caller retry with the same key.
+      this.idempotentOrders.delete(key);
+      throw err;
+    }
+  }
+
+  private pruneIdempotent(now: number): void {
+    for (const [key, entry] of this.idempotentOrders) {
+      if (entry.expiresAt <= now) this.idempotentOrders.delete(key);
+    }
+    // Bounded map: a burst larger than the cap evicts the oldest keys (Map keeps insertion order).
+    while (this.idempotentOrders.size >= IDEMPOTENCY_MAX_ENTRIES) {
+      const oldest = this.idempotentOrders.keys().next().value;
+      if (oldest === undefined) break;
+      this.idempotentOrders.delete(oldest);
+    }
+  }
+
+  private async createOrderInner(p: CreateOrderParams, peer?: Peer): Promise<CreatedOrder> {
     if (this.draining) throw new RpcError("daemon_draining", "the daemon is draining for an update; retry after it restarts");
     const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
     const parent = p.parentOrderId ? this.knownOrders.get(p.parentOrderId) : undefined;
@@ -1241,6 +1302,39 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Entry point for every event, local or relayed. Idempotent on eventId. */
   private seen = new Set<string>();
+  /** Cheap counters for /api/health (dogfooding probes, #31/#34): since this Daemon started. */
+  private stats = { events: 0, appendBytes: 0, metaWrites: 0, metaBytes: 0, snapshotMs: 0, searchMs: 0 };
+  private loopLagMs = 0;
+  private lagTimer?: ReturnType<typeof setInterval>;
+
+  /** Append to the Thread's JSONL, keeping the byte counters for /api/health. */
+  private appendEvent(file: string, env: ThreadEnvelope): void {
+    this.stats.appendBytes += this.store.appendEvent(file, env);
+    this.stats.events++;
+  }
+
+  /** Write Thread metadata, keeping the write counters for /api/health. */
+  private writeMeta(meta: ThreadMeta): void {
+    this.stats.metaBytes += this.store.putThread(meta);
+    this.stats.metaWrites++;
+  }
+
+  /** Sample event-loop delay so a busy daemon is visible without a profiler. */
+  private startLagSampler(): void {
+    this.lagTimer = setInterval(() => {
+      const started = performance.now();
+      setImmediate(() => {
+        this.loopLagMs = performance.now() - started;
+      });
+    }, 500);
+    this.lagTimer.unref?.();
+  }
+
+  /** Snapshot of the counters exposed at GET /api/health. */
+  metrics(): { threads: number; events: number; appendBytes: number; metaWrites: number; metaBytes: number; snapshotMs: number; searchMs: number; eventLoopLagMs: number } {
+    return { threads: this.store.countThreads(), ...this.stats, eventLoopLagMs: this.loopLagMs };
+  }
+
   /** Pending metadata writes, coalesced so a burst of events does not rewrite a growing row each time. */
   private metaFlush = new Map<string, ReturnType<typeof setTimeout>>();
   private scheduleMeta(meta: ThreadMeta): void {
@@ -1248,7 +1342,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const timer = setTimeout(() => {
       this.metaFlush.delete(meta.threadId);
       const latest = this.metas.get(meta.threadId);
-      if (latest) this.store.putThread(latest);
+      if (latest) this.writeMeta(latest);
     }, 150);
     timer.unref?.();
     this.metaFlush.set(meta.threadId, timer);
@@ -1258,7 +1352,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const [threadId, timer] of this.metaFlush) {
       clearTimeout(timer);
       const meta = this.metas.get(threadId);
-      if (meta) this.store.putThread(meta);
+      if (meta) this.writeMeta(meta);
     }
     this.metaFlush.clear();
   }
@@ -1280,13 +1374,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // download still works after the origin Host goes offline again.
     if (meta?.from.host === this.host) for (const a of carried ?? []) this.enqueuePull(a, env.threadId);
     if (meta) {
-      this.store.appendEvent(meta.file, env);
+      this.appendEvent(meta.file, env);
       // Thread creation / closure is durable immediately; heartbeats and interim events can wait.
       if (env.event.type === "order.created" || env.event.type === "order.closed") {
         const pending = this.metaFlush.get(meta.threadId);
         if (pending) clearTimeout(pending);
         this.metaFlush.delete(meta.threadId);
-        this.store.putThread(meta);
+        this.writeMeta(meta);
       } else {
         this.scheduleMeta(meta);
       }
@@ -1343,6 +1437,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   routingHints(): Record<string, RoutingHint> {
     if (!this.isRoot && this.rootOnline && this.rootHints) return this.rootHints;
     return this.ownHints();
+  }
+
+  /** Recent routing mix, fan-out and response timings from Thread metadata (no JSONL scan). */
+  routingStats(limit = 200) {
+    const n = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1000) : 200;
+    return computeRoutingStats(this.store.listThreads(n));
   }
 
   private hintsFor(candidates: AgentRecord[]): Map<string, RoutingHint> | undefined {
@@ -1404,8 +1504,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.metas.has(order.threadId) || this.store.getThread(order.threadId)) return;
     const env: ThreadEnvelope = { eventId: `${order.orderId}:created`, threadId: order.threadId, orderId: order.orderId, host: order.from.host, at: order.createdAt, event: { type: "order.created", order } };
     const meta = this.updateMeta(env)!;
-    this.store.appendEvent(meta.file, env);
-    this.store.putThread(meta);
+    this.appendEvent(meta.file, env);
+    this.writeMeta(meta);
     for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
   }
 
@@ -1843,12 +1943,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return { dryRun, cutoff, threads: stale.length, bytes, agentEvents, oldest };
   }
 
-  /** Plain substring search over questions and answers, newest threads first. Scans the JSONL files. */
-  search(q: string, limit = 20): { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] {
-    if (!Number.isFinite(limit) || limit <= 0) return [];
+  /** Plain substring search over questions and answers, newest threads first. Scans the JSONL files.
+ * A scan longer than `budgetMs` returns what it found so far and marks `stats.truncated`. */
+  search(
+    q: string,
+    limit = 20,
+    opts: { budgetMs?: number; stats?: { scanned: number; elapsedMs: number; truncated: boolean } } = {},
+  ): { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] {
+    const started = performance.now();
+    const fill = (scanned: number, truncated: boolean) => {
+      const elapsedMs = performance.now() - started;
+      this.stats.searchMs = elapsedMs;
+      if (opts.stats) Object.assign(opts.stats, { scanned, elapsedMs, truncated });
+    };
+    if (!Number.isFinite(limit) || limit <= 0) {
+      fill(0, false);
+      return [];
+    }
     const needle = q.toLowerCase();
+    const budget = opts.budgetMs ?? 1_000;
     const out: { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] = [];
+    let scanned = 0;
     for (const meta of this.store.allThreads()) {
+      scanned++;
       const hits: { orderId: string; who: string; text: string; at: number }[] = [];
       for (const env of this.store.readEvents(meta.file)) {
         const ev = env.event;
@@ -1862,7 +1979,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       if (hits.length) out.push({ meta, hits });
       if (out.length >= limit) break;
+      if (performance.now() - started > budget) {
+        fill(scanned, true);
+        return out;
+      }
     }
+    fill(scanned, false);
     return out;
   }
 
@@ -2130,7 +2252,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   snapshot() {
-    return {
+    const started = performance.now();
+    const result = {
       host: this.host,
       displayName: this.displayName,
       aliases: this.hostAliases,
@@ -2144,6 +2267,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       daemons: this.daemons(),
       threads: this.store.listThreads(200).map((m) => this.summaryMeta(m)),
     };
+    this.stats.snapshotMs = performance.now() - started;
+    return result;
   }
 
   thread(threadId: string, opts: { limit?: number; before?: string } = {}) {
@@ -2179,6 +2304,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.pruneInterval);
     clearInterval(this.pullTimer);
     clearInterval(this.stagingTimer);
+    clearInterval(this.lagTimer);
     this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
     for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();

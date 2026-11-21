@@ -73,9 +73,11 @@ cafe extension install --agent pi                     # persistent pi extension 
 cafe barista start --dir ~/code/billing               # run a headless pi Barista for that directory
 cafe barista start --dir ~/code/billing --agent codex # a Codex Barista (codex app-server); --agent claude for Claude Code
 cafe barista start --dir ~/code/billing --agent codex --tui  # answer in the Codex session already running there
-cafe claude install                                   # running Claude Code sessions in a dir with .cafe answer questions (/cafe off pauses)
+cafe claude install                                   # running Claude Code sessions in a dir with .cafe answer questions (/cafe-barista off pauses)
                                                       # read-only by default; --write lets it edit files in --dir
 cafe mcp install                                      # Customer only: register `cafe mcp` (cafe_ask / cafe_wait / …)
+cafe connector install packages/connector/mock         # Customer connector sidecar (experimental; Discord first)
+cafe connector start mock                              # mock: feed events on stdin or config.ingestPort, replies in the log
 cafe serve --preset claude --dir ~/code/billing       # one `claude -p` per question, no session (or --preset codex)
                                                       # presets are read-only by default; --write widens them
 cafe serve --exec "./answer.sh" --dir .               # any command: prompt on stdin (or {prompt_file}), answer on stdout;

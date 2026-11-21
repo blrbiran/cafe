@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { LABEL, serviceFile, servicePath, startInstalledService } from "../packages/cli/src/service.ts";
+import { dirname, join } from "node:path";
+import { LABEL, retargetInstalledService, serviceFile, servicePath, startInstalledService } from "../packages/cli/src/service.ts";
 
 const spec = { node: "/opt/node/bin/node", bin: "/repo/packages/cli/bin/cafe.js", cafeHome: "/u/.cafe", path: "/opt/node/bin:/usr/bin", home: "/u" };
 
@@ -53,5 +53,46 @@ describe("autostart service files", () => {
 
   it("refuses other platforms with a hint", () => {
     expect(() => serviceFile({ ...spec, platform: "win32" })).toThrow(/cafe daemon start/);
+  });
+
+  it("retargets an installed service at current/ so the first update starts the new code", () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-svc-"));
+    const ran: string[][] = [];
+    const runner = (cmds: string[][]) => void ran.push(...cmds);
+    const entry = "/u/.cafe/current/bin/cafe.js";
+    const opts = { platform: "darwin" as const, home, node: spec.node, path: spec.path, runner };
+
+    // Nothing installed for this CAFE_HOME: the caller spawns the release itself.
+    expect(retargetInstalledService("/u/.cafe", entry, opts)).toBe(false);
+
+    const old = serviceFile({ ...spec, home, platform: "darwin" });
+    mkdirSync(dirname(old.file), { recursive: true });
+    writeFileSync(old.file, old.content);
+    // A service installed for another CAFE_HOME is never touched.
+    expect(retargetInstalledService("/other/.cafe", entry, opts)).toBe(false);
+    expect(ran).toEqual([]);
+
+    // Old entry installed: rewrite it to current/bin/cafe.js and reload.
+    expect(retargetInstalledService("/u/.cafe", entry, opts)).toBe(true);
+    expect(readFileSync(old.file, "utf8")).toContain(`<string>${entry}</string>`);
+    expect(ran.map((c) => c[1])).toEqual(["bootout", "bootstrap"]);
+
+    // Already pointed at current: only restart, so it loads the new release.
+    ran.length = 0;
+    expect(retargetInstalledService("/u/.cafe", entry, opts)).toBe(true);
+    expect(ran.map((c) => c[1])).toEqual(["kickstart"]);
+  });
+
+  it("keeps the installed service's PATH and node when retargeting", () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-svc-"));
+    const runner = () => {};
+    const old = serviceFile({ ...spec, home, platform: "darwin" });
+    mkdirSync(dirname(old.file), { recursive: true });
+    writeFileSync(old.file, old.content);
+    // No node/path override: the rewritten unit must keep what the service was installed with.
+    expect(retargetInstalledService("/u/.cafe", "/u/.cafe/current/bin/cafe.js", { platform: "darwin", home, runner })).toBe(true);
+    const written = readFileSync(old.file, "utf8");
+    expect(written).toContain("<string>/opt/node/bin/node</string>");
+    expect(written).toContain("<key>PATH</key><string>/opt/node/bin:/usr/bin</string>");
   });
 });

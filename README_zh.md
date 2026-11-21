@@ -80,7 +80,7 @@ cafe daemon rename ssh1 ssh1-docker # Root 上改另一台 Daemon 的展示名
 |---|---|---|
 | Codex | `$cafe` + MCP 工具 | `cafe mcp install` 让 Codex 成为 **Customer**；`cafe barista start --agent codex` 才让它成为 **Barista** |
 | pi / omp | `/cafe agents\|ask\|status\|thread\|help` + `/skill:cafe` + 扩展工具 | 扩展注册 `/cafe`，skill 仍走自己的 `/skill:cafe` 命名空间 |
-| Claude Code | `/cafe`（插件暂停/恢复）、`/cafe-ask`、skill、MCP | `/cafe on\|off` 暂停正在运行的会话作为 Barista |
+| Claude Code | `/cafe agents\|ask\|status\|thread\|help`（Customer，需 `cafe commands install --agent claude`）、`/cafe-barista off\|on`（插件会话控制）、skill、MCP | Claude 插件占用 `/cafe-barista`；`/cafe` 与 pi/omp 是同一套 Customer 入口 |
 
 `cafe mcp install` 只让宿主**提问**。要让它**回答**，启动 Barista：`cafe barista start --dir <dir> --agent codex|claude`，或 `cafe serve --preset codex|claude`（默认只读，`--write` 才放开写入）。
 - **CLI**：`cafe ask "..."`、`cafe ask --to billing "..."`、`cafe ask --thread <id> "追问"`、`cafe inbox`、`cafe thread <id>`、`cafe tail`（全网 routed / delivered / acked / replied / closed 事件；`--json` 输出 JSONL，`--host` / `--type` / `--thread` 过滤，默认隐藏心跳）。
@@ -119,8 +119,8 @@ cafe barista start --dir ~/code/billing --agent claude   # claude -p，每题一
 ```bash
 cafe claude install            # 装 cafe 的 Claude Code 插件（--dry-run 先看）
                                # 之后在有 .cafe 的目录里开的 Claude Code 会话自动接问题
-                               # 会话里：/cafe 看地址，/cafe off 暂停，/cafe on 恢复
-                               # 如果 /cafe 已被占用，插件改用 /cafe-barista
+                               # 会话里：/cafe 看地址，/cafe-barista off 暂停，on 恢复
+                               # （旧插件的暂停/恢复占用 /cafe；重跑 `cafe claude install` 即可切换）
 cafe barista start --dir ~/code/billing --agent codex --tui   # 问题放进该目录最近活动的 Codex 会话
 ```
 
@@ -133,6 +133,23 @@ cafe serve --exec "<任意命令>" --dir ~/code/billing    # 或 --preset claude
 ```
 
 每个问题跑一次命令，prompt 走 stdin，stdout 即回答；输出 `CAFE_DECLINE: 原因` 表示婉拒。追问没有会话，只靠 prompt 里的历史。
+
+## 聊天 connector（实验）
+
+`cafe connector` 以**进程外 sidecar** 的方式运行 Customer connector：把平台消息变成 cafe Order，再把回答发回原频道。SDK、监管器和 mock connector 已落地；第一个真实平台是 Discord（下一轮）。
+
+```bash
+cafe connector install packages/connector/mock   # 从源码仓库安装
+cafe connector config mock ingestPort 4899       # 可选：用本地 HTTP 喂事件
+cafe connector start mock
+curl -s -X POST 127.0.0.1:4899 -H 'content-type: application/json' \
+  -d '{"channel":"demo","user":"you","eventId":"e1","text":"cafe 是做什么的？"}'
+cafe connector logs mock --follow                # 心跳和回复
+cafe connector status mock
+cafe connector stop mock
+```
+
+connector 是一个目录：`cafe-connector.json`（name / entry / permissions / configSchema）+ 一个用 `@cafe/connector` 的 `defineConnector` 写的入口。状态在 `CAFE_HOME/connector-data/<name>/`，日志在 `CAFE_HOME/logs/connector-<name>.log`。`install` 复制目录；源码安装会链接 workspace SDK（尚未随发布包分发）。
 
 ## 配置
 

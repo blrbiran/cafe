@@ -243,7 +243,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
 
-  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus() });
+  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus(), metrics: daemon.metrics() });
   if (m === "GET" && path === "/api/router/models") {
     return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });
   }
@@ -307,6 +307,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, daemon.store.agentStats(since));
   }
   if (m === "GET" && path === "/api/routing/hints") return send(res, 200, { learn: daemon.config.router.learn, hints: daemon.routingHints() });
+  if (m === "GET" && path === "/api/routing/stats") return send(res, 200, daemon.routingStats(parseLimit(url.searchParams.get("limit"), 200)));
   if (m === "GET" && path === "/api/daemons") return send(res, 200, daemon.daemons());
   if (m === "GET" && path === "/api/settings") {
     const token = daemon.config.token ?? "";
@@ -389,7 +390,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && path === "/api/search") {
     const q = url.searchParams.get("q") ?? "";
     if (!q.trim()) throw new RpcError("bad_request", "q required");
-    return send(res, 200, daemon.search(q, parseLimit(url.searchParams.get("limit"), 20, { zeroOk: true })));
+    const limit = parseLimit(url.searchParams.get("limit"), 20, { zeroOk: true });
+    // `stats=1` adds scan/elapsed/truncated without changing the default array shape the CLI and Web use.
+    if (url.searchParams.get("stats") === "1") {
+      const stats = { scanned: 0, elapsedMs: 0, truncated: false };
+      const results = daemon.search(q, limit, { stats });
+      return send(res, 200, { results, ...stats });
+    }
+    return send(res, 200, daemon.search(q, limit));
   }
   if (m === "POST" && path === "/api/prune") {
     const { olderThanDays, dryRun } = await readJson(req);

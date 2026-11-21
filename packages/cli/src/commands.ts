@@ -5,12 +5,14 @@ import { defaultExtensionPath } from "@cafe/daemon";
 import { ompExtensionState, piExtensionState } from "./extension.ts";
 
 /** Written into the command file so an uninstall never deletes a person's own command. */
-export const COMMAND_MARKER = "<!-- Managed by cafe: /cafe-ask -->";
+export const COMMAND_MARKER = "<!-- Managed by cafe: /cafe -->";
+/** Older installs wrote /cafe-ask; `install` removes that file when it is ours. */
+const LEGACY_MARKER = "<!-- Managed by cafe: /cafe-ask -->";
 
-const COMMAND_BODY = `---
+export const COMMAND_BODY = `---
 description: Ask the cafe network (agents, ask, status, thread)
 ---
-The user invoked /cafe-ask with: $ARGUMENTS
+The user invoked /cafe with: $ARGUMENTS
 
 Forward it to the cafe CLI with the Bash tool:
 
@@ -24,7 +26,21 @@ Report the command's output as-is. If the daemon is unreachable, show the error 
 `;
 
 export function claudeCommandPath(home = homedir()): string {
+  return join(home, ".claude/commands/cafe.md");
+}
+
+function legacyClaudeCommandPath(home: string): string {
   return join(home, ".claude/commands/cafe-ask.md");
+}
+
+/** Remove the old /cafe-ask file, but only when cafe wrote it. */
+function removeLegacyClaudeCommand(home: string): void {
+  const path = legacyClaudeCommandPath(home);
+  try {
+    if (readFileSync(path, "utf8").includes(LEGACY_MARKER)) rmSync(path, { force: true });
+  } catch {
+    // missing or unreadable: nothing to clean up
+  }
 }
 
 export type ClaudeCommandState = "missing" | "ours" | "foreign";
@@ -44,15 +60,23 @@ export function installClaudeCommand(home = homedir(), opts: { dryRun?: boolean;
   mkdirSync(dirname(path), { recursive: true });
   const replaced = state === "foreign" ? readFileSync(path, "utf8") : undefined;
   writeFileSync(path, `${COMMAND_MARKER}\n${COMMAND_BODY}`);
+  removeLegacyClaudeCommand(home);
   return { path, state, written: true, ...(replaced !== undefined ? { replaced } : {}) };
 }
 
 export function uninstallClaudeCommand(home = homedir()): { path: string; removed: boolean } {
   const { path, state } = claudeCommandState(home);
-  if (state === "missing") return { path, removed: false };
+  const legacy = legacyClaudeCommandPath(home);
+  let legacyOurs = false;
+  try {
+    legacyOurs = readFileSync(legacy, "utf8").includes(LEGACY_MARKER);
+  } catch {
+    // no legacy file
+  }
   if (state === "foreign") throw new Error(`${path} is not managed by cafe; remove it yourself if you want it gone`);
-  rmSync(path, { force: true });
-  return { path, removed: true };
+  if (state === "ours") rmSync(path, { force: true });
+  if (legacyOurs) rmSync(legacy, { force: true });
+  return { path, removed: state === "ours" || legacyOurs };
 }
 
 export interface CommandStatus {
@@ -75,8 +99,8 @@ export function commandsStatus(opts: { userHome?: string; cafeHome?: string } = 
   return [
     { agent: "pi", entry: "/cafe", status: pi.installed ? "installed" : "missing", detail: `${pi.settingsPath} (extension)` },
     { agent: "omp", entry: "/cafe", status: !omp.available ? "unavailable" : omp.installed ? "installed" : "missing", detail: omp.detail },
-    { agent: "claude", entry: "/cafe", status: plugin ? "installed" : "missing", detail: plugin ? "plugin (pause/resume)" : "run `cafe claude install` for the plugin" },
-    { agent: "claude", entry: "/cafe-ask", status: claude.state === "ours" ? "installed" : claude.state === "foreign" ? "conflict" : "missing", detail: claude.path },
+    { agent: "claude", entry: "/cafe", status: claude.state === "ours" ? "installed" : claude.state === "foreign" ? "conflict" : "missing", detail: claude.path },
+    { agent: "claude", entry: "/cafe-barista", status: plugin ? "installed" : "missing", detail: plugin ? "plugin (pause/resume)" : "run `cafe claude install` for session pause/resume" },
     { agent: "codex", entry: "$cafe", status: existsSync(skill) ? "installed" : "missing", detail: existsSync(skill) ? skill : "run `cafe skill install`" },
   ];
 }

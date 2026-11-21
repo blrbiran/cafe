@@ -230,8 +230,19 @@ export class CafeClient {
   }
 }
 
+/**
+ * The interval `keepAlive()` uses when no explicit one is passed.
+ * `CAFE_HEARTBEAT_INTERVAL_MS` is a test hook: the test daemon's lease is the FAST
+ * 200 ms × 3, far below production's 30 s × 3, so an unmodified Bridge would lose
+ * any Order that takes longer than 600 ms (#6).
+ */
+export function heartbeatIntervalMs(): number {
+  const ms = Number(process.env.CAFE_HEARTBEAT_INTERVAL_MS);
+  return Number.isFinite(ms) && ms > 0 ? ms : HEARTBEAT_INTERVAL_MS;
+}
+
 /** Keep an Order alive while long work runs: sends a heartbeat every interval until stopped. */
-export function keepAlive(h: OrderHandle, intervalMs = HEARTBEAT_INTERVAL_MS): () => void {
+export function keepAlive(h: OrderHandle, intervalMs = heartbeatIntervalMs()): () => void {
   const t = setInterval(() => void h.heartbeat().catch(() => {}), intervalMs);
   return () => clearInterval(t);
 }

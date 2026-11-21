@@ -13,6 +13,7 @@ export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";
 export { Store } from "./store.ts";
+export { routingStats, formatRoutingStats, type RoutingStats } from "./routing-stats.ts";
 export { discoverRoots, type FoundRoot } from "./discovery.ts";
 export { Supervisor, defaultCliBin, defaultExtensionPath, type BaristaSpec, type SupervisorOptions, type WorkerInfo } from "./supervisor.ts";
 

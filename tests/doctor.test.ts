@@ -104,7 +104,7 @@ describe("cafe doctor", () => {
     expect(r.stdout).toMatch(/ok\s+root\s+127\.0\.0\.1/);
   });
 
-  it("reports a /cafe-ask command file it does not own", async () => {
+  it("reports a /cafe command file it does not own", async () => {
     const root = await startDaemon("root", { mode: "root" });
     cleanup.push(root.stop);
     const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-"));
@@ -116,11 +116,11 @@ describe("cafe doctor", () => {
     mkdirSync(home, { recursive: true });
     mkdirSync(join(userHome, ".claude/commands"), { recursive: true });
     writeFileSync(join(cwd, ".cafe"), "name: widgets\ndescription: answers widget questions\n");
-    const own = join(userHome, ".claude/commands/cafe-ask.md");
+    const own = join(userHome, ".claude/commands/cafe.md");
     writeFileSync(own, "my command");
 
     const r = await doctor(cwd, home, root.addr, userHome);
-    expect(r.stdout).toContain("/cafe-ask");
+    expect(r.stdout).toContain("/cafe");
     expect(r.stdout).toContain("not managed by cafe");
     expect(r.stdout).toContain("cafe commands install --agent claude --force");
     expect(readFileSync(own, "utf8")).toBe("my command");

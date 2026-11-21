@@ -169,6 +169,12 @@ export const RoutingDecision = z.object({
   demoted: z.array(z.string()).optional(),
   /** Set when the LLM router failed and the keyword rules decided instead. */
   llmError: z.string().optional(),
+  /** A coarse, explainable confidence: 1 = explicit/only owner, below 0.5 = a guess. */
+  confidence: z.number().min(0).max(1).optional(),
+  /** Why plausible Baristas were not chosen (bounded to a few entries). */
+  whyNot: z.array(z.object({ agentId: z.string(), reason: z.string() })).optional(),
+  /** How many Baristas received this Order (targets.length). */
+  fanout: z.number().int().min(0).optional(),
 });
 export type RoutingDecision = z.infer<typeof RoutingDecision>;
 
@@ -299,6 +305,13 @@ export const CreateOrderParams = z.object({
   attachments: z.array(Attachment).optional(),
   /** Ask every eligible Barista, bypassing routing (only when the customer explicitly wants it). */
   broadcast: z.boolean().optional(),
+  /**
+   * Customer-side dedupe key (a platform event id for connectors). A repeated
+   * request inside the Daemon's short window returns the first Order/Thread
+   * instead of creating a new Thread. Optional: callers without it guarantee
+   * idempotency themselves.
+   */
+  idempotencyKey: z.string().min(1).max(256).optional(),
 });
 export type CreateOrderParams = z.infer<typeof CreateOrderParams>;
 
