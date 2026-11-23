@@ -668,9 +668,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /**
    * Root: a person's hand-set address for another Host. It beats the address that Host reports about
-   * itself, and is what the Root broadcasts to children (#75). `null` clears it.
+   * itself, and — once proven reachable — is what the Root broadcasts to children (#75). `null` clears it.
    */
-  setHostAddress(host: string, url: string | null): DaemonRecord {
+  async setHostAddress(host: string, url: string | null): Promise<DaemonRecord> {
     if (!this.isRoot) throw new RpcError("not_root", "only the Root can set another Host's address");
     if (host === this.host) throw new RpcError("bad_request", "this is the Root itself; set `advertise` instead");
     const record = this.daemons().find((d) => d.host === host);
@@ -682,9 +682,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     saveConfig(this.config, this.store.home);
     const rec = this.daemonRecords.get(host);
-    if (rec) rec.url = url === null ? rec.url : `ws://${this.config.pinnedDaemons[host]}`;
+    // A cleared pin must fall back to the address the Root verified, not keep the stale pin (#75).
+    if (rec) rec.url = url === null ? (this.verifiedAddress(host) ?? rec.url) : `ws://${this.config.pinnedDaemons[host]}`;
     this.emitDaemons();
     this.log(url === null ? `cleared pinned address for ${host}` : `pinned ${host} -> ${this.config.pinnedDaemons[host]}`);
+    // Prove the new address before it reaches the children: a hand-typed Docker address is as useless
+    // to them as a self-reported one (#75).
+    if (url !== null) await this.rememberChildUrl(host, `ws://${this.config.pinnedDaemons[host]}`);
     return this.daemons().find((d) => d.host === host) ?? record!;
   }
 
@@ -694,11 +698,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return pin ? `ws://${pin}` : undefined;
   }
 
-  /** A child address has been proven reachable from this Host (pinned, or probed before saving). */
+  /**
+   * A child address has been proven reachable from this Host (pinned, or probed before saving).
+   * A pin counts only once the probe recorded it in `knownDaemons`; until then the last verified
+   * address keeps being shared, so an unreachable pin never breaks the other children's direct links.
+   */
   private verifiedAddress(host: string): string | undefined {
     const pinned = this.pinnedAddress(host);
-    if (pinned) return pinned;
     const known = this.config.knownDaemons[host];
+    if (pinned && known === pinned) return pinned;
     return known ? known : undefined;
   }
 
@@ -2524,6 +2532,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return { meta, ...this.store.readEventsPage(meta.file, limit, opts.before) };
   }
 
+  /**
+   * The `order.closed` event of one Order, read straight from the Thread's JSONL. A follower needs it
+   * even when the turn is older than the bounded tail page that `thread()` returns — otherwise an SSE
+   * stream for an old turn replays filler and never ends (#31). Every terminal path closes, so this
+   * one event ends the wait.
+   *
+   * Scans the file, so the live path avoids it: an Order still tracked here is open and has not closed.
+   */
+  closingEvent(threadId: string, orderId: string): ThreadEnvelope | undefined {
+    const live = this.tracking.get(orderId);
+    if (live && live.status === "open") return undefined;
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!meta) return undefined;
+    let last: ThreadEnvelope | undefined;
+    for (const env of this.store.readEvents(meta.file)) {
+      if (env.orderId === orderId && env.event.type === "order.closed") last = env;
+    }
+    return last;
+  }
+
   /** Disconnect an Agent (web UI "kick"). Remote Agents are kicked via the Root. */
   kick(agentId: string): void {
     const local = this.agents.get(agentId);
@@ -2581,6 +2609,11 @@ function hasPort(addr: string): boolean {
  */
 export function hostWithPort(addr: string, port: number): string {
   return hasPort(addr) ? addr : `${addr}:${port}`;
+}
+
+/** The address this Host tells other machines to dial: `advertise` (if set) or the LAN IP, plus the port. */
+export function advertisedAddress(config: { advertise?: string; port: number }): string {
+  return hostWithPort(config.advertise ?? lanAddress(), config.port);
 }
 
 /** A Root/peer address is accepted only when it can become a WebSocket URL. */

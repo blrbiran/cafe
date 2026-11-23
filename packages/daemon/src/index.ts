@@ -5,10 +5,10 @@ import { cafeHome, loadConfig } from "./config.ts";
 import { startServer, type ServerHandle } from "./server.ts";
 import { Supervisor } from "./supervisor.ts";
 import { advertiseRoot, discoverRoots } from "./discovery.ts";
-import { lanAddress } from "./daemon.ts";
+import { lanAddress, advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
 
-export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, type DaemonOptions, type Timing } from "./daemon.ts";
+export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
 export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configPath, diffConfig, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
@@ -118,7 +118,8 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   let searching: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
   if (discovery && config.mode === "root") {
-    stopAdvert = advertiseRoot({ host: config.host, addr: () => `${config.advertise ?? lanAddress()}:${config.port}` });
+    // Same formatter as every other address: `advertise` may already carry a port (#76).
+    stopAdvert = advertiseRoot({ host: config.host, addr: () => advertisedAddress(config) });
   } else if (discovery && !config.root) {
     // No Root configured: look for exactly one on the LAN, retrying until found.
     const search = async () => {

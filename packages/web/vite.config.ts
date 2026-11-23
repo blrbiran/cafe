@@ -12,9 +12,11 @@ export default defineConfig({
     assetsDir: ".",
     rollupOptions: {
       output: {
-        entryFileNames: "[name].js",
-        chunkFileNames: "[name].js",
-        assetFileNames: "[name].[ext]",
+        // Content-hashed names: the daemon can then mark them immutable for a year (#69), and an
+        // upgrade changes the name the HTML points at instead of living on in a warm browser cache.
+        entryFileNames: "[name]-[hash].js",
+        chunkFileNames: "[name]-[hash].js",
+        assetFileNames: "[name]-[hash].[ext]",
       },
     },
   },

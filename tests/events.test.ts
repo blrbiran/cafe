@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { ThreadEnvelope } from "@cafe/protocol";
+import { DEFAULT_THREAD_PAGE } from "@cafe/protocol";
 import { eventMatches, parseEventFilter, replayAfter } from "../packages/daemon/src/events.ts";
 import { barista, customer, identity, startDaemon, untilClosed } from "./helpers.ts";
 
@@ -104,5 +105,30 @@ describe("thread stream close (#54)", () => {
     } finally {
       delete process.env.CAFE_SSE_PING_MS;
     }
+  });
+
+  it("finishes following an old turn whose close is older than the replay page", async () => {
+    const d = await startDaemon("sse2", { mode: "root" });
+    cleanup.push(d.stop);
+    const b = await barista(d.addr, identity("widgets"));
+    cleanup.push(() => b.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const res = await c.ask({ body: "hi" });
+    await untilClosed(c, res.threadId, res.orderId);
+    // Push the first turn's `order.closed` out of the bounded tail page while the Thread is open:
+    // this is what a long-running conversation looks like to `cafe wait <threadId>` (#31/#60).
+    for (let i = 0; i < DEFAULT_THREAD_PAGE + 10; i++) {
+      d.daemon.recordEvent({
+        eventId: `pad-${i}`,
+        threadId: res.threadId,
+        orderId: res.orderId,
+        host: "sse2",
+        at: Date.now(),
+        event: { type: "order.heartbeat", agentId: b.rec.agentId },
+      });
+    }
+    const body = await (await fetch(`http://${d.addr}/api/threads/${res.threadId}/stream?orderId=${res.orderId}`, { signal: AbortSignal.timeout(3000) })).text();
+    expect(body).toContain("order.closed");
   });
 });

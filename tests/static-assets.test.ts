@@ -20,7 +20,9 @@ async function withWeb() {
   mkdirSync(web, { recursive: true });
   const js = "export const big = '" + "x".repeat(50_000) + "';\n";
   writeFileSync(join(web, "index.js"), js);
-  writeFileSync(join(web, "index.html"), '<!doctype html><html><body><div id="root"></div><script type="module" src="/index.js"></script></body></html>');
+  // Vite emits content-hashed names; only those may be cached forever (#69 follow-up).
+  writeFileSync(join(web, "index-BZg5MLuf.js"), js);
+  writeFileSync(join(web, "index.html"), '<!doctype html><html><body><div id="root"></div><script type="module" src="/index-BZg5MLuf.js"></script></body></html>');
   writeFileSync(join(home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0 }));
   const r = await runDaemon({ home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: web });
   cleanup.push(async () => {
@@ -48,7 +50,7 @@ describe("static web assets (#69)", () => {
   it("gzips when the client accepts it", async () => {
     const addr = await withWeb();
     // fetch() decompresses transparently, so the byte count has to come from a raw request.
-    const { status, headers, body } = await raw(addr, "/index.js", { "accept-encoding": "gzip" });
+    const { status, headers, body } = await raw(addr, "/index-BZg5MLuf.js", { "accept-encoding": "gzip" });
     expect(status).toBe(200);
     expect(headers["content-encoding"]).toBe("gzip");
     expect(headers.vary).toMatch(/accept-encoding/i);
@@ -57,30 +59,40 @@ describe("static web assets (#69)", () => {
 
   it("serves plain bytes when gzip is not accepted", async () => {
     const addr = await withWeb();
-    const res = await fetch(`http://${addr}/index.js`, { headers: { "accept-encoding": "identity" } });
+    const res = await fetch(`http://${addr}/index-BZg5MLuf.js`, { headers: { "accept-encoding": "identity" } });
     expect(res.headers.get("content-encoding")).toBeNull();
     expect((await res.text()).length).toBeGreaterThan(50_000);
   });
 
   it("answers 304 for a matching ETag", async () => {
     const addr = await withWeb();
-    const first = await fetch(`http://${addr}/index.js`);
+    const first = await fetch(`http://${addr}/index-BZg5MLuf.js`);
     const etag = first.headers.get("etag");
     expect(etag).toBeTruthy();
     await first.arrayBuffer();
-    const second = await fetch(`http://${addr}/index.js`, { headers: { "if-none-match": etag! } });
+    const second = await fetch(`http://${addr}/index-BZg5MLuf.js`, { headers: { "if-none-match": etag! } });
     expect(second.status).toBe(304);
   });
 
   it("gives the built JS a long cache and the HTML no-cache", async () => {
     const addr = await withWeb();
-    const js = await fetch(`http://${addr}/index.js`);
+    const js = await fetch(`http://${addr}/index-BZg5MLuf.js`);
     await js.arrayBuffer();
     expect(js.headers.get("cache-control")).toMatch(/max-age=31536000/);
     const html = await fetch(`http://${addr}/`);
     await html.text();
     expect(html.headers.get("cache-control")).toMatch(/no-cache/);
     expect(html.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  // The name is what makes a year-long cache safe: an unhashed file must be revalidated, or a warm
+  // browser cache keeps running the previous release's JS after an upgrade (#69 follow-up).
+  it("does not cache an unhashed asset as immutable", async () => {
+    const addr = await withWeb();
+    const plain = await fetch(`http://${addr}/index.js`);
+    await plain.arrayBuffer();
+    expect(plain.headers.get("cache-control")).toMatch(/no-cache/);
+    expect(plain.headers.get("cache-control")).not.toMatch(/immutable/);
   });
 
   it("keeps the CSP compatible with the app's inline styles and data: images", async () => {

@@ -91,10 +91,19 @@ export function untilClosed(
   });
 }
 
+/** Poll until true. A predicate that throws (a file the writer has not created yet) counts as "not yet". */
 export async function waitFor(fn: () => boolean | Promise<boolean>, timeoutMs = 3000): Promise<void> {
   const start = Date.now();
-  while (!(await fn())) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+  let last: unknown;
+  for (;;) {
+    try {
+      if (await fn()) return;
+    } catch (err) {
+      last = err;
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`waitFor timed out${last ? ` (last error: ${(last as Error).message ?? String(last)})` : ""}`);
+    }
     await new Promise((r) => setTimeout(r, 20));
   }
 }

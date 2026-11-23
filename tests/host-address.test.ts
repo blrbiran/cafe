@@ -65,4 +65,41 @@ describe("host address overrides (#75)", () => {
     await post(root.addr, "/api/hosts/address", { host: "pc1", url: child.addr });
     await waitFor(() => other.daemon.peerUrlFor("pc1") === `ws://${child.addr}`);
   });
+
+  it("restores the learned address when the pin is cleared", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1"));
+    await waitFor(() => root.daemon.config.knownDaemons.pc1 === `ws://${child.addr}`);
+
+    await post(root.addr, "/api/hosts/address", { host: "pc1", url: "10.255.255.1:4777" });
+    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe("ws://10.255.255.1:4777");
+
+    // Clearing must fall back to the address the Root actually verified, not keep the old pin.
+    const cleared = await post(root.addr, "/api/hosts/address", { host: "pc1", url: null });
+    expect(cleared.status).toBe(200);
+    expect(root.daemon.config.pinnedDaemons?.pc1).toBeUndefined();
+    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe(`ws://${child.addr}`);
+  });
+
+  it("does not hand an unreachable pinned address to other children", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1"));
+    const other = await startDaemon("pc2", { config: { root: root.addr } });
+    cleanup.push(other.stop);
+    await waitFor(() => other.daemon.rootOnline);
+    await waitFor(() => other.daemon.peerUrlFor("pc1") === `ws://${child.addr}`);
+
+    // A person can still pin this address (the UI keeps it), but it was never proven reachable
+    // from the Root, so broadcasting it would break the children's direct links again (#75).
+    await post(root.addr, "/api/hosts/address", { host: "pc1", url: "10.255.255.1:4777" });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe("ws://10.255.255.1:4777");
+    expect(other.daemon.peerUrlFor("pc1")).toBe(`ws://${child.addr}`);
+  });
 });

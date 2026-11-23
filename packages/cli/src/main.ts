@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
-import { cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
+import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
@@ -166,14 +166,21 @@ async function follow(threadId: string, opts: { quiet?: boolean; orderId?: strin
   } catch (err) {
     if (!reason) throw err;
     // The daemon already closed the Order on its own deadline, so this is often just the local
-    // stream ending late; say what happened and never leave the person without the thread id.
+    // stream ending late; say what happened and never leave the person without the thread id. A
+    // cancel that fails must be reported as such: claiming "cancelled" hides a question still open.
+    const cancelled = await api(`/api/threads/${threadId}/cancel`, { method: "POST" }).then(
+      () => true,
+      (e: Error) => e,
+    );
+    const state =
+      cancelled === true
+        ? "it is cancelled now"
+        : `could not cancel it (${(cancelled as Error).message}) — it may still be running`;
     if (reason === "timeout") {
-      await api(`/api/threads/${threadId}/cancel`, { method: "POST" }).catch(() => {});
-      throw new Error(`gave up waiting on thread ${threadId} after ${Math.round((opts.timeoutMs ?? 0) / 1000)}s; it is cancelled now — check \`cafe thread ${threadId}\``);
+      throw new Error(`gave up waiting on thread ${threadId} after ${Math.round((opts.timeoutMs ?? 0) / 1000)}s; ${state} — check \`cafe thread ${threadId}\``);
     }
-    await api(`/api/threads/${threadId}/cancel`, { method: "POST" }).catch(() => {});
-    console.error(`\nthread ${threadId} cancelled — it stays readable with \`cafe thread ${threadId}\``);
-    return "cancelled";
+    console.error(`\nthread ${threadId}: ${state} — it stays readable with \`cafe thread ${threadId}\``);
+    return cancelled === true ? "cancelled" : "unknown";
   } finally {
     if (timer) clearTimeout(timer);
     process.off("SIGINT", onInt);
@@ -804,10 +811,11 @@ program
   .option("--token <token>", "the Root's token (cafe config get token on the Root)")
   .action((addr: string, o) => {
     if (!o.token) throw new Error("--token is required (cafe config get token on the Root)");
+    const clean = assertDaemonAddress(addr);
     setConfigValue("mode", "daemon");
-    setConfigValue("root", addr);
+    setConfigValue("root", clean);
     setConfigValue("token", o.token);
-    out(`saved root ${addr}; restart required: cafe daemon restart`, { mode: "daemon", root: addr, restartRequired: true });
+    out(`saved root ${clean}; restart required: cafe daemon restart`, { mode: "daemon", root: clean, restartRequired: true });
   });
 
 const host = program.command("host").description("this Host's display name and aliases (internal ids and Addresses stay stable)");
@@ -897,9 +905,12 @@ root
   .argument("<host:port>")
   .description("point this daemon at a (moved) Root; updates config.yml and the live connection")
   .action(async (addr: string) => {
-    setConfigValue("root", addr);
-    if (await healthy()) await api("/api/root", { method: "POST", body: JSON.stringify({ root: addr }) });
-    out(`root set to ${addr}`, { root: addr });
+    // Validate before writing: a bad address used to land in config.yml first and only the live API
+    // (when one was running) refused it, leaving a stopped daemon pointed at an unparsable Root (#76).
+    const clean = assertDaemonAddress(addr);
+    setConfigValue("root", clean);
+    if (await healthy()) await api("/api/root", { method: "POST", body: JSON.stringify({ root: clean }) });
+    out(`root set to ${clean}`, { root: clean });
   });
 root
   .command("discover")

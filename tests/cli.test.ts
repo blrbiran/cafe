@@ -61,6 +61,49 @@ describe("daemon API errors", () => {
   });
 });
 
+describe("cafe wait cancellation is honest (#60)", () => {
+  /** A daemon stub: health answers, the stream hangs once, the cancel call fails its way. */
+  async function stubDaemon(cancelFails: boolean) {
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => {
+      const url = req.url ?? "/";
+      if (url.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "stub", pid: 1, isRoot: true, version: "0.1.4" }));
+      if (url.startsWith("/api/agents")) return res.end("[]");
+      if (url === "/api/orders") return res.end(JSON.stringify({ threadId: "t1", orderId: "o1", decision: { mode: "unicast", reason: "stub" } }));
+      if (url.endsWith("/cancel")) {
+        res.writeHead(cancelFails ? 400 : 200, { "content-type": "application/json" });
+        return res.end(JSON.stringify(cancelFails ? { error: "not_found", message: "no open question on thread" } : {}));
+      }
+      if (url.includes("/stream")) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ eventId: "e1", threadId: "t1", orderId: "o1", host: "stub", at: 1, event: { type: "order.created", order: { orderId: "o1", threadId: "t1", turn: 1, from: { address: "cli" }, body: "hi", kind: "order" } } })}\n\n`);
+        return; // never closes: the CLI's timeout has to end it
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+    return addr;
+  }
+
+  it("does not claim the question was cancelled when the cancel request failed", async () => {
+    const addr = await stubDaemon(true);
+    const r = await cafeAsync(home(), addr, "ask", "--timeout", "1", "hi");
+    expect(r.status).toBe(1);
+    expect(r.stderr).not.toContain("cancelled");
+    expect(r.stderr).toContain("could not cancel");
+  });
+
+  it("still reports a real cancellation", async () => {
+    const addr = await stubDaemon(false);
+    const r = await cafeAsync(home(), addr, "ask", "--timeout", "1", "hi");
+    expect(r.stderr).toContain("cancelled");
+    expect(r.stderr).not.toContain("could not cancel");
+  });
+});
+
 describe("cafe commands", () => {
   it("status lists the entry point for each host", () => {
     const r = cafeEnv(home(), home(), "commands", "status");
@@ -182,6 +225,26 @@ describe("config get", () => {
     const saved = parse(readFileSync(join(h, "config.yml"), "utf8"));
     expect(saved).toMatchObject({ mode: "daemon", root: "10.0.0.5:4777", token: "shared" });
     expect(r.stdout).toContain("restart required");
+  });
+
+  // #76: a malformed address used to be written to config.yml first, and only the live API (when
+  // a daemon was running) rejected it — so a stopped daemon was pointed at an address it could
+  // never parse on the next start.
+  it("root set refuses a malformed address without touching config.yml", () => {
+    const h = home();
+    writeFileSync(join(h, "config.yml"), "port: 47821\nroot: 10.0.0.5:4777\n");
+    const r = cafe(h, "root", "set", "1.2.3.4:4777:4777");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("host:port");
+    expect(parse(readFileSync(join(h, "config.yml"), "utf8")).root).toBe("10.0.0.5:4777");
+  });
+
+  it("connect refuses a malformed Root address", () => {
+    const h = home();
+    writeFileSync(join(h, "config.yml"), "port: 47821\n");
+    const r = cafe(h, "connect", "http://10.0.0.5:4777/x", "--token", "shared");
+    expect(r.status).toBe(1);
+    expect(parse(readFileSync(join(h, "config.yml"), "utf8")).root).toBeUndefined();
   });
 
   it("config diff reports that there is no running daemon to compare with", () => {

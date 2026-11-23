@@ -128,20 +128,44 @@ function hostAllowed(req: IncomingMessage, daemon: Daemon): boolean {
 /**
  * A browser sends `Origin` on every cross-origin write, and a page cannot forge
  * it. A request from the console/CLI/MCP has no Origin at all, so it is allowed;
- * what must never pass is a page on some other site (CSRF, #65).
+ * what must never pass is a page on some other site (CSRF, #65). Same-origin means
+ * the Origin names exactly the scheme + host + port the request arrived on, not
+ * merely a hostname this machine answers to (#65 follow-up).
  */
 function originAllowed(req: IncomingMessage, daemon: Daemon): boolean {
   const origin = req.headers.origin;
   if (!origin) return true;
-  let host: string;
+  const host = req.headers.host;
+  if (!host) return false;
+  let url: URL;
   try {
-    host = new URL(origin).hostname.toLowerCase();
+    url = new URL(origin);
   } catch {
     return false;
   }
-  // Same machine through a different scheme (http/https) is still this UI.
-  return allowedHosts(daemon).has(host);
+  const scheme = (req.socket as { encrypted?: boolean }).encrypted ? "https" : "http";
+  if (url.protocol !== `${scheme}:`) return false;
+  if (url.host.toLowerCase() !== hostOnlyPort(host)) return false;
+  // Belt and braces: a forged Host that is not one of ours still fails.
+  return allowedHosts(daemon).has(url.hostname.toLowerCase());
 }
+
+/** `Host` header reduced to what an Origin must match: lowercase host:port, default port dropped. */
+function hostOnlyPort(host: string): string {
+  const lower = host.trim().toLowerCase();
+  try {
+    return new URL(`http://${lower}`).host;
+  } catch {
+    return lower;
+  }
+}
+
+/**
+ * A content-hashed asset name. Vite's hash is base64url-ish (`index-BZg5MLuf.js`,
+ * `index-lV5otHzq.css`), not hex, so only the shape `-<8+ word chars>.<ext>` may be
+ * assumed; anything else must be revalidated (#69).
+ */
+const HASHED_ASSET = /-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/;
 
 /** GET/HEAD change nothing; everything else can. */
 function isWrite(method: string | undefined): boolean {
@@ -296,12 +320,14 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         }
         return send(res, 404, { error: "not found" });
       }
-      // The HTML names the entry script, so it must be revalidated; hashed assets never change (#69).
+      // The HTML names the entry script, so it must be revalidated. Only a content-hashed name can be
+      // cached for a year: an unhashed file (`index.js`) keeps that name across releases (#69).
       const html = key.endsWith(".html");
+      const hashed = HASHED_ASSET.test(key);
       const headers: Record<string, string> = {
         "content-type": file.type,
         etag: file.etag,
-        "cache-control": html ? "no-cache" : "public, max-age=31536000, immutable",
+        "cache-control": hashed ? "public, max-age=31536000, immutable" : "no-cache",
         vary: "accept-encoding",
       };
       if (html) headers["content-security-policy"] = CSP;
@@ -407,7 +433,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const { host, url } = await readJson(req);
     if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host required");
     if (url !== null && (typeof url !== "string" || !url.trim())) throw new RpcError("bad_request", "url must be a host:port string or null");
-    return send(res, 200, daemon.setHostAddress(host, url === null ? null : url.trim()));
+    return send(res, 200, await daemon.setHostAddress(host, url === null ? null : url.trim()));
   }
   if (m === "POST" && path === "/api/hosts/test") {
     const { host } = await readJson(req);
@@ -658,6 +684,13 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   const replay = thread.events;
   const from = after ? replay.findIndex((e) => e.eventId === after) + 1 : 0;
   for (const env of replay.slice(Math.max(0, from))) onEvent(env);
+  // The page above is bounded: when the turn being followed closed before that page starts, its
+  // `order.closed` is missing and the stream would keep the caller waiting forever (#31/#60). A replay
+  // that did include the close has already finished the stream here.
+  if (!finished && until) {
+    const closed = daemon.closingEvent(threadId, until);
+    if (closed) onEvent(closed);
+  }
 }
 
 /** SSE: every Thread event on the network, filtered. Heartbeats are hidden unless asked for. */

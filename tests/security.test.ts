@@ -102,6 +102,46 @@ describe("browser-facing auth (#65)", () => {
     expect(await wsHandshake(d.addr, "https://evil.example")).toBe("rejected");
     expect(await wsHandshake(d.addr, `http://${d.addr}`)).toBe("open");
   });
+
+  // The first pass compared only the Origin hostname, so any scheme/port on a trusted host got in.
+  // Same-origin means scheme+host+port equal to the Host header the request arrived on.
+  it("rejects a write from a different port on the same hostname", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    const res = await raw(d.addr, {
+      method: "POST",
+      path: "/api/orders",
+      headers: { origin: `http://${d.addr.split(":")[0]}:1`, "content-type": "application/json" },
+      body: JSON.stringify({ body: "port probe" }),
+    });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body).error).toBe("forbidden_origin");
+    expect(d.daemon.store.listThreads(10)).toHaveLength(0);
+  });
+
+  it("rejects a write from a different scheme on the same host and port", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    const res = await raw(d.addr, {
+      method: "POST",
+      path: "/api/orders",
+      headers: { origin: `https://${d.addr}`, "content-type": "application/json" },
+      body: JSON.stringify({ body: "scheme probe" }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("still accepts the UI served on an advertised address", async () => {
+    const d = await startDaemon("pc1", { config: { advertise: "127.0.0.1" } });
+    cleanup.push(d.stop);
+    const res = await raw(d.addr, {
+      method: "POST",
+      path: "/api/orders",
+      headers: { origin: `http://${d.addr}`, "content-type": "application/json" },
+      body: JSON.stringify({ body: "same origin", to: "nobody" }),
+    });
+    expect(res.status).not.toBe(403);
+  });
 });
 
 describe("/api/baristas only starts cafe's own agents (#65)", () => {

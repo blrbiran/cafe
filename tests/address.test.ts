@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { runDaemon } from "@cafe/daemon";
+import { runDaemon, advertisedAddress } from "@cafe/daemon";
 import { FAST, startDaemon } from "./helpers.ts";
 
 // #76: `advertise: 127.0.0.1:4801` used to become `ws://127.0.0.1:4801:4801`, which was then persisted
@@ -26,6 +26,15 @@ describe("daemon addresses (#76)", () => {
     const d = await startDaemon("pc1", { mode: "root", config: { advertise: "10.0.0.5" } });
     cleanup.push(d.stop);
     expect(d.daemon.url()).toMatch(/^ws:\/\/10\.0\.0\.5:\d+$/);
+  });
+
+  // mDNS had its own `${advertise}:${port}` formatter, so it still advertised `host:port:port` after
+  // the URL fix (#76) even though every other address went through hostWithPort.
+  it("formats the mDNS address with the same port rule as the URL", () => {
+    expect(advertisedAddress({ advertise: "127.0.0.1:4801", port: 4801 })).toBe("127.0.0.1:4801");
+    expect(advertisedAddress({ advertise: "10.0.0.5", port: 4801 })).toBe("10.0.0.5:4801");
+    expect(advertisedAddress({ port: 4777 })).toMatch(/:\d+$/);
+    expect(advertisedAddress({ port: 4777 })).not.toMatch(/:\d+:\d+$/);
   });
 
   it("refuses a malformed Root address instead of persisting it", async () => {
