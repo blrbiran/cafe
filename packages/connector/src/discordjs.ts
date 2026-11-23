@@ -24,10 +24,19 @@ interface AnyMessage {
   content: string;
   guildId: string | null;
   channelId: string;
-  channel?: { send(text: string, opts?: { nonce?: string; enforceNonce?: boolean }): Promise<unknown>; isDMBased?(): boolean };
+  channel?: AnyChannel;
   author: { id: string; bot?: boolean };
   mentions?: { users?: { has(id: string): boolean }; everyone?: boolean; here?: boolean };
   attachments?: Map<string, AnyAttachment> | AnyAttachment[];
+}
+
+/**
+ * discord.js 14 takes **one** options object (`{ content, nonce, enforceNonce }`). A second
+ * positional argument is silently dropped, which would lose the dedupe nonce.
+ */
+interface AnyChannel {
+  send(options: { content: string; nonce?: string; enforceNonce?: boolean }): Promise<unknown>;
+  isDMBased?(): boolean;
 }
 
 interface AnyAttachment {
@@ -65,21 +74,30 @@ export function toPlatformMessage(m: AnyMessage, botUserId: string | undefined):
   };
 }
 
-export async function createDiscordJsPlatform(ctx: ConnectorContext): Promise<DiscordPlatform> {
+export interface DiscordJsOptions {
+  /** Inject the `discord.js` module (tests); otherwise it is resolved from the connector directory. */
+  loadDiscordJs?: () => any;
+}
+
+export async function createDiscordJsPlatform(ctx: ConnectorContext, opts: DiscordJsOptions = {}): Promise<DiscordPlatform> {
   const token = String(ctx.config.token ?? "");
   let mod: any;
   try {
-    // The supervisor starts in the installed connector directory, which owns this dependency.
-    const requireFromConnector = createRequire(join(process.cwd(), "package.json"));
-    let runtime: string;
-    try {
-      runtime = requireFromConnector.resolve("discord.js");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") throw err;
-      // Source checkouts may already provide the runtime alongside the SDK.
-      runtime = createRequire(import.meta.url).resolve("discord.js");
+    if (opts.loadDiscordJs) {
+      mod = opts.loadDiscordJs();
+    } else {
+      // The supervisor starts in the installed connector directory, which owns this dependency.
+      const requireFromConnector = createRequire(join(process.cwd(), "package.json"));
+      let runtime: string;
+      try {
+        runtime = requireFromConnector.resolve("discord.js");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") throw err;
+        // Source checkouts may already provide the runtime alongside the SDK.
+        runtime = createRequire(import.meta.url).resolve("discord.js");
+      }
+      mod = requireFromConnector(runtime);
     }
-    mod = requireFromConnector(runtime);
   } catch {
     throw new Error("discord.js is not installed in this connector; run `npm install discord.js` in CAFE_HOME/connectors/discord");
   }
@@ -122,8 +140,9 @@ export async function createDiscordJsPlatform(ctx: ConnectorContext): Promise<Di
     async send(channelId, text, opts) {
       const ch = channels.get(channelId);
       if (!ch?.send) throw new Error(`discord channel ${channelId} is not known to this connector yet`);
-      // `enforceNonce` makes Discord drop a resend that repeats the nonce: recovery cannot double-post.
-      await ch.send(text, opts?.nonce ? { nonce: opts.nonce, enforceNonce: true } : undefined);
+      // One options object: discord.js 14 ignores a second positional argument, and `enforceNonce`
+      // makes Discord drop a resend that repeats the nonce, so recovery cannot double-post.
+      await ch.send(opts?.nonce ? { content: text, nonce: opts.nonce, enforceNonce: true } : { content: text });
     },
     download: downloadDiscordAttachment,
     async close() {

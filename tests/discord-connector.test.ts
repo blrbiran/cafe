@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDiscordConnector, chunkText, filterReason, readConfig, useReason, type DiscordPlatform, type PlatformMessage } from "../packages/connector/src/discord-core.ts";
-import { downloadDiscordAttachment } from "../packages/connector/src/discordjs.ts";
+import { createDiscordJsPlatform, downloadDiscordAttachment } from "../packages/connector/src/discordjs.ts";
 import { barista, identity, startDaemon, waitFor } from "./helpers.ts";
 
 it("disables redirects for Discord attachment downloads", async () => {
@@ -20,6 +20,67 @@ it("disables redirects for Discord attachment downloads", async () => {
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   while (cleanups.length) await cleanups.pop()!();
+});
+
+describe("discord.js adapter", () => {
+  /**
+   * discord.js 14's `channel.send` takes a single options object. Passing the text and an options
+   * object as two positional arguments silently drops the options, so the dedupe nonce never reaches
+   * Discord and a crash-recovery resend double-posts. This drives the real adapter with a fake module.
+   */
+  it("sends text and the dedupe nonce in one options object", async () => {
+    const calls: unknown[][] = [];
+    const channel = {
+      isDMBased: () => true,
+      async send(...args: unknown[]) {
+        calls.push(args);
+        return {};
+      },
+    };
+    const listeners = new Map<string, (...args: any[]) => void>();
+    class FakeClient {
+      user = { id: "bot" };
+      options = {};
+      isReady() {
+        return true;
+      }
+      on(event: string, fn: (...args: any[]) => void) {
+        listeners.set(event, fn);
+        return this;
+      }
+      async login() {
+        listeners.get("ready")?.();
+        return {};
+      }
+      async destroy() {}
+    }
+    const fakeModule = {
+      Client: FakeClient,
+      Events: { ClientReady: "ready", ShardReconnecting: "shardReconnecting", ShardDisconnect: "shardDisconnect", ShardReady: "shardReady", ShardResume: "shardResume" },
+      GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 3, DirectMessages: 4 },
+      Partials: { Channel: 1 },
+    };
+
+    const platform = await createDiscordJsPlatform({ config: { token: "x" } } as any, { loadDiscordJs: () => fakeModule });
+    const connected = platform.connect(async () => {}, () => {});
+    // Deliver a message so the adapter remembers the channel, as it does in production.
+    listeners.get("messageCreate")?.({
+      id: "m1",
+      content: "hi",
+      guildId: null,
+      channelId: "c1",
+      channel,
+      author: { id: "u1" },
+    });
+    await platform.send("c1", "hello", { nonce: "abc123" });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toHaveLength(1);
+    expect(calls[0][0]).toEqual({ content: "hello", nonce: "abc123", enforceNonce: true });
+
+    await platform.close();
+    await connected.catch(() => {});
+  });
 });
 
 function tempDir(prefix: string): string {
