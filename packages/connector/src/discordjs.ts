@@ -5,12 +5,15 @@
  * connector directory gets discord.js installed next to it (`npm install discord.js` inside the
  * connector directory, or globally). Never use Node's global WebSocket — discord.js needs `ws`.
  */
+import { createRequire } from "node:module";
+import { join } from "node:path";
 import type { ConnectorContext } from "@cafe/connector/sdk";
-import type { DiscordPlatform, PlatformMessage } from "./discord-core.ts";
+import type { DiscordPlatform, PlatformAttachment, PlatformDownload, PlatformMessage } from "./discord-core.ts";
 
 interface AnyClient {
   login(token: string): Promise<unknown>;
   destroy(): Promise<void>;
+  isReady(): boolean;
   on(event: string, fn: (...args: any[]) => void): void;
   user?: { id: string };
 }
@@ -66,20 +69,31 @@ export async function createDiscordJsPlatform(ctx: ConnectorContext): Promise<Di
   const token = String(ctx.config.token ?? "");
   let mod: any;
   try {
-    // Not a cafe dependency: resolved from the connector directory's own node_modules when present.
-    const spec = "discord.js";
-    mod = await import(/* @vite-ignore */ spec);
+    // The supervisor starts in the installed connector directory, which owns this dependency.
+    const requireFromConnector = createRequire(join(process.cwd(), "package.json"));
+    let runtime: string;
+    try {
+      runtime = requireFromConnector.resolve("discord.js");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") throw err;
+      // Source checkouts may already provide the runtime alongside the SDK.
+      runtime = createRequire(import.meta.url).resolve("discord.js");
+    }
+    mod = requireFromConnector(runtime);
   } catch {
     throw new Error("discord.js is not installed in this connector; run `npm install discord.js` in CAFE_HOME/connectors/discord");
   }
-  const { Client, GatewayIntentBits, Partials } = mod;
+  const { Client, Events, GatewayIntentBits, Partials } = mod;
   const client: AnyClient = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
     partials: [Partials.Channel],
   });
   const channels = new Map<string, NonNullable<AnyMessage["channel"]>>();
+  const unavailableShards = new Set<number>();
+  let finishConnection: (() => void) | undefined;
 
   return {
+    isReady: () => client.isReady() && unavailableShards.size === 0,
     async connect(onMessage, onError, onReady) {
       client.on("error", (err: Error) => onError(err));
       client.on("messageCreate", (m: AnyMessage) => {
@@ -89,16 +103,21 @@ export async function createDiscordJsPlatform(ctx: ConnectorContext): Promise<Di
         if (client.user && m.author.id === client.user.id) return;
         void onMessage(toPlatformMessage(m, client.user?.id)).catch((err: Error) => onError(err));
       });
+      let reportedReady = false;
+      const reportReady = () => {
+        if (reportedReady) return;
+        reportedReady = true;
+        onReady?.();
+      };
+      client.on(Events?.ClientReady ?? "ready", reportReady);
+      client.on(Events?.ShardReconnecting ?? "shardReconnecting", (id: number) => unavailableShards.add(id));
+      client.on(Events?.ShardDisconnect ?? "shardDisconnect", (_event: unknown, id: number) => unavailableShards.add(id));
+      client.on(Events?.ShardReady ?? "shardReady", (id: number) => unavailableShards.delete(id));
+      client.on(Events?.ShardResume ?? "shardResume", (id: number) => unavailableShards.delete(id));
+      const done = new Promise<void>((resolve) => { finishConnection = resolve; });
       await client.login(token);
-      onReady?.();
-      // `login()` resolves at ready; hold the connection open until the process is signalled. Resolve only
-      // when the gateway goes away, so the connector's `await connect()` returns on a real disconnect.
-      await new Promise<void>((resolve) => {
-        client.on("disconnect", () => {
-          onError(new Error("discord gateway disconnected"));
-          resolve();
-        });
-      });
+      if (client.isReady()) reportReady();
+      await done;
     },
     async send(channelId, text, opts) {
       const ch = channels.get(channelId);
@@ -106,32 +125,39 @@ export async function createDiscordJsPlatform(ctx: ConnectorContext): Promise<Di
       // `enforceNonce` makes Discord drop a resend that repeats the nonce: recovery cannot double-post.
       await ch.send(text, opts?.nonce ? { nonce: opts.nonce, enforceNonce: true } : undefined);
     },
-    async download(a, opts) {
-      // The URL came from the message and already passed the host allowlist; follow redirects only
-      // within the same policy by re-checking where we ended up is overkill for Discord's CDN, so
-      // cap by size and by the caller's own byte budget instead.
-      const res = await fetch(a.url, { signal: AbortSignal.timeout(30_000) });
-      if (!res.ok) throw new Error(`attachment ${a.id}: HTTP ${res.status}`);
-      const declared = Number(res.headers.get("content-length") ?? 0);
-      if (declared && declared > opts.maxBytes) throw new Error(`attachment ${a.id} is larger than ${Math.floor(opts.maxBytes / 1024 / 1024)}MB`);
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      if (!res.body) throw new Error(`attachment ${a.id} returned no body`);
-      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-        total += chunk.byteLength;
-        if (total > opts.maxBytes) throw new Error(`attachment ${a.id} is larger than ${Math.floor(opts.maxBytes / 1024 / 1024)}MB`);
-        chunks.push(chunk);
-      }
-      const bytes = new Uint8Array(total);
-      let at = 0;
-      for (const c of chunks) {
-        bytes.set(c, at);
-        at += c.byteLength;
-      }
-      return { bytes, name: a.name, mime: a.contentType || "application/octet-stream" };
-    },
+    download: downloadDiscordAttachment,
     async close() {
-      await client.destroy().catch(() => {});
+      try {
+        await client.destroy();
+      } catch {
+        // Closing an already-disconnected client is harmless.
+      } finally {
+        finishConnection?.();
+      }
     },
   };
+}
+
+export async function downloadDiscordAttachment(a: PlatformAttachment, opts: { maxBytes: number }, fetchAttachment: typeof fetch = fetch): Promise<PlatformDownload> {
+  // The connector checks the initial URL against its CDN allowlist. Refuse redirects so no request
+  // is made to a different destination after that check.
+  const res = await fetchAttachment(a.url, { redirect: "error", signal: AbortSignal.timeout(30_000) });
+  if (!res.ok) throw new Error(`attachment ${a.id}: HTTP ${res.status}`);
+  const declared = Number(res.headers.get("content-length") ?? 0);
+  if (declared && declared > opts.maxBytes) throw new Error(`attachment ${a.id} is larger than ${Math.floor(opts.maxBytes / 1024 / 1024)}MB`);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (!res.body) throw new Error(`attachment ${a.id} returned no body`);
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    total += chunk.byteLength;
+    if (total > opts.maxBytes) throw new Error(`attachment ${a.id} is larger than ${Math.floor(opts.maxBytes / 1024 / 1024)}MB`);
+    chunks.push(chunk);
+  }
+  const bytes = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    bytes.set(c, at);
+    at += c.byteLength;
+  }
+  return { bytes, name: a.name, mime: a.contentType || "application/octet-stream" };
 }

@@ -9,6 +9,7 @@ import { applyTheme, readTheme, type Theme } from "./theme.ts";
 import { Dot, KindTag, Pill } from "./ui/bits.tsx";
 import { SettingsDrawer } from "./ui/SettingsDrawer.tsx";
 import { useDismiss } from "./ui/useDismiss.ts";
+import { ConnectorSidebar } from "./ui/ConnectorStatusPanel.tsx";
 
 function CafeIcon() {
   return (
@@ -243,6 +244,7 @@ export function Shell({
                 <span>{t.agentsAll}</span>
                 <span aria-hidden="true">→</span>
               </a>
+              <ConnectorSidebar />
             </div>
           </div>
 

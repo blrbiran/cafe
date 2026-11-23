@@ -44,6 +44,8 @@ export interface ConnectorOptions {
   log?: (line: string) => void;
   /** Heartbeat interval; 0 disables the interval (one heartbeat is still sent at start). */
   heartbeatMs?: number;
+  /** Platform connection state sampled and reported with each heartbeat, when available. */
+  connectionState?: () => "connecting" | "connected" | "disconnected";
 }
 
 export interface ConnectorMain {
@@ -81,7 +83,10 @@ export function createConnectorContext(opts: ConnectorOptions = {}): ConnectorCo
     ...state,
     log,
     emit: output,
-    heartbeat: (ok = true) => output({ type: "heartbeat", at: Date.now(), ok }),
+    heartbeat: (ok = true) => {
+      const connection = opts.connectionState?.();
+      output({ type: "heartbeat", at: Date.now(), ok, pid: process.pid, intervalMs: opts.heartbeatMs, ...(connection ? { connection } : {}) });
+    },
     error: (message: string) => output({ type: "error", message }),
   };
 }
@@ -108,9 +113,9 @@ export function defineConnector(fn: ConnectorHandler, opts: ConnectorOptions = {
 
   const run = async (): Promise<void> => {
     const env = opts.env ?? process.env;
-    const ctx = createConnectorContext(opts);
     const envMs = Number(env.CAFE_CONNECTOR_HEARTBEAT_MS);
     const heartbeatMs = opts.heartbeatMs ?? (Number.isFinite(envMs) && envMs > 0 ? envMs : 30_000);
+    const ctx = createConnectorContext({ ...opts, heartbeatMs });
     ctx.heartbeat(true);
     if (heartbeatMs > 0) {
       timer = setInterval(() => {

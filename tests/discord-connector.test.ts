@@ -3,7 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDiscordConnector, chunkText, filterReason, readConfig, useReason, type DiscordPlatform, type PlatformMessage } from "../packages/connector/src/discord-core.ts";
+import { downloadDiscordAttachment } from "../packages/connector/src/discordjs.ts";
 import { barista, identity, startDaemon, waitFor } from "./helpers.ts";
+
+it("disables redirects for Discord attachment downloads", async () => {
+  const attachment = { id: "a1", name: "notes.txt", url: "https://cdn.discordapp.com/attachments/1/notes.txt", size: 5 };
+  const fetchLocal: typeof fetch = async (url, options) => {
+    expect(url).toBe(attachment.url);
+    expect(options?.redirect).toBe("error");
+    return new Response("notes");
+  };
+  const result = await downloadDiscordAttachment(attachment, { maxBytes: 1024 }, fetchLocal);
+  expect(new TextDecoder().decode(result.bytes)).toBe("notes");
+});
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -128,7 +140,10 @@ describe("discord attachments end to end (fake platform)", () => {
     return { platform, sent, downloaded, ready, push: (m: PlatformMessage) => deliver(m) };
   }
 
-  it("downloads an allowlisted file, attaches it to the Order, and keeps the bytes off the prompt", async () => {
+  it.each([
+    { guildId: "g1", text: "please read this", expectedBody: "please read this" },
+    { guildId: undefined, text: "", expectedBody: "Please see the attached file." },
+  ])("attaches an allowlisted file without adding its contents to the prompt (guild=$guildId)", async ({ guildId, text, expectedBody }) => {
     const d = await daemonWithBarista();
     const seenOrders: Array<{ body: string; attachments?: Array<{ name: string; id: string }> }> = [];
     const b2 = await barista(d.addr, identity("reader", { description: "reads files" }), async (h) => {
@@ -144,21 +159,28 @@ describe("discord attachments end to end (fake platform)", () => {
     const fake = fakePlatform(new Map([[url, new TextEncoder().encode("secret file body")]]));
     writeFileSync(
       stateDir + "/config.json",
-      JSON.stringify({ token: "x", allowChannels: ["c1"], allowUsers: ["u1"], allowAttachments: true, requireMention: false }),
+      JSON.stringify({ token: "x", allowChannels: ["c1"], allowUsers: ["u1"], allowAttachments: true, allowDMs: true, requireMention: true }),
     );
+    const reports: Array<Record<string, unknown>> = [];
     const main = createDiscordConnector({
       platform: async () => fake.platform,
       env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
       heartbeatMs: 0,
+      output: (report) => reports.push(report),
     });
     const runP = main.run();
     await fake.ready;
+    expect(reports.filter((report) => report.type === "heartbeat")).toMatchObject([
+      { connection: "connecting", pid: process.pid },
+      { connection: "connected", pid: process.pid },
+    ]);
     await fake
       .push(
         baseMsg({
           eventId: "e-att",
-          text: "please read this",
-          mentionsBot: false,
+          guildId,
+          text,
+          mentionsBot: Boolean(guildId),
           attachments: [{ id: "a1", name: "notes.txt", url, size: 16, contentType: "text/plain" }],
         }),
       )
@@ -166,9 +188,13 @@ describe("discord attachments end to end (fake platform)", () => {
     await waitFor(() => fake.sent.some((s) => s.text === "read it"), 8_000);
     expect(fake.downloaded).toEqual([url]);
     const order = seenOrders.at(-1)!;
-    expect(order.body).toBe("please read this");
+    expect(order.body).toBe(expectedBody);
     expect(order.body).not.toContain("secret file body");
     expect(order.attachments?.map((a) => a.name)).toEqual(["notes.txt"]);
+    const snapshot = await fetch(`http://${d.addr}/api/snapshot`).then((res) => res.json());
+    expect(snapshot.threads).toEqual(expect.arrayContaining([
+      expect.objectContaining({ origin: "agent", via: expect.objectContaining({ address: expect.stringMatching(/^discord@/) }) }),
+    ]));
     main.stop();
     await runP.catch(() => {});
   }, 20_000);

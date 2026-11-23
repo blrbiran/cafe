@@ -8,6 +8,7 @@ import { hashFor, navigate } from "../route.ts";
 import { openComposer, refreshStore, useStore } from "../store.ts";
 import { Dot, Empty, Facts, KindTag, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
 import { useDismiss } from "../ui/useDismiss.ts";
+import { ConnectorStatusPanel } from "../ui/ConnectorStatusPanel.tsx";
 
 const WEEK = 7 * 24 * 3600 * 1000;
 
@@ -48,6 +49,7 @@ export function AgentsPage() {
   return (
     <>
       <PageHeader title={t.agentsTitle} sub={t.agentsSub} />
+      <ConnectorStatusPanel />
       {hosts.length === 0 && <Empty>{t.agentsEmpty}</Empty>}
       {hosts.map((h) => {
         const list = byHost.get(h)!;

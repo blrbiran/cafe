@@ -1,4 +1,4 @@
-import type { AgentRecord, Attachment, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import type { AgentRecord, Attachment, ConnectorStatusRow, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 
 export interface Snapshot {
   host: string;
@@ -38,9 +38,10 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(withToken(path), {
     method,
+    signal,
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -111,6 +112,7 @@ export interface SearchHit {
 
 export const api = {
   snapshot: () => call<Snapshot>("GET", "/api/snapshot"),
+  connectors: (signal: AbortSignal) => call<ConnectorStatusRow[]>("GET", "/api/connectors", undefined, signal),
   /** Threads created before `before` (ms), newest first. */
   threads: (before: number, limit: number) => call<ThreadMeta[]>("GET", `/api/threads?before=${before}&limit=${limit}`),
   /** Full-text search over questions and answers (all threads, not only the loaded ones). */

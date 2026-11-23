@@ -1,8 +1,8 @@
 # v4-7 — Per-target sub-questions on a multicast Order (#39, remainder)
 
-Status: **wire spec only; not implemented.** Drafted 2026-11-23. This closes the
-"每 target 子问题" leftover from #39. It changes the Order wire, so the owner
-approves this document before any code moves. Q1–Q4 at the bottom need an answer.
+Status: **wire design approved, pending implementation.** Drafted 2026-11-23
+for the per-target sub-question work from #39. The owner approved Q1–Q4 as
+recommended.
 
 ## 0. Why
 
@@ -108,8 +108,8 @@ cap to `TOP_K`, drop unknown agentIds, drop empty strings). The model must not b
   `order.body`, which is today's behaviour. That is a correct, degraded delivery.
 - No `PROTOCOL_VERSION` bump: the field is optional and an old daemon behaves
   identically to a router that never split the question.
-- The Web UI shows the shared `body` on the card; it may show a small "拆分给 N 个
-  Barista" note when `variants` is present, but nothing else changes.
+- The Web UI continues to show the shared `body` on the card. This release adds
+  no split indicator.
 
 ## 6. Observability
 
@@ -131,9 +131,9 @@ eval script can assert that a two-clause case produced `mode: multicast` with tw
 6. No `PROTOCOL_VERSION` change; `packages/protocol` Order schema accepts an Order
    without `variants` and with a partial map.
 
-## 8. Open questions (owner)
+## 8. Owner decisions
 
-| # | Question | Recommendation |
+| # | Question | Approved decision |
 |---|---|---|
 | Q1 | Map keyed by `agentId` vs an array of `{ agentId, body }`? | **Map** — partial maps and relay are simpler; a dropped target needs no cleanup. |
 | Q2 | Should the generic history record per-variant text at all? | **No** — record the shared `body`; per-target text stays in each Barista's own session (§3.3). |

@@ -1,6 +1,6 @@
 # cafe — handoff
 
-Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs (v2-x, v3-1 phases 1 and 2, v3-2, v4-1 attachments, v4-2 update/rollback, v4-3 connector SDK with the Discord platform, v4-4 routing accuracy: all implemented; v4-3 still needs a real Discord end-to-end run) are in [`docs/specs/`](../specs/). Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
+Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs are in [`docs/specs/`](../specs/). See §5 first for the live Discord verification and approved designs awaiting implementation. Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
 
 > Start with the newest entry in §5 and the operational notes in §8. Run `git status --short --branch` and `git log --oneline -5` to establish the checkout and recent commits. Run `cafe daemon status` separately to check the process that is serving requests.
 
@@ -115,12 +115,82 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
+### 2026-11-24 — Discord live test and Connectors in Agents
+
+- **Current checkout and runtime.** Check `git status --short --branch` and
+  `git log --oneline -5` on arrival. The follow-up batch groups Discord install,
+  status and UI fixes with the approved spec decisions. The local Root and Discord
+  connector were restarted after the changes. A read-only handoff check returned
+  Root `0.1.4` healthy and Discord `connected`.
+- **Real Discord verification.** A private text DM went through the local
+  connector, reached a Barista, and got a reply. The owner confirmed the round
+  trip. DMs and attachments are enabled locally with a single-user allowlist.
+  A real attachment DM and restart/replay deduplication remain to be tested.
+- **Where to look.** The Agents page and expanded Agents sidebar share one poller.
+  Both show connectors on the daemon serving the page and label Discord as
+  `Discord Connector`. The separate Network panel was removed. Browser checks
+  covered both placements and recovery from a failed status refresh. For the
+  status contract see `packages/daemon/src/connector-status.ts` and
+  `tests/connector-status-api.test.ts`. For install, attachments and Discord
+  readiness tests see `tests/connector.test.ts` and `tests/discord-connector.test.ts`.
+- **Adapter follow-up.** `packages/connector/src/discordjs.ts` still passes the
+  nonce as a second argument to `send`. The installed discord.js takes one options
+  object. Correct that call and verify real replay deduplication before relying on
+  it. Connection state already tracks gateway reconnect, resume and disconnect.
+- **Approved designs.** [TLS #61](../specs/v4-6-tls.md) and
+  [per-target questions #39](../specs/v4-7-per-target-questions.md) are approved
+  and awaiting implementation. Start from the recorded decisions. For TLS, keep
+  CA trust bootstrap and per-peer identity pinning distinct and preserve SAN
+  verification. Agent teams #71/#72 and Orca integration #73 are separate work.
+
+- **Verification.** Root and Web typechecks, Web build, 342 Vitest tests, 65/65
+  offline routing cases, and 17 packed release checks passed. Three team cases
+  remain blocked and unscored. The Claude plugin was unchanged in this batch.
+- **Suggested skills.** Use `cafe` for live status, `playwright` for Web checks,
+  `superpowers:systematic-debugging` and `superpowers:test-driven-development`
+  for the nonce follow-up, and `superpowers:writing-plans` for the approved specs.
+
+### 2026-11-23 — Discord connection status in Web
+
+- Network → External connections lists connectors on the current node. Discord
+  readiness comes from the current connector process. The read-only
+  `/api/connectors` response contains names and status only.
+- The local daemon and Discord connector were restarted. A real browser showed
+  Discord as connected. The fake Discord DM test verified that the resulting
+  Thread enters the Web snapshot with Discord provenance. Real DM delivery is
+  left for the owner to test.
+- Typecheck, Web check and build, and 342 Vitest tests passed.
+- The Web panel keeps the last successful status during refresh failures and
+  marks it as stale. It pauses polling in hidden tabs and announces state
+  changes to screen readers. Browser verification covered an authorization
+  error followed by recovery. The local daemon was restarted after the change.
+
+### 2026-11-23 — design decisions and private Discord attachment checks
+
+- The owner approved all decisions in the TLS and per-target question specs,
+  including SAN validation plus fingerprint pinning. Both are pending implementation.
+- The owner's existing Discord bot is used in DMs. The local Cafe connector list
+  was empty and its Discord config did not exist. The bot's host or integration is
+  needed to enable attachments on the intended instance.
+- The Discord adapter now rejects redirects during attachment downloads. An
+  attachment-only DM uses a short Order body and keeps file bytes in the attachment.
+  Verified with a fake Discord platform and a loopback Cafe daemon. Typecheck, the
+  full Vitest suite (340 tests), and offline release smoke (17 checks) passed.
+- The local Discord connector is now installed. `allowDMs` and `allowAttachments`
+  are enabled. A bot token is configured and the connector is stopped while the
+  owner supplies the Discord user ID for `allowUsers`.
+- Install the Discord dependency before linking the Cafe SDK, since npm prunes
+  those links. Resolve `discord.js` from the installed connector directory. The
+  local install loads the entry and the real adapter without a Discord login.
+  Typecheck, 341 Vitest tests, and 17 release smoke checks passed.
+- Real login and reply delivery remain unverified. Follow-ups in the adapter are
+  reporting pre-ready login rejection and passing the nonce in the single
+  message options object accepted by discord.js.
+
 ### 2026-11-23 (later) — release-review fixes, Discord attachments/nonce, two specs
 
-**Current state.** Uncommitted at handoff: the four review items from the previous
-batch, Discord attachment + nonce support, README/README_zh/SKILL updates, and two
-new specs. The previous two commits are unchanged. The local Root was restarted on
-this code.
+**Current state of this batch.** The review fixes, Discord changes, and specs were
+committed separately. The local Root was restarted after this batch.
 
 **Implemented.**
 
@@ -169,8 +239,8 @@ this code.
 **Verification.** Typecheck, web `check` + `build:web`, **338 tests ×3**, rules
 eval **65/65**, packed release smoke **17/17**. Local Root restarted on this code.
 
-**Open questions for the user.** The two specs each end with numbered questions;
-the recommendations are in the tables. Nothing in the spec files was implemented.
+**Decision status.** The owner approved both specs after this batch. The decisions
+are recorded in each spec. Implementation is pending.
 
 **Still open.** Real Discord end-to-end (needs the bot token + Message Content
 intent; attachment download needs the connector restarted with the new config);

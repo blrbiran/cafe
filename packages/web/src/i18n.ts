@@ -248,6 +248,14 @@ const zh = {
   hostOffline: "离线",
 
   networkTitle: "网络",
+  connectorsTitle: "连接器",
+  connectorsEmpty: "本机还没有安装外部连接。",
+  connectorsUnavailable: "暂时无法读取连接状态。",
+  connectorsUnauthorized: "无法读取连接状态，请检查访问令牌。",
+  connectorsLastKnown: "下方显示的是上次查到的状态。",
+  connectorsDiscordHint: "能否接收你的私信还取决于 Discord 的私信设置和用户白名单。",
+  connectorUnknown: "未知状态",
+  connectorStates: { connecting: "连接中", connected: "已连接", disconnected: "已断开", running: "运行中", stopped: "已停止", crashed: "运行异常" },
   networkSub: "加入网络的机器，以及它们和中心节点的连接情况。",
   networkExplain:
     "每台机器运行一个 cafe 服务，负责本机 agent 的注册和消息收发。其中一台是「中心节点」：它掌握全网 agent 名单，并转发所有问答，所以在中心节点的页面上能看到全网的对话。中心节点离线时，本机内部照常问答，跨机器的问题会直接发到对方机器；对方也连不上才会失败。中心节点恢复后，这期间的对话会补到它那里。",
@@ -578,6 +586,14 @@ const en: Dict = {
   hostOffline: "Offline",
 
   networkTitle: "Network",
+  connectorsTitle: "Connectors",
+  connectorsEmpty: "No external connections are installed on this machine.",
+  connectorsUnavailable: "Connection status is temporarily unavailable.",
+  connectorsUnauthorized: "Unable to read connection status. Check your access token.",
+  connectorsLastKnown: "Showing the last known status below.",
+  connectorsDiscordHint: "Receiving your DMs also depends on the Discord integration’s DM settings and allowed users.",
+  connectorUnknown: "Unknown status",
+  connectorStates: { connecting: "Connecting", connected: "Connected", disconnected: "Disconnected", running: "Running", stopped: "Stopped", crashed: "Failed" },
   networkSub: "Machines on the network and how they connect to the hub.",
   networkExplain:
     "Each machine runs one cafe service that registers its local agents and carries their messages. One machine is the hub: it holds the list of every agent and relays every conversation, which is why its page shows the whole network. While the hub is offline, agents on the same machine still talk, and questions across machines go straight to the other machine; they fail only if that machine is unreachable too. When the hub is back, it receives the conversations it missed.",

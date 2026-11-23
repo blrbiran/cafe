@@ -11,6 +11,12 @@ export const MAX_ORDER_DEPTH = 4;
 /** Events a Thread read returns when the caller gives no page size (#31). */
 export const DEFAULT_THREAD_PAGE = 200;
 
+/** Public status of a connector installed on the daemon serving the page. */
+export interface ConnectorStatusRow {
+  name: string;
+  state: "connecting" | "connected" | "disconnected" | "running" | "stopped" | "crashed";
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------

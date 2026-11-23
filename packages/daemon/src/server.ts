@@ -15,6 +15,7 @@ import type { Daemon } from "./daemon.ts";
 import { loadConfig, saveConfig } from "./config.ts";
 import { eventMatches, parseEventFilter, replayAfter } from "./events.ts";
 import { listRouterModels } from "./router.ts";
+import { connectorStatuses } from "./connector-status.ts";
 
 /** pi's model catalogue is expensive to build; settings can ask for it repeatedly. */
 let modelCache: { at: number; models: string[] } | undefined;
@@ -460,6 +461,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && path === "/api/routing/hints") return send(res, 200, { learn: daemon.config.router.learn, hints: daemon.routingHints() });
   if (m === "GET" && path === "/api/routing/stats") return send(res, 200, daemon.routingStats(parseLimit(url.searchParams.get("limit"), 200)));
   if (m === "GET" && path === "/api/daemons") return send(res, 200, daemon.daemons());
+  if (m === "GET" && path === "/api/connectors") {
+    res.setHeader("cache-control", "no-store");
+    try {
+      return send(res, 200, await connectorStatuses(daemon.store.home));
+    } catch {
+      return send(res, 503, { error: "unavailable", message: "connector status is unavailable" });
+    }
+  }
   if (m === "GET" && path === "/api/settings") {
     const token = daemon.config.token ?? "";
     return send(res, 200, {

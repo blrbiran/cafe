@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer as createNetServer } from "node:net";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMockConnector } from "../packages/connector/src/mock.ts";
 import { barista, identity, startDaemon, waitFor } from "./helpers.ts";
@@ -215,6 +216,54 @@ describe("cafe connector CLI", () => {
       p.on("close", (status) => resolveP({ status, stdout, stderr }));
     });
   }
+
+  it("loads the installed Discord entry and its local runtime after npm installation", async () => {
+    const home = tempDir("cafe-discord-install-");
+    const bin = tempDir("cafe-discord-npm-");
+    // Model npm pruning undeclared workspace symlinks in this isolated install.
+    writeFileSync(join(bin, "npm"), [
+      `#!${process.execPath}`,
+      'const fs = require("node:fs");',
+      'const args = process.argv.slice(2);',
+      'const prefix = args.indexOf("--prefix");',
+      'if (prefix < 0 || fs.realpathSync(args[prefix + 1]) !== fs.realpathSync(".")) process.exit(2);',
+      'for (const name of ["connector", "protocol"]) {',
+      '  const link = `node_modules/@cafe/${name}`;',
+      '  if (fs.existsSync(link)) fs.unlinkSync(link);',
+      '}',
+      'fs.mkdirSync("node_modules/discord.js", { recursive: true });',
+      'fs.writeFileSync("node_modules/discord.js/index.js", `const { EventEmitter } = require("node:events"); exports.Client = class extends EventEmitter { constructor() { super(); globalThis.testDiscord = this; } isReady() { return true; } async login() {} async destroy() {} }; exports.GatewayIntentBits = {}; exports.Partials = {};`);',
+      "",
+    ].join("\n"), { mode: 0o755 });
+    const source = resolve(import.meta.dirname, "../packages/connector/discord");
+    const result = await cli(home, ["connector", "install", source], {
+      CAFE_CONNECTOR_SKIP_RUNTIME: "0",
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("installed discord.js");
+    const adapter = pathToFileURL(resolve(import.meta.dirname, "../packages/connector/src/discordjs.ts")).href;
+    const check = spawnSync(process.execPath, ["--input-type=module", "-e", [
+      'await import("./index.ts");',
+      `const { createDiscordJsPlatform } = await import(${JSON.stringify(adapter)});`,
+      'const platform = await createDiscordJsPlatform({ config: {} });',
+      'let ready;',
+      'const login = new Promise(resolve => { ready = resolve; });',
+      'const connection = platform.connect(async () => {}, () => {}, ready);',
+      'await login;',
+      'const assert = (condition, message) => { if (!condition) throw new Error(message); };',
+      'assert(platform.isReady(), "expected ready gateway after login");',
+      'globalThis.testDiscord.emit("shardReconnecting", 0);',
+      'assert(!platform.isReady(), "reconnecting shard must clear gateway readiness");',
+      'globalThis.testDiscord.emit("shardResume", 0);',
+      'assert(platform.isReady(), "resumed shard must restore gateway readiness");',
+      'globalThis.testDiscord.emit("shardDisconnect", {}, 0);',
+      'assert(!platform.isReady(), "closed shard must clear gateway readiness");',
+      'await platform.close();',
+      'await connection;',
+    ].join("\n")], { cwd: join(home, "connectors", "discord"), encoding: "utf8" });
+    expect(check.status, check.stderr).toBe(0);
+  });
 
   function fixtureConnector(name: string): string {
     const dir = tempDir(`cafe-conn-${name}-`);

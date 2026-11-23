@@ -284,7 +284,7 @@ function ensureDiscordRuntime(dir: string, name: string): { installed: boolean; 
   if (process.env.CAFE_CONNECTOR_SKIP_RUNTIME === "1") return { installed: false, detail: "skipped installing discord.js (CAFE_CONNECTOR_SKIP_RUNTIME=1)" };
   // A published connector gets discord.js; a source checkout may already resolve it from the repo root.
   try {
-    execFileSync("npm", ["install", "--no-audit", "--no-fund", "--silent", "discord.js"], { cwd: dir, stdio: "pipe", timeout: 120_000 });
+    execFileSync("npm", ["install", "--prefix", dir, "--no-audit", "--no-fund", "--silent", "discord.js"], { cwd: dir, stdio: "pipe", timeout: 120_000 });
     return { installed: existsSync(nm), detail: existsSync(nm) ? "installed discord.js" : "discord.js install returned without node_modules" };
   } catch (err) {
     return { installed: false, detail: `could not install discord.js (${(err as Error).message.split("\n")[0]}); run: cd ${dir} && npm install discord.js` };
@@ -306,11 +306,12 @@ export function installConnector(home: string, source: string, opts: { force?: b
   mkdirSync(connectorRoot(home), { recursive: true });
   cpSync(src, dest, { recursive: true, force: true });
   if (!existsSync(join(dest, manifest.entry))) throw new Error(`connector '${manifest.name}': copied entry ${manifest.entry} is missing`);
-  linkSdkPackages(dest);
   writeMarker(dest, manifest, src);
   const config = ensureConfig(home, manifest);
   mkdirSync(connectorStateDir(home, manifest.name), { recursive: true });
   const runtime = ensureDiscordRuntime(dest, manifest.name);
+  // npm prunes undeclared symlinks, so link the SDK after installing the runtime.
+  linkSdkPackages(dest);
 
   return {
     name: manifest.name,

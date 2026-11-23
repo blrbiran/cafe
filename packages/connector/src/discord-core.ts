@@ -54,6 +54,8 @@ export interface DiscordPlatform {
    * adapters may still refuse (Discord CDN URLs expire), which fails the event, not the connector.
    */
   download(a: PlatformAttachment, opts: { maxBytes: number }): Promise<PlatformDownload>;
+  /** Whether the gateway is ready to process messages right now. */
+  isReady?(): boolean;
   /** Disconnect (tests: stop delivering). */
   close(): Promise<void>;
 }
@@ -202,7 +204,7 @@ async function sendAndFollow(ctx: ConnectorContext, platform: DiscordPlatform, m
     const known = ctx.threads.get(m.channelId);
     const { text, attachments } = await orderAttachments(ctx, platform, m);
     const created = await ctx.cafe.sendOrder({
-      body: text,
+      body: text.trim() ? text : "Please see the attached file.",
       ...(known ? { threadId: known } : {}),
       idempotencyKey: m.eventId,
       origin: "agent",
@@ -257,6 +259,7 @@ export interface DiscordConnectorOptions extends ConnectorOptions {
 
 export function createDiscordConnector(opts: DiscordConnectorOptions = {}): ConnectorMain {
   let platform: DiscordPlatform | undefined;
+  let gatewayState: "connecting" | "connected" | "disconnected" = "connecting";
   let stopRequested = false;
   /** Set once the connector is holding the process open; `stop()` uses it to end `run()` cleanly. */
   let releaseHold: (() => void) | undefined;
@@ -274,16 +277,33 @@ export function createDiscordConnector(opts: DiscordConnectorOptions = {}): Conn
     platform = opts.platform ? await opts.platform() : await (await import("./discordjs.ts")).createDiscordJsPlatform(ctx);
     await recover(ctx, platform);
     // `connect()` resolves only when the connection ends. `onReady` fires once the gateway is up.
-    const ready = new Promise<void>((r) => {
+    const ready = new Promise<void>((resolve, reject) => {
       void platform!
         .connect(
           (m) => (stopRequested ? Promise.resolve() : handleMessage(ctx, platform!, m)),
           (err) => ctx.error(err.message),
-          () => r(),
+          () => {
+            gatewayState = "connected";
+            ctx.heartbeat();
+            resolve();
+          },
         )
-        .catch((err: Error) => ctx.error(err.message));
+        .then(() => {
+          gatewayState = "disconnected";
+          ctx.heartbeat();
+          reject(new Error("Discord disconnected before login completed"));
+        }, (err: Error) => {
+          gatewayState = "disconnected";
+          ctx.heartbeat();
+          reject(err);
+        });
     });
-    await ready;
+    try {
+      await ready;
+    } catch (err) {
+      await platform.close();
+      throw err;
+    }
     ctx.log(`connected as ${ctx.address}`);
     // Hold the process open until a stop signal (or `main.stop()`); the gateway runs in the background.
     await new Promise<void>((resolve) => {
@@ -293,7 +313,10 @@ export function createDiscordConnector(opts: DiscordConnectorOptions = {}): Conn
       process.once("SIGTERM", stop);
       process.once("SIGINT", stop);
     });
-  }, opts);
+  }, {
+    ...opts,
+    connectionState: () => gatewayState === "connected" && platform?.isReady?.() === false ? "disconnected" : gatewayState,
+  });
   return {
     run: () => base.run(),
     stop: () => {

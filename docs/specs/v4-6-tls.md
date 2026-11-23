@@ -1,9 +1,8 @@
 # v4-6 — Transport security: TLS between cafe daemons and agents (#61)
 
-Status: **design only; not implemented.** Drafted 2026-11-23 from dogfooding ledger
-#61. The owner picked "TLS gets its own design and rollout round" on 2026-11-23, so
-this document is the decision record that round starts from. Q1–Q5 at the bottom need
-the owner's answers before any code is written; recommendations are given for each.
+Status: **design approved, pending implementation.** Drafted 2026-11-23 from
+dogfooding ledger #61. The owner approved Q1–Q5 as recommended and confirmed
+that the design requires both SAN validation and fingerprint pinning.
 
 ## 0. Why
 
@@ -106,10 +105,10 @@ trust-on-first-use with a pinned fingerprint:
   After that, only certificates issued by that CA are accepted.
 - Without a fingerprint, first contact is allowed (TOFU) with a loud warning; once
   a fingerprint is stored, a mismatch is refused unconditionally.
-- `checkServerIdentity` sees the **leaf** certificate, so comparing
-  `fingerprint256` there also blocks a forged leaf signed by the same CA
-  (measured: the real cert passes, a stranger leaf from the same CA is rejected).
-  The same callback applies to the global `WebSocket` (measured).
+- Each peer checks the certificate chain against the enrolled CA, validates the
+  dialed DNS name or IP against the SAN, and checks the separate peer identity pin
+  from §5. `checkServerIdentity` receives the leaf, so it must not compare the leaf
+  fingerprint with `security.tls.caFingerprint`.
 
 Both SAN-completeness and fingerprint pinning are done together; they cover
 different failures (see §5 detail A).
@@ -157,23 +156,24 @@ the Web UI untouched this round, and gives a clear "this is local only" boundary
 it forces browser trust-store issues and self-signed warnings on the UI, which is
 a separate product problem.
 
-## 5. Two details the owner must decide, not default
+## 5. Approved certificate checks and lifetime
 
-**A. SAN and fingerprint pin.** Doing both is recommended: SAN covers normal
-connections to IPs and names; pinning covers "same CA, forged leaf" and
-replacement scenarios. Doing only SAN means a leaf signed by a compromised CA is
-accepted; doing only pinning means every renewal or new node churns the pin.
+**A. SAN and fingerprint pin.** Use both. The CA fingerprint authenticates the
+trust anchor at enrollment. Rejecting an unexpected leaf under that CA also
+requires a separate per-peer identity pin in addition to SAN verification.
+The implementation plan must specify pin provisioning and authenticated key
+rotation.
 
-**B. Leaf validity: 90 days with automatic renewal, or 825 days.** 90 days shrinks
+**B. Leaf validity: 90 days with automatic renewal.** 90 days shrinks
 the exposure window from a leaked key but requires that renewal actually works,
 because fail-closed means there is no plaintext rescue when the fleet expires at
 once. Recommendation: land the SNICallback hot-renewal and the renew command
 **first**, then enable 90-day leaves; do not ship the short validity before the
 renewal path is proven.
 
-## 6. Open questions (owner)
+## 6. Owner decisions
 
-| # | Question | Recommendation |
+| # | Question | Approved decision |
 |---|---|---|
 | Q1 | Is `node-forge` acceptable for CA/leaf generation? | **Yes** — one package, 0 transitive deps. If zero-dependency is a hard rule, require a preinstalled OpenSSL and generate via CLI (worse on Windows). |
 | Q2 | Where does the CA private key live? | `CAFE_HOME/tls/ca.key`, 0600, Root only. External CA later, not this round. |
