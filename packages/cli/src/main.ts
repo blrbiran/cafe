@@ -18,7 +18,7 @@ import { runInit } from "./init.ts";
 import { extensionPackageDir, installPiExtension, ompExtensionCommand, ompExtensionState, piExtensionState, removePiExtension, summarizeProcessError } from "./extension.ts";
 import { runDoctor } from "./doctor.ts";
 import { claudeCommandPath, claudeCommandState, commandsStatus, installClaudeCommand, uninstallClaudeCommand } from "./commands.ts";
-import { claudePluginPlan, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
+import { claudePluginPlan, claudePluginState, MARKETPLACE as CLAUDE_MARKETPLACE, PLUGIN as CLAUDE_PLUGIN, pluginSource, writeClaudePlugin } from "./claude-plugin.ts";
 import { mcpInstallCommands, runMcp } from "./mcp.ts";
 import { installService, serviceFile, servicePath, startInstalledService, uninstallService } from "./service.ts";
 import { applyUpdate, checkUpdate, rollbackUpdate, updateStatus } from "./update.ts";
@@ -1145,14 +1145,26 @@ claudeCmd
     if (o.dryRun) return out([`write ${plan.marketplace} (plugin from ${pluginSource()}, cafe.json argv ${plan.argv.join(" ")})`, ...shown].join("\n"), { ...plan, dryRun: true });
     writeClaudePlugin(plan);
     const results: string[] = [`wrote ${plan.marketplace}`];
+    let failed = 0;
     for (const cmd of plan.commands) {
       const r = spawnSync(cmd[0]!, cmd.slice(1), { encoding: "utf8" });
       const msg = (r.stderr || r.stdout || "").trim().split("\n").at(-1) ?? "";
       if (r.error) throw new Error(`${cmd[0]} not found; install Claude Code first`);
-      results.push(`${r.status === 0 ? "ok" : /already/i.test(msg) ? "ok (already)" : `failed: ${msg}`}  ${cmd.join(" ")}`);
+      const ok = r.status === 0 || /already/i.test(msg);
+      if (!ok) failed++;
+      results.push(`${ok ? (r.status === 0 ? "ok" : "ok (already)") : `failed: ${msg}`}  ${cmd.join(" ")}`);
     }
-    results.push("New Claude Code sessions in a directory with a Barista .cafe now answer cafe questions; in open sessions run /reload-plugins. /cafe-barista off pauses a session.");
-    out(results.join("\n"), { ...plan, results });
+    if (failed) {
+      // `claude plugin ...` failing means the plugin is NOT registered; a bare exit 0 hid that (#55).
+      process.exitCode = 1;
+      results.push(
+        `${failed} of ${plan.commands.length} claude plugin command(s) failed; the plugin is not registered.`,
+        "Check `claude plugin list`; if Claude Code itself is broken, reinstall it, then rerun `cafe claude install`.",
+      );
+    } else {
+      results.push("New Claude Code sessions in a directory with a Barista .cafe now answer cafe questions; in open sessions run /reload-plugins. /cafe-barista off pauses a session.");
+    }
+    out(results.join("\n"), { ...plan, results, failed });
   });
 claudeCmd
   .command("uninstall")
@@ -1267,7 +1279,7 @@ commandsCmd
   .command("status")
   .description("show each host's /cafe or $cafe entry point and whether it is installed")
   .action(() => {
-    const rows = commandsStatus({ cafeHome: cafeHome() });
+    const rows = commandsStatus({ userHome: homedir(), claudePlugin: claudePluginState() });
     out(rows.map((r) => `${r.agent.padEnd(7)} ${r.entry.padEnd(10)} ${r.status.padEnd(11)} ${r.detail}`).join("\n"), rows);
   });
 
@@ -1318,25 +1330,49 @@ program
   .description("manage the cafe skill for Claude Code / Codex / pi")
   .command("install")
   .description("symlink it into ~/.claude/skills/cafe and ~/.agents/skills/cafe")
-  .action(() => {
+  .option("--dry-run", "print what would change")
+  .option("--force", "replace an existing link or directory cafe did not create")
+  .action((o) => {
     // Published package: dist/cli.js with ../skills/cafe; repo: packages/cli/src → ../../../skills/cafe.
     const src = [resolve(here, "../skills/cafe"), resolve(here, "../../../skills/cafe")].find((d) => existsSync(join(d, "SKILL.md")))!;
     const targets = [join(homedir(), ".claude/skills/cafe"), join(homedir(), ".agents/skills/cafe")];
     const done: string[] = [];
     for (const t of targets) {
-      mkdirSync(dirname(t), { recursive: true });
-      if (existsSync(t) || lstatSafe(t)) {
-        if (lstatSafe(t)?.isSymbolicLink() && readlinkSync(t) === src) {
+      const existing = lstatSafe(t);
+      if (existing) {
+        const isLink = existing.isSymbolicLink();
+        const target = isLink ? readlinkSync(t) : undefined;
+        if (target === src) {
           done.push(`${t} (already linked)`);
           continue;
         }
-        done.push(`${t} (exists, skipped — remove it to relink)`);
+        // A stale link to another checkout (repo moved) is safe to repoint.
+        if (isLink && !o.force) {
+          if (o.dryRun) {
+            done.push(`${t} -> ${src} (would repoint from ${target})`);
+          } else {
+            rmSync(t, { force: true });
+            symlinkSync(src, t);
+            done.push(`${t} -> ${src} (repointed from ${target})`);
+          }
+          continue;
+        }
+        if (o.force && !o.dryRun) {
+          rmSync(t, { recursive: true, force: true });
+          symlinkSync(src, t);
+          done.push(`${t} -> ${src} (replaced; was ${target ?? "a directory"})`);
+          continue;
+        }
+        done.push(`${t} (exists${isLink ? ` -> ${target}` : ""}, skipped — rerun with --force to replace)`);
         continue;
       }
-      symlinkSync(src, t);
-      done.push(`${t} -> ${src}`);
+      if (!o.dryRun) {
+        mkdirSync(dirname(t), { recursive: true });
+        symlinkSync(src, t);
+      }
+      done.push(o.dryRun ? `${t} -> ${src} (dry run)` : `${t} -> ${src}`);
     }
-    out(done.join("\n"), done);
+    out(done.join("\n"), { targets: done, dryRun: !!o.dryRun });
   });
 
 function lstatSafe(p: string) {

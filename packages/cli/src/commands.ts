@@ -86,21 +86,33 @@ export interface CommandStatus {
   detail: string;
 }
 
-/** One row per entry point; mirrors what `cafe doctor` and the Web Settings page show. */
-export function commandsStatus(opts: { userHome?: string; cafeHome?: string } = {}): CommandStatus[] {
+/**
+ * One row per entry point; mirrors what `cafe doctor` and the Web Settings page show.
+ * `claudePlugin` is passed in so this stays pure: the caller reads `claude plugin list` once
+ * (see `claudePluginState()`), because the marketplace folder alone does not prove registration.
+ */
+export function commandsStatus(opts: { userHome?: string; cafeHome?: string; claudePlugin?: { state: string; detail: string } } = {}): CommandStatus[] {
   const userHome = opts.userHome ?? homedir();
   const source = defaultExtensionPath();
   const pi = piExtensionState(userHome, source);
   const omp = ompExtensionState(source);
   const claude = claudeCommandState(userHome);
-  const plugin = opts.cafeHome ? existsSync(join(opts.cafeHome, "claude-marketplace")) : false;
+  const plugin = opts.claudePlugin;
   const skill = join(userHome, ".agents/skills/cafe");
+
+  const pluginRow: CommandStatus = !plugin
+    ? { agent: "claude", entry: "/cafe-barista", status: "missing", detail: "run `cafe claude install` for session pause/resume" }
+    : plugin.state === "installed"
+      ? { agent: "claude", entry: "/cafe-barista", status: "installed", detail: `plugin (pause/resume); ${plugin.detail}` }
+      : plugin.state === "unknown"
+        ? { agent: "claude", entry: "/cafe-barista", status: "unavailable", detail: plugin.detail }
+        : { agent: "claude", entry: "/cafe-barista", status: "missing", detail: plugin.detail };
 
   return [
     { agent: "pi", entry: "/cafe", status: pi.installed ? "installed" : "missing", detail: `${pi.settingsPath} (extension)` },
     { agent: "omp", entry: "/cafe", status: !omp.available ? "unavailable" : omp.installed ? "installed" : "missing", detail: omp.detail },
     { agent: "claude", entry: "/cafe", status: claude.state === "ours" ? "installed" : claude.state === "foreign" ? "conflict" : "missing", detail: claude.path },
-    { agent: "claude", entry: "/cafe-barista", status: plugin ? "installed" : "missing", detail: plugin ? "plugin (pause/resume)" : "run `cafe claude install` for session pause/resume" },
+    pluginRow,
     { agent: "codex", entry: "$cafe", status: existsSync(skill) ? "installed" : "missing", detail: existsSync(skill) ? skill : "run `cafe skill install`" },
   ];
 }

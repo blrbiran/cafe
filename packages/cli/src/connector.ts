@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   closeSync,
   cpSync,
@@ -42,6 +42,8 @@ export type ConnectorRunStatus = "running" | "stopped" | "crashed";
 
 export interface ConnectorRunState {
   pid?: number;
+  /** Pid of the supervised connector process (when a supervisor is running). */
+  childPid?: number;
   status: ConnectorRunStatus;
   startedAt?: number;
   stoppedAt?: number;
@@ -72,6 +74,12 @@ const LOG_TAIL_BYTES = 128 * 1024;
 
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** A positive integer from the environment, for the restart knobs (tests use small values). */
+function numEnv(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 function readJson<T>(path: string, fallback: T): T {
@@ -208,6 +216,15 @@ function ensureConfig(home: string, manifest: ConnectorManifest): Record<string,
 
 /** Walk up from a resolved package entry to the directory whose package.json has this name. */
 function packageRoot(name: string): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  // Published package: the SDK is packed as connector/ next to dist/, not resolved as a dependency.
+  if (name === "@cafe/connector") {
+    const bundled = resolve(here, "..", "connector");
+    if (existsSync(join(bundled, "package.json"))) {
+      const pkg = readJson<{ name?: string }>(join(bundled, "package.json"), {});
+      if (pkg.name === name) return bundled;
+    }
+  }
   let url: string;
   try {
     url = import.meta.resolve(name);
@@ -256,6 +273,22 @@ export interface InstallResult {
   state: string;
   version?: string;
   manifest: ConnectorManifest;
+  runtime?: string;
+}
+
+/** Install discord.js next to an installed Discord connector (not a cafe dependency). Best effort: prints a hint on failure. */
+function ensureDiscordRuntime(dir: string, name: string): { installed: boolean; detail: string } {
+  if (name !== "discord") return { installed: false, detail: "" };
+  const nm = join(dir, "node_modules", "discord.js");
+  if (existsSync(nm)) return { installed: true, detail: "discord.js already installed" };
+  if (process.env.CAFE_CONNECTOR_SKIP_RUNTIME === "1") return { installed: false, detail: "skipped installing discord.js (CAFE_CONNECTOR_SKIP_RUNTIME=1)" };
+  // A published connector gets discord.js; a source checkout may already resolve it from the repo root.
+  try {
+    execFileSync("npm", ["install", "--no-audit", "--no-fund", "--silent", "discord.js"], { cwd: dir, stdio: "pipe", timeout: 120_000 });
+    return { installed: existsSync(nm), detail: existsSync(nm) ? "installed discord.js" : "discord.js install returned without node_modules" };
+  } catch (err) {
+    return { installed: false, detail: `could not install discord.js (${(err as Error).message.split("\n")[0]}); run: cd ${dir} && npm install discord.js` };
+  }
 }
 
 /** Copy a connector into CAFE_HOME/connectors/<name>, validate it and create its default config. */
@@ -277,6 +310,7 @@ export function installConnector(home: string, source: string, opts: { force?: b
   writeMarker(dest, manifest, src);
   const config = ensureConfig(home, manifest);
   mkdirSync(connectorStateDir(home, manifest.name), { recursive: true });
+  const runtime = ensureDiscordRuntime(dest, manifest.name);
 
   return {
     name: manifest.name,
@@ -285,6 +319,7 @@ export function installConnector(home: string, source: string, opts: { force?: b
     state: connectorStateDir(home, manifest.name),
     ...(manifest.version ? { version: manifest.version } : {}),
     manifest,
+    ...(runtime.detail ? { runtime: runtime.detail } : {}),
   };
 }
 
@@ -348,7 +383,7 @@ export function statusConnector(home: string, name: string): ConnectorStatus {
       })()
     : undefined;
   const alive = run.pid !== undefined && processAlive(run.pid);
-  const status: ConnectorRunStatus = alive ? "running" : run.status === "running" ? "crashed" : "stopped";
+  const status: ConnectorRunStatus = alive ? "running" : run.status === "running" || run.status === "crashed" ? "crashed" : "stopped";
   const events = protocolLines(connectorLogPath(home, name));
   const heartbeat = [...events].reverse().find((e) => e.type === "heartbeat");
   const error = [...events].reverse().find((e) => e.type === "error");
@@ -406,6 +441,8 @@ export interface StartOptions {
   token?: string;
   /** How long to wait for an immediate crash before reporting success. */
   waitMs?: number;
+  /** The command that runs `cafe connector supervise <name>` (defaults to this CLI). */
+  supervisorArgv?: string[];
 }
 
 export interface StartResult {
@@ -416,7 +453,131 @@ export interface StartResult {
   alreadyRunning: boolean;
 }
 
-/** Detached `node <entry>` with the CAFE_CONNECTOR_* environment and a log under CAFE_HOME/logs. */
+/** The environment a connector (and its supervisor) runs with. */
+function connectorEnv(home: string, name: string, manifest: ConnectorManifest, opts: StartOptions): NodeJS.ProcessEnv {
+  const configPath = connectorConfigPath(home, name);
+  const statePath = connectorStateDir(home, name);
+  const local = loadConfig(home);
+  const daemon = opts.daemon || process.env.CAFE_DAEMON || `127.0.0.1:${local.port}`;
+  const token = opts.token || process.env.CAFE_TOKEN || local.token;
+  return {
+    ...process.env,
+    CAFE_DAEMON: daemon.replace(/^https?:\/\//, ""),
+    CAFE_TOKEN: token,
+    CAFE_CONNECTOR_NAME: name,
+    CAFE_CONNECTOR_CONFIG: configPath,
+    CAFE_CONNECTOR_STATE: statePath,
+    ...(manifest.health?.heartbeatMs ? { CAFE_CONNECTOR_HEARTBEAT_MS: String(manifest.health.heartbeatMs) } : {}),
+  };
+}
+
+export interface SuperviseOptions extends StartOptions {
+  /** Restarts allowed inside `windowMs` before giving up (crash loop). */
+  maxRestarts?: number;
+  windowMs?: number;
+  /** First backoff delay; doubles per restart up to 30 s. */
+  baseDelayMs?: number;
+  /** Stop after the child exits (tests). */
+  once?: boolean;
+}
+
+/**
+ * The foreground supervisor behind `cafe connector start`: runs the connector, restarts it when it exits
+ * unexpectedly, and gives up (status `crashed`) after a crash loop. Started detached by `startConnector`;
+ * `run.json` carries this process's pid (`pid`) and the connector's (`childPid`).
+ */
+export async function superviseConnector(home: string, name: string, opts: SuperviseOptions = {}): Promise<void> {
+  const dir = installedDir(home, name);
+  if (!existsSync(dir)) throw new Error(`connector '${name}' is not installed; cafe connector install <path>`);
+  const manifest = readManifest(dir);
+  const entry = resolve(dir, manifest.entry);
+  if (!existsSync(entry)) throw new Error(`connector '${name}': entry ${manifest.entry} does not exist`);
+  ensureConfig(home, manifest);
+  mkdirSync(connectorStateDir(home, name), { recursive: true });
+  const logPath = connectorLogPath(home, name);
+  mkdirSync(dirname(logPath), { recursive: true });
+  const env = connectorEnv(home, name, manifest, opts);
+
+  const maxRestarts = opts.maxRestarts ?? numEnv("CAFE_CONNECTOR_MAX_RESTARTS", 5);
+  const windowMs = opts.windowMs ?? numEnv("CAFE_CONNECTOR_WINDOW_MS", 60_000);
+  const baseDelayMs = opts.baseDelayMs ?? numEnv("CAFE_CONNECTOR_BACKOFF_MS", 500);
+  let stopping = false;
+  let child: ReturnType<typeof spawn> | undefined;
+  let recent: number[] = [];
+
+  const writeRunState = (patch: Partial<ConnectorRunState>) => {
+    const prev = readJson<ConnectorRunState>(connectorRunPath(home, name), { status: "stopped", restarts: 0 });
+    writeJson(connectorRunPath(home, name), { ...prev, ...patch });
+  };
+
+  const stopChild = async () => {
+    const c = child;
+    if (!c?.pid || c.exitCode !== null) return;
+    try {
+      c.kill("SIGTERM");
+    } catch {
+      // gone
+    }
+    for (let i = 0; i < 60 && c.exitCode === null; i++) await new Promise((r) => setTimeout(r, 50));
+    if (c.exitCode === null) {
+      try {
+        c.kill("SIGKILL");
+      } catch {
+        // gone
+      }
+    }
+  };
+
+  const onSignal = () => {
+    stopping = true;
+    void stopChild().then(() => {
+      writeRunState({ status: "stopped", pid: undefined, childPid: undefined, stoppedAt: Date.now() });
+      process.exit(0);
+    });
+  };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
+
+  writeRunState({ status: "running", pid: process.pid, startedAt: Date.now() });
+
+  for (;;) {
+    const fd = openSync(logPath, "a");
+    try {
+      child = spawn(process.execPath, ["--no-warnings", entry], { cwd: dir, stdio: ["ignore", fd, fd], env });
+    } finally {
+      closeSync(fd);
+    }
+    const current = child;
+    writeRunState({ childPid: current.pid, status: "running" });
+    const exit = await new Promise<{ code: number | null; signal: string | null }>((r) => {
+      current.once("exit", (code, signal) => r({ code, signal }));
+      current.once("error", (err) => r({ code: 127, signal: err.message }));
+    });
+    if (stopping) return;
+    if (opts.once) {
+      writeRunState({ status: exit.code === 0 ? "stopped" : "crashed", pid: undefined, childPid: undefined, stoppedAt: Date.now(), ...(exit.code ? { lastError: `exited ${exit.code}` } : {}) });
+      return;
+    }
+
+    const now = Date.now();
+    recent = recent.filter((t) => now - t < windowMs);
+    recent.push(now);
+    if (recent.length > maxRestarts) {
+      const lastError = `crash loop: ${recent.length} exits within ${Math.round(windowMs / 1000)}s (last: ${exit.code ?? exit.signal ?? "unknown"}); not restarting. See ${logPath}`;
+      writeRunState({ status: "crashed", pid: undefined, childPid: undefined, stoppedAt: now, lastError });
+      process.stderr.write(`[cafe connector ${name}] ${lastError}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    const delay = Math.min(30_000, baseDelayMs * 2 ** (recent.length - 1));
+    const restarts = (readJson<ConnectorRunState>(connectorRunPath(home, name), { status: "stopped", restarts: 0 }).restarts ?? 0) + 1;
+    writeRunState({ status: "crashed", restarts, lastError: `exited ${exit.code ?? exit.signal ?? "unknown"}; restarting in ${delay}ms` });
+    await new Promise((r) => setTimeout(r, delay));
+    if (stopping) return;
+  }
+}
+
+/** Detached supervisor that auto-restarts the connector (`cafe connector supervise <name>`). */
 export async function startConnector(home: string, name: string, opts: StartOptions = {}): Promise<StartResult> {
   const dir = installedDir(home, name);
   if (!existsSync(dir)) throw new Error(`connector '${name}' is not installed; cafe connector install <path>`);
@@ -430,30 +591,19 @@ export async function startConnector(home: string, name: string, opts: StartOpti
     return { name, pid: previous.pid, dir, log: connectorLogPath(home, name), alreadyRunning: true };
   }
 
-  const configPath = connectorConfigPath(home, name);
   ensureConfig(home, manifest);
-  const statePath = connectorStateDir(home, name);
-  mkdirSync(statePath, { recursive: true });
+  mkdirSync(connectorStateDir(home, name), { recursive: true });
   const logPath = connectorLogPath(home, name);
   mkdirSync(dirname(logPath), { recursive: true });
+  const env = connectorEnv(home, name, manifest, opts);
 
-  const local = loadConfig(home);
-  const daemon = opts.daemon || process.env.CAFE_DAEMON || `127.0.0.1:${local.port}`;
-  const token = opts.token || process.env.CAFE_TOKEN || local.token;
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    CAFE_DAEMON: daemon.replace(/^https?:\/\//, ""),
-    CAFE_TOKEN: token,
-    CAFE_CONNECTOR_NAME: name,
-    CAFE_CONNECTOR_CONFIG: configPath,
-    CAFE_CONNECTOR_STATE: statePath,
-    ...(manifest.health?.heartbeatMs ? { CAFE_CONNECTOR_HEARTBEAT_MS: String(manifest.health.heartbeatMs) } : {}),
-  };
-
+  // Run the connector under a supervisor so an unexpected exit restarts it instead of leaving it dead (#28).
+  const cliJs = process.argv[1] || resolve(dirname(fileURLToPath(import.meta.url)), "..", "bin", "cafe.js");
+  const supervisor = opts.supervisorArgv ?? [process.execPath, cliJs, "connector", "supervise", name];
   const fd = openSync(logPath, "a");
   let child;
   try {
-    child = spawn(process.execPath, ["--no-warnings", entry], { cwd: dir, detached: true, stdio: ["ignore", fd, fd], env });
+    child = spawn(supervisor[0]!, supervisor.slice(1), { cwd: dir, detached: true, stdio: ["ignore", fd, fd], env });
   } finally {
     closeSync(fd);
   }
@@ -465,8 +615,9 @@ export async function startConnector(home: string, name: string, opts: StartOpti
 
   await new Promise((r) => setTimeout(r, opts.waitMs ?? 150));
   if (!processAlive(child.pid)) {
-    writeRun(home, name, { pid: child.pid, status: "crashed", startedAt: Date.now(), lastError: "process exited immediately", restarts });
-    throw new Error(`connector '${name}' exited immediately; see ${logPath}`);
+    const why = readRun(home, name).lastError;
+    writeRun(home, name, { pid: undefined, status: "crashed", startedAt: Date.now(), lastError: why ?? "process exited immediately", restarts });
+    throw new Error(`connector '${name}' exited immediately${why ? `: ${why}` : ""}; see ${logPath}`);
   }
   return { name, pid: child.pid, dir, log: logPath, alreadyRunning: false };
 }
@@ -486,31 +637,36 @@ export interface StopResult {
   pid?: number;
 }
 
-/** SIGTERM, wait, then SIGKILL if the connector ignores it. */
+/** SIGTERM, wait, then SIGKILL if the connector ignores it. `pid` is the supervisor: signal its whole group. */
 export async function stopConnector(home: string, name: string, opts: { timeoutMs?: number } = {}): Promise<StopResult> {
   const run = readRun(home, name);
   if (run.pid === undefined || !processAlive(run.pid)) {
-    writeRun(home, name, { ...run, status: "stopped", pid: undefined, stoppedAt: Date.now() });
+    writeRun(home, name, { ...run, status: "stopped", pid: undefined, childPid: undefined, stoppedAt: Date.now() });
     return { stopped: false, killed: false, ...(run.pid !== undefined ? { pid: run.pid } : {}) };
   }
   const pid = run.pid;
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // Already gone.
-  }
+  // The supervisor is a process-group leader (started detached), so -pid reaches it and the connector child;
+  // it then records `stopped` and exits instead of treating the exit as a crash to restart.
+  const signalGroup = (sig: NodeJS.Signals) => {
+    try {
+      process.kill(-pid, sig);
+    } catch {
+      try {
+        process.kill(pid, sig);
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+  signalGroup("SIGTERM");
   let exited = await waitExit(pid, opts.timeoutMs ?? 5_000);
   let killed = false;
   if (!exited) {
     killed = true;
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Already gone.
-    }
+    signalGroup("SIGKILL");
     exited = await waitExit(pid, 1_000);
   }
-  writeRun(home, name, { ...run, status: exited ? "stopped" : "crashed", pid: undefined, stoppedAt: Date.now() });
+  writeRun(home, name, { ...run, status: exited ? "stopped" : "crashed", pid: undefined, childPid: undefined, stoppedAt: Date.now() });
   return { stopped: true, killed, pid };
 }
 
@@ -676,8 +832,10 @@ export function addConnectorCommands(program: Command, out: OutFn, base: () => s
       out(
         [
           `installed ${r.name}${r.version ? ` ${r.version}` : ""} in ${r.dir}`,
+          ...(r.runtime ? [`runtime: ${r.runtime}`] : []),
           `config: ${r.config}`,
           `state:  ${r.state}`,
+          ...(r.name === "discord" ? ["next:   cafe connector config discord token <bot token>   (needs the Message Content intent)"] : []),
           `next:   cafe connector config ${r.name} <key> <value>`,
           `        cafe connector start ${r.name}`,
         ].join("\n"),
@@ -778,6 +936,14 @@ export function addConnectorCommands(program: Command, out: OutFn, base: () => s
       const v = view.shown[key];
       const shown = typeof v === "string" ? v : JSON.stringify(v);
       out(`${key} = ${shown}\n(saved; takes effect on the next start: cafe connector restart ${name})`, { ...view.shown, [key]: view.config[key] });
+    });
+
+  connector
+    .command("supervise", { hidden: true })
+    .argument("<name>")
+    .description("run a connector in the foreground, restarting it after crashes (used by `cafe connector start`)")
+    .action(async (name: string) => {
+      await superviseConnector(cafeHome(), name);
     });
 
   connector

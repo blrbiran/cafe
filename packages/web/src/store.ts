@@ -195,15 +195,46 @@ function liveFromEvents(events: ThreadEnvelope[], live: Record<string, LiveTurn>
 }
 
 function appendEvent(env: ThreadEnvelope): void {
+  pendingEvents.push(env);
+  if (flushScheduled) return;
+  flushScheduled = true;
+  // Coalesce a burst (SSE/backfill often delivers several) into one set() and one array copy (#33).
+  queueMicrotask(() => {
+    flushScheduled = false;
+    const batch = pendingEvents;
+    pendingEvents = [];
+    if (!batch.length) return;
+    appendEvents(batch);
+  });
+}
+
+let pendingEvents: ThreadEnvelope[] = [];
+let flushScheduled = false;
+
+function appendEvents(batch: ThreadEnvelope[]): void {
+  // The same envelope can arrive twice (replay + live): keep the first of each id.
+  const uniq: ThreadEnvelope[] = [];
+  const inBatch = new Set<string>();
+  for (const e of batch) {
+    if (inBatch.has(e.eventId)) continue;
+    inBatch.add(e.eventId);
+    uniq.push(e);
+  }
   set((s) => {
-    const live = foldLive(s.live, env);
-    // Global Live page: newest first, bounded; the same envelope can be replayed on reconnect.
-    const events = s.events[0]?.eventId === env.eventId ? s.events : [env, ...s.events].slice(0, 300);
-    if (!s.detail || s.detail.meta.threadId !== env.threadId) return { live, events, lastEventId: env.eventId };
-    const detailEvents = s.detail.events;
-    // Notifications arrive in order; a repeated id can only be the one just appended.
-    if (detailEvents.length && detailEvents[detailEvents.length - 1]!.eventId === env.eventId) return { live, events, lastEventId: env.eventId };
-    return { live, events, lastEventId: env.eventId, detail: { ...s.detail, events: [...detailEvents, env] } };
+    let live = s.live;
+    for (const env of uniq) live = foldLive(live, env);
+    // Global Live page: newest first, bounded; the same envelopes can be replayed on reconnect.
+    const seen = new Set(s.events.map((e) => e.eventId));
+    const fresh = uniq.filter((e) => !seen.has(e.eventId));
+    const events = [...[...fresh].sort((a, b) => b.at - a.at), ...s.events].slice(0, 300);
+    const lastEventId = uniq[uniq.length - 1]!.eventId;
+    const openId = s.detail?.meta.threadId;
+    const mine = openId ? uniq.filter((e) => e.threadId === openId) : [];
+    if (!s.detail || !mine.length) return { live, events, lastEventId };
+    const known = new Set(s.detail.events.map((e) => e.eventId));
+    const add = mine.filter((e) => !known.has(e.eventId));
+    if (!add.length) return { live, events, lastEventId };
+    return { live, events, lastEventId, detail: { ...s.detail, events: [...s.detail.events, ...add] } };
   });
 }
 

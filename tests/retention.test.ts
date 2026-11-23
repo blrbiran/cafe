@@ -29,6 +29,36 @@ describe("search", () => {
     // Both the question and the echoed answer match.
     expect(res[0].hits.length).toBe(2);
   });
+
+  it("uses the FTS index for queries of 3+ chars and still matches mid-word", async () => {
+    const { root, c } = await setup();
+    const a = await c.ask({ body: "deploying the billing pipeline" });
+    await untilClosed(c, a.threadId, a.orderId);
+    expect(root.daemon.store.countIndexed()).toBeGreaterThan(0);
+    // A substring in the middle of a word (trigram, not word, matching).
+    const mid = await fetch(`http://${root.addr}/api/search?q=illin`).then((r) => r.json());
+    expect(mid.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
+    // Case-insensitive.
+    const upper = await fetch(`http://${root.addr}/api/search?q=BILLING`).then((r) => r.json());
+    expect(upper.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
+    // Two chars is below the trigram minimum: the JSONL scan answers it.
+    const short = await fetch(`http://${root.addr}/api/search?q=de`).then((r) => r.json());
+    expect(short.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
+  });
+
+  it("a pruned Thread leaves the search index", async () => {
+    const { root, c } = await setup();
+    const a = await c.ask({ body: "vanishing zebra question" });
+    await untilClosed(c, a.threadId, a.orderId);
+    const meta = root.daemon.thread(a.threadId)!.meta;
+    const old = Date.now() - 40 * 24 * 3600_000;
+    root.daemon.store.putThread({ ...meta, createdAt: old, lastActivityAt: old });
+    (root.daemon.store as any).db.prepare("UPDATE threads SET created_at = ? WHERE thread_id = ?").run(old, a.threadId);
+    const post = (body: unknown) => fetch(`http://${root.addr}/api/prune`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json());
+    await post({ olderThanDays: 30, dryRun: false });
+    const after = await fetch(`http://${root.addr}/api/search?q=zebra`).then((r) => r.json());
+    expect(after).toEqual([]);
+  });
 });
 
 describe("prune", () => {

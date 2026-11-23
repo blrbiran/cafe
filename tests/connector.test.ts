@@ -243,6 +243,39 @@ describe("cafe connector CLI", () => {
     return dir;
   }
 
+  /** Heartbeats, but exits 1 the first time it runs (a marker file), then stays up: one crash, then healthy. */
+  function crashedConnector(name: string): string {
+    const dir = tempDir(`cafe-conn-crash-${name}-`);
+    writeFileSync(
+      join(dir, "cafe-connector.json"),
+      JSON.stringify({ name, kind: "customer-connector", version: "0.1.0", entry: "./index.ts", permissions: ["orders:write"], health: { type: "stdio", heartbeatMs: 150 } }),
+    );
+    writeFileSync(
+      join(dir, "index.ts"),
+      [
+        'import { existsSync, writeFileSync } from "node:fs";',
+        'import { join } from "node:path";',
+        'const dir = process.env.CAFE_CONNECTOR_STATE;',
+        'const marker = join(dir, "crashed-once");',
+        'process.stdout.write(JSON.stringify({ type: "hello", crashedBefore: existsSync(marker) }) + "\\n");',
+        "if (!existsSync(marker)) { writeFileSync(marker, \"1\"); process.stderr.write(\"first run fails on purpose\\n\"); process.exit(1); }",
+        'const beat = () => process.stdout.write(JSON.stringify({ type: "heartbeat", at: Date.now(), ok: true }) + "\\n");',
+        "beat();",
+        "const timer = setInterval(beat, 150);",
+        'process.on("SIGTERM", () => { clearInterval(timer); process.exit(0); });',
+      ].join("\n"),
+    );
+    return dir;
+  }
+
+  /** Exits immediately, every time: the supervisor must give up after the crash-loop window. */
+  function alwaysCrashConnector(name: string): string {
+    const dir = tempDir(`cafe-conn-loop-${name}-`);
+    writeFileSync(join(dir, "cafe-connector.json"), JSON.stringify({ name, kind: "customer-connector", version: "0.1.0", entry: "./index.ts", permissions: ["orders:write"] }));
+    writeFileSync(join(dir, "index.ts"), 'process.stderr.write("boom\\n"); process.exit(3);\n');
+    return dir;
+  }
+
   it("installs, starts, reports status, tails logs and removes only cafe-owned connectors", async () => {
     const home = tempDir("cafe-connector-home-");
     const source = fixtureConnector("fixture");
@@ -299,4 +332,49 @@ describe("cafe connector CLI", () => {
     expect(forced.status, forced.stderr).toBe(0);
     expect(existsSync(foreign)).toBe(false);
   });
+
+  it("restarts a crashed connector and reports it running again", async () => {
+    const home = tempDir("cafe-connector-super-");
+    const source = crashedConnector("crasher"); // exits once on the first run, then stays alive
+    const install = await cli(home, ["connector", "install", source]);
+    expect(install.status, install.stderr).toBe(0);
+    try {
+      const start = await cli(home, ["connector", "start", "crasher"], { CAFE_DAEMON: "127.0.0.1:1", CAFE_TOKEN: "t0k" });
+      expect(start.status, start.stderr).toBe(0);
+      // The supervisor restarts the child (first exit is unexpected) and it stays running.
+      await waitFor(async () => {
+        const s = await cli(home, ["connector", "status", "crasher"]);
+        return s.stdout.includes("running") && Number(/restarts:\s+(\d+)/.exec(s.stdout)?.[1] ?? 0) >= 1;
+      }, 8_000);
+      const status = await cli(home, ["connector", "status", "crasher"]);
+      expect(status.stdout).toContain("running");
+      const logs = await cli(home, ["connector", "logs", "crasher"]);
+      expect(logs.stdout).toContain('"type":"heartbeat"');
+    } finally {
+      const stop = await cli(home, ["connector", "stop", "crasher"]);
+      expect(stop.status, stop.stderr).toBe(0);
+    }
+    const after = await cli(home, ["connector", "status", "crasher"]);
+    expect(after.stdout).toContain("stopped");
+  });
+
+  it("gives up after a crash loop instead of restarting forever", async () => {
+    const home = tempDir("cafe-connector-loop-");
+    const source = alwaysCrashConnector("loop");
+    const install = await cli(home, ["connector", "install", source]);
+    expect(install.status, install.stderr).toBe(0);
+    try {
+      const start = await cli(home, ["connector", "start", "loop"], { CAFE_DAEMON: "127.0.0.1:1", CAFE_TOKEN: "t0k", CAFE_CONNECTOR_MAX_RESTARTS: "2", CAFE_CONNECTOR_BACKOFF_MS: "50", CAFE_CONNECTOR_WINDOW_MS: "60000" });
+      await waitFor(async () => {
+        const s = await cli(home, ["connector", "status", "loop"]);
+        return s.stdout.includes("crash loop") || s.stdout.includes("crashed");
+      }, 20_000);
+      const status = await cli(home, ["connector", "status", "loop"]);
+      expect(status.stdout).toMatch(/crashed|crash loop/);
+      // The supervisor exited: its pid is gone from run.json.
+      expect(status.stdout).toContain("pid:       -");
+    } finally {
+      await cli(home, ["connector", "stop", "loop"]).catch(() => {});
+    }
+  }, 30_000);
 });

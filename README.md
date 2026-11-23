@@ -138,7 +138,7 @@ One command run per question: prompt on stdin, answer on stdout; print `CAFE_DEC
 
 ## Chat connectors (experimental)
 
-`cafe connector` runs a Customer connector **out of process**: it turns platform messages into cafe Orders and posts the answers back. The SDK, supervisor and a mock connector are in place; Discord is the first real platform (next round).
+`cafe connector` runs a Customer connector **out of process**: it turns platform messages into cafe Orders and posts the answers back. A mock connector ships for testing, and **Discord** is the first real platform.
 
 ```bash
 cafe connector install packages/connector/mock   # from a source checkout
@@ -151,7 +151,20 @@ cafe connector status mock
 cafe connector stop mock
 ```
 
-A connector is a directory with `cafe-connector.json` (name, entry, permissions, configSchema) and an entry that uses `@cafe/connector`'s `defineConnector`. State lives in `CAFE_HOME/connector-data/<name>/`; logs in `CAFE_HOME/logs/connector-<name>.log`. `install` copies the directory; package resolution links the workspace SDK for source installs (a published SDK is not packaged yet).
+**Discord** (needs the bot token and the **Message Content** privileged intent in the Discord Developer Portal → Bot):
+
+```bash
+cafe connector install <cafe-package>/connector/discord   # or packages/connector/discord from a checkout
+cafe connector config discord token <bot token>           # stored owner-only; never echoed
+cafe connector config discord allowChannels '["1234"]'    # allowlist guild/channel/user ids
+cafe connector config discord allowGuilds   '["5678"]'
+cafe connector start discord
+cafe connector logs discord --follow
+```
+
+In a guild the bot answers only messages that mention it (`requireMention`, default on); `allowDMs` enables direct messages. Replies are posted back to the same channel, chunked to Discord's 2000-character limit. `allowGuilds`/`allowChannels`/`allowUsers` default to empty = allow all, so set an allowlist for a shared server. The connector installs `discord.js` into its own directory (not a cafe dependency).
+
+A connector is a directory with `cafe-connector.json` (name, entry, permissions, configSchema) and an entry that uses `@cafe/connector`'s `defineConnector`. State lives in `CAFE_HOME/connector-data/<name>/`; logs in `CAFE_HOME/logs/connector-<name>.log`. `install` copies the directory and links the SDK into its `node_modules`; the SDK ships with the package (`connector/`), so a connector installed from a published cafe resolves `@cafe/connector` too. A connector runs under a supervisor: if it exits unexpectedly it is restarted with backoff, and after 5 exits within a minute it is left `crashed` (check `cafe connector logs`) instead of looping forever. Tune with `CAFE_CONNECTOR_MAX_RESTARTS` / `CAFE_CONNECTOR_WINDOW_MS` / `CAFE_CONNECTOR_BACKOFF_MS`.
 
 ## Configuration
 

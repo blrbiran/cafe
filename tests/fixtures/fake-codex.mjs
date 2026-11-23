@@ -15,6 +15,7 @@ const log = (m) => logFile && appendFileSync(logFile, JSON.stringify(m) + "\n");
 const threadFile = (id) => join(state, `${id}.json`);
 const waiting = new Map(); // server request id -> resolve
 const interrupts = new Map(); // turnId -> resolve
+const interruptRequests = new Set(); // turns interrupted before runTurn registered a waiter
 let srv = 0;
 
 function ask(method, params) {
@@ -35,7 +36,11 @@ async function runTurn(threadId, turnId, text) {
   const followup = text.startsWith("Follow-up from");
   const q = followup ? lines[2] : lines[lines.indexOf("Question:") + 1];
   if (q.includes("SLOW")) {
-    await new Promise((r) => interrupts.set(turnId, r));
+    // `turn/interrupt` can arrive before this waiter is registered (the bridge aborts the moment the
+    // test cancels, and runTurn is not awaited): remember early interrupts so the SLOW turn still ends.
+    if (!interruptRequests.has(turnId)) await new Promise((r) => interrupts.set(turnId, r));
+    interruptRequests.delete(turnId);
+    interrupts.delete(turnId);
     send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "interrupted", items: [] } } });
     return;
   }
@@ -75,7 +80,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       return;
     }
     case "turn/interrupt":
-      interrupts.get(p.turnId)?.();
+      if (interrupts.has(p.turnId)) interrupts.get(p.turnId)?.();
+      else interruptRequests.add(p.turnId);
       return send({ id: m.id, result: {} });
     default:
       if (m.id !== undefined) send({ id: m.id, error: { code: -32601, message: `unknown ${m.method}` } });

@@ -103,6 +103,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
     for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);
   }
   daemon.recover();
+  daemon.backfillSearchIndex();
   daemon.connectRoot();
   void daemon.announceRoot();
   const discovery = config.discovery && process.env.CAFE_DISCOVERY !== "0";

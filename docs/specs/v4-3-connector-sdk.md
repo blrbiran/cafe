@@ -1,6 +1,6 @@
 # v4-3 Customer connector SDK
 
-状态（2026-11-19）：spec 草案，来源 dogfooding #28。**只写 spec，不实现。** 待用户确认 Q1–Q4 后进入实现。
+状态（2026-11-23）：**已实现到 Discord 平台。** `cafe connector install|list|status|start|stop|restart|logs|config|remove`、`@cafe/connector` SDK、mock connector、Discord connector（`packages/connector/discord/`；核心在 `src/discord-core.ts`，真机适配在 `src/discordjs.ts`）、崩溃自动重启监管器（`cafe connector supervise`）、`POST /api/orders` 幂等键，以及 SDK 随发布包分发（`connector/`）。**真实 Discord 端到端运行仍需 bot token + Message Content intent**，留待有人参与的会话。原始 spec（2026-11-19）如下，保留作契约基线。
 
 ## 为什么
 

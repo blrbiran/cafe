@@ -1,4 +1,5 @@
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -63,4 +64,26 @@ export function writeClaudePlugin(plan: ClaudePluginPlan, source = pluginSource(
       2,
     ) + "\n",
   );
+}
+
+export type ClaudePluginState = "installed" | "missing" | "unknown";
+
+/**
+ * Whether Claude Code actually has the plugin registered. Asking `claude plugin list` is the only trustworthy
+ * signal: the local marketplace folder under CAFE_HOME only means `writeClaudePlugin` ran, not that the two
+ * `claude plugin ...` commands after it succeeded (#55).
+ */
+export function claudePluginState(claude = "claude"): { state: ClaudePluginState; detail: string } {
+  const r = spawnSync(claude, ["plugin", "list"], { encoding: "utf8", timeout: 20_000 });
+  if (r.error) {
+    const code = (r.error as NodeJS.ErrnoException).code;
+    return { state: "unknown", detail: code === "ENOENT" ? `claude not found (${claude})` : `claude plugin list failed: ${r.error.message}` };
+  }
+  const text = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  if (r.status !== 0) {
+    const line = text.trim().split("\n").at(-1) ?? "";
+    return { state: "unknown", detail: `claude plugin list exited ${r.status}${line ? `: ${line.slice(0, 120)}` : ""}` };
+  }
+  if (text.includes(`${PLUGIN}@${MARKETPLACE}`)) return { state: "installed", detail: `plugin ${PLUGIN}@${MARKETPLACE}` };
+  return { state: "missing", detail: `run \`cafe claude install\` for session pause/resume` };
 }

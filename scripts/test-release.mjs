@@ -60,9 +60,9 @@ try {
   const tgz = join(packDir, readdirSync(packDir).find((f) => f.endsWith(".tgz")));
   const files = execFileSync("tar", ["tzf", tgz], { encoding: "utf8" }).split("\n").filter(Boolean);
   check("tarball contents", () => {
-    for (const f of ["bin/cafe.js", "dist/cli.js", "dist/pi-extension.js", "dist/proc/guard.mjs", "web/index.html", "skills/cafe/SKILL.md", "claude-plugin/.claude-plugin/plugin.json", "claude-plugin/hooks/hooks.json", "claude-plugin/hooks/register.ts", "README.md", "LICENSE"])
+    for (const f of ["bin/cafe.js", "dist/cli.js", "dist/pi-extension.js", "dist/proc/guard.mjs", "connector/package.json", "connector/index.js", "connector/mock.js", "web/index.html", "skills/cafe/SKILL.md", "claude-plugin/.claude-plugin/plugin.json", "claude-plugin/hooks/hooks.json", "claude-plugin/hooks/register.ts", "README.md", "LICENSE"])
       assert(files.includes(`package/${f}`), `missing ${f}`);
-    // The Claude Code mod is TypeScript that Claude Code loads itself; nothing else ships as .ts.
+    // The Claude Code mod is TypeScript that Claude Code loads itself; nothing else ships as .ts or node_modules.
     const stray = files.filter((f) => /\.ts$|node_modules|\.map$/.test(f) && f !== "package/claude-plugin/hooks/register.ts");
     assert(stray.length === 0, `unexpected files: ${stray.join(", ")}`);
     return `${files.length} files`;
@@ -130,6 +130,41 @@ const env = { ...process.env, HOME: fakeHome, CAFE_HOME: home, CAFE_DISCOVERY: "
   check("claude install --dry-run finds the packaged Claude Code plugin", () => {
     const outText = execFileSync(cafeBin, ["claude", "install", "--dry-run"], { env, encoding: "utf8" });
     assert(outText.includes(join("cafe", "claude-plugin")) && outText.includes("claude plugin install cafe@cafe-local"), outText);
+  });
+
+  const connectorDir = join(work, "connector-src");
+  mkdirSync(connectorDir);
+  writeFileSync(join(connectorDir, "cafe-connector.json"), JSON.stringify({ name: "smoke", kind: "customer-connector", entry: "./index.ts", permissions: ["orders:write"] }));
+  writeFileSync(
+    join(connectorDir, "index.ts"),
+    'import { defineConnector } from "@cafe/connector";\nconst main = defineConnector(async () => { process.stdout.write(JSON.stringify({ type: "hello" }) + "\\n"); await new Promise(() => {}); });\nawait main.run();\n',
+  );
+  check("the packaged connector SDK resolves for an installed connector", () => {
+    const outText = cafe("connector", "install", connectorDir);
+    assert(outText.includes("installed smoke"), outText);
+    const link = join(home, "connectors/smoke/node_modules/@cafe/connector/package.json");
+    assert(existsSync(link), `missing ${link}`);
+  });
+  await checkAsync("the supervised connector starts and reports running", async () => {
+    cafe("connector", "start", "smoke");
+    let ok = false;
+    for (let i = 0; i < 60 && !ok; i++) {
+      await sleep(150);
+      ok = cafe("connector", "status", "smoke").includes("status:    running");
+    }
+    cafe("connector", "stop", "smoke");
+    const log = readFileSync(join(home, "logs", "connector-smoke.log"), "utf8");
+    assert(ok, `smoke did not start: ${log.slice(-300)}`);
+    assert(log.includes('"type":"hello"'), log.slice(-300));
+  });
+
+  check("the packaged Discord connector installs (runtime fetch skipped offline)", () => {
+    const outText = execFileSync(cafeBin, ["connector", "install", join(prefix, "lib/node_modules", pkg.name, "connector/discord")], { env: { ...env, CAFE_CONNECTOR_SKIP_RUNTIME: "1" }, encoding: "utf8" });
+    assert(outText.includes("installed discord"), outText);
+    assert(outText.includes("Message Content intent"), outText);
+    const status = execFileSync(cafeBin, ["connector", "status", "discord"], { env, encoding: "utf8" });
+    assert(status.includes("status:    stopped"), status);
+    assert(existsSync(join(home, "connectors/discord/node_modules/@cafe/connector/package.json")), "SDK not linked for the Discord connector");
   });
 
   await checkAsync("session-host registers a Claude Code session and says ready", async () => {

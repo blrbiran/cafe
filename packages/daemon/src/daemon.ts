@@ -93,6 +93,13 @@ interface Tracking {
 /** Metadata keeps only recent reply/decline summaries; the JSONL log has the full history. */
 const MAX_META_REPLIES = 50;
 const MAX_META_DECLINES = 50;
+/** In-memory caches are bounded so a long-running Daemon does not grow with history (#31). */
+function cacheLimit(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+const META_CACHE_MAX = () => cacheLimit("CAFE_META_CACHE_MAX", 2_000);
+const KNOWN_ORDERS_MAX = () => cacheLimit("CAFE_KNOWN_ORDERS_MAX", 10_000);
 
 /** How long `CreateOrderParams.idempotencyKey` keeps returning the first Order (v4-3 Q4). */
 const IDEMPOTENCY_WINDOW_MS = 10 * 60_000;
@@ -1331,8 +1338,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** Snapshot of the counters exposed at GET /api/health. */
-  metrics(): { threads: number; events: number; appendBytes: number; metaWrites: number; metaBytes: number; snapshotMs: number; searchMs: number; eventLoopLagMs: number } {
-    return { threads: this.store.countThreads(), ...this.stats, eventLoopLagMs: this.loopLagMs };
+  metrics(): { threads: number; events: number; appendBytes: number; metaWrites: number; metaBytes: number; snapshotMs: number; searchMs: number; eventLoopLagMs: number; cachedThreads: number; cachedOrders: number; indexedEvents: number } {
+    return { threads: this.store.countThreads(), ...this.stats, eventLoopLagMs: this.loopLagMs, cachedThreads: this.metas.size, cachedOrders: this.knownOrders.size, indexedEvents: this.store.countIndexed() };
   }
 
   /** Pending metadata writes, coalesced so a burst of events does not rewrite a growing row each time. */
@@ -1357,12 +1364,47 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.metaFlush.clear();
   }
 
+  /**
+   * Keep the in-memory caches bounded on a long-running Daemon (#31). Closed Threads are
+   * re-read from SQLite on demand, so evicting them costs one row read, not correctness.
+   */
+  private evictCaches(): void {
+    const metaMax = META_CACHE_MAX();
+    if (metaMax > 0 && this.metas.size > metaMax) {
+      const keep = metaMax / 2;
+      const victims = [...this.metas.values()]
+        .filter((m) => m.status === "done" || m.status === "failed" || m.status === "cancelled")
+        .sort((a, b) => (a.lastActivityAt ?? 0) - (b.lastActivityAt ?? 0))
+        .slice(0, Math.max(0, this.metas.size - keep));
+      for (const m of victims) {
+        if (this.metaFlush.has(m.threadId)) continue;
+        this.metas.delete(m.threadId);
+      }
+    }
+    const ordersMax = KNOWN_ORDERS_MAX();
+    if (ordersMax > 0 && this.knownOrders.size > ordersMax) {
+      // Map preserves insertion order: drop the oldest half.
+      const drop = this.knownOrders.size - ordersMax / 2;
+      let i = 0;
+      for (const id of this.knownOrders.keys()) {
+        if (i++ >= drop) break;
+        this.knownOrders.delete(id);
+      }
+    }
+  }
+
   recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
     if (this.stopped || this.seen.has(env.eventId)) return;
     this.seen.add(env.eventId);
     if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
 
     const meta = this.updateMeta(env);
+    // Keep `cafe search` current without rescanning JSONL (#34); the index is best-effort.
+    try {
+      this.store.indexEvent(env, (id) => this.registry.get(id)?.address ?? id);
+    } catch (err) {
+      this.log(`search index: ${(err as Error).message}`);
+    }
     // Attachments live on their origin Host. Elsewhere they are metadata only,
     // but the row is needed so the local Web/CLI can proxy the download.
     const carried = env.event.type === "order.created" ? env.event.order.attachments : env.event.type === "order.replied" ? env.event.attachments : undefined;
@@ -1534,6 +1576,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     this.metas.set(env.threadId, meta);
     meta.lastActivityAt = env.at;
+    this.evictCaches();
     const addr = (id: string) => this.registry.get(id)?.address;
     if (ev.type === "order.created") {
       this.knownOrders.set(ev.order.orderId, ev.order);
@@ -1935,6 +1978,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const m of stale) {
       this.metas.delete(m.threadId);
       this.store.deleteArtifactsForThread(m.threadId);
+      this.store.unindexThread(m.threadId);
       rmSync(join(this.store.home, "artifacts", m.threadId), { recursive: true, force: true });
     }
     const agentEvents = this.store.deleteAgentEventsBefore(cutoff);
@@ -1962,6 +2006,33 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const needle = q.toLowerCase();
     const budget = opts.budgetMs ?? 1_000;
+    // Fast path: the FTS trigram index answers substring queries without touching the JSONL (#34).
+    // Very short queries (below the trigram minimum) and any index failure fall back to the scan.
+    if (needle.length >= 3) {
+      try {
+        const indexed = this.store.searchIndex(q, limit * 5);
+        if (!indexed.short) {
+          const byThread = new Map<string, { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }>();
+          const seenEvents = new Set<string>();
+          for (const h of indexed.hits) {
+            const meta = this.metas.get(h.threadId) ?? this.store.getThread(h.threadId);
+            if (!meta) continue;
+            if (seenEvents.has(h.eventId)) continue;
+            seenEvents.add(h.eventId);
+            const entry = byThread.get(h.threadId) ?? { meta, hits: [] };
+            const i = h.text.toLowerCase().indexOf(needle);
+            const start = Math.max(0, i - 60);
+            entry.hits.push({ orderId: h.orderId, who: h.who, at: h.at, text: i < 0 ? h.text.slice(0, 160) : `${start ? "…" : ""}${h.text.slice(start, i + needle.length + 100)}` });
+            byThread.set(h.threadId, entry);
+          }
+          const out = [...byThread.values()].sort((a, b) => b.meta.createdAt - a.meta.createdAt).slice(0, limit);
+          fill(byThread.size, false);
+          return out;
+        }
+      } catch {
+        // Fall through to the JSONL scan.
+      }
+    }
     const out: { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] = [];
     let scanned = 0;
     for (const meta of this.store.allThreads()) {
@@ -1986,6 +2057,36 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     fill(scanned, false);
     return out;
+  }
+
+  /**
+   * Index Threads that predate the search index (#34). Runs a bounded batch at startup and a few more
+   * times in the background so an upgraded daemon converges without blocking the event loop.
+   */
+  backfillSearchIndex(): void {
+    const batch = 200;
+    let rounds = 0;
+    const run = () => {
+      let todo: ThreadMeta[];
+      try {
+        todo = this.store.threadsNeedingIndex(batch);
+      } catch {
+        return;
+      }
+      if (!todo.length) return;
+      const started = performance.now();
+      const who = (id: string) => this.registry.get(id)?.address ?? id;
+      for (const m of todo) {
+        try {
+          for (const env of this.store.readEvents(m.file)) this.store.indexEvent(env, who);
+        } catch {
+          // An unreadable Thread must not stop the backfill.
+        }
+      }
+      this.log(`search index: backfilled ${todo.length} thread(s) in ${Math.round(performance.now() - started)}ms`);
+      if (todo.length === batch && ++rounds < 20) setTimeout(run, 250).unref?.();
+    };
+    run();
   }
 
   /** Daily automatic pruning when `retention.days` is set. */

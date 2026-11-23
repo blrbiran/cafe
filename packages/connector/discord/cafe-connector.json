@@ -1,0 +1,17 @@
+{
+  "name": "discord",
+  "kind": "customer-connector",
+  "version": "0.1.0",
+  "entry": "./index.ts",
+  "permissions": ["orders:write", "threads:read"],
+  "configSchema": {
+    "token": { "type": "string", "secret": true, "required": true },
+    "allowGuilds": { "type": "array", "items": "string", "default": [] },
+    "allowChannels": { "type": "array", "items": "string", "default": [] },
+    "allowUsers": { "type": "array", "items": "string", "default": [] },
+    "allowDMs": { "type": "boolean", "default": false },
+    "requireMention": { "type": "boolean", "default": true },
+    "address": { "type": "string", "required": false }
+  },
+  "health": { "type": "stdio", "heartbeatMs": 30000 }
+}

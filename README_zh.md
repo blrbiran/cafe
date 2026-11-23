@@ -136,7 +136,7 @@ cafe serve --exec "<任意命令>" --dir ~/code/billing    # 或 --preset claude
 
 ## 聊天 connector（实验）
 
-`cafe connector` 以**进程外 sidecar** 的方式运行 Customer connector：把平台消息变成 cafe Order，再把回答发回原频道。SDK、监管器和 mock connector 已落地；第一个真实平台是 Discord（下一轮）。
+`cafe connector` 以**进程外 sidecar** 的方式运行 Customer connector：把平台消息变成 cafe Order，再把回答发回原频道。提供 mock connector 用于测试，**Discord** 是第一个真实平台。
 
 ```bash
 cafe connector install packages/connector/mock   # 从源码仓库安装
@@ -149,7 +149,20 @@ cafe connector status mock
 cafe connector stop mock
 ```
 
-connector 是一个目录：`cafe-connector.json`（name / entry / permissions / configSchema）+ 一个用 `@cafe/connector` 的 `defineConnector` 写的入口。状态在 `CAFE_HOME/connector-data/<name>/`，日志在 `CAFE_HOME/logs/connector-<name>.log`。`install` 复制目录；源码安装会链接 workspace SDK（尚未随发布包分发）。
+**Discord**（需要 bot token，并在 Discord Developer Portal → Bot 开启 **Message Content** 特权 intent）：
+
+```bash
+cafe connector install <cafe 包目录>/connector/discord   # 或源码仓库的 packages/connector/discord
+cafe connector config discord token <bot token>         # 仅本人可读，不会回显
+cafe connector config discord allowChannels '["1234"]'  # guild/channel/user id 白名单
+cafe connector config discord allowGuilds   '["5678"]'
+cafe connector start discord
+cafe connector logs discord --follow
+```
+
+在 guild 里机器人只回答 @ 它的消息（`requireMention` 默认开）；`allowDMs` 打开私聊。回复发回同一频道，按 Discord 2000 字符上限切分。`allowGuilds`/`allowChannels`/`allowUsers` 默认为空 = 全部允许，共享服务器请设置白名单。安装时会把 `discord.js` 装进 connector 自己的目录（不是 cafe 的依赖）。
+
+connector 是一个目录：`cafe-connector.json`（name / entry / permissions / configSchema）+ 一个用 `@cafe/connector` 的 `defineConnector` 写的入口。状态在 `CAFE_HOME/connector-data/<name>/`，日志在 `CAFE_HOME/logs/connector-<name>.log`。`install` 复制目录并把 SDK 链接进它的 `node_modules`；SDK 随发布包分发（`connector/`），所以从已发布 cafe 安装的 connector 也能解析 `@cafe/connector`。connector 由监管器托管：意外退出会退避重启，1 分钟内退出 5 次则停在 `crashed`（看 `cafe connector logs`），不会无限重启。可用 `CAFE_CONNECTOR_MAX_RESTARTS` / `CAFE_CONNECTOR_WINDOW_MS` / `CAFE_CONNECTOR_BACKOFF_MS` 调整。
 
 ## 配置
 

@@ -61,6 +61,50 @@ await build({
 });
 
 cpSync(join(root, "packages/daemon/src/proc/guard.mjs"), join(out, "dist/proc/guard.mjs"));
+// The connector SDK ships with the CLI so `cafe connector install` can resolve `@cafe/connector`
+// for a connector installed from a published cafe (#28). It lives at connector/ (npm refuses to pack
+// node_modules); `linkSdkPackages` finds it next to dist/. Type-only @cafe/protocol imports are
+// stripped by Node, so protocol (and zod/yaml) is not needed at runtime. Node does not strip types
+// under node_modules, hence JS bundles.
+const connectorDir = join(out, "connector");
+mkdirSync(connectorDir, { recursive: true });
+for (const [from, to] of [["index.ts", "index.js"], ["mock.ts", "mock.js"], ["discord-core.ts", "discord.js"], ["discordjs.ts", "discordjs.js"]]) {
+  await build({
+    ...common,
+    entryPoints: [join(root, "packages/connector/src", from)],
+    outfile: join(connectorDir, to),
+    external: ["node:*", "discord.js"],
+  });
+}
+mkdirSync(join(connectorDir, "discord"), { recursive: true });
+// The shipped connector runs the bundled JS, not the source .ts.
+const discordManifest = JSON.parse(readFileSync(join(root, "packages/connector/discord/cafe-connector.json"), "utf8"));
+discordManifest.entry = "./index.js";
+writeFileSync(join(connectorDir, "discord/cafe-connector.json"), JSON.stringify(discordManifest, null, 2) + "\n");
+writeFileSync(
+  join(connectorDir, "discord/index.js"),
+  'import { createDiscordConnector } from "@cafe/connector/discord";\nimport { isEntryPoint } from "@cafe/connector/mock";\nconst main = createDiscordConnector();\nexport default main;\nif (isEntryPoint(import.meta.url)) main.run().catch((err) => { process.stderr.write(`discord connector: ${err?.message ?? err}\\n`); process.exitCode = 1; });\n',
+);
+writeFileSync(
+  join(connectorDir, "package.json"),
+  JSON.stringify(
+    {
+      name: "@cafe/connector",
+      version: rootPkg.version,
+      type: "module",
+      exports: {
+        ".": "./index.js",
+        "./sdk": "./index.js",
+        "./client": "./index.js",
+        "./state": "./index.js",
+        "./mock": "./mock.js",
+        "./discord": "./discord.js",
+      },
+    },
+    null,
+    2,
+  ) + "\n",
+);
 cpSync(join(root, "packages/web/dist"), join(out, "web"), { recursive: true });
 cpSync(join(root, "skills/cafe"), join(out, "skills/cafe"), { recursive: true });
 for (const part of [".claude-plugin/plugin.json", "hooks"]) cpSync(join(root, "claude-plugin", part), join(out, "claude-plugin", part), { recursive: true });
@@ -92,7 +136,7 @@ const pkg = {
   description: "cafe: a DNS-like network of coding agents — ask a question, the right agent answers",
   type: "module",
   bin: { cafe: "bin/cafe.js" },
-  files: ["bin", "dist", "web", "skills", "claude-plugin", "README.md", ...(existsSync(join(root, "README_zh.md")) ? ["README_zh.md"] : []), ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])],
+  files: ["bin", "dist", "connector", "web", "skills", "claude-plugin", "README.md", ...(existsSync(join(root, "README_zh.md")) ? ["README_zh.md"] : []), ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])],
   engines: rootPkg.engines,
   // Model-based routing (router.model) only; rules routing works without it.
   optionalDependencies: { "@earendil-works/pi-coding-agent": `^${piVersion}` },

@@ -8,7 +8,8 @@
     "./sdk": "./src/sdk.ts",
     "./client": "./src/client.ts",
     "./state": "./src/state.ts",
-    "./mock": "./src/mock.ts"
+    "./mock": "./src/mock.ts",
+    "./discord": "./src/discord-core.ts"
   },
   "dependencies": {
     "@cafe/protocol": "^0.1.0"

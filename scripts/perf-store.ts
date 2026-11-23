@@ -113,6 +113,20 @@ const stale10kMs = ms(() => {
   staleCount = store.staleThreads(now + 1).length;
 });
 
+// Search: index 2000 threads x 20 events, then run the FTS path the daemon uses for 3+ char queries.
+const who = (id: string) => `${id}#1@root`;
+const indexMs = ms(() => {
+  for (const f of scanFiles) for (const env of store.readEvents(f)) store.indexEvent(env as any, who);
+});
+let ftsHits = 0;
+const searchFtsMs = ms(() => {
+  ftsHits = store.searchIndex("answer 7", 20).hits.length;
+});
+let registryUnchangedMs = 0;
+registryUnchangedMs = ms(() => {
+  for (let i = 0; i < 1000; i++) store.saveRegistry(i, records);
+});
+
 console.log(
   JSON.stringify(
     {
@@ -129,10 +143,15 @@ console.log(
       allThreads10kMs,
       allCount: allThreadsCount,
       registry100x1000Ms,
+      registryUnchanged1000Ms: registryUnchangedMs,
       searchScan2000x20Ms,
       scanned,
       stale10kMs,
       staleCount,
+      indexMs,
+      indexEvents: scanned,
+      searchFtsMs,
+      ftsHits,
     },
     null,
     2,

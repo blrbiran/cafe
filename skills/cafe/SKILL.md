@@ -76,8 +76,9 @@ cafe barista start --dir ~/code/billing --agent codex --tui  # answer in the Cod
 cafe claude install                                   # running Claude Code sessions in a dir with .cafe answer questions (/cafe-barista off pauses)
                                                       # read-only by default; --write lets it edit files in --dir
 cafe mcp install                                      # Customer only: register `cafe mcp` (cafe_ask / cafe_wait / …)
-cafe connector install packages/connector/mock         # Customer connector sidecar (experimental; Discord first)
+cafe connector install packages/connector/mock         # Customer connector sidecar (Discord is the first real platform)
 cafe connector start mock                              # mock: feed events on stdin or config.ingestPort, replies in the log
+cafe connector install packages/connector/discord      # Discord: set `token`, allowlists, start; needs the Message Content intent
 cafe serve --preset claude --dir ~/code/billing       # one `claude -p` per question, no session (or --preset codex)
                                                       # presets are read-only by default; --write widens them
 cafe serve --exec "./answer.sh" --dir .               # any command: prompt on stdin (or {prompt_file}), answer on stdout;

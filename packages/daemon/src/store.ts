@@ -67,6 +67,11 @@ export class Store {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS artifacts_thread ON artifacts(thread_id);
+      -- Full-text index over the searchable text of each Order/reply (#34). Trigram tokenizer =
+      -- case-insensitive substring match (cafe search is substring, not word, matching); a query
+      -- shorter than 3 characters falls back to the JSONL scan.
+      CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(event_id UNINDEXED, thread_id UNINDEXED, order_id UNINDEXED, who UNINDEXED, at UNINDEXED, text, tokenize='trigram');
+      CREATE TABLE IF NOT EXISTS search_indexed (event_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL);
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
@@ -105,6 +110,82 @@ export class Store {
   /** The last `limit` events, read from the end so a long Thread is not parsed whole. */
   readEventsTail(file: string, limit: number): ThreadEnvelope[] {
     return this.readEventsPage(file, limit).events;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Search index (#34)
+  // ---------------------------------------------------------------------------
+
+  /** The searchable text of an event: the question (as ordered) or a Barista reply; undefined otherwise. */
+  private static searchable(env: ThreadEnvelope, who: (agentId: string) => string): { who: string; text: string } | undefined {
+    const ev = env.event;
+    if (ev.type === "order.created") return { who: ev.order.from.address, text: ev.order.body };
+    if (ev.type === "order.replied") return { who: who(ev.agentId), text: ev.text };
+    return undefined;
+  }
+
+  /**
+   * Index one event for `cafe search`. `who` resolves an agent id to its display address. Text shorter
+   * than the trigram minimum still goes in (trigram ignores it) — `search()` scans the JSONL for short
+   * queries.
+   */
+  indexEvent(env: ThreadEnvelope, who: (agentId: string) => string): void {
+    if (this.db.prepare("SELECT 1 FROM search_indexed WHERE event_id = ?").get(env.eventId)) return;
+    const hit = Store.searchable(env, who);
+    this.db.prepare("INSERT OR IGNORE INTO search_indexed(event_id, thread_id) VALUES (?, ?)").run(env.eventId, env.threadId);
+    if (!hit || !hit.text) return;
+    this.db.prepare("INSERT INTO search_index(event_id, thread_id, order_id, who, at, text) VALUES (?, ?, ?, ?, ?, ?)").run(env.eventId, env.threadId, env.orderId, hit.who, env.at, hit.text);
+  }
+
+  /** Whether the FTS index has an entry for this event (a Thread migrated before indexing). */
+  isIndexed(eventId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM search_indexed WHERE event_id = ?").get(eventId);
+  }
+
+  /** Number of indexed events, for diagnostics. */
+  countIndexed(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM search_indexed").get() as { n: number }).n;
+  }
+
+  /** Drop all index rows for a Thread (prune). */
+  unindexThread(threadId: string): void {
+    this.db.prepare("DELETE FROM search_index WHERE thread_id = ?").run(threadId);
+    this.db.prepare("DELETE FROM search_indexed WHERE thread_id = ?").run(threadId);
+  }
+
+  /** Threads with at least one event not yet in the search index, newest first (backfill after an upgrade). */
+  threadsNeedingIndex(limit: number): ThreadMeta[] {
+    const rows = this.db
+      .prepare("SELECT meta FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM search_indexed) ORDER BY created_at DESC LIMIT ?")
+      .all(limit) as { meta: string }[];
+    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+  }
+
+  /**
+   * Substring search over the FTS trigram index. Returns raw hits in recency order (newest first),
+   * capped at `limit` Threads. A query shorter than 3 characters (the trigram minimum) yields `short: true`.
+   */
+  searchIndex(q: string, limit: number): { hits: { eventId: string; threadId: string; orderId: string; who: string; at: number; text: string }[]; short: boolean } {
+    if (q.length < 3) return { hits: [], short: true };
+    // FTS5 string literals: wrap in double quotes, doubling any embedded quote; the trigram tokenizer
+    // then treats the whole thing as a case-insensitive substring.
+    const phrase = `"${q.replace(/"/g, '""')}"`;
+    let rows: { event_id: string; thread_id: string; order_id: string; who: string; at: string; text: string }[];
+    try {
+      rows = this.db
+        .prepare("SELECT event_id, thread_id, order_id, who, at, text FROM search_index WHERE search_index MATCH ? ORDER BY at DESC LIMIT ?")
+        .all(phrase, Math.max(1, limit) * 20) as typeof rows;
+    } catch {
+      // A query the tokenizer rejects (unbalanced quote, symbol-only): no hits rather than an error.
+      return { hits: [], short: false };
+    }
+    return { hits: rows.map((r) => ({ eventId: r.event_id, threadId: r.thread_id, orderId: r.order_id, who: r.who, at: Number(r.at), text: r.text })), short: false };
+  }
+
+  /** Everything indexed so far, grouped by Thread — used to backfill the index once on first start. */
+  indexedThreadIds(): Set<string> {
+    const rows = this.db.prepare("SELECT DISTINCT thread_id FROM search_index").all() as { thread_id: string }[];
+    return new Set(rows.map((r) => r.thread_id));
   }
 
   /**
@@ -205,11 +286,13 @@ export class Store {
   }
 
   /** Finished threads whose last activity is before `cutoff` (candidates for pruning). */
-  staleThreads(cutoff: number): ThreadMeta[] {
-    const rows = this.db.prepare("SELECT meta FROM threads WHERE created_at < ?").all(cutoff) as { meta: string }[];
-    return rows
-      .map((r) => JSON.parse(r.meta) as ThreadMeta)
-      .filter((m) => (m.lastActivityAt ?? m.createdAt) < cutoff && ["done", "failed", "cancelled"].includes(m.status));
+  /** Rows whose last activity is older than the cutoff and that already finished (#34: push both filters to SQL). */
+  staleThreads(cutoff: number, statuses: ThreadMeta["status"][] = ["done", "failed", "cancelled"]): ThreadMeta[] {
+    if (!statuses.length) return [];
+    const rows = this.db
+      .prepare(`SELECT meta FROM threads WHERE created_at < ? AND status IN (${statuses.map(() => "?").join(", ")})`)
+      .all(cutoff, ...statuses) as { meta: string }[];
+    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta).filter((m) => (m.lastActivityAt ?? m.createdAt) < cutoff);
   }
 
   /** Delete thread rows and their JSONL files; empty day directories go too. Returns bytes freed. */
@@ -217,15 +300,23 @@ export class Store {
     let bytes = 0;
     const dirs = new Set<string>();
     const del = this.db.prepare("DELETE FROM threads WHERE thread_id = ?");
-    for (const m of metas) {
-      del.run(m.threadId);
-      // Never touch files outside this home's sessions/ directory, whatever the metadata says.
-      const sessions = resolve(this.home, "sessions") + sep;
-      if (resolve(m.file).startsWith(sessions) && existsSync(m.file)) {
-        bytes += statSync(m.file).size;
-        rmSync(m.file, { force: true });
-        dirs.add(dirname(m.file));
+    // One transaction for the row deletes (#34); the files go afterwards, outside the transaction.
+    this.db.exec("BEGIN");
+    try {
+      for (const m of metas) {
+        del.run(m.threadId);
+        // Never touch files outside this home's sessions/ directory, whatever the metadata says.
+        const sessions = resolve(this.home, "sessions") + sep;
+        if (resolve(m.file).startsWith(sessions) && existsSync(m.file)) {
+          bytes += statSync(m.file).size;
+          rmSync(m.file, { force: true });
+          dirs.add(dirname(m.file));
+        }
       }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
     }
     for (const d of dirs) {
       try {
@@ -320,15 +411,31 @@ export class Store {
     return (this.db.prepare("SELECT meta FROM threads ORDER BY created_at DESC").all() as { meta: string }[]).map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 
-  saveRegistry(version: number, records: AgentRecord[]): void {
+  /**
+   * `full`: replace (startup, registry snapshot). Otherwise the delta path: only rows whose
+   * record changed are rewritten, and a version bump alone costs no row write (#34).
+   */
+  saveRegistry(version: number, records: AgentRecord[], opts: { full?: boolean } = {}): void {
+    const existing = new Map<string, string>();
+    for (const row of this.db.prepare("SELECT agent_id, record FROM registry").all() as { agent_id: string; record: string }[]) existing.set(row.agent_id, row.record);
+    const keep = new Set(records.map((r) => r.agentId));
+    const changed: Array<{ agentId: string; json: string }> = [];
+    for (const r of records) {
+      const json = JSON.stringify(r);
+      if (opts.full || existing.get(r.agentId) !== json) changed.push({ agentId: r.agentId, json });
+    }
+    const removed = [...existing.keys()].filter((id) => !keep.has(id));
+    // A version bump with no row changes (the common status-toggle case) skips the row writes (#34).
     this.db.exec("BEGIN");
     try {
-      const keep = new Set(records.map((r) => r.agentId));
-      const existing = (this.db.prepare("SELECT agent_id FROM registry").all() as { agent_id: string }[]).map((r) => r.agent_id);
-      const del = this.db.prepare("DELETE FROM registry WHERE agent_id = ?");
-      for (const id of existing) if (!keep.has(id)) del.run(id);
-      const ins = this.db.prepare("INSERT INTO registry(agent_id, record) VALUES (?, ?) ON CONFLICT(agent_id) DO UPDATE SET record=excluded.record");
-      for (const r of records) ins.run(r.agentId, JSON.stringify(r));
+      if (removed.length) {
+        const del = this.db.prepare("DELETE FROM registry WHERE agent_id = ?");
+        for (const id of removed) del.run(id);
+      }
+      if (changed.length) {
+        const ins = this.db.prepare("INSERT INTO registry(agent_id, record) VALUES (?, ?) ON CONFLICT(agent_id) DO UPDATE SET record=excluded.record");
+        for (const c of changed) ins.run(c.agentId, c.json);
+      }
       this.db.prepare("INSERT INTO kv(key, value) VALUES ('registryVersion', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(version));
       this.db.exec("COMMIT");
     } catch (e) {
