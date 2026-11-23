@@ -2,7 +2,7 @@
 
 Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs (v2-x, v3-1 phases 1 and 2, v3-2, v4-1 attachments, v4-2 update/rollback, v4-3 connector SDK with the Discord platform, v4-4 routing accuracy: all implemented; v4-3 still needs a real Discord end-to-end run) are in [`docs/specs/`](../specs/). Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
 
-> Git state: this file is updated at the end of each work batch and committed with it, so check `git log --oneline` and `git status` yourself instead of trusting any hash written here. The v2 work starts after `docs: add handoff document for the next agent`. Published npm versions: `npm view @blrbiran/cafe versions`.
+> Start with the newest entry in §5 and the operational notes in §8. Run `git status --short --branch` and `git log --oneline -5` to establish the checkout and recent commits. Run `cafe daemon status` separately to check the process that is serving requests.
 
 ## 1. What cafe is
 
@@ -23,8 +23,8 @@ cafe is an agent network. A message (an **Order**) is routed to the agent or age
 - First use: `cafe init` writes a commented `.cafe` (interactive or `--yes --name …`), `cafe extension install` puts the extension into pi's settings and links it with omp, `cafe doctor` checks daemon / identity / extension / skill / router / root and prints the next command. `cafe config get` prints `(not set)` for unset known keys and fails for unknown ones.
 - Display names: `cafe host rename|alias`, `cafe agent rename|alias`, `cafe daemon rename` (Root). Internal `host` / `agentId` / Address never change; old names become aliases (ADR-0007). `knownDaemons` is written only after the Root can reach the child (prevents Docker-internal IPs).
 - Routing control: `cafe router models|set|status|apply`; `router.model` can be switched and cleared on a running daemon, unknown models are rejected and rolled back. `router.timeoutMs` (10 s) and `router.concurrency` (2) bound the LLM. `cafe daemon restart` applies restart-required config; `cafe config set` says whether a change was applied or needs a restart.
-- A Thread holds several turns. A Barista can decline ("不归我管"); operational declines (timeout, abort, shutdown, command failure) carry `unavailable` and do not count against a topic. An acknowledged Order has no overall timeout, because heartbeats keep it alive.
-- **Attachments (v4-1 phases 1 and 2)**: an Order can carry files (`Order.attachments`), and a Barista reply can carry them too (`OrderHandle.reply(text, final, attachments)`, pi/omp `cafe_reply` `attachments: [path]`). Blobs live under `CAFE_HOME/artifacts/<threadId>/`; upload is `POST /api/artifacts`, download `GET /api/artifacts/:id`. A remote Barista daemon **pulls from the origin Host before delivery** and proxies downloads for its Web/CLI; a receiving daemon registers reply-attachment metadata so downloads proxy to the Barista's host. CLI `cafe ask --attach`, `cafe thread --download`, MCP `cafe_ask attachments: [path]`, Web composer + download links. Limits `attachments.maxMb|threadMaxMb|maxCount` (25/100/10). **Only local paths are passed to a Barista, never file contents.** Still missing: a `cafe reply` CLI entry, a Bridge/serve file producer, and a pull-later queue for offline Customers.
+- A Thread holds several turns. A Barista can decline ("不归我管"). Operational declines carry `unavailable` and do not count against a topic. Heartbeats renew the liveness lease. A unicast Order also has a 10-minute default deadline, which an explicit `deadlineMs` can override. See §5 for CLI wait and cancellation behavior.
+- **Attachments (v4-1 phases 1 and 2)** support Orders and replies across Hosts. Blobs live under `CAFE_HOME/artifacts/<threadId>/`. Use `cafe ask --attach`, `cafe reply --attach`, `cafe thread --download`, the MCP tools, or the Web composer. Bridge/serve replies can declare files with `CAFE_ATTACH:`. Reply pulls can retry when the Customer comes back online. Limits are `attachments.maxMb|threadMaxMb|maxCount` (25/100/10). **Pass only local paths to a Barista.** See [`v4-1-attachments.md`](../specs/v4-1-attachments.md).
 - **Provenance**: an Order records `origin: human | agent` and, for relays, `via: { id?, address, name? }`. Web sends `human`; MCP sends `agent`; the CLI defaults to `human` with `--origin agent [--via <address>]`; a registered Agent asking over RPC is `agent` automatically. The Thread title stays on the **first** question; `summaryTurn` no longer follows follow-ups. Threads created before this batch have no `origin`/`via` (the UI shows nothing).
 
 ## 2. Code map
@@ -82,7 +82,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
 npm test                   # vitest; all 320 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
-npm run routing:eval       # offline rules eval, 53 cases, no model, no cost
+npm run routing:eval       # offline rules eval: 65 scored cases, 3 blocked team cases, no model cost
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
 npm run test:release       # only when packaging/paths changed; ~1 min, no model
@@ -115,22 +115,87 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-**Done on 2026-11-23 in the security / correctness / ops batch** (Wave 1+2 of the ledger sweep; the user chose "Wave 1+2", "#72 = spec + eval only", "#61 = next round"):
+### 2026-11-23 (later) — release-review fixes, Discord attachments/nonce, two specs
 
-- **#65 P0 CSRF / DNS rebinding** — the daemon now answers only to a `Host` that belongs to this machine (`server.ts`: `allowedHosts()`/`hostAllowed()`), refuses a write that carries a foreign `Origin` (`originAllowed()`; CLI/MCP send none), and applies both to the WebSocket upgrade. `POST /api/baristas` accepts only `pi|omp|codex|claude` and no longer takes `bin`/`args`. `tests/security.test.ts` covers cross-site POST, rebinding `Host`, same-origin write, no-Origin CLI, cross-origin WS and the barista whitelist. **The ledger's P0 probes must be re-run against a restarted daemon.**
-- **#76 crash-on-bad-address** — `hostWithPort()` stops the `ws://host:port:port` doubling in `url()`/`announceRoot`/`reconnectHost`; `assertDaemonAddress()` validates `cafe root set` and `POST /api/root`; `connectRoot()` catches an invalid URL, logs `cannot dial root ...` and retries instead of exiting. `tests/address.test.ts`.
-- **#75 address editing / broadcast hygiene** — new `pinnedDaemons` config, `daemon.setHostAddress()`, `POST /api/hosts/address`, `cafe host address <host> [url|--clear]`, Network page "Edit address"; a pinned address beats what a child reports about itself; `emitDaemons()` only pushes addresses verified from the Root (pinned or probed into `knownDaemons`), so a Docker-internal IP no longer propagates. `tests/host-address.test.ts` + `direct-links.test.ts`.
-- **#60 no upper bound on unicast** — `timing.unicastDeadlineMs` (10 min) arms a deadline for every unicast Order; `finishOnDeadline` marks `failed reason=deadline unavailable` (new optional `unavailable` on `order.failed`); `cafe ask --timeout <s>` aborts the stream and cancels the Order, Ctrl-C cancels too, `thread_busy` names `cafe cancel <id>` and `--replace` / `replace: true` cancels the old Order and asks again. `tests/unicast-deadline.test.ts`.
-- **#56/#57/#58/#59** — a connector that exits 0 is `stopped` (no restart, no `error:`), a manual `start` no longer increments `restarts`, the crash-loop message keeps the exit code and signal; `tests/connector.test.ts` now waits for a real heartbeat value and a real log line (6 consecutive green runs); `claudePluginState()` reports `SIGKILL`/timeout instead of `exited null`; `cafe connector ls` works.
-- **#66 daemon log** — `daemonLog()` (ISO timestamp, start line with version/pid/mode, 16 MB cap + one `.1`) replaces the inherited stdout; launchd/systemd and `cafe daemon start` now write raw output to `daemon.stdout.log`; `cafe doctor` warns past 15 MB. `tests/daemon-log.test.ts`, `tests/service.test.ts`.
-- **#67/#68 index and hints write path** — `indexEvent()` returns before touching SQLite when an event has no searchable text (heartbeats/acks/closes: **0 index rows, 0.2 ms for 1000**), statements are prepared once; `outcomeSummary()` groups in SQL and only reads recent decline rows, `hintsFromSummary()` replaces the full-week JS walk, with `agent_events(identity, kind, at DESC)`. `perf:store`: hint recompute **456.6 ms → 51.5 ms** at 200k rows. `tests/search-index.test.ts`, `tests/hint-aggregate.test.ts`.
-- **#70 listeners** — `setMaxListeners(0)`; `/api/health` metrics gain `threadListeners`, `sseClients`, `wsClients`, `hintMs`, `hintRows`. `tests/listeners.test.ts`.
-- **#69 static assets** — gzip when accepted and smaller, ETag/304, immutable cache for assets and `no-cache` + CSP for HTML. `tests/static-assets.test.ts`.
-- **#31 remainder** — `daemon.thread()` returns a bounded page by default (`DEFAULT_THREAD_PAGE = 200`), so SSE replay, the Web UI and `GET /api/threads/:id` stop parsing whole JSONL files.
-- **#72 spec + eval only** — `docs/specs/v4-5-agent-teams.md` (D1 escalate to the direct leader with `excluded_by_chain` reasons, D2 optional `parallel`, D3 `collect: any|all`, D4 keep `TOP_K`/depth constants); `TEAM_CASES` in the fixtures, which `routing:eval` lists as **blocked, not scored**. No routing behaviour changed.
-- **Verification**: typecheck, web `check` + `build:web` (337.60 kB / 103.88 kB gzip), **320 tests** green, `routing:eval` **65/65** (3 blocked team cases), `test:release` **17/17**, `perf:store` numbers above.
-- **Not done**: #61 TLS (next round, by the user's choice), #71 team/channel design, #73 orca, #18 token write, #27 network announce, #39 domain guard, Web virtual lists, snapshot paging, real Discord run.
-- **Committed** as one commit (see `git log`). **The user must restart the daemon** — this session's sandbox refused `cafe daemon stop/start`.
+**Current state.** Uncommitted at handoff: the four review items from the previous
+batch, Discord attachment + nonce support, README/README_zh/SKILL updates, and two
+new specs. The previous two commits are unchanged. The local Root was restarted on
+this code.
+
+**Implemented.**
+
+1. **#65 Origin is now same-origin, not same-hostname.** `originAllowed()` compares
+   the Origin's scheme + host + port against the `Host` header the request arrived
+   on, and still requires the host to be one this machine answers to. A different
+   port or scheme on a trusted name is refused. Two new cases in
+   `tests/security.test.ts`.
+2. **#75/#76 address handling.** `cafe connect` and `cafe root set` validate with
+   `assertDaemonAddress()` **before** writing config. `setHostAddress(…, null)`
+   falls back to the verified address instead of keeping the stale pin, and a pin is
+   broadcast only after the reachability probe records it in `knownDaemons`
+   (`verifiedAddress()` now requires `knownDaemons[host] === pin`). mDNS and
+   `url()` share one formatter (`advertisedAddress()`), so `advertise: host:port` can
+   no longer produce `host:port:port`. Tests in `tests/host-address.test.ts`,
+   `tests/cli.test.ts`, `tests/address.test.ts`.
+3. **#60/#31 follow-up and cancellation.** `daemon.closingEvent()` reads a turn's
+   `order.closed` from the Thread file, and `stream()` replays it when the bounded
+   200-event page did not contain it — so `cafe wait` on an old turn finishes. A
+   failed cancel is reported as `could not cancel it (…)` instead of claiming the
+   question was cancelled. Tests in `tests/events.test.ts`, `tests/cli.test.ts`.
+4. **#69 cache correctness.** Vite now emits content-hashed asset names, and the
+   server marks a file `immutable` for a year **only** when its name carries a
+   hash; everything else is `no-cache`. Tests in `tests/static-assets.test.ts`.
+   `packages/web/dist` was rebuilt, so `web/index.html` now points at hashed files.
+5. **Discord attachments + outbound nonce (#28 leftovers).** `allowAttachments`
+   (default off), `attachmentHosts` (default `cdn.discordapp.com`,
+   `media.discordapp.net`, exact match, https only) and `attachmentMaxMb` (default
+   25) in `readConfig()`/`useReason()`; an attachment-only message is accepted when
+   enabled. On the inbound path the connector downloads via
+   `DiscordPlatform.download()`, uploads through `CafeHttpClient.uploadAttachment()`
+   and sends metadata only — file bytes never enter the Order body. Outbound chunks
+   carry a stable `sha256(eventId:index)` nonce and the discord.js adapter passes
+   `enforceNonce`, so a crash-recovery resend cannot double-post. Tests in
+   `tests/discord-connector.test.ts` (fake platform, 11 cases).
+6. **Two specs, decisions complete, no code:** [`v4-6-tls.md`](../specs/v4-6-tls.md)
+   (#61: two ports, Root CA, TOFU + fingerprint pin, fail-closed, hot renewal;
+   Q1–Q5 with recommendations) and
+   [`v4-7-per-target-questions.md`](../specs/v4-7-per-target-questions.md) (#39:
+   optional `Order.variants` map keyed by agentId, shared `body` fallback, history
+   records the shared body; Q1–Q4).
+7. **Test helper fix.** `waitFor()` treats a throwing predicate as "not yet" (the
+   supervisor runtime file is written after the predicate first runs); the whole
+   suite had one flaky failure from this, now three consecutive green runs.
+
+**Verification.** Typecheck, web `check` + `build:web`, **338 tests ×3**, rules
+eval **65/65**, packed release smoke **17/17**. Local Root restarted on this code.
+
+**Open questions for the user.** The two specs each end with numbered questions;
+the recommendations are in the tables. Nothing in the spec files was implemented.
+
+**Still open.** Real Discord end-to-end (needs the bot token + Message Content
+intent; attachment download needs the connector restarted with the new config);
+Web virtualization, snapshot paging, #27 network-wide announcements, #18 token
+management, Q88/#16 paid runs (each needs its own approval). #62/#63/#64/#74 Web
+changes still need an approved prototype.
+
+### 2026-11-23 — Wave 1+2 dogfooding batch
+
+**Current state.** The batch is in two local commits. Find them by the subjects `fix: close the browser-facing auth hole, bad daemon addresses, and unicast hangs` and `fix: refuse unknown /api/baristas fields instead of ignoring them`. The local Root was restarted after the follow-up fix and still reports `0.1.4`. A read-only health check during this handoff confirmed it is serving and exposes the new listener, connection, and hint metrics. The restart mentioned in the previous batch is no longer pending.
+
+**Implemented.** #65 adds a Host check for loopback requests and Origin checks for HTTP writes and WebSocket upgrades. Loopback still skips tokens. The follow-up commit rejects unknown Barista start fields before reaching the supervisor. #75/#76 add Root-side address overrides in the CLI and Network page, filter child addresses sent to peers, and keep a malformed saved Root address from crashing the Daemon. #60 adds the unicast deadline, `ask --timeout`, interrupt cancellation, and `--replace`. Wave 2 covers connector exit handling and test synchronization, CLI diagnostics, capped daemon logs, FTS and hint costs, static assets, connection metrics, and bounded Thread reads (#31, #56–59, #66–70). See the commit diffs and the sibling ledger `../cafe_dogfooding/issue-20261119.md` for details.
+
+**Verification from the batch.** Typecheck, web check/build, 320 Vitest tests, rules eval 65/65, packed release smoke 17/17, and Claude plugin tests 5/5 passed. The final Barista validation fix was followed by a full 320-test run and a live check confirming rejection with no new worker. The initial live probe had started the default pi worker because unknown fields were silently dropped. That worker was stopped. `perf:store` added zero FTS rows for 1,000 heartbeats and measured the grouped hints query at 51.5 ms versus 458.6 ms for the old row-fetch path in the same synthetic 200k-row run.
+
+**Review before the next release.** The following are from a source check during handoff. Keep new regression checks in isolated `CAFE_HOME` instances.
+
+- **#65.** Review full Origin matching, including scheme and port. The current comparison uses the origin hostname. Existing tests and live checks covered the original cases. See `packages/daemon/src/server.ts` and `tests/security.test.ts`.
+- **#75/#76.** Verify `--clear` restores the advertised or learned address and propagates the change across multiple Hosts. The current clear branch leaves the previous URL in the in-memory record. A manually pinned address can be shared without a reachability probe. `cafe root set` writes config before the live API validates it, and mDNS still formats `advertise` separately. See `packages/daemon/src/daemon.ts`, `packages/daemon/src/index.ts`, and `packages/cli/src/main.ts`.
+- **#60/#31.** CLI cancellation is best-effort and can report success after a failed cancel request. Test that an SSE subscriber following an older Order can finish when its terminal event is outside the 200-event replay window. Synchronous event appends remain. See `packages/cli/src/main.ts` and `packages/daemon/src/server.ts`.
+- **#69.** The built JS/CSS paths are stable and the server marks them `immutable` for one year. Verify an upgrade with an already-warm browser cache and align the cache policy with the filenames. See `packages/web/vite.config.ts` and `packages/daemon/src/server.ts`.
+
+**Agreed next work.** #61 TLS gets its own design and rollout round. #72 is a draft and offline eval coverage only. Three team cases are blocked and excluded from the 65-case score. Review the proposed collect, parallel sub-Order and direct-leader clarification semantics before implementing them. #71 team/channel design and #73 Orca integration are separate efforts. See [`v4-5-agent-teams.md`](../specs/v4-5-agent-teams.md).
+
+**Still open.** #62/#63/#64/#74 Web changes need an approved prototype. Web virtualization, snapshot paging, #39 per-target questions, #27 network-wide announcements, and #18 token management remain on the backlog. Real Discord end-to-end needs a supervised test in an allowlisted channel with Message Content intent. Use a fresh bot token via secure local configuration. Q88/#16 real-model runs still need separate approval per paid run.
 
 **Done on 2026-11-23 in the dogfooding + Discord batch** (the user asked to work the `cafe_dogfooding/issue-20261119.md` ledger by priority against the current code, decide fixes on their own judgement, skip anything needing a person, and hand off; they went to rest):
 
@@ -142,7 +207,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 6. **#33 web store** — `appendEvent` now batches a burst into one `set()` + one array copy (was `[...events, env]` per event), dedupes by id. Web `check` + `build:web` pass.
 7. **`cafe skill install --dry-run / --force`** — repoints a stale link to another checkout instead of "remove it to relink" (from the ledger's "confirmed not a defect" note).
 8. **Verification**: typecheck; web check + `build:web`; **276 tests ×3 (plus two more full-equivalent runs, 11× bridge alone)**; `routing:eval` 63/63; `test:release` **17/17** (packaged Discord connector installs, SDK links). `npm run perf:store` numbers above.
-9. **Not done / needs a person**: real Discord end-to-end (token + Message Content intent), the paid Q88/#16 TUI Bridge runs, #39 per-target sub-questions (needs a wire spec), Web virtualization (`#33` remainder), snapshot paging (#34 remainder), and the user's daemon restart (blocked by the session's sandbox: `cafe daemon restart` was denied — the daemon still runs the pre-batch code until the user restarts it). **Committed** as `feat: Discord connector, connector supervisor and packaging, FTS search, honest claude install` (commit `ca6e2d4`; find it with `git log --oneline`, not by hash). The connector is opt-in: nothing runs until `cafe connector install discord` + a configured bot token. Still to do by the user: restart the daemon.
+9. **Remaining from that batch**: real Discord end-to-end, the paid Q88/#16 TUI Bridge runs, #39 per-target sub-questions (needs a wire spec), Web virtualization (#33), and snapshot paging (#34). The feature commit is `feat: Discord connector, connector supervisor and packaging, FTS search, honest claude install`. The connector is opt-in and needs local bot configuration. The restart deferred at that handoff was completed in the later Wave 1+2 batch above.
 
 **Done on 2026-11-21 in the UI / reliability batch** (the user reviewed the web UI and the dogfooding ledger, chose to finish the agreed plan, asked for parallel subagents, and went to rest; Q2 was revised to "one intuitive `/cafe` across Claude/pi/omp, rename the inconsistent group"; Q3 = observability only, no per-target sub-question wire change):
 
@@ -316,7 +381,7 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
    - Change A's IP and restart A: A dials back `knownDaemons`; else `cafe root set <new-ip>:4777` on B.
    - Restart B's daemon mid-question: recovers or fails cleanly, no duplicate pi workers.
    - `cafe daemon install` on B, reboot or `kill -9` the daemon: it comes back; `cafe daemon stop` keeps it stopped.
-6. Logs: `~/.cafe/daemon.log`, `~/.cafe/logs/barista-*.log`.
+6. Logs under `CAFE_HOME` (`~/.cafe` by default): `daemon.log` is timestamped and capped, `daemon.log.1` holds the prior rotation, and `logs/barista-*.log` holds worker output. New service definitions send raw startup output to `daemon.stdout.log`. An existing service definition may still point at `daemon.log`.
 
 ## 7. Backlog after v2
 
@@ -411,4 +476,4 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - Restart their daemon yourself after daemon / web changes (section 8). Publishing to npm and changing their Claude / Codex config stay with them.
 - UI prototypes are Claude artifacts: v1 https://claude.ai/artifact/JQDywMh5YuYWsT7yaMXtSK, routing-history display https://claude.ai/artifact/JJit3GCxiQZUypYVWZFxFg (approved: Q51–Q53 as recommended), older threads + search https://claude.ai/artifact/ARjRg8XRAdsx44YSdYehvZ (approved: Q67–Q68 as recommended), versions https://claude.ai/artifact/SVLEJhirFrxq7ugMipjeiZ (Q71 A, implemented), agent kinds https://claude.ai/artifact/X3F3dx2PtBQf3R5HwsiRL5 (Q81–Q83 as recommended, implemented). Artifacts are unavailable under `ANTHROPIC_AUTH_TOKEN`; the v3-3 workbench used a local prototype instead: [`docs/prototypes/web-workbench-2026-11-19.html`](../prototypes/web-workbench-2026-11-19.html) (Q101–Q107, implemented).
 
-**Suggested skills for the next agent** (call via the Skill tool): `superpowers:brainstorming` before specifying #20 attachments / #28 connector SDK / #27 update-rollback; `superpowers:writing-plans` / `superpowers:executing-plans` for the remaining backlog; `superpowers:test-driven-development` for every fix; `superpowers:systematic-debugging` for the paid phase-2 runs and any flake; the `cafe` skill when debugging the network itself; `playwright` for real-browser UI checks. `artifact-design` only if a claude.ai login is available (Artifacts are refused under `ANTHROPIC_AUTH_TOKEN`; use a local HTML prototype instead).
+**Suggested skills for the next agent** (call via Skill): use `superpowers:brainstorming` for #61 TLS and #71 team/channel design, `superpowers:writing-plans` once a spec is approved, and `superpowers:systematic-debugging` plus `superpowers:test-driven-development` for the regressions listed in §5. Use `cafe` for live network diagnosis and `playwright` for browser regressions. For UI design, use `artifact-design` when the artifact tool is available. A local HTML prototype works when it is unavailable.

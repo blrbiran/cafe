@@ -162,7 +162,9 @@ cafe connector start discord
 cafe connector logs discord --follow
 ```
 
-在 guild 里机器人只回答 @ 它的消息（`requireMention` 默认开）；`allowDMs` 打开私聊。回复发回同一频道，按 Discord 2000 字符上限切分。`allowGuilds`/`allowChannels`/`allowUsers` 默认为空 = 全部允许，共享服务器请设置白名单。安装时会把 `discord.js` 装进 connector 自己的目录（不是 cafe 的依赖）。
+在 guild 里机器人只回答 @ 它的消息（`requireMention` 默认开）；`allowDMs` 打开私聊。回复发回同一频道，按 Discord 2000 字符上限切分；每段带稳定的 nonce，崩溃恢复重发不会把同一条回答发两遍。`allowGuilds`/`allowChannels`/`allowUsers` 默认为空 = 全部允许，共享服务器请设置白名单。安装时会把 `discord.js` 装进 connector 自己的目录（不是 cafe 的依赖）。
+
+**附件需要显式开启。** 设置 `cafe connector config discord allowAttachments true` 后，消息里的文件会被下载、上传到本地 daemon 并挂到 Order 上；Barista 只看到文字和本地路径，永远拿不到文件内容。由于消息里的 URL 属于不可信输入，只有当 URL 是 `https`、且主机名精确列在 `attachmentHosts`（默认 `cdn.discordapp.com`、`media.discordapp.net`）时才下载，单文件上限 `attachmentMaxMb`（默认 25）。开启附件后，只有文件没有文字的消息也会被接收。
 
 connector 是一个目录：`cafe-connector.json`（name / entry / permissions / configSchema）+ 一个用 `@cafe/connector` 的 `defineConnector` 写的入口。状态在 `CAFE_HOME/connector-data/<name>/`，日志在 `CAFE_HOME/logs/connector-<name>.log`。`install` 复制目录并把 SDK 链接进它的 `node_modules`；SDK 随发布包分发（`connector/`），所以从已发布 cafe 安装的 connector 也能解析 `@cafe/connector`。connector 由监管器托管：意外退出会退避重启，1 分钟内退出 5 次则停在 `crashed`（看 `cafe connector logs`），不会无限重启。可用 `CAFE_CONNECTOR_MAX_RESTARTS` / `CAFE_CONNECTOR_WINDOW_MS` / `CAFE_CONNECTOR_BACKOFF_MS` 调整。
 
@@ -215,11 +217,12 @@ open http://127.0.0.1:4777/
 ### 地址与访问
 
 - Daemon 只接受属于本机的 `Host` 头（`localhost`、`127.0.0.1`、本机 host 名、`advertise` 或其 IP）。被 DNS rebinding 骗进本机的页面会被拒绝，连静态文件也不给。
-- 带外部 `Origin` 的请求不能写。Web UI 与 CLI 不受影响；`curl` / MCP 不带 `Origin`，照常可用。loopback 仍免 token，远程访问仍需 token。
-- `advertise` 可以只写主机（`192.168.1.20`），也可以写 `host:port`；已经带端口时不会再拼一遍。`cafe root set` 与 `POST /api/root` 会拒绝畸形地址而不是写进配置；daemon 读到坏 `root:` 时只记日志并继续重连，不再退出。
-- 子机 `advertise` 从 Root 不可达（Docker/NAT）时不再污染直连：Root 只广播验证过的地址，用 `cafe host address`（或 Network 页「改地址」）可以固定一个可用地址。
-- `cafe ask` 支持 `--timeout <秒>`（默认不限），超时会取消该 Order；Ctrl-C 也会取消，不会留下 `thread_busy`。unicast Order 的目标只发心跳不回答时，10 分钟后自动关单。Thread 忙时追问可加 `--replace` 取消旧问题。
+- 带外部 `Origin` 的请求不能写。写请求只有在 `Origin` 与本次请求到达时的 scheme、主机、端口完全一致时才放行——同一主机名换个端口或 scheme 也会被拒。Web UI 与 CLI 不受影响；`curl` / MCP 不带 `Origin`，照常可用。loopback 仍免 token，远程访问仍需 token。
+- `advertise` 可以只写主机（`192.168.1.20`），也可以写 `host:port`；已经带端口时不会再拼一遍。`cafe root set` 与 `cafe connect` 会先校验再写盘（`POST /api/root` 同样拒绝畸形地址），所以停着的 daemon 不会被写进一个它解析不了的地址。
+- 子机 `advertise` 从 Root 不可达（Docker/NAT）时不再污染直连：Root 只广播验证过的地址，用 `cafe host address`（或 Network 页「改地址」）可以固定一个可用地址。手工固定的地址要等可达性探测成功才会下发给其它子机；`cafe host address <host> --clear` 会回退到 Root 最后验证过的地址。
+- `cafe ask` 支持 `--timeout <秒>`（默认不限），超时会取消该 Order；Ctrl-C 也会取消，不会留下 `thread_busy`。取消请求本身失败时会如实报告，不再谎称已取消。unicast Order 的目标只发心跳不回答时，10 分钟后自动关单。Thread 忙时追问可加 `--replace` 取消旧问题。对早于 daemon 200 条回放窗口的旧轮次执行 `cafe wait` 也会正常结束（daemon 会从 Thread 文件里读出该轮次的关闭事件）。
 - `POST /api/baristas` 只接受 `pi` / `omp` / `codex` / `claude`，不再接受任意可执行文件与 argv。
+- **目前传输层仍是明文。** 共享 token 在 WebSocket 握手中穿过局域网，能抓包的人即可获得完整权限。TLS 方案（Root 自建 CA、fail-closed、指纹 pin、独立端口）已写在 [`docs/specs/v4-6-tls.md`](docs/specs/v4-6-tls.md)，尚未实现；在此之前请把 daemon 限制在 loopback 或可信 tailnet 内。
 
 ## 包结构
 
