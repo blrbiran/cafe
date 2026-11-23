@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RoutingHint } from "@cafe/protocol";
-import { RulesRouter, TOP_K } from "../packages/daemon/src/router.ts";
+import { RulesRouter, TOP_K, splitClauses } from "../packages/daemon/src/router.ts";
 import { computeHints, identityOf, orderKeywords, type OutcomeRow } from "../packages/daemon/src/hints.ts";
 import { EVAL_CASES, EXTRA_CASES, TEAM_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
 
@@ -73,6 +73,22 @@ describe("routing eval (rules)", () => {
     expect(after.filter((r) => !r.clear).every(pass)).toBe(true);
   });
 });
+describe("per-target sub-questions in the eval (v4-7 #39)", () => {
+  it("splits exactly the explicit two-clause structures, verbatim", () => {
+    expect(splitClauses("the refund page is broken, and the invoice total is wrong")).toEqual(["the refund page is broken", "the invoice total is wrong"]);
+    expect(splitClauses("页面崩了；发票也不对")).toEqual(["页面崩了", "发票也不对"]);
+    expect(splitClauses("页面崩了以及发票也不对")).toEqual(["页面崩了", "发票也不对"]);
+    // A bare "and", or a conjunction inside one clause, is not a split.
+    expect(splitClauses("the refund page is broken and the invoice total is wrong")).toBeUndefined();
+    expect(splitClauses("the refund page is broken")).toBeUndefined();
+  });
+
+  it("records a two-clause case that expects variants, and one that must not split", () => {
+    expect(EXTRA_CASES.some((c) => c.variants === 2)).toBe(true);
+    expect(EXTRA_CASES.some((c) => c.mode === "multicast" && c.variants === undefined)).toBe(true);
+  });
+});
+
 describe("team cases (#71/#72) are recorded without changing routing", () => {
   it("keeps every team case labelled, and marks the ones waiting on a decision", () => {
     const blocked = TEAM_CASES.filter((c) => c.blocked).map((c) => c.blocked);

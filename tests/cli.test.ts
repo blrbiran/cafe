@@ -313,7 +313,7 @@ describe("Node version precheck", () => {
       { encoding: "utf8" },
     );
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain("cafe requires Node >= 22.18");
+    expect(r.stderr).toContain("cafe requires Node >= 22.19");
     expect(r.stderr).toContain("18.20.8");
     expect(r.stderr).not.toContain("ERR_UNKNOWN_FILE_EXTENSION");
   });

@@ -28,7 +28,7 @@ cafe is an agent network: a message (an **Order**) from any party is routed to t
 
 ## Quick start
 
-Requires Node ≥ 22.18.
+Requires Node ≥ 22.19.
 
 ```bash
 npm i -g @blrbiran/cafe
@@ -226,7 +226,7 @@ Logs: `~/.cafe/daemon.log` (timestamped, capped at 16 MB with one `daemon.log.1`
 - A child whose `advertise` is unreachable from the Root (Docker/NAT) no longer poisons direct links: the Root only broadcasts addresses it has verified, and `cafe host address` (or Network → Edit address) pins a working one. A pinned address is broadcast only once a reachability probe succeeds; `cafe host address <host> --clear` falls back to the address the Root last verified.
 - `cafe ask` gives up after `--timeout <seconds>` (default: no limit) and cancels the Order, and Ctrl-C cancels it too, so a stuck follow-up does not leave `thread_busy` behind. If that cancel request fails, the CLI says so instead of claiming the question was cancelled. A unicast Order whose Barista only heartbeats closes after 10 minutes. A follow-up on a busy Thread can pass `--replace` to cancel the old question. `cafe wait` on a turn older than the daemon's 200-event replay page still finishes, because the daemon reads that turn's close from the Thread file.
 - `POST /api/baristas` only starts `pi`, `omp`, `codex` or `claude`; it no longer accepts an arbitrary executable or argv.
-- **Transport is plaintext today.** The shared token crosses the LAN inside the WebSocket handshake, so anyone who can capture packets has full access. A TLS design (Root-issued CA, fail-closed, fingerprint pin, separate port) is written up in [`docs/specs/v4-6-tls.md`](docs/specs/v4-6-tls.md) and not yet implemented; until then, keep the daemon on loopback or a trusted tailnet.
+- **Transport security (TLS, v4-6).** `security.mode: tls` is the default. A Root generates a CA once (`~/.cafe/tls/ca.crt` + `ca.key`, 0600) and each Daemon presents a leaf signed by it on a TLS port (`security.tls.port`, default 4778); the Web UI and loopback calls stay on plaintext 4777. A child Host with a `root` and no CA fetches the Root's public CA and pins its SHA-256 fingerprint; set the pin explicitly with `cafe connect <host:port> --token … --ca-fingerprint sha256:…` (`cafe root show` on the Root prints it). Verification is fail-closed — there is no plaintext fallback — and SAN plus the pinned fingerprint are both checked. `cafe daemon renew-cert` reissues a leaf that new connections pick up without a restart. `security.mode: plaintext` is an explicit local/isolation escape hatch. See [`docs/specs/v4-6-tls.md`](docs/specs/v4-6-tls.md).
 
 ## Package layout
 
@@ -264,7 +264,7 @@ The Daemon is a long-running process: `npm run build:web` does **not** switch a 
 
 ```bash
 git pull
-source ~/.bash_profile          # Node ≥ 22.18 (nvm); a bare ssh login may still be Node 18
+source ~/.bash_profile          # Node ≥ 22.19 (nvm); a bare ssh login may still be Node 18
 npm install
 npm run build:web
 npm link --workspace @cafe/cli

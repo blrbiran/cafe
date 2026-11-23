@@ -43,6 +43,8 @@ interface Attempt {
   pass: boolean;
   fallback: boolean;
   ms: number;
+  /** How many per-target variants the decision carried (v4-7 #39). */
+  variantCount: number;
 }
 
 const router: Router = model ? new LlmRouter(await piComplete(model), new RulesRouter(), { timeoutMs, concurrency, cache: false }) : new RulesRouter();
@@ -59,7 +61,10 @@ async function once(): Promise<Attempt[]> {
       ? d.mode === "multicast" && d.targets.length >= 1 && d.targets.length <= TOP_K
       : d.mode === wantMode &&
         (wantMode === "broadcast" ? names.length === baristas.length : wantMode === "unicast" ? names.length === 1 && names[0] === c.expect[0] : c.expect.every((n) => names.includes(n)));
-    out.push({ q: c.q, expected: c.expect, mode: wantMode, got: names, gotMode: d.mode, pass, fallback: !!d.llmError, ms });
+    // A case that expects per-target variants (v4-7 #39) must also carry that many.
+    const variantCount = d.variants ? Object.keys(d.variants).length : 0;
+    const variantsOk = c.variants === undefined || variantCount === c.variants;
+    out.push({ q: c.q, expected: c.expect, mode: wantMode, got: names, gotMode: d.mode, pass: pass && variantsOk, fallback: !!d.llmError, ms, variantCount });
   }
   return out;
 }

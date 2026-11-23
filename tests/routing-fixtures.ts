@@ -32,6 +32,8 @@ export interface EvalCase {
   clear?: boolean;
   /** No clear owner: a bounded fan-out to at most TOP_K Baristas, never everyone. */
   topK?: boolean;
+  /** Per-target sub-questions (v4-7 #39): how many variants the decision should carry. */
+  variants?: number;
 }
 
 export const EVAL_CASES: EvalCase[] = [
@@ -117,6 +119,10 @@ export const EXTRA_CASES: EvalCase[] = [
   { q: "rotate the oauth client secret", expect: ["security"] },
   // Multicast: a question that genuinely spans two owners, with a sub-task each.
   { q: "the refund page shows a hydration error and the invoice total is wrong", expect: ["web", "billing"], mode: "multicast" },
+  // Per-target sub-questions (v4-7 #39): a clean two-clause split gives each owner its own half.
+  { q: "the refund page shows a hydration error, and the invoice total is wrong", expect: ["web", "billing"], mode: "multicast", variants: 2 },
+  // Ambiguous: separable enough to multicast, but no mechanical two-clause split → shared body.
+  { q: "hydration error on the refund page as well as the invoice total being wrong", expect: ["web", "billing"], mode: "multicast" },
   // Unknown owner should not fan out to everyone.
   { q: "what is the meaning of life", expect: [], mode: "multicast", topK: true },
   // Same input, repeated: the LLM run should keep the mode and target set stable.

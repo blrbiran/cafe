@@ -16,7 +16,7 @@ const timing = { ...FAST, linkConnectTimeoutMs: 300, linkIdleMs: 60_000 };
 /** A Root that can be stopped and started again on the same home and port. */
 async function restartableRoot() {
   const home = mkdtempSync(join(tmpdir(), "cafe-root-"));
-  writeFileSync(join(home, "config.yml"), stringify({ host: "root", token: "t0k", port: 0, mode: "root", advertise: "127.0.0.1" }));
+  writeFileSync(join(home, "config.yml"), stringify({ host: "root", token: "t0k", port: 0, mode: "root", advertise: "127.0.0.1", security: { mode: "plaintext" } }));
   const opts = { home, timing, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "none") };
   let r: Running | undefined = await runDaemon(opts);
   const port = r.server.port;

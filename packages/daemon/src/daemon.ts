@@ -141,6 +141,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   readonly isRoot: boolean;
   /** Headless Barista process supervisor (set by runDaemon). */
   supervisor?: import("./supervisor.ts").Supervisor;
+  /**
+   * TLS state shared with the server and the CLI (v4-6): the CA PEM, its fingerprint and the
+   * currently active leaf. Set by `runDaemon`; undefined when `security.mode: plaintext`.
+   */
+  tlsContext?: {
+    ca: string;
+    caFingerprint: string;
+    /**
+     * False while this Host is running on a temporary local CA because its Root was unreachable at
+     * boot: agent traffic is TLS, but daemon-to-daemon links stay on their established scheme until
+     * the real CA is enrolled.
+     */
+    network?: boolean;
+    current(): { cert: string; key: string };
+    replace(next: { cert: string; key: string }): void;
+    /** Called after `replace`; the TLS listener swaps in the new leaf for new connections. */
+    onRenew(fn: () => void): () => void;
+    /**
+     * Root only: issue a leaf for a child Host (has the CA key). Absent on a child, which asks the
+     * Root for one over TLS with its token (`POST /api/tls/leaf`).
+     */
+    issue?(sans: string[]): Promise<{ cert: string; key: string }>;
+  };
   readonly host: string;
   readonly version: string;
   private router: Router;
@@ -340,6 +363,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   url(): string {
     return `ws://${hostWithPort(this.config.advertise ?? lanAddress(), this.config.port)}`;
+  }
+
+  /** Scheme for outgoing Daemon-to-Daemon sockets (v4-6): `wss://` once a network CA is enrolled. */
+  private linkScheme(): "ws" | "wss" {
+    return this.tlsContext?.network ? "wss" : "ws";
+  }
+
+  /** WebSocket URL for another Daemon's `host:port`-style address, following the TLS mode. */
+  private wsUrlTo(addr: string): string {
+    return `${this.linkScheme()}://${addr}/ws`;
+  }
+
+  /** `ws` client options for a Daemon link: trust exactly the network's CA, never disable verification. */
+  private linkOptions(): { ca?: string } {
+    return this.tlsContext?.network ? { ca: this.tlsContext.ca } : {};
   }
 
   get rootOnline(): boolean {
@@ -999,7 +1037,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const rec = this.registry.get(agentId);
     if (!rec) return this.targetFailed(t, agentId, "unknown agent");
     if (t.order.kind === "order") this.armAck(t, agentId);
-    this.deliver(t.order, agentId);
+    this.deliver(this.forTarget(t.order, agentId, t.decision?.variants ?? t.order.variants), agentId);
+  }
+
+  /**
+   * The Order one target receives. A multicast that the router split into sub-questions (v4-7 #39)
+   * sends only that target's own text and never carries the other halves: `variants` is stripped so
+   * a Barista's prompt cannot leak another target's question. The recorded Order keeps `body`.
+   */
+  private forTarget(order: Order, agentId: string, variants: Record<string, string> | undefined): Order {
+    if (!variants) return order;
+    const { variants: _drop, ...rest } = order;
+    return { ...rest, body: variants[agentId] ?? order.body };
   }
 
   /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally or directly (ADR-0004). */
@@ -1050,7 +1099,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const url = this.peerUrls.get(host);
     if (!url) return Promise.reject(new Error(`no address for ${host}`));
     const attempt = new Promise<Peer>((resolve, reject) => {
-      const ws = new WebSocket(`${url}/ws`);
+      // `url` is a stored `ws(s)://host:port`; keep its scheme, add the CA when it is TLS.
+      const ws = new WebSocket(`${url}/ws`, this.linkOptions());
       const peer = new Peer(ws);
       peer.meta.kind = "peer";
       peer.meta.host = host;
@@ -1937,7 +1987,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const target = this.config.root;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(`ws://${target}/ws`);
+      ws = new WebSocket(this.wsUrlTo(target), this.linkOptions());
     } catch (err) {
       // A persisted bad address must not crash the daemon on every boot (#76): say so and keep
       // retrying at the normal backoff, so `cafe root set` can still repair it later.
@@ -2440,6 +2490,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       retention: this.config.retention,
       attachments: this.config.attachments,
       discovery: this.config.discovery,
+      // Report the CA fingerprint actually in force, so a fingerprint enrolled automatically at
+      // startup does not show as a pending change (the file still lags until the next save).
+      security: { ...this.config.security, tls: { ...this.config.security.tls, caFingerprint: this.tlsContext?.caFingerprint ?? this.config.security.tls.caFingerprint } },
     };
     // Saved-but-not-applied values, so the CLI and Web can say "restart required"
     // without reading config.yml themselves.

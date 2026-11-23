@@ -1,3 +1,5 @@
+import { setDefaultCACertificates, getCACertificates } from "node:tls";
+import { daemonWsUrl } from "./urls.ts";
 import {
   DEFAULT_PORT,
   HEARTBEAT_INTERVAL_MS,
@@ -25,6 +27,12 @@ export interface ClientOptions {
   /** Longest wait between reconnect attempts. Default: 5 s for a Daemon on this machine, 30 s otherwise. */
   reconnectMaxMs?: number;
   log?: (msg: string) => void;
+  /**
+   * TLS transport (v4-6). When set, the socket uses `wss://` and the Root CA is added to the trust
+   * store — via the per-client `WebSocket` options under Node's `ws`-compatible API, or by extending
+   * the process-wide default CA list (Node ≥ 22.19), never by disabling verification.
+   */
+  tls?: { ca?: string; caFingerprint?: string; servername?: string };
 }
 
 /** A local Daemon restarts in seconds (launchd, `cafe daemon start`); do not leave its Agents waiting 30 s. */
@@ -106,9 +114,21 @@ export class CafeClient {
     return this.open();
   }
 
+  /**
+   * Open the WebSocket with the right scheme. Plaintext uses the global `WebSocket`; TLS adds the
+   * Root CA to Node's default trust store before the handshake (`tls.setDefaultCACertificates`,
+   * Node ≥ 22.19). The CA is *added*, never swapped for "accept everything", so a leaf outside it
+   * still fails.
+   */
+  private connectSocket(): WebSocket {
+    const url = daemonWsUrl(this.opts.daemon, { tls: !!this.opts.tls });
+    if (this.opts.tls?.ca) applyCa(this.opts.tls.ca);
+    return new WebSocket(url);
+  }
+
   private open(): Promise<AgentRecord | undefined> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://${this.opts.daemon}/ws`);
+      const ws = this.connectSocket();
       this.ws = ws;
       const peer = new Peer(ws);
       let settled = false;
@@ -239,6 +259,24 @@ export class CafeClient {
 export function heartbeatIntervalMs(): number {
   const ms = Number(process.env.CAFE_HEARTBEAT_INTERVAL_MS);
   return Number.isFinite(ms) && ms > 0 ? ms : HEARTBEAT_INTERVAL_MS;
+}
+
+/**
+ * Add a CA to Node's default trust store so the global `fetch`/`WebSocket` accept the Daemon's leaf
+ * (v4-6 §2). Idempotent and additive: the system roots stay trusted, and verification is never
+ * turned off. A no-op outside Node (the Web UI never calls this — it stays on plaintext 4777).
+ */
+const appliedCas = new Set<string>();
+function applyCa(caPem: string): void {
+  if (appliedCas.has(caPem)) return;
+  try {
+    // Additive: the system roots stay trusted, and verification is never turned off.
+    setDefaultCACertificates([...getCACertificates("default"), caPem]);
+    appliedCas.add(caPem);
+  } catch {
+    // A runtime without this API keeps the system roots only; the handshake then fails closed
+    // rather than silently trusting everything.
+  }
 }
 
 /** Keep an Order alive while long work runs: sends a heartbeat every interval until stopped. */

@@ -9,13 +9,28 @@ import { runDaemon, type Running, type RunOptions } from "@cafe/daemon";
 export const FAST = { ackTimeoutMs: 300, heartbeatIntervalMs: 200, broadcastDeadlineMs: 800, reconnectMinMs: 50, reconnectMaxMs: 200 };
 
 export async function startDaemon(host: string, opts: Partial<RunOptions> & { config?: Record<string, unknown> } = {}): Promise<Running & { home: string; addr: string }> {
-  const home = mkdtempSync(join(tmpdir(), `cafe-${host}-`));
-  writeFileSync(join(home, "config.yml"), stringify({ host, token: "t0k", port: 0, advertise: "127.0.0.1", ...(opts.mode ? { mode: opts.mode } : {}), ...opts.config }));
+  // A caller may supply its own home (e.g. a TLS test that pre-seeds certs); otherwise a scratch
+  // home is created, which the returned stop() removes.
+  const supplied = opts.home;
+  const home = supplied ?? mkdtempSync(join(tmpdir(), `cafe-${host}-`));
+  // Tests default to plaintext transport (the production default is TLS): a fixed TLS port would
+  // collide across dozens of parallel test daemons. The TLS suites opt in with an explicit
+  // `security` block.
+  const config = { security: { mode: "plaintext" }, ...opts.config };
+  writeFileSync(join(home, "config.yml"), stringify({ host, token: "t0k", port: 0, advertise: "127.0.0.1", ...(opts.mode ? { mode: opts.mode } : {}), ...config }));
   const r = await runDaemon({ home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "no-web"), ...opts });
   const addr = `127.0.0.1:${r.server.port}`;
   const stop = r.stop;
   let stopped: Promise<void> | undefined;
-  return Object.assign(r, { home, addr, stop: () => (stopped ??= (async () => { await stop(); rmSync(home, { recursive: true, force: true }); })()) });
+  return Object.assign(r, {
+    home,
+    addr,
+    // Only a scratch home this helper created is removed here; a caller-supplied home is theirs.
+    stop: () => (stopped ??= (async () => {
+      await stop();
+      if (!supplied) rmSync(home, { recursive: true, force: true });
+    })()),
+  });
 }
 
 export function identity(name: string, extra: Partial<AgentIdentity> = {}): AgentIdentity {

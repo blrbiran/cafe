@@ -45,6 +45,21 @@ const INTENT_GROUPS: ReadonlyArray<{ test: RegExp; words: readonly string[] }> =
 const specific = (t: string) => (t.length >= 8 ? 2 : 0);
 
 /**
+ * An explicit two-clause question (v4-7 #39). Returns the two clause texts verbatim, or undefined
+ * when the split is not mechanical and safe to explain. Deliberately narrow: the rules router never
+ * rewrites the customer's words, only splits on a conjunction that separates two whole clauses.
+ */
+export function splitClauses(body: string): [string, string] | undefined {
+  // English: ", and " / ", also " / " and also " (never a bare "and", which joins within a clause).
+  const en = body.match(/^(.{3,}?)(?:,\s*(?:and|also)\s+|\s+and\s+also\s+)(.{3,})$/i);
+  if (en) return [en[1]!.trim(), en[2]!.trim()];
+  // CJK punctuation or 以及 between two clauses.
+  const cjk = body.match(/^(.{2,}?)\s*(?:[；;]|以及)\s*(.{2,})$/);
+  if (cjk) return [cjk[1]!.trim(), cjk[2]!.trim()];
+  return undefined;
+}
+
+/**
  * Deterministic fallback: keyword overlap between the Order body and each
  * Barista's name/tags/description/scope.
  *
@@ -57,24 +72,30 @@ const specific = (t: string) => (t.length >= 8 ? 2 : 0);
 export class RulesRouter implements Router {
   readonly name = "rules" as const;
 
+  /** Keyword score of one candidate against one text; shared by whole-body and per-clause scoring. */
+  private score(c: AgentRecord, body: Set<string>, raw: string): { score: number; weak: number } {
+    const text = tokenize(`${c.name} ${c.tags.join(" ")} ${c.description} ${c.scope.join(" ")}`);
+    let score = 0;
+    if (mentions(body, c.name)) score += 5;
+    for (const t of c.tags) {
+      if (mentions(body, t)) score += 3 + specific(t);
+    }
+    for (const t of text) if (body.has(t)) score += 1 + specific(t);
+    for (const group of INTENT_GROUPS) {
+      if (group.test.test(raw) && group.words.some((w) => text.has(w))) score += 10;
+    }
+    // Weak signal for the top-k fallback: how many body tokens this Barista mentions at all.
+    const weak = [...body].filter((t) => text.has(t)).length;
+    return { score, weak };
+  }
+
   async decide({ order, candidates, hints, broadcast }: RouteInput): Promise<RoutingDecision> {
     if (candidates.length === 0) return { targets: [], mode: "broadcast", reason: "no eligible baristas", router: "rules", candidates: [], confidence: 0, fanout: 0 };
     if (broadcast) return { targets: candidates.map((c) => c.agentId), mode: "broadcast", reason: "customer asked everyone", router: "rules", candidates: [], confidence: 1, fanout: candidates.length };
     const body = tokenize(order.body);
     const scored = candidates
       .map((c) => {
-        const text = tokenize(`${c.name} ${c.tags.join(" ")} ${c.description} ${c.scope.join(" ")}`);
-        let score = 0;
-        if (mentions(body, c.name)) score += 5;
-        for (const t of c.tags) {
-          if (mentions(body, t)) score += 3 + specific(t);
-        }
-        for (const t of text) if (body.has(t)) score += 1 + specific(t);
-        for (const group of INTENT_GROUPS) {
-          if (group.test.test(order.body) && group.words.some((w) => text.has(w))) score += 10;
-        }
-        // Weak signal for the top-k fallback: how many body tokens this Barista mentions at all.
-        const weak = [...body].filter((t) => text.has(t)).length;
+        const { score, weak } = this.score(c, body, order.body);
         const penalty = historyPenalty(hints?.get(c.agentId), body);
         const tiebreak = (c.status === "idle" ? 0.5 : 0) - penalty;
         return { c, score, weak, penalty, tiebreak };
@@ -91,6 +112,23 @@ export class RulesRouter implements Router {
       if (separable && strong.length >= 2 && strong[1]!.score >= strong[0]!.score * 0.6) {
         const top = strong.slice(0, TOP_K);
         const leftOut = matched.filter((s) => !top.includes(s)).slice(0, 3);
+        // A clean two-clause split gives each owner only its own half (v4-7 #39). The clause text is
+        // passed through verbatim; the rules router never rewrites the customer's words.
+        const variants = this.clauseVariants(order.body, top.map((s) => s.c));
+        const chosen = variants ? top.filter((s) => variants[s.c.agentId] !== undefined) : top;
+        if (variants && chosen.length === 2) {
+          return {
+            targets: chosen.map((s) => s.c.agentId),
+            mode: "multicast",
+            reason: `two-clause split: ${chosen.map((s) => `${s.c.address} gets its own half`).join(", ")}`,
+            router: "rules",
+            candidates: leftOut.map((s) => s.c.agentId),
+            confidence: 0.65,
+            fanout: chosen.length,
+            variants,
+            ...(leftOut.length ? { whyNot: leftOut.map((s) => ({ agentId: s.c.agentId, reason: `lower description score (${s.score}) than the chosen targets` })) } : {}),
+          };
+        }
         return {
           targets: top.map((s) => s.c.agentId),
           mode: top.length > 1 ? "multicast" : "unicast",
@@ -139,6 +177,32 @@ export class RulesRouter implements Router {
       fanout: top.length,
       ...(leftOut.length ? { whyNot: leftOut.map((s) => ({ agentId: s.c.agentId, reason: "not in the top 3 by keyword overlap" })) } : {}),
     };
+  }
+
+  /**
+   * Assign each of two verbatim clauses to its own best owner among `owners`. Returns undefined
+   * unless the split is unambiguous: exactly two owners, each clause clearly matching a different
+   * one. The clause text is not rewritten.
+   */
+  private clauseVariants(body: string, owners: AgentRecord[]): Record<string, string> | undefined {
+    const parts = splitClauses(body);
+    if (!parts || owners.length !== 2) return undefined;
+    const bestOwner = (clause: string): { id: string; score: number } | undefined => {
+      const tokens = tokenize(clause);
+      let winner: { id: string; score: number } | undefined;
+      for (const c of owners) {
+        const { score } = this.score(c, tokens, clause);
+        if (!winner || score > winner.score) winner = { id: c.agentId, score };
+      }
+      return winner && winner.score > 0 ? winner : undefined;
+    };
+    const [a, b] = parts;
+    const ownerA = bestOwner(a);
+    const ownerB = bestOwner(b);
+    if (!ownerA || !ownerB) return undefined;
+    // Both clauses must point at different owners; otherwise there is nothing to split.
+    if (ownerA.id === ownerB.id) return undefined;
+    return { [ownerA.id]: a, [ownerB.id]: b };
   }
 }
 
@@ -192,6 +256,7 @@ Policy:
 - Use broadcast only when the Order explicitly says to ask everyone.
 - Prefer the candidate whose scope/description is the most specific. An action word (write/update/rotate/deploy the README) can outweigh a domain word (billing).
 - candidates: ordered fallbacks if the unicast target does not acknowledge.
+- variants (optional): ONLY for multicast when each target handles a different part. Give each target the exact clause it owns, copied verbatim, e.g. {"variants": {"<agentId A>": "<clause A>", "<agentId B>": "<clause B>"}}. Never paraphrase or merge clauses; omit variants when the target(s) should see the whole Order.
 - A "history" line is only a weak hint: use it to choose between Baristas that fit about equally well, never to skip a Barista that clearly fits better.`;
 
 /** LLM-backed router. `complete` is injected so tests can use a fake model. */
@@ -273,6 +338,16 @@ export class LlmRouter implements Router {
       };
       if (decision.candidates.length) {
         decision.whyNot = decision.candidates.map((agentId) => ({ agentId, reason: "the model listed it as a fallback, not a target" }));
+      }
+      // Per-target sub-questions are optional (v4-7 #39): keep only variants for real, distinct
+      // multicast targets, drop blank text, and never attach variants to a single-target Order.
+      if (mode !== "unicast" && targets.length > 1 && json.variants && typeof json.variants === "object") {
+        const variants: Record<string, string> = {};
+        for (const t of targets) {
+          const text = (json.variants as Record<string, unknown>)[t];
+          if (typeof text === "string" && text.trim()) variants[t] = text;
+        }
+        if (Object.keys(variants).length) decision.variants = variants;
       }
       if (this.cacheEnabled) {
         this.cache.set(cacheKey, decision);

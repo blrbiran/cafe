@@ -1,5 +1,5 @@
 // Plain ESM (no TypeScript) so an old Node can run this check before it tries to load src/main.ts.
-export const MIN_NODE = "22.18";
+export const MIN_NODE = "22.19";
 
 /** `undefined` when `version` is new enough, otherwise the user-facing message. */
 export function nodeVersionError(version) {

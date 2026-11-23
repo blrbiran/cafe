@@ -8,6 +8,7 @@
     "./peer": "./src/peer.ts",
     "./cafe-file": "./src/cafeFile.ts",
     "./client": "./src/client.ts",
+    "./urls": "./src/urls.ts",
     "./version": "./src/version.ts"
   },
   "dependencies": {

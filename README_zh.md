@@ -26,7 +26,7 @@ cafe 是一个 agent 网络：任意一方发出的一条消息（Order），会
 
 ## Quick start
 
-需要 Node ≥ 22.18。
+需要 Node ≥ 22.19。
 
 ```bash
 npm i -g @blrbiran/cafe
@@ -222,7 +222,7 @@ open http://127.0.0.1:4777/
 - 子机 `advertise` 从 Root 不可达（Docker/NAT）时不再污染直连：Root 只广播验证过的地址，用 `cafe host address`（或 Network 页「改地址」）可以固定一个可用地址。手工固定的地址要等可达性探测成功才会下发给其它子机；`cafe host address <host> --clear` 会回退到 Root 最后验证过的地址。
 - `cafe ask` 支持 `--timeout <秒>`（默认不限），超时会取消该 Order；Ctrl-C 也会取消，不会留下 `thread_busy`。取消请求本身失败时会如实报告，不再谎称已取消。unicast Order 的目标只发心跳不回答时，10 分钟后自动关单。Thread 忙时追问可加 `--replace` 取消旧问题。对早于 daemon 200 条回放窗口的旧轮次执行 `cafe wait` 也会正常结束（daemon 会从 Thread 文件里读出该轮次的关闭事件）。
 - `POST /api/baristas` 只接受 `pi` / `omp` / `codex` / `claude`，不再接受任意可执行文件与 argv。
-- **目前传输层仍是明文。** 共享 token 在 WebSocket 握手中穿过局域网，能抓包的人即可获得完整权限。TLS 方案（Root 自建 CA、fail-closed、指纹 pin、独立端口）已写在 [`docs/specs/v4-6-tls.md`](docs/specs/v4-6-tls.md)，尚未实现；在此之前请把 daemon 限制在 loopback 或可信 tailnet 内。
+- **传输层安全（TLS，v4-6）。** 默认 `security.mode: tls`。Root 首次生成一次 CA（`~/.cafe/tls/ca.crt` + `ca.key`，0600），每个 Daemon 在 TLS 端口（`security.tls.port`，默认 4778）出示由它签发的叶子证书；Web UI 与本机 loopback 调用仍走明文 4777。配置了 `root` 但没有 CA 的子节点会从 Root 取回公开的 CA 并 pin 其 SHA-256 指纹，也可显式指定：`cafe connect <host:port> --token … --ca-fingerprint sha256:…`（在 Root 上 `cafe root show` 会打印）。校验 fail-closed，不会退回明文，且同时校验 SAN 与 pin 的指纹。`cafe daemon renew-cert` 重新签发叶子，新连接无需重启即生效。`security.mode: plaintext` 是显式的本地/隔离逃生口。详见 [`docs/specs/v4-6-tls.md`](docs/specs/v4-6-tls.md)。
 
 ## 包结构
 
@@ -258,7 +258,7 @@ Daemon 是长进程：`npm run build:web` **不会**让正在运行的 Daemon �
 
 ```bash
 git pull
-source ~/.bash_profile          # Node ≥ 22.18（nvm）；直接 ssh 登录可能还是 Node 18
+source ~/.bash_profile          # Node ≥ 22.19（nvm）；直接 ssh 登录可能还是 Node 18
 npm install
 npm run build:web
 npm link --workspace @cafe/cli

@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { createSecureContext, type SecureContext } from "node:tls";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { networkInterfaces } from "node:os";
@@ -173,10 +175,13 @@ function isWrite(method: string | undefined): boolean {
   return !!method && method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
-function tokenOf(req: IncomingMessage, url: URL): string | undefined {
+/**
+ * The caller's token. Only `Authorization: Bearer` is accepted (v4-6 §3.6): a `?token=` parameter
+ * ends up in logs, shell history and every proxy along the way.
+ */
+function tokenOf(req: IncomingMessage): string | undefined {
   const h = req.headers.authorization;
-  if (h?.startsWith("Bearer ")) return h.slice(7);
-  return url.searchParams.get("token") ?? undefined;
+  return h?.startsWith("Bearer ") ? h.slice(7) : undefined;
 }
 
 async function readJson(req: IncomingMessage): Promise<any> {
@@ -263,10 +268,28 @@ const recentEvents = new WeakMap<Daemon, ThreadEnvelope[]>();
 export interface ServerHandle {
   close(): Promise<void>;
   port: number;
+  /** Port of the TLS listener (v4-6); undefined in `mode: plaintext`. */
+  tlsPort?: number;
 }
 
-/** One port serves the HTTP API, the WebSocket endpoint (`/ws`) and the web UI. */
-export function startServer(daemon: Daemon, opts: { port: number; bind?: string; webDist?: string }): Promise<ServerHandle> {
+export interface TlsServerOptions {
+  /** CA PEM used to verify peers; also the trust anchor advertised to clients. */
+  ca: string;
+  /**
+   * The leaf to present. Called per new connection and per SNI, so a hot renewal takes effect
+   * without a restart. Live connections keep theirs.
+   */
+  current(): { cert: string; key: string };
+  /** Registers a callback the daemon calls after swapping in a renewed leaf. Returns an unsubscribe. */
+  onRenew?(fn: () => void): () => void;
+}
+
+/**
+ * Two listeners share one request handler (v4-6 §3.1): the plaintext port (4777) serves the Web UI
+ * and loopback calls; the TLS port (4778) serves the same API and `/ws` for agents, the CLI,
+ * connectors and other Daemons. There is no protocol sniffing and no plaintext fallback.
+ */
+export function startServer(daemon: Daemon, opts: { port: number; bind?: string; webDist?: string; tlsPort?: number; tls?: TlsServerOptions }): Promise<ServerHandle> {
   const webDir = opts.webDist ?? defaultWebDist();
   const statics = loadStatic(webDir);
   // The UI is read into memory at start; remember which build that was so the
@@ -292,7 +315,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
   };
   daemon.on("thread", remember);
 
-  const server = createServer(async (req, res) => {
+  const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://x");
     const path = url.pathname;
     try {
@@ -307,7 +330,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         if (isWrite(req.method) && !originAllowed(req, daemon)) {
           return send(res, 403, { error: "forbidden_origin", message: "cross-site requests cannot change this daemon; use the Web UI or the CLI" });
         }
-        if (!isLoopback(req) && tokenOf(req, url) !== daemon.config.token) {
+        if (!isLoopback(req) && tokenOf(req) !== daemon.config.token) {
           return send(res, 401, { error: "unauthorized", message: "token mismatch or wrong Root address; compare `cafe config get token` on both hosts" });
         }
         return await api(daemon, req, res, url, webStale, recent);
@@ -345,9 +368,9 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       const e = err as RpcError;
       send(res, e.code === "not_found" ? 404 : 400, { error: e.code ?? "error", message: e.message });
     }
-  });
+  };
 
-  server.on("upgrade", (req, socket, head) => {
+  const handleUpgrade = (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) => {
     const url = new URL(req.url ?? "/", "http://x");
     if (url.pathname !== "/ws") return socket.destroy();
     // A browser always sends Origin on a WebSocket handshake and cannot forge it; CLI clients send
@@ -363,25 +386,101 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       ws.on("close", () => (counts.ws = Math.max(0, counts.ws - 1)));
       daemon.accept(ws, isLoopback(req));
     });
-  });
+  };
+
+  const server = createServer(handleRequest);
+  server.on("upgrade", handleUpgrade);
 
   return new Promise((resolveP, reject) => {
     server.once("error", reject);
     server.listen(opts.port, opts.bind ?? "0.0.0.0", () => {
       const addr = server.address();
-      resolveP({
-        port: typeof addr === "object" && addr ? addr.port : opts.port,
-        close: () =>
-          new Promise<void>((r) => {
-            daemon.off("thread", remember);
-            for (const c of wss.clients) c.terminate();
-            wss.close();
-            server.closeAllConnections();
-            server.close(() => r());
-          }),
+      const httpPort = typeof addr === "object" && addr ? addr.port : opts.port;
+      const finish = (tlsServer?: import("node:https").Server, tlsPort?: number) => {
+        resolveP({
+          port: httpPort,
+          ...(tlsPort !== undefined ? { tlsPort } : {}),
+          close: () =>
+            new Promise<void>((r) => {
+              daemon.off("thread", remember);
+              for (const c of wss.clients) c.terminate();
+              wss.close();
+              server.closeAllConnections();
+              const closeTls = tlsServer
+                ? new Promise<void>((done) => {
+                    tlsServer.closeAllConnections();
+                    tlsServer.close(() => done());
+                  })
+                : Promise.resolve();
+              server.close(() => void closeTls.then(() => r()));
+            }),
+        });
+      };
+      if (!opts.tls) return finish();
+      // A TLS listener that fails to bind (port taken, bad certificate) is a startup failure, not a
+      // reason to fall back to plaintext.
+      let tlsServer: import("node:https").Server;
+      try {
+        tlsServer = createTlsServer(opts.tls, handleRequest, handleUpgrade);
+      } catch (err) {
+        server.close();
+        return reject(err);
+      }
+      tlsServer.once("error", (err) => {
+        server.close();
+        reject(err);
+      });
+      tlsServer.listen(opts.tlsPort ?? 0, opts.bind ?? "0.0.0.0", () => {
+        const a = tlsServer.address();
+        finish(tlsServer, typeof a === "object" && a ? a.port : opts.tlsPort ?? 0);
       });
     });
   });
+}
+
+/**
+ * The `https` server. The leaf is read through `tls.current()` on every new connection and in
+ * `SNICallback`, so a renewed leaf is used by new connections without a restart (v4-6 §3.5); live
+ * connections keep the context they negotiated.
+ */
+function createTlsServer(
+  tls: TlsServerOptions,
+  onRequest: (req: IncomingMessage, res: ServerResponse) => void,
+  onUpgrade: (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) => void,
+): import("node:https").Server {
+  const leaf = () => tls.current();
+  let current = createSecureContext(leaf());
+  const server = createHttpsServer(
+    {
+      ...leaf(),
+      ca: tls.ca,
+      // No client certificate this round: agent identity/cert lifecycle is phase 2.
+      requestCert: false,
+      SNICallback: (_servername: string, cb: (err: Error | null, ctx?: SecureContext) => void) => {
+        try {
+          cb(null, current);
+        } catch (err) {
+          cb(err as Error);
+        }
+      },
+    },
+    onRequest,
+  );
+  /**
+   * A renewed leaf becomes the context used by new connections. `setSecureContext` swaps the
+   * default context `https` uses when the client sends no SNI (an IP dial sends none); a client that
+   * does send SNI gets the same new context through `SNICallback`. Live connections keep the
+   * context they negotiated, so renewal never interrupts them.
+   */
+  tls.onRenew?.(() => {
+    const fresh = leaf();
+    current = createSecureContext(fresh);
+    server.setSecureContext(fresh);
+  });
+  server.on("upgrade", onUpgrade);
+  // A plaintext client hitting the TLS port fails its handshake; do not let that kill the process.
+  server.on("tlsClientError", (_err, socket) => (socket as { destroy(): void }).destroy());
+  return server;
 }
 
 async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, url: URL, webStale: () => boolean, recent: ThreadEnvelope[]): Promise<void> {
@@ -408,6 +507,34 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && path === "/api/snapshot") {
     const snap = daemon.snapshot();
     return send(res, 200, webStale() ? { ...snap, webStale: true } : snap);
+  }
+  if (m === "POST" && path === "/api/tls/renew") {
+    // Reissue this Host's leaf and swap it for new connections. Only the Root holds the CA key.
+    if (!daemon.isRoot) return send(res, 400, { error: "not_root", message: "only the Root signs leaves; restart this Host to request one from the Root" });
+    const ca = daemon.tlsContext;
+    if (!ca) return send(res, 400, { error: "tls_off", message: "TLS is off (security.mode: plaintext)" });
+    const body = await readJson(req);
+    const sans = Array.isArray(body.sans) ? body.sans.filter((s: unknown): s is string => typeof s === "string" && !!s) : [];
+    const issued = await ca.issue?.(sans.length ? sans : ["127.0.0.1", "localhost"]);
+    if (!issued) return send(res, 400, { error: "not_root", message: "this Host cannot sign a leaf" });
+    ca.replace(issued);
+    return send(res, 200, { ok: true, fingerprint256: new (await import("node:crypto")).X509Certificate(issued.cert).fingerprint256 });
+  }
+  if (m === "GET" && path === "/api/tls") {
+    // The trust anchor a person or a child Host needs to enrol: the CA and its fingerprint. Public
+    // on purpose (a CA certificate is not a secret); the private key never appears here.
+    return daemon.tlsContext
+      ? send(res, 200, { ca: daemon.tlsContext.ca, fingerprint256: daemon.tlsContext.caFingerprint })
+      : send(res, 200, { ca: null, fingerprint256: null, note: "TLS is off (security.mode: plaintext)" });
+  }
+  if (m === "POST" && path === "/api/tls/leaf") {
+    // A child Host with this network's token asks the Root to issue its leaf. Only the Root has the
+    // CA key; every other Host gets a clear refusal instead of a fake certificate.
+    if (!daemon.isRoot || !daemon.tlsContext?.issue) return send(res, 400, { error: "not_root", message: "only the Root issues leaf certificates; set security.tls.ca to the Root's ca.crt on this Host" });
+    const body = await readJson(req);
+    const sans = Array.isArray(body.sans) ? body.sans.filter((s: unknown): s is string => typeof s === "string" && !!s) : [];
+    if (!sans.length) throw new RpcError("bad_request", "sans must be a non-empty string array");
+    return send(res, 200, await daemon.tlsContext.issue(sans));
   }
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {

@@ -1,12 +1,17 @@
 import { closeSync, existsSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { Daemon, type DaemonOptions } from "./daemon.ts";
-import { cafeHome, loadConfig } from "./config.ts";
+import { cafeHome, loadConfig, saveConfig } from "./config.ts";
 import { startServer, type ServerHandle } from "./server.ts";
 import { Supervisor } from "./supervisor.ts";
 import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress, advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
+import { ensureLeaf, tlsPaths } from "./tls/store.ts";
+import { bootstrapCa, fetchLeafFromRoot, trustCaForClient } from "./tls/bootstrap.ts";
+import { readTlsConfig } from "./tls/trust.ts";
+import { issueLeaf, sanList } from "./tls/certs.ts";
+import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
 export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configPath, diffConfig, loadConfig, saveConfig, setConfigValue } from "./config.ts";
@@ -93,16 +98,79 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   const log = opts.log ?? ((m: string) => logFile!(m));
   const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, timing: opts.timing, log, version: opts.version });
   await daemon.initRouter();
+  // Transport security (v4-6 #61). The Root owns the CA; every Daemon presents a leaf signed by it.
+  const security = readTlsConfig(config);
+  let tls: { tlsPort: number; current(): { cert: string; key: string } } | undefined;
+  const tlsOpts =
+    security.mode === "tls"
+      ? await (async () => {
+          const isRoot = config.mode === "root";
+          const boot = await bootstrapCa({ home, isRoot, root: config.root, token: config.token, security, log });
+          const ca = boot.ca;
+          // Trust the network CA for every outgoing global fetch/WebSocket (leaf fetch, Doctor probes).
+          trustCaForClient(ca.cert);
+          // Persist a newly enrolled/created CA fingerprint so a later mismatch is refused.
+          if (boot.enroll && !security.caFingerprint) {
+            config.security.tls.caFingerprint = boot.enroll;
+            saveConfig(config, home);
+          }
+          const leaf = await ensureLeaf(
+            home,
+            config.host,
+            ca,
+            { host: config.host, advertise: config.advertise, lan: lanAddress() },
+            {
+              // A child Host holds the CA certificate but not its key; the Root issues the leaf.
+              fetchLeaf: async () => {
+                if (!config.root) throw new Error("no leaf for this Host and no Root configured to issue one");
+                // Trust the enrolled CA for this one call. A dedicated `https` request with `ca` is
+                // deterministic; the process-wide default store could be racing other Daemons in tests.
+                return fetchLeafFromRoot(config.root, ca.cert, config.token, sanList({ host: config.host, advertise: config.advertise, lan: lanAddress() }));
+              },
+            },
+          );
+          // `current()` reads run through this closure: a later renewal swaps it in place.
+          let active = { cert: leaf.cert, key: leaf.key };
+          const renewListeners = new Set<() => void>();
+          daemon.tlsContext = {
+            ca: leaf.ca,
+            caFingerprint: leaf.caFingerprint,
+            /** Daemon-to-daemon links use TLS only once a *network* CA is enrolled (not a temp local one). */
+            network: !boot.pendingRoot,
+            current: () => active,
+            replace: (next) => {
+              active = next;
+              for (const fn of renewListeners) fn();
+            },
+            onRenew: (fn) => {
+              renewListeners.add(fn);
+              return () => renewListeners.delete(fn);
+            },
+            ...(isRoot
+              ? {
+                  issue: async (sans: string[]) => {
+                    const fresh = await issueLeaf(ca, sans);
+                    return { cert: fresh.cert, key: fresh.key };
+                  },
+                }
+              : {}),
+          };
+          return { ca: leaf.ca, current: () => active, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn) };
+        })()
+      : undefined;
   let server: ServerHandle;
   try {
-    server = await startServer(daemon, { port: config.port, webDist: opts.webDist });
+    server = await startServer(daemon, { port: config.port, webDist: opts.webDist, tlsPort: security.port, tls: tlsOpts });
   } catch (e) {
     release();
     daemon.stop();
     throw e;
   }
+  tls = tlsOpts && server.tlsPort !== undefined ? { tlsPort: server.tlsPort, current: tlsOpts.current } : undefined;
   config.port = server.port;
   daemon.log(`listening on :${server.port} as ${config.mode} (${daemon.url()})`);
+  if (tls) daemon.log(`tls on :${tls.tlsPort} (ca ${daemon.tlsContext?.caFingerprint})`);
+  else daemon.log("tls disabled (security.mode: plaintext)");
   if (!opts.noSupervisor) {
     daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token });
     const { reaped, skipped } = await daemon.supervisor.restore();

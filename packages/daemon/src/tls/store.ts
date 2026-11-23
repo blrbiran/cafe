@@ -1,0 +1,135 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { X509Certificate } from "node:crypto";
+import { join } from "node:path";
+import { fingerprintOf, generateCa, issueLeaf, sanList, type CertPair } from "./certs.ts";
+
+/**
+ * A child Host's leaf: read `CAFE_HOME/tls/<host>.crt` + `.key`, or write a leaf the Root issued.
+ */
+export function readLeaf(home: string, host: string): { cert: string; key: string } | undefined {
+  const p = tlsPaths(home, host);
+  if (!existsSync(p.leafCertPath) || !existsSync(p.leafKeyPath)) return undefined;
+  return { cert: readFileSync(p.leafCertPath, "utf8"), key: readFileSync(p.leafKeyPath, "utf8") };
+}
+
+export function writeLeaf(home: string, host: string, leaf: { cert: string; key: string }): void {
+  const p = tlsPaths(home, host);
+  mkdirSync(join(p.leafCertPath, ".."), { recursive: true });
+  writeFileSync(p.leafCertPath, leaf.cert, { mode: 0o644 });
+  writeFileSync(p.leafKeyPath, leaf.key, { mode: 0o600 });
+}
+
+/**
+ * Where the TLS materials live and how a Daemon obtains them (v4-6 §3.2).
+ *
+ * - `CAFE_HOME/tls/ca.crt` + `ca.key` (0600): Root only. `ca.crt` is public and distributed; the
+ *   key never leaves the Root.
+ * - `CAFE_HOME/tls/<host>.crt` + `.key`: this Daemon's leaf, issued by the Root's CA.
+ *
+ * A Daemon that has a CA but no leaf asks the Root for one; until TLS transport is fully rolled
+ * out, a Daemon can also be handed a leaf directly (`cafe daemon renew-cert` or the config).
+ */
+
+export interface TlsFiles {
+  caPath: string;
+  caKeyPath: string;
+  leafCertPath: string;
+  leafKeyPath: string;
+}
+
+export function tlsPaths(home: string, host: string): TlsFiles {
+  const dir = join(home, "tls");
+  return {
+    caPath: join(dir, "ca.crt"),
+    caKeyPath: join(dir, "ca.key"),
+    leafCertPath: join(dir, `${host}.crt`),
+    leafKeyPath: join(dir, `${host}.key`),
+  };
+}
+
+export interface TlsContext {
+  /** Leaf certificate PEM the listener presents. */
+  cert: string;
+  /** Leaf private key PEM. */
+  key: string;
+  /** CA certificate PEM used to verify peers (and returned to callers in `cafe root show`). */
+  ca: string;
+  /** CA fingerprint, for enrolment. */
+  caFingerprint: string;
+  /** SANs the current leaf carries. */
+  sans: string[];
+}
+
+function readPair(certPath: string, keyPath: string): CertPair | undefined {
+  if (!existsSync(certPath) || !existsSync(keyPath)) return undefined;
+  const cert = readFileSync(certPath, "utf8");
+  const key = readFileSync(keyPath, "utf8");
+  return { cert, key, fingerprint256: fingerprintOf(cert) };
+}
+
+export interface CaOptions {
+  /** Create the CA when it does not exist (Root only). */
+  create: boolean;
+  /** Certificate path override (`security.tls.ca`); the key sits beside it as `<name>.key`. */
+  caPath?: string;
+}
+
+/**
+ * Load the CA, or create it when this is the Root and none exists. The key path is derived from the
+ * certificate path, so a configured `security.tls.ca` works too.
+ */
+export async function ensureCaAsync(home: string, opts: CaOptions): Promise<CertPair | undefined> {
+  const p = tlsPaths(home, "unused");
+  const certPath = opts.caPath ?? p.caPath;
+  const keyPath = certPath.endsWith(".crt") ? `${certPath.slice(0, -4)}.key` : `${certPath}.key`;
+  const existing = readPair(certPath, keyPath);
+  if (existing) return existing;
+  // A child Host has the CA certificate but not its key: it verifies peers with `ca.crt` and never
+  // signs anything. Only the Root keeps `ca.key` (and only the Root can create the CA).
+  if (existsSync(certPath)) {
+    const cert = readFileSync(certPath, "utf8");
+    const key = existsSync(keyPath) ? readFileSync(keyPath, "utf8") : "";
+    return { cert, key, fingerprint256: fingerprintOf(cert) };
+  }
+  if (!opts.create) return undefined;
+  const ca = await generateCa();
+  mkdirSync(join(certPath, ".."), { recursive: true });
+  writeFileSync(certPath, ca.cert, { mode: 0o644 });
+  writeFileSync(keyPath, ca.key, { mode: 0o600 });
+  return ca;
+}
+
+/**
+ * Load this Daemon's leaf, or issue one from the CA when it is missing. `sans` is recomputed on
+ * every start so an `advertise`/LAN change is reflected in a reissued leaf.
+ */
+export async function ensureLeaf(
+  home: string,
+  host: string,
+  ca: CertPair,
+  sansInput: { host: string; advertise?: string; lan?: string },
+  opts: { fetchLeaf?: () => Promise<{ cert: string; key: string }> } = {},
+): Promise<TlsContext> {
+  const sans = sanList(sansInput);
+  const existing = readLeaf(home, host);
+  // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed).
+  if (existing) {
+    const cert = new X509Certificate(existing.cert);
+    const sanText = cert.subjectAltName ?? "";
+    const covered = sans.every((s) => sanText.includes(/^\d/.test(s) ? `IP Address:${s}` : `DNS:${s}`));
+    if (covered) {
+      return { cert: existing.cert, key: existing.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
+    }
+  }
+  let leaf: { cert: string; key: string };
+  if (ca.key) {
+    leaf = await issueLeaf(ca, sans);
+  } else if (opts.fetchLeaf) {
+    // A child Host never holds the CA key: the Root issues the leaf over TLS with our token.
+    leaf = await opts.fetchLeaf();
+  } else {
+    throw new Error(`no leaf for ${host} and this Host cannot issue one (no CA key); run \`cafe daemon renew-cert\``);
+  }
+  writeLeaf(home, host, leaf);
+  return { cert: leaf.cert, key: leaf.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
+}

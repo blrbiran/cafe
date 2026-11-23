@@ -1,8 +1,27 @@
 # v4-6 — Transport security: TLS between cafe daemons and agents (#61)
 
-Status: **design approved, pending implementation.** Drafted 2026-11-23 from
+Status: **implemented 2026-11-24 (phase 1).** Drafted 2026-11-23 from
 dogfooding ledger #61. The owner approved Q1–Q5 as recommended and confirmed
 that the design requires both SAN validation and fingerprint pinning.
+
+Implementation notes (2026-11-24):
+
+- **Leaf keys are RSA-2048, not ECDSA P-256.** `node-forge` 1.x has no EC key
+  generation (`pki.ec` does not exist), and the spec's own constraint was "no
+  new dependency beyond `node-forge`". RSA costs ~23% more CPU per handshake
+  (§2), paid once per connection and per reconnect; cafe keeps one long-lived
+  WebSocket, so steady-state cost is unchanged. Moving to ECDSA later means
+  generating the leaf with Node's own `crypto.generateKeyPairSync("ec", …)` and
+  signing the TBSCertificate by hand, or adding a second library — not done here.
+- **Trust bootstrap**: a Root with no CA creates one; a child with a configured
+  `root` and no CA fetches the Root's public `ca.crt` (`GET /api/tls`), refusing a
+  configured-pin mismatch and persisting a TOFU fingerprint; a standalone Daemon
+  creates a local CA. If the Root is unreachable at boot, the child starts on an
+  in-memory local CA (never plaintext) and its daemon-to-daemon links stay on
+  `ws://` until enrolment succeeds.
+- **No daemon-to-daemon leaf signing over the network yet** beyond the Root
+  issuing to the child's SANs on `POST /api/tls/leaf`; phase 2 (mutual TLS) is
+  still out of scope.
 
 ## 0. Why
 

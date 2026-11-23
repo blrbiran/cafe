@@ -114,6 +114,32 @@ describe("LlmRouter output policy (#39)", () => {
     await router.decide(input(three));
     expect(complete).toHaveBeenCalledTimes(2);
   });
+
+  it("keeps model-provided variants for two distinct targets, dropping unknown and empty ones", async () => {
+    const complete = async () =>
+      JSON.stringify({
+        targets: ["A", "B"],
+        mode: "multicast",
+        reason: "two halves",
+        variants: { A: "the widget half", B: "the gadget half", Z: "unknown target", C: "   " },
+      });
+    const d = await new LlmRouter(complete, new RulesRouter()).decide(input(three));
+    expect(d.mode).toBe("multicast");
+    expect(d.variants).toEqual({ A: "the widget half", B: "the gadget half" });
+  });
+
+  it("drops variants for a unicast decision: there is nothing to split", async () => {
+    const complete = async () => JSON.stringify({ targets: ["A"], mode: "unicast", reason: "one owner", variants: { A: "half", B: "other half" } });
+    const d = await new LlmRouter(complete, new RulesRouter()).decide(input(three));
+    expect(d.mode).toBe("unicast");
+    expect(d.variants).toBeUndefined();
+  });
+
+  it("a model that omits variants still routes the shared body", async () => {
+    const complete = async () => JSON.stringify({ targets: ["A", "B"], mode: "multicast", reason: "two parts" });
+    const d = await new LlmRouter(complete, new RulesRouter()).decide(input(three));
+    expect(d.variants).toBeUndefined();
+  });
 });
 
 describe("initRouter", () => {

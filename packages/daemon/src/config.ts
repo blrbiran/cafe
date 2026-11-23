@@ -55,6 +55,28 @@ export const CafeConfig = z.object({
   pinnedDaemons: z.record(z.string(), z.string()).default({}),
   /** Root only: display-name overrides for Daemons that may be offline when renamed. */
   hostNames: z.record(z.string(), z.object({ displayName: z.string().optional(), aliases: z.array(z.string()).default([]), legacyAliases: z.array(z.string()).default([]) })).default({}),
+  /**
+   * Transport security (v4-6 #61). `tls` is the default and there is no plaintext fallback; a TLS
+   * failure is an error. `plaintext` is a deliberate local/isolation escape hatch, not a mode the
+   * daemon picks by itself.
+   */
+  security: z
+    .object({
+      mode: z.enum(["tls", "plaintext"]).default("tls"),
+      tls: z
+        .object({
+          /** Plaintext stays on `port`; this is the TLS listener's port (0 = pick a free one). */
+          port: z.number().int().min(0).default(4778),
+          /** CA certificate path; defaults to `CAFE_HOME/tls/ca.crt`. */
+          ca: z.string().optional(),
+          /** TOFU pin for the CA (`cafe connect --ca-fingerprint`). */
+          caFingerprint: z.string().optional(),
+          /** Per-peer leaf pin, keyed by `host:port`. */
+          pins: z.record(z.string(), z.string()).default({}),
+        })
+        .default({}),
+    })
+    .default({}),
 });
 export type CafeConfig = z.infer<typeof CafeConfig>;
 
@@ -79,6 +101,8 @@ export function cafeHome(): string {
  * schema so CLI and Web describe the same contract.
  */
 export function configApplyMode(key: string): "hot" | "restart-required" {
+  // A pin changes nothing the listener owns: it is checked per connection, so it can change live.
+  if (key === "security.tls.caFingerprint" || key.startsWith("security.tls.pins.")) return "hot";
   return key === "root" || key.startsWith("router.") ? "hot" : "restart-required";
 }
 
@@ -100,6 +124,10 @@ const DIFF_KEYS = [
   "attachments.threadMaxMb",
   "attachments.maxCount",
   "discovery",
+  "security.mode",
+  "security.tls.port",
+  "security.tls.ca",
+  "security.tls.caFingerprint",
 ] as const;
 
 function leaf(obj: unknown, key: string): unknown {

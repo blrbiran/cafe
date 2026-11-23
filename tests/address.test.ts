@@ -48,7 +48,7 @@ describe("daemon addresses (#76)", () => {
   it("starts with an unusable persisted root instead of dying", async () => {
     const home = mkdtempSync(join(tmpdir(), "cafe-badroot-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));
-    writeFileSync(join(home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0, root: "1.2.3.4:4777:4777" }));
+    writeFileSync(join(home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0, root: "1.2.3.4:4777:4777", security: { mode: "plaintext" } }));
     // An invalid URL used to throw out of a timer callback and exit the process.
     const r = await runDaemon({ home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "no-web") });
     cleanup.push(r.stop);

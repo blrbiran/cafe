@@ -1,8 +1,21 @@
 # v4-7 — Per-target sub-questions on a multicast Order (#39, remainder)
 
-Status: **wire design approved, pending implementation.** Drafted 2026-11-23
-for the per-target sub-question work from #39. The owner approved Q1–Q4 as
-recommended.
+Status: **implemented 2026-11-24.** Drafted 2026-11-23 for the per-target
+sub-question work from #39. The owner approved Q1–Q4 as recommended.
+
+Implementation notes (2026-11-24):
+
+- `Order.variants` and `RoutingDecision.variants` are both optional; `dispatch()`
+  sends target `t` a copy of the Order with `body = variants[t] ?? body` and
+  `variants` stripped, so a Barista's prompt cannot leak another target's half.
+  The recorded `order.created` and `history()` keep the shared `body`.
+- Rules router splits only on an explicit two-clause structure (`, and `, `, also `,
+  ` and also `, `；`, `以及`), assigns each verbatim clause to its own best owner
+  and only when the two point at different Agents; otherwise it multicasts the
+  shared body. LLM router keeps model-provided `variants` for real multicast
+  targets only (drops unknown/blank; never attaches them to a unicast).
+- Eval: two cases added to `EXTRA_CASES` (a clean split expecting 2 variants, and
+  a non-split conjunction expecting a shared body); the rules baseline is 67/67.
 
 ## 0. Why
 

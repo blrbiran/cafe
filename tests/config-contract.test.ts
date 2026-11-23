@@ -19,6 +19,14 @@ describe("config apply modes", () => {
     expect(configApplyMode("host")).toBe("restart-required");
     expect(configApplyMode("retention.days")).toBe("restart-required");
   });
+
+  it("treats TLS pins as hot and the TLS port/CA/mode as restart-required (v4-6)", () => {
+    expect(configApplyMode("security.tls.caFingerprint")).toBe("hot");
+    expect(configApplyMode("security.tls.pins.desk")).toBe("hot");
+    expect(configApplyMode("security.tls.port")).toBe("restart-required");
+    expect(configApplyMode("security.tls.ca")).toBe("restart-required");
+    expect(configApplyMode("security.mode")).toBe("restart-required");
+  });
 });
 
 describe("config diff", () => {
@@ -26,6 +34,12 @@ describe("config diff", () => {
     const file = { host: "new-name", router: { model: "p/m" } };
     const running = { host: "old-name", router: { model: "p/m" } };
     expect(diffConfig(file, running)).toEqual([{ key: "host", file: "new-name", running: "old-name", mode: "restart-required" }]);
+  });
+
+  it("reports a changed TLS mode as restart-required (v4-6)", () => {
+    const file = { security: { mode: "plaintext" } };
+    const running = { security: { mode: "tls" } };
+    expect(diffConfig(file, running)).toEqual([{ key: "security.mode", file: "plaintext", running: "tls", mode: "restart-required" }]);
   });
 
   it("reports a changed hot value", () => {
@@ -58,7 +72,7 @@ describe("runtime config endpoint", () => {
   it("lists config.yml changes the running daemon has not applied", async () => {
     const d = await startDaemon("pc1");
     cleanup.push(d.stop);
-    writeFileSync(join(d.home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0, advertise: "127.0.0.1", mode: "root" }));
+    writeFileSync(join(d.home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0, advertise: "127.0.0.1", mode: "root", security: { mode: "plaintext" } }));
     const body = (await (await fetch(`http://${d.addr}/api/config`)).json()) as { pending: unknown[] };
     expect(body.pending).toEqual([{ key: "mode", file: "root", running: "daemon", mode: "restart-required" }]);
   });

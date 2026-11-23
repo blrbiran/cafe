@@ -9,6 +9,12 @@ import { Command } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
+import { fingerprintOf, issueLeaf, sanList } from "../../daemon/src/tls/certs.ts";
+import { tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
+import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
+import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
+import { daemonHttpUrl } from "@cafe/protocol/urls";
+import { lanAddress } from "@cafe/daemon";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
@@ -430,6 +436,33 @@ daemon
     out(`cafe daemon restarted on ${base()} (host ${h.host}${h.isRoot ? ", root" : ""}, pid ${h.pid})`, h);
   });
 daemon
+  .command("renew-cert")
+  .description("reissue this Host's TLS leaf from the CA (a running daemon picks it up on the next connection)")
+  .action(async () => {
+    const cfg = loadConfig();
+    const tls = readTlsConfig(cfg);
+    if (tls.mode !== "tls") throw new Error("TLS is off (security.mode: plaintext); set security.mode: tls and restart first");
+    const caPath = tls.ca ?? tlsPaths(cafeHome(), cfg.host).caPath;
+    const caKeyPath = caPath.endsWith(".crt") ? `${caPath.slice(0, -4)}.key` : `${caPath}.key`;
+    if (!existsSync(caPath)) throw new Error(`no CA at ${caPath}; copy the Root's ca.crt here (\`cafe root show\` on the Root prints it) and start the daemon once`);
+    const ca = { cert: readFileSync(caPath, "utf8"), key: existsSync(caKeyPath) ? readFileSync(caKeyPath, "utf8") : "", fingerprint256: fingerprintOf(readFileSync(caPath, "utf8")) };
+    if (!ca.key) {
+      throw new Error(
+        "this Host has no CA key (only the Root signs certificates); reissue from the Root with `cafe daemon renew-cert` there, or restart this daemon to request a leaf from the Root",
+      );
+    }
+    const sans = sanList({ host: cfg.host, advertise: cfg.advertise, lan: lanAddress() });
+    if (await healthy()) {
+      // The running daemon reissues in place and swaps the leaf for new connections (SNICallback).
+      const r = await api<{ fingerprint256: string }>("/api/tls/renew", { method: "POST", body: JSON.stringify({ sans }) });
+      out(`reissued leaf for ${cfg.host} (fingerprint ${r.fingerprint256}); new connections use it, no restart needed`, r);
+      return;
+    }
+    const leaf = await issueLeaf(ca, sans);
+    writeLeaf(cafeHome(), cfg.host, { cert: leaf.cert, key: leaf.key });
+    out(`reissued leaf for ${cfg.host} (fingerprint ${leaf.fingerprint256}); written to ${tlsPaths(cafeHome(), cfg.host).leafCertPath}`, leaf);
+  });
+daemon
   .command("drain")
   .description("stop accepting new Orders and wait for open ones (for a controlled update); stays drained until restart")
   .option("--timeout <s>", "how long to wait for open Orders", Number, 30)
@@ -809,13 +842,26 @@ program
   .argument("<host:port>")
   .description("join another machine's Root: saves mode, root and token")
   .option("--token <token>", "the Root's token (cafe config get token on the Root)")
+  .option("--ca-fingerprint <sha256>", "the Root's CA fingerprint (`cafe root show` on the Root); pins the trust anchor")
   .action((addr: string, o) => {
     if (!o.token) throw new Error("--token is required (cafe config get token on the Root)");
     const clean = assertDaemonAddress(addr);
+    // Validate the pin before writing anything: a bad pin must not leave a half-configured Host.
+    let pin: string | undefined;
+    if (o.caFingerprint !== undefined) {
+      pin = normalizeFingerprint(String(o.caFingerprint));
+      if (!/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(pin)) {
+        throw new Error("--ca-fingerprint must be a SHA-256 fingerprint (64 hex digits, e.g. from `cafe root show` on the Root)");
+      }
+    }
     setConfigValue("mode", "daemon");
     setConfigValue("root", clean);
     setConfigValue("token", o.token);
-    out(`saved root ${clean}; restart required: cafe daemon restart`, { mode: "daemon", root: clean, restartRequired: true });
+    if (pin) setConfigValue("security.tls.caFingerprint", pin);
+    out(
+      `saved root ${clean}${pin ? ` with CA pin ${pin}` : ""}; restart required: cafe daemon restart`,
+      { mode: "daemon", root: clean, restartRequired: true, ...(pin ? { caFingerprint: pin } : {}) },
+    );
   });
 
 const host = program.command("host").description("this Host's display name and aliases (internal ids and Addresses stay stable)");
@@ -925,10 +971,24 @@ root
   });
 root
   .command("show")
-  .description("print the Root this Daemon uses")
+  .description("print the Root this Daemon uses and the TLS CA fingerprint to enrol other Hosts")
   .action(() => {
     const c = loadConfig();
-    out(c.mode === "root" ? "this host is the root" : (c.root ?? "(no root configured)"), { mode: c.mode, root: c.root });
+    const tls = readTlsConfig(c);
+    const caPath = tls.ca ?? join(cafeHome(), "tls", "ca.crt");
+    const haveCa = existsSync(caPath);
+    const where = c.mode === "root" ? "this host is the root" : (c.root ?? "(no root configured)");
+    if (!haveCa) {
+      out(`${where}\nsha256: (no CA on this Host — TLS is ${tls.mode}${tls.mode === "tls" ? " but the CA is not written yet; start the daemon once" : ""})`, {
+        mode: c.mode,
+        root: c.root,
+        security: tls.mode,
+        ca: null,
+      });
+      return;
+    }
+    const fingerprint = fingerprintOf(readFileSync(caPath, "utf8"));
+    out(`${where}\nsha256:${fingerprint}`, { mode: c.mode, root: c.root, security: tls.mode, ca: caPath, fingerprint256: fingerprint });
   });
 root
   .command("test")
@@ -936,8 +996,14 @@ root
   .action(async () => {
     const c = loadConfig();
     if (!c.root) throw new Error("no root configured; use `cafe root discover` or `cafe connect <host:port> --token <token>`");
+    const tls = readTlsConfig(c);
     try {
-      const res = await fetch(`http://${c.root}/api/health`, {
+      // A TLS Root is reached over https; the CA is applied so the probe verifies rather than skips.
+      if (tls.mode === "tls" && tls.caFingerprint) {
+        const caPath = tls.ca ?? join(cafeHome(), "tls", "ca.crt");
+        if (existsSync(caPath)) trustCaForClient(readFileSync(caPath, "utf8"));
+      }
+      const res = await fetch(`${daemonHttpUrl(c.root, { tls: tls.mode === "tls" })}/api/health`, {
         headers: { authorization: `Bearer ${c.token}` },
         signal: AbortSignal.timeout(2000),
       });

@@ -94,7 +94,7 @@ describe("restart & reconnect", () => {
   it("recovers an in-flight order after the daemon restarts", async () => {
     const home = mkdtempSync(join(tmpdir(), "cafe-restart-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));
-    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1" }));
+    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1", security: { mode: "plaintext" } }));
     const timing = { ...FAST, heartbeatIntervalMs: 1000 };
     const opts = { home, timing, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "none") };
     let d = await runDaemon(opts);
@@ -133,7 +133,7 @@ describe("restart & reconnect", () => {
   it("fails a recovered order whose barista never comes back", async () => {
     const home = mkdtempSync(join(tmpdir(), "cafe-restart-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));
-    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1" }));
+    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1", security: { mode: "plaintext" } }));
     const opts = { home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "none") };
     let d = await runDaemon(opts);
     const addr = `127.0.0.1:${d.server.port}`;

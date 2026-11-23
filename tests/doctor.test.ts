@@ -87,7 +87,7 @@ describe("cafe doctor", () => {
     cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
     const home = join(tmp, "cafe-home");
     mkdirSync(home, { recursive: true });
-    writeFileSync(join(home, "config.yml"), `port: 0\nroot: 127.0.0.1:${port}\ntoken: t0k\n`);
+    writeFileSync(join(home, "config.yml"), `port: 0\nroot: 127.0.0.1:${port}\ntoken: t0k\nsecurity:\n  mode: plaintext\n`);
     const userHome = join(tmp, "user-home");
     mkdirSync(userHome, { recursive: true });
 

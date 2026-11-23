@@ -23,7 +23,7 @@ async function withWeb() {
   // Vite emits content-hashed names; only those may be cached forever (#69 follow-up).
   writeFileSync(join(web, "index-BZg5MLuf.js"), js);
   writeFileSync(join(web, "index.html"), '<!doctype html><html><body><div id="root"></div><script type="module" src="/index-BZg5MLuf.js"></script></body></html>');
-  writeFileSync(join(home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0 }));
+  writeFileSync(join(home, "config.yml"), stringify({ host: "pc1", token: "t0k", port: 0, security: { mode: "plaintext" } }));
   const r = await runDaemon({ home, timing: FAST, log: () => {}, noLock: true, noSupervisor: true, webDist: web });
   cleanup.push(async () => {
     await r.stop();

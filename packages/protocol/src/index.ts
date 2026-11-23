@@ -151,6 +151,12 @@ export const Order = z.object({
   /** Explicit Address requested by the Customer; skips LLM routing. */
   to: z.string().optional(),
   body: z.string(),
+  /**
+   * Optional per-target question text, keyed by agentId (v4-7 #39). A target missing from the map
+   * receives `body`, so a partial map is safe. Delivery sends only the target's own text; the
+   * recorded Order and history keep the shared `body`.
+   */
+  variants: z.record(z.string(), z.string()).optional(),
   /** Files attached to this Order; the blobs stay on their origin Host. */
   attachments: z.array(Attachment).optional(),
   parentOrderId: z.string().optional(),
@@ -183,6 +189,11 @@ export const RoutingDecision = z.object({
   whyNot: z.array(z.object({ agentId: z.string(), reason: z.string() })).optional(),
   /** How many Baristas received this Order (targets.length). */
   fanout: z.number().int().min(0).optional(),
+  /**
+   * Per-target question text for a multicast Order (v4-7 #39). Delivery-only: `dispatch()` sends
+   * target `t` the text `variants[t]`, falling back to the Order's `body`.
+   */
+  variants: z.record(z.string(), z.string()).optional(),
 });
 export type RoutingDecision = z.infer<typeof RoutingDecision>;
 

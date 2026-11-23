@@ -80,7 +80,7 @@ async function setup() {
   homes.push(work);
   const port = await freePort();
   ports.push(port);
-  writeFileSync(join(home, "config.yml"), `port: ${port}\nhost: t\nmode: root\ndiscovery: false\n`);
+  writeFileSync(join(home, "config.yml"), `port: ${port}\nhost: t\nmode: root\ndiscovery: false\nsecurity:\n  mode: plaintext\n`);
   return { home, work, port, base: `http://127.0.0.1:${port}` };
 }
 
