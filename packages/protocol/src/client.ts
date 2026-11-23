@@ -1,4 +1,4 @@
-import { setDefaultCACertificates, getCACertificates } from "node:tls";
+import * as nodeTls from "node:tls";
 import { daemonWsUrl } from "./urls.ts";
 import {
   DEFAULT_PORT,
@@ -270,8 +270,13 @@ const appliedCas = new Set<string>();
 function applyCa(caPem: string): void {
   if (appliedCas.has(caPem)) return;
   try {
+    // `setDefaultCACertificates` is Node ≥ 22.19 only; Bun (omp) lacks it. Detect rather than assume,
+    // so importing this module never throws under an alternate runtime.
+    const set = (nodeTls as { setDefaultCACertificates?: (certs: string[]) => void }).setDefaultCACertificates;
+    const get = (nodeTls as { getCACertificates?: (kind: string) => string[] }).getCACertificates;
+    if (typeof set !== "function" || typeof get !== "function") return;
     // Additive: the system roots stay trusted, and verification is never turned off.
-    setDefaultCACertificates([...getCACertificates("default"), caPem]);
+    set([...get("default"), caPem]);
     appliedCas.add(caPem);
   } catch {
     // A runtime without this API keeps the system roots only; the handshake then fails closed
