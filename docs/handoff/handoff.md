@@ -1,6 +1,6 @@
 # cafe — handoff
 
-Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs are in [`docs/specs/`](../specs/). See §5 first for the live Discord verification and approved designs awaiting implementation. Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
+Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs are in [`docs/specs/`](../specs/). See §5 first for the newest batch (Discord live test, #39 per-target questions, TLS #61). Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
 
 > Start with the newest entry in §5 and the operational notes in §8. Run `git status --short --branch` and `git log --oneline -5` to establish the checkout and recent commits. Run `cafe daemon status` separately to check the process that is serving requests.
 
