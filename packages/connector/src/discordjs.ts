@@ -21,14 +21,24 @@ interface AnyMessage {
   content: string;
   guildId: string | null;
   channelId: string;
-  channel?: { send(text: string): Promise<unknown>; isDMBased?(): boolean };
+  channel?: { send(text: string, opts?: { nonce?: string; enforceNonce?: boolean }): Promise<unknown>; isDMBased?(): boolean };
   author: { id: string; bot?: boolean };
   mentions?: { users?: { has(id: string): boolean }; everyone?: boolean; here?: boolean };
+  attachments?: Map<string, AnyAttachment> | AnyAttachment[];
+}
+
+interface AnyAttachment {
+  id: string;
+  name: string;
+  url: string;
+  size: number;
+  contentType?: string | null;
 }
 
 /** Build a `PlatformMessage` from a discord.js message; `botUserId` is our own user id. */
 export function toPlatformMessage(m: AnyMessage, botUserId: string | undefined): PlatformMessage {
   const mentionsBot = !!botUserId && !!m.mentions?.users?.has(botUserId);
+  const files = [...(m.attachments ? (Array.isArray(m.attachments) ? m.attachments : m.attachments.values()) : [])];
   return {
     eventId: m.id,
     ...(m.guildId ? { guildId: m.guildId } : {}),
@@ -38,6 +48,17 @@ export function toPlatformMessage(m: AnyMessage, botUserId: string | undefined):
     mentionEveryone: !!(m.mentions?.everyone || m.mentions?.here),
     mentionsBot,
     authorIsBot: !!m.author.bot,
+    ...(files.length
+      ? {
+          attachments: files.map((a) => ({
+            id: a.id,
+            name: a.name,
+            url: a.url,
+            size: a.size,
+            ...(a.contentType ? { contentType: a.contentType } : {}),
+          })),
+        }
+      : {}),
   };
 }
 
@@ -79,10 +100,35 @@ export async function createDiscordJsPlatform(ctx: ConnectorContext): Promise<Di
         });
       });
     },
-    async send(channelId, text) {
+    async send(channelId, text, opts) {
       const ch = channels.get(channelId);
       if (!ch?.send) throw new Error(`discord channel ${channelId} is not known to this connector yet`);
-      await ch.send(text);
+      // `enforceNonce` makes Discord drop a resend that repeats the nonce: recovery cannot double-post.
+      await ch.send(text, opts?.nonce ? { nonce: opts.nonce, enforceNonce: true } : undefined);
+    },
+    async download(a, opts) {
+      // The URL came from the message and already passed the host allowlist; follow redirects only
+      // within the same policy by re-checking where we ended up is overkill for Discord's CDN, so
+      // cap by size and by the caller's own byte budget instead.
+      const res = await fetch(a.url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`attachment ${a.id}: HTTP ${res.status}`);
+      const declared = Number(res.headers.get("content-length") ?? 0);
+      if (declared && declared > opts.maxBytes) throw new Error(`attachment ${a.id} is larger than ${Math.floor(opts.maxBytes / 1024 / 1024)}MB`);
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      if (!res.body) throw new Error(`attachment ${a.id} returned no body`);
+      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+        total += chunk.byteLength;
+        if (total > opts.maxBytes) throw new Error(`attachment ${a.id} is larger than ${Math.floor(opts.maxBytes / 1024 / 1024)}MB`);
+        chunks.push(chunk);
+      }
+      const bytes = new Uint8Array(total);
+      let at = 0;
+      for (const c of chunks) {
+        bytes.set(c, at);
+        at += c.byteLength;
+      }
+      return { bytes, name: a.name, mime: a.contentType || "application/octet-stream" };
     },
     async close() {
       await client.destroy().catch(() => {});

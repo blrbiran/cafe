@@ -15,6 +15,8 @@ export interface SendOrderOptions {
   origin?: "human" | "agent";
   via?: { id?: string; address: string; name?: string };
   as?: string;
+  /** Uploaded metadata (`uploadAttachment`) to carry on the Order. Contents never go on the wire. */
+  attachments?: Array<Record<string, unknown>>;
 }
 
 export interface CreatedOrder {
@@ -83,8 +85,33 @@ export class CafeHttpClient {
         ...(o.idempotencyKey ? { idempotencyKey: o.idempotencyKey } : {}),
         ...(o.via ? { via: o.via } : {}),
         ...(o.as ? { as: o.as } : {}),
+        ...(o.attachments?.length ? { attachments: o.attachments } : {}),
       }),
     });
+  }
+
+  /**
+   * Upload one file to the Daemon's staging area; the returned metadata goes on an Order or reply.
+   * A connector downloads from its platform and hands the bytes here — the Daemon owns validation.
+   */
+  async uploadAttachment(file: { bytes: Uint8Array; name: string; mime: string }): Promise<Record<string, unknown>> {
+    const q = `?name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.mime)}`;
+    const res = await fetch(`${this.base}/api/artifacts${q}`, {
+      method: "POST",
+      headers: this.headers({ "content-type": "application/octet-stream" }),
+      body: Buffer.from(file.bytes),
+    });
+    const text = await res.text();
+    let body: unknown = {};
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { message: text };
+    }
+    if (!res.ok) throw errorFrom(res.status, body);
+    const attachment = (body as { attachment?: Record<string, unknown> }).attachment;
+    if (!attachment) throw new Error(`upload of ${file.name} returned no attachment`);
+    return attachment;
   }
 
   getThread(threadId: string): Promise<ThreadResponse> {

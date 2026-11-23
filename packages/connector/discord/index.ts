@@ -7,7 +7,13 @@
  *
  * Requires the bot's **Message Content** intent (Discord Developer Portal → Bot → Privileged
  * Gateway Intents). Allowlist guild/channel/user ids; a message that does not mention the bot is
- * ignored (`requireMention`). Discord posts are chunked to 2000 characters.
+ * ignored (`requireMention`). Discord posts are chunked to 2000 characters, and each chunk carries a
+ * stable nonce so a crash-recovery resend cannot double-post.
+ *
+ * Attachments are opt-in (`allowAttachments: true`). Message URLs are attacker-controlled, so a
+ * download happens only when the URL is https and its host is exactly in `attachmentHosts`
+ * (`cdn.discordapp.com` / `media.discordapp.net` by default). The bytes go to the Daemon's upload
+ * API; the Order carries metadata plus the text, never the file contents.
  */
 import { createDiscordConnector } from "@cafe/connector/discord";
 import { isEntryPoint } from "@cafe/connector/mock";

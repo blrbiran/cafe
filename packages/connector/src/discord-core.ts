@@ -5,11 +5,21 @@
  * Order → reply path is unit-tested with a fake platform (no bot token, no network). `discordjs.ts`
  * is the real implementation, loaded lazily so the SDK itself never depends on discord.js.
  */
+import { createHash } from "node:crypto";
 import type { ConnectorContext, ConnectorMain, ConnectorOptions } from "@cafe/connector/sdk";
 import { defineConnector } from "@cafe/connector/sdk";
 import type { ThreadEnvelope } from "@cafe/protocol";
 
 export const DISCORD_MAX_CHARS = 2000;
+
+export interface PlatformAttachment {
+  id: string;
+  name: string;
+  /** The CDN URL Discord handed us. Treated as untrusted until it passes the host allowlist. */
+  url: string;
+  size: number;
+  contentType?: string;
+}
 
 export interface PlatformMessage {
   /** Discord message id: also the idempotency key. */
@@ -21,6 +31,14 @@ export interface PlatformMessage {
   mentionEveryone?: boolean;
   mentionsBot: boolean;
   authorIsBot: boolean;
+  /** Files on the message; only used when the connector opts into attachments. */
+  attachments?: PlatformAttachment[];
+}
+
+export interface PlatformDownload {
+  bytes: Uint8Array;
+  name: string;
+  mime: string;
 }
 
 export interface DiscordPlatform {
@@ -29,8 +47,13 @@ export interface DiscordPlatform {
    * not on success — the connector awaits it, so "connected" is signalled through `onReady`.
    */
   connect(onMessage: (m: PlatformMessage) => Promise<void>, onError: (err: Error) => void, onReady?: () => void): Promise<void>;
-  /** Send one chunk (≤ 2000 chars) to a channel. */
-  send(channelId: string, text: string): Promise<void>;
+  /** Send one chunk (≤ 2000 chars) to a channel. `nonce` is stable per chunk so a resend dedupes. */
+  send(channelId: string, text: string, opts?: { nonce?: string }): Promise<void>;
+  /**
+   * Fetch one attachment's bytes. Only called after `filterReason`/`useReason` approved the URL;
+   * adapters may still refuse (Discord CDN URLs expire), which fails the event, not the connector.
+   */
+  download(a: PlatformAttachment, opts: { maxBytes: number }): Promise<PlatformDownload>;
   /** Disconnect (tests: stop delivering). */
   close(): Promise<void>;
 }
@@ -41,10 +64,23 @@ export interface DiscordConfig {
   allowUsers: string[];
   allowDMs: boolean;
   requireMention: boolean;
+  /** Inbound files are opt-in: a platform-supplied URL is fetched by this process. */
+  allowAttachments: boolean;
+  /** Hosts an attachment URL may point at (exact match; https only). */
+  attachmentHosts: string[];
+  /** Per-file cap; also bounded by the Daemon's attachments.maxMb. */
+  attachmentMaxMb: number;
 }
+
+/** Only Discord's own CDN by default: a message URL is attacker-controlled input. */
+export const DEFAULT_ATTACHMENT_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"];
 
 function stringList(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && !!x) : [];
+}
+
+function positive(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
 export function readConfig(config: Record<string, unknown>): DiscordConfig {
@@ -54,6 +90,9 @@ export function readConfig(config: Record<string, unknown>): DiscordConfig {
     allowUsers: stringList(config.allowUsers),
     allowDMs: !!config.allowDMs,
     requireMention: config.requireMention !== false,
+    allowAttachments: !!config.allowAttachments,
+    attachmentHosts: (config.attachmentHosts === undefined ? DEFAULT_ATTACHMENT_HOSTS : stringList(config.attachmentHosts)).map((h) => h.toLowerCase()),
+    attachmentMaxMb: positive(config.attachmentMaxMb, 25),
   };
 }
 
@@ -61,17 +100,38 @@ function allows(list: string[], value: string | undefined): boolean {
   return list.length === 0 || (!!value && list.includes(value));
 }
 
+/** Why a message's attachments may not be fetched, or undefined when they are acceptable. */
+export function useReason(m: PlatformMessage, c: DiscordConfig): string | undefined {
+  const files = m.attachments ?? [];
+  if (!files.length) return undefined;
+  if (!c.allowAttachments) return "attachments are disabled (allowAttachments: false)";
+  const maxBytes = c.attachmentMaxMb * 1024 * 1024;
+  for (const a of files) {
+    let url: URL;
+    try {
+      url = new URL(a.url);
+    } catch {
+      return `attachment ${a.id} has no usable URL`;
+    }
+    if (url.protocol !== "https:") return `attachment ${a.id} must be fetched over https`;
+    // Exact host match: `cdn.discordapp.com.evil.example` must not inherit the allowance.
+    if (!c.attachmentHosts.includes(url.hostname.toLowerCase())) return `attachment ${a.id} host ${url.hostname} is not an allowed attachment host`;
+    if (a.size > maxBytes) return `attachment ${a.id} is too large (${a.size} bytes > ${c.attachmentMaxMb}MB)`;
+  }
+  return undefined;
+}
+
 /** Why a Discord message is ignored, or undefined when it should become an Order. */
 export function filterReason(m: PlatformMessage, c: DiscordConfig): string | undefined {
   if (m.authorIsBot) return "author is a bot";
-  if (!m.text.trim()) return "empty message";
+  if (!m.text.trim() && !(c.allowAttachments && m.attachments?.length)) return "empty message";
   if (m.mentionEveryone) return "@everyone/@here is not accepted";
   if (!m.guildId && !c.allowDMs) return "direct messages are disabled (allowDMs: false)";
   if (m.guildId && !allows(c.allowGuilds, m.guildId)) return `guild ${m.guildId} is not in allowGuilds`;
   if (!allows(c.allowChannels, m.channelId)) return `channel ${m.channelId} is not in allowChannels`;
   if (!allows(c.allowUsers, m.userId)) return `user ${m.userId} is not in allowUsers`;
   if (c.requireMention && !m.mentionsBot && m.guildId) return "message does not mention the bot (requireMention)";
-  return undefined;
+  return useReason(m, c);
 }
 
 /** Split a reply into Discord-sized chunks at a word or newline boundary where possible. */
@@ -89,6 +149,32 @@ export function chunkText(text: string, max = DISCORD_MAX_CHARS): string[] {
   return out.length ? out : [""];
 }
 
+/**
+ * A stable per-(event, chunk) nonce. Discord dedupes a resend that repeats the same nonce within
+ * its window, so a crash-recovery re-delivery cannot post the same answer twice.
+ */
+function chunkNonce(eventId: string, index: number): string {
+  return createHash("sha256").update(`${eventId}:${index}`).digest("hex").slice(0, 24);
+}
+
+/**
+ * Order body for an inbound message. File contents never go into the prompt: the Order carries
+ * attachment metadata, and a Barista reads the blob through cafe's own attachment path.
+ */
+async function orderAttachments(ctx: ConnectorContext, platform: DiscordPlatform, m: PlatformMessage): Promise<{ text: string; attachments?: Array<Record<string, unknown>> }> {
+  const cfg = readConfig(ctx.config);
+  const files = m.attachments ?? [];
+  if (!files.length || !cfg.allowAttachments) return { text: m.text };
+  const maxBytes = cfg.attachmentMaxMb * 1024 * 1024;
+  const attachments: Array<Record<string, unknown>> = [];
+  for (const a of files) {
+    const got = await platform.download(a, { maxBytes });
+    if (got.bytes.byteLength > maxBytes) throw new Error(`attachment ${a.id} is larger than ${cfg.attachmentMaxMb}MB`);
+    attachments.push(await ctx.cafe.uploadAttachment({ bytes: got.bytes, name: got.name, mime: got.mime }));
+  }
+  return { text: m.text, ...(attachments.length ? { attachments } : {}) };
+}
+
 /** Follow the Order's Thread over SSE and send each final reply back to Discord. */
 export async function followAndSend(ctx: ConnectorContext, platform: DiscordPlatform, item: { eventId: string; channel: string; threadId?: string; orderId?: string }): Promise<void> {
   if (!item.threadId || !item.orderId) throw new Error(`event ${item.eventId} has no Thread/Order to follow`);
@@ -102,8 +188,11 @@ export async function followAndSend(ctx: ConnectorContext, platform: DiscordPlat
   if (!finals.length) {
     ctx.error(`order ${item.orderId} closed without a final reply`);
   }
+  let chunkIndex = 0;
   for (const text of finals) {
-    for (const chunk of chunkText(text)) await platform.send(item.channel, chunk);
+    for (const chunk of chunkText(text)) {
+      await platform.send(item.channel, chunk, { nonce: chunkNonce(item.eventId, chunkIndex++) });
+    }
   }
   ctx.outbox.markDelivered(item.eventId);
 }
@@ -111,13 +200,15 @@ export async function followAndSend(ctx: ConnectorContext, platform: DiscordPlat
 async function sendAndFollow(ctx: ConnectorContext, platform: DiscordPlatform, m: PlatformMessage): Promise<void> {
   try {
     const known = ctx.threads.get(m.channelId);
+    const { text, attachments } = await orderAttachments(ctx, platform, m);
     const created = await ctx.cafe.sendOrder({
-      body: m.text,
+      body: text,
       ...(known ? { threadId: known } : {}),
       idempotencyKey: m.eventId,
       origin: "agent",
       via: { address: ctx.address, ...(m.userId ? { id: m.userId } : {}) },
       as: ctx.name,
+      ...(attachments ? { attachments } : {}),
     });
     ctx.threads.set(m.channelId, created.threadId);
     ctx.outbox.markSent(m.eventId, created.threadId, created.orderId);
