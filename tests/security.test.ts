@@ -110,13 +110,18 @@ describe("/api/baristas only starts cafe's own agents (#65)", () => {
     cleanup.push(d.stop);
     const post = (body: Record<string, unknown>) =>
       raw(d.addr, { method: "POST", path: "/api/baristas", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    const shell = await post({ dir: "/tmp", bin: "/bin/sh", args: ["-c", "id"] });
-    expect(shell.status).toBe(400);
-    const args = await post({ dir: "/tmp", agent: "codex", args: ["--dangerous"] });
-    expect(args.status).toBe(400);
-    const bogus = await post({ dir: "/tmp", agent: "sh" });
-    expect(bogus.status).toBe(400);
-    const noDir = await post({ agent: "codex" });
-    expect(noDir.status).toBe(400);
+    const err = async (body: Record<string, unknown>) => {
+      const res = await post(body);
+      // `bad_request` proves validation ran; `unavailable` would only mean no supervisor in tests.
+      expect(res.status, res.body).toBe(400);
+      const parsed = JSON.parse(res.body) as { error: string; message?: string };
+      expect(parsed.error, res.body).toBe("bad_request");
+      return parsed;
+    };
+    const shell = await err({ dir: "/tmp", bin: "/bin/sh", args: ["-c", "id"] });
+    expect(shell.message).toContain("unknown field");
+    await err({ dir: "/tmp", agent: "codex", args: ["--dangerous"] });
+    await err({ dir: "/tmp", agent: "sh" });
+    await err({ agent: "codex" });
   });
 });

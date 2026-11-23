@@ -555,10 +555,16 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   }
   if (path === "/api/baristas") {
     const sup = daemon.supervisor;
-    if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
-    if (m === "GET") return send(res, 200, sup.list());
+    if (m !== "POST" && !sup) throw new RpcError("unavailable", "barista supervisor disabled");
+    if (m === "GET") return send(res, 200, sup!.list());
     if (m === "POST") {
-      const { dir, agent, access, model, tui, thread } = await readJson(req);
+      const body = await readJson(req);
+      // Unknown fields are refused, not ignored: `bin`/`args` used to start any local executable,
+      // and silently ignoring them would start the default pi instead (#65).
+      const allowed = new Set(["dir", "agent", "access", "model", "tui", "thread"]);
+      const extra = Object.keys(body).filter((k) => !allowed.has(k));
+      if (extra.length) throw new RpcError("bad_request", `unknown field(s): ${extra.join(", ")}; cafe only starts its own agents (pi, omp, codex, claude)`);
+      const { dir, agent, access, model, tui, thread } = body;
       // Only cafe's own agents (#65). A free-form `bin`/`args` meant any local executable could be
       // started with any argv by any page that reached this API; `cafe barista start --agent` is the
       // supported path and it never needed more than these fields.
@@ -572,9 +578,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       if (thread !== undefined && (!tui || typeof thread !== "string" || !/^[\w-]+$/.test(thread))) throw new RpcError("bad_request", "bad thread id (needs tui)");
       // pi and omp are the local extension binaries the supervisor already knows how to run.
       const native = agent === "codex" || agent === "claude" ? { agent } : agent === "omp" ? { bin: "omp" } : {};
+      if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
       return send(res, 200, sup.start({ dir, ...native, ...(access ? { access } : {}), ...(model ? { model } : {}), ...(tui ? { tui } : {}), ...(thread ? { thread } : {}) }));
     }
-    if (m === "DELETE") return send(res, 200, { stopped: sup.stop(url.searchParams.get("dir") ?? "") });
+    if (m === "DELETE") return send(res, 200, { stopped: sup!.stop(url.searchParams.get("dir") ?? "") });
   }
   if (m === "POST" && path === "/api/root") {
     const { root } = await readJson(req);
