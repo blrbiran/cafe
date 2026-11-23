@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
+import { networkInterfaces } from "node:os";
 import { createReadStream, createWriteStream, existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { Readable } from "node:stream";
 import { finished, pipeline } from "node:stream/promises";
@@ -24,6 +26,15 @@ async function routerModels(search?: string): Promise<string[]> {
   return q ? modelCache.models.filter((m) => m.toLowerCase().includes(q)) : modelCache.models;
 }
 
+/** Barista kinds `cafe barista start --agent` accepts; anything else (a raw `bin`) is refused (#65). */
+const AGENT_NAMES = ["pi", "omp", "codex", "claude"] as const;
+
+/**
+ * The UI is a local app: nothing loads from elsewhere, styles are Tailwind classes plus a few inline
+ * ones, and the WebSocket is same-origin. `ws:`/`wss:` keep the live stream working over either (#69).
+ */
+const CSP = "default-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'";
+
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -47,15 +58,29 @@ export function defaultWebDist(): string {
   }
 }
 
+/** A static file: raw bytes, a gzip copy when that is smaller, and an ETag over the content (#69). */
+interface StaticFile {
+  body: Buffer;
+  gz?: Buffer;
+  type: string;
+  etag: string;
+}
+
 /** Read the built web UI into memory once (flat, exact-match lookup; no path traversal). */
-function loadStatic(dist: string): Map<string, { body: Buffer; type: string }> {
-  const files = new Map<string, { body: Buffer; type: string }>();
+function loadStatic(dist: string): Map<string, StaticFile> {
+  const files = new Map<string, StaticFile>();
   if (!existsSync(dist)) return files;
   const walk = (dir: string, prefix: string) => {
     for (const name of readdirSync(dir)) {
       const full = join(dir, name);
-      if (statSync(full).isDirectory()) walk(full, `${prefix}${name}/`);
-      else files.set(`${prefix}${name}`, { body: readFileSync(full), type: MIME[extname(name)] ?? "application/octet-stream" });
+      if (statSync(full).isDirectory()) {
+        walk(full, `${prefix}${name}/`);
+        continue;
+      }
+      const body = readFileSync(full);
+      const type = MIME[extname(name)] ?? "application/octet-stream";
+      const gz = /^(text\/|application\/(javascript|json))/.test(type) && body.length > 1024 ? gzipSync(body) : undefined;
+      files.set(`${prefix}${name}`, { body, ...(gz && gz.length < body.length ? { gz } : {}), type, etag: `"${createHash("sha1").update(body).digest("hex").slice(0, 16)}"` });
     }
   };
   walk(dist, "");
@@ -65,6 +90,62 @@ function loadStatic(dist: string): Map<string, { body: Buffer; type: string }> {
 function isLoopback(req: IncomingMessage): boolean {
   const a = req.socket.remoteAddress ?? "";
   return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1";
+}
+
+/** `host:port`, `[::1]:port` and a bare IPv6 address all reduce to the host part. */
+function hostOnly(host: string): string {
+  const v6 = /^\[([^\]]+)\](?::\d+)?$/.exec(host);
+  if (v6) return v6[1]!;
+  const withPort = /^([^:]+):\d+$/.exec(host);
+  return (withPort ? withPort[1]! : host).toLowerCase();
+}
+
+/**
+ * Hosts a browser may use to reach this daemon (#65). A page can only be trusted
+ * when it came from one of these: a DNS-rebinding page arrives with its own
+ * domain in `Host`, and an IP that belongs to this machine cannot be rebound.
+ */
+function allowedHosts(daemon: Daemon): Set<string> {
+  if (hostCache?.daemon === daemon) return hostCache.hosts;
+  const hosts = new Set<string>(["localhost", "127.0.0.1", "::1", daemon.config.host.toLowerCase()]);
+  const advertise = daemon.config.advertise;
+  if (advertise) hosts.add(hostOnly(advertise));
+  for (const list of Object.values(networkInterfaces())) {
+    for (const ni of list ?? []) if (ni.address) hosts.add(ni.address.toLowerCase());
+  }
+  hostCache = { daemon, hosts };
+  return hosts;
+}
+let hostCache: { daemon: Daemon; hosts: Set<string> } | undefined;
+
+function hostAllowed(req: IncomingMessage, daemon: Daemon): boolean {
+  const raw = req.headers.host;
+  // HTTP/1.1 requires Host; a missing one is not a browser we can vouch for.
+  if (!raw) return false;
+  return allowedHosts(daemon).has(hostOnly(raw));
+}
+
+/**
+ * A browser sends `Origin` on every cross-origin write, and a page cannot forge
+ * it. A request from the console/CLI/MCP has no Origin at all, so it is allowed;
+ * what must never pass is a page on some other site (CSRF, #65).
+ */
+function originAllowed(req: IncomingMessage, daemon: Daemon): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  let host: string;
+  try {
+    host = new URL(origin).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  // Same machine through a different scheme (http/https) is still this UI.
+  return allowedHosts(daemon).has(host);
+}
+
+/** GET/HEAD change nothing; everything else can. */
+function isWrite(method: string | undefined): boolean {
+  return !!method && method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
 function tokenOf(req: IncomingMessage, url: URL): string | undefined {
@@ -190,7 +271,17 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
     const url = new URL(req.url ?? "/", "http://x");
     const path = url.pathname;
     try {
+      // Any Host we do not answer to is a DNS-rebinding attempt (#65). Static files are included:
+      // the page itself decides which API calls it makes, so a rebound page must not load at all.
+      // Only loopback needs this: a non-loopback request still has to present the token.
+      if (isLoopback(req) && !hostAllowed(req, daemon)) {
+        return send(res, 403, { error: "forbidden_host", message: `this daemon does not answer to Host '${req.headers.host ?? ""}'` });
+      }
       if (path.startsWith("/api/")) {
+        // A cross-site page must not be able to write, even though the socket is loopback (#65).
+        if (isWrite(req.method) && !originAllowed(req, daemon)) {
+          return send(res, 403, { error: "forbidden_origin", message: "cross-site requests cannot change this daemon; use the Web UI or the CLI" });
+        }
         if (!isLoopback(req) && tokenOf(req, url) !== daemon.config.token) {
           return send(res, 401, { error: "unauthorized", message: "token mismatch or wrong Root address; compare `cafe config get token` on both hosts" });
         }
@@ -205,8 +296,24 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         }
         return send(res, 404, { error: "not found" });
       }
-      res.writeHead(200, { "content-type": file.type });
-      res.end(file.body);
+      // The HTML names the entry script, so it must be revalidated; hashed assets never change (#69).
+      const html = key.endsWith(".html");
+      const headers: Record<string, string> = {
+        "content-type": file.type,
+        etag: file.etag,
+        "cache-control": html ? "no-cache" : "public, max-age=31536000, immutable",
+        vary: "accept-encoding",
+      };
+      if (html) headers["content-security-policy"] = CSP;
+      if (req.headers["if-none-match"] === file.etag) {
+        res.writeHead(304, headers);
+        return res.end();
+      }
+      const accepts = (req.headers["accept-encoding"] ?? "").toString();
+      const useGzip = file.gz !== undefined && /\bgzip\b/.test(accepts);
+      if (useGzip) headers["content-encoding"] = "gzip";
+      res.writeHead(200, headers);
+      res.end(useGzip ? file.gz! : file.body);
     } catch (err) {
       const e = err as RpcError;
       send(res, e.code === "not_found" ? 404 : 400, { error: e.code ?? "error", message: e.message });
@@ -216,7 +323,19 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://x");
     if (url.pathname !== "/ws") return socket.destroy();
-    wss.handleUpgrade(req, socket, head, (ws) => daemon.accept(ws, isLoopback(req)));
+    // A browser always sends Origin on a WebSocket handshake and cannot forge it; CLI clients send
+    // none. Without this a page on any site could open the socket (loopback skips the token, #65).
+    // Host matters for loopback only, exactly as on the HTTP side.
+    if ((isLoopback(req) && !hostAllowed(req, daemon)) || !originAllowed(req, daemon)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return socket.destroy();
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      const counts = daemon.streamCounts;
+      counts.ws++;
+      ws.on("close", () => (counts.ws = Math.max(0, counts.ws - 1)));
+      daemon.accept(ws, isLoopback(req));
+    });
   });
 
   return new Promise((resolveP, reject) => {
@@ -283,6 +402,12 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (displayName !== undefined && typeof displayName !== "string") throw new RpcError("bad_request", "displayName must be a string");
     const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && !!x) : []);
     return send(res, 200, daemon.renameHost(host, typeof displayName === "string" ? displayName : "", { aliases: list(aliases), removeAliases: list(removeAliases) }));
+  }
+  if (m === "POST" && path === "/api/hosts/address") {
+    const { host, url } = await readJson(req);
+    if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host required");
+    if (url !== null && (typeof url !== "string" || !url.trim())) throw new RpcError("bad_request", "url must be a host:port string or null");
+    return send(res, 200, daemon.setHostAddress(host, url === null ? null : url.trim()));
   }
   if (m === "POST" && path === "/api/hosts/test") {
     const { host } = await readJson(req);
@@ -433,14 +558,21 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
     if (m === "GET") return send(res, 200, sup.list());
     if (m === "POST") {
-      const { dir, args, bin, agent, access, model, tui, thread } = await readJson(req);
-      if (bin !== undefined && (typeof bin !== "string" || !/^[\w./-]+$/.test(bin))) throw new RpcError("bad_request", "bin must be an executable name or path");
-      if (agent !== undefined && agent !== "codex" && agent !== "claude") throw new RpcError("bad_request", "agent must be codex or claude");
+      const { dir, agent, access, model, tui, thread } = await readJson(req);
+      // Only cafe's own agents (#65). A free-form `bin`/`args` meant any local executable could be
+      // started with any argv by any page that reached this API; `cafe barista start --agent` is the
+      // supported path and it never needed more than these fields.
+      if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
+      if (agent !== undefined && !AGENT_NAMES.includes(agent)) throw new RpcError("bad_request", `agent must be one of ${AGENT_NAMES.join(", ")}`);
       if (access !== undefined && access !== "read-only" && access !== "workspace-write") throw new RpcError("bad_request", "access must be read-only or workspace-write");
+      if (access !== undefined && agent !== "codex" && agent !== "claude") throw new RpcError("bad_request", "access is for agent codex or claude");
       if (model !== undefined && (typeof model !== "string" || !/^[\w./:@-]+$/.test(model))) throw new RpcError("bad_request", "bad model name");
+      if (model !== undefined && agent !== "codex" && agent !== "claude") throw new RpcError("bad_request", "model is for agent codex or claude");
       if (tui !== undefined && (tui !== true || agent !== "codex")) throw new RpcError("bad_request", "tui is for agent codex");
       if (thread !== undefined && (!tui || typeof thread !== "string" || !/^[\w-]+$/.test(thread))) throw new RpcError("bad_request", "bad thread id (needs tui)");
-      return send(res, 200, sup.start({ dir, args, ...(bin ? { bin } : {}), ...(agent ? { agent } : {}), ...(access ? { access } : {}), ...(model ? { model } : {}), ...(tui ? { tui } : {}), ...(thread ? { thread } : {}) }));
+      // pi and omp are the local extension binaries the supervisor already knows how to run.
+      const native = agent === "codex" || agent === "claude" ? { agent } : agent === "omp" ? { bin: "omp" } : {};
+      return send(res, 200, sup.start({ dir, ...native, ...(access ? { access } : {}), ...(model ? { model } : {}), ...(tui ? { tui } : {}), ...(thread ? { thread } : {}) }));
     }
     if (m === "DELETE") return send(res, 200, { stopped: sup.stop(url.searchParams.get("dir") ?? "") });
   }
@@ -499,11 +631,14 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
     write(env);
   };
   daemon.on("thread", onEvent);
+  const counts = daemon.streamCounts;
+  counts.sse++;
   const done = () => {
     if (finished) return;
     finished = true;
     if (ping) clearInterval(ping);
     daemon.off("thread", onEvent);
+    counts.sse = Math.max(0, counts.sse - 1);
   };
   // Register cleanup before the replay: the replay itself can end the response.
   req.on("close", done);
@@ -537,11 +672,14 @@ function eventStream(daemon: Daemon, url: URL, req: IncomingMessage, res: Server
   for (const env of replayAfter(recent, lastId)) write(env);
   const onEvent = (env: ThreadEnvelope) => write(env);
   daemon.on("thread", onEvent);
+  const counts = daemon.streamCounts;
+  counts.sse++;
   const done = () => {
     if (finished) return;
     finished = true;
     if (ping) clearInterval(ping);
     daemon.off("thread", onEvent);
+    counts.sse = Math.max(0, counts.sse - 1);
   };
   req.on("close", done);
   res.on("close", done);

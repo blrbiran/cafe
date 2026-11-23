@@ -6,8 +6,9 @@ import { startServer, type ServerHandle } from "./server.ts";
 import { Supervisor } from "./supervisor.ts";
 import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress } from "./daemon.ts";
+import { daemonLog } from "./proc/daemonLog.ts";
 
-export { Daemon, lanAddress, type DaemonOptions, type Timing } from "./daemon.ts";
+export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, type DaemonOptions, type Timing } from "./daemon.ts";
 export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configPath, diffConfig, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
@@ -15,6 +16,7 @@ export { startServer, type ServerHandle } from "./server.ts";
 export { Store } from "./store.ts";
 export { routingStats, formatRoutingStats, type RoutingStats } from "./routing-stats.ts";
 export { discoverRoots, type FoundRoot } from "./discovery.ts";
+export { daemonLog, daemonLogPath, type DaemonLogOptions } from "./proc/daemonLog.ts";
 export { Supervisor, defaultCliBin, defaultExtensionPath, type BaristaSpec, type SupervisorOptions, type WorkerInfo } from "./supervisor.ts";
 
 function alive(pid: number): boolean {
@@ -84,7 +86,12 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   if (opts.root) config.root = opts.root;
   const release = opts.noLock ? () => {} : acquireLock(home);
   if (!release) throw new Error(`another cafe daemon is already running for ${home}`);
-  const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, timing: opts.timing, log: opts.log, version: opts.version });
+  // The daemon owns daemon.log (timestamped, capped, #66) unless a caller supplies its own sink
+  // (tests pass a no-op). Foreground `cafe daemon run` used to inherit stdout from launchd/systemd,
+  // which cannot add timestamps or stop the file growing.
+  const logFile = opts.log ? undefined : daemonLog(config.host, home, { version: opts.version ?? "dev", pid: process.pid, mode: config.mode });
+  const log = opts.log ?? ((m: string) => logFile!(m));
+  const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, timing: opts.timing, log, version: opts.version });
   await daemon.initRouter();
   let server: ServerHandle;
   try {
@@ -138,6 +145,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
       await daemon.supervisor?.shutdown();
       daemon.stop();
       await server.close();
+      logFile?.close();
       release();
     },
   };

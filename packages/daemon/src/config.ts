@@ -48,6 +48,11 @@ export const CafeConfig = z.object({
   discovery: z.boolean().default(true),
   /** Root only: last known URLs of Daemons, for dial-back after the Root moves. */
   knownDaemons: z.record(z.string(), z.string()).default({}),
+  /**
+   * Root only: addresses a person set by hand. They win over whatever a child reports about itself,
+   * because a child behind Docker/NAT only knows an address that is useless to everyone else (#75).
+   */
+  pinnedDaemons: z.record(z.string(), z.string()).default({}),
   /** Root only: display-name overrides for Daemons that may be offline when renamed. */
   hostNames: z.record(z.string(), z.object({ displayName: z.string().optional(), aliases: z.array(z.string()).default([]), legacyAliases: z.array(z.string()).default([]) })).default({}),
 });

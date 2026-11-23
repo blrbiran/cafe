@@ -144,6 +144,8 @@ export const api = {
     call<unknown>("POST", "/api/hosts/rename", { host, displayName, aliases, removeAliases }),
   testHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/test", { host }),
   reconnectHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }>("POST", "/api/hosts/reconnect", { host }),
+  /** Root only: pin the address other machines use for `host`; `null` forgets it (#75). */
+  setHostAddress: (host: string, url: string | null) => call<DaemonRecord>("POST", "/api/hosts/address", { host, url }),
   renameAgent: (address: string, displayName: string) => call<unknown>("POST", "/api/agents/rename", { address, displayName }),
   aliasAgent: (address: string, alias: string) => call<unknown>("POST", "/api/agents/rename", { address, alias }),
   removeAgentAlias: (address: string, removeAlias: string) => call<unknown>("POST", "/api/agents/rename", { address, removeAlias }),

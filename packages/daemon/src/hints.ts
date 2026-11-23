@@ -69,6 +69,31 @@ export interface OutcomeRow {
   tokens: string[];
 }
 
+/**
+ * Build hints from pre-counted outcomes (#68). `Store.outcomeSummary()` does the grouping in SQL, so
+ * this only has to weight the recent decline topics; it no longer walks every row of the last week.
+ */
+export function hintsFromSummary(
+  rows: { identity: string; answered: number; declined: number; failed: number; declinedTopics?: string[]; declinedAt?: number }[],
+  now = Date.now(),
+): Record<string, RoutingHint> {
+  const out: Record<string, RoutingHint> = {};
+  for (const r of rows) {
+    const h: RoutingHint = (out[r.identity] ??= { identity: r.identity, answered: 0, declined: 0, failed: 0, declinedTopics: {} });
+    h.answered += r.answered;
+    h.declined += r.declined;
+    h.failed += r.failed;
+    if (r.declinedAt === undefined || now - r.declinedAt > HINT_WINDOW_MS) continue;
+    const w = Math.pow(0.5, Math.max(0, now - r.declinedAt) / HINT_HALF_LIFE_MS);
+    for (const t of r.declinedTopics ?? []) h.declinedTopics[t] = (h.declinedTopics[t] ?? 0) + w;
+  }
+  for (const h of Object.values(out)) {
+    const top = Object.entries(h.declinedTopics).sort((a, b) => b[1] - a[1]).slice(0, MAX_TOPICS);
+    h.declinedTopics = Object.fromEntries(top.map(([k, v]) => [k, Math.round(v * 1000) / 1000]));
+  }
+  return out;
+}
+
 export function computeHints(rows: OutcomeRow[], now = Date.now()): Record<string, RoutingHint> {
   const out: Record<string, RoutingHint> = {};
   for (const r of rows) {

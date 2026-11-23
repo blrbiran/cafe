@@ -145,3 +145,18 @@ describe("cafe commands install --agent claude", () => {
     expect(existsSync(path)).toBe(true);
   });
 });
+describe("a signal-killed claude keeps its signal in the diagnosis (#58)", () => {
+  it("reports SIGKILL instead of `exited null`", () => {
+    const home = temp();
+    const binDir = join(home, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const fake = join(binDir, "claude");
+    writeFileSync(fake, "#!/bin/sh\nkill -9 $$\n");
+    chmodSync(fake, 0o755);
+    const state = claudePluginState(fake);
+    expect(state.state).toBe("unknown");
+    expect(state.detail).toContain("SIGKILL");
+    expect(state.detail).not.toContain("null");
+    expect(state.detail).toMatch(/reinstall|Claude Code/);
+  });
+});

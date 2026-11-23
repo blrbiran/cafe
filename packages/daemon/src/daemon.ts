@@ -7,6 +7,7 @@ import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
+import { hintsFromSummary } from "./hints.ts";
 import {
   ACK_TIMEOUT_MS,
   AgentIdentity,
@@ -15,6 +16,7 @@ import {
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MISSES,
   InitializeParams,
+  DEFAULT_THREAD_PAGE,
   MAX_ORDER_DEPTH,
   Methods,
   PROTOCOL_VERSION,
@@ -59,6 +61,12 @@ export interface Timing {
   ackTimeoutMs: number;
   heartbeatIntervalMs: number;
   broadcastDeadlineMs: number;
+  /**
+   * Upper bound for a unicast Order. Heartbeats only prove the Barista is alive, not that it will ever
+   * answer; without this a queued Order could hold `cafe ask` open for hours (#60). Much longer than
+   * the broadcast deadline because a single Barista may legitimately work for a while.
+   */
+  unicastDeadlineMs: number;
   /** After the first final answer in a multicast/broadcast, skip silent targets after this long (#39). */
   graceMs: number;
   reconnectMinMs: number;
@@ -218,12 +226,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.hostAliases = [...opts.config.aliases];
     this.hostLegacyAliases = [...(opts.config.legacyAliases ?? [])];
     this.store = new Store(opts.home);
+    // Every SSE stream and Web UI attaches a "thread" listener; the default limit of 10 is far below
+    // normal use (one tab per Thread, `cafe tail`, MCP) and the warning was hidden by --no-warnings (#70).
+    this.setMaxListeners(0);
     this.startLagSampler();
     this.log = opts.log ?? ((m) => console.error(`[cafe ${this.host}] ${m}`));
     this.timing = {
       ackTimeoutMs: ACK_TIMEOUT_MS,
       heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
       broadcastDeadlineMs: BROADCAST_DEADLINE_MS,
+      unicastDeadlineMs: 10 * 60_000,
       graceMs: 2_000,
       reconnectMinMs: 500,
       reconnectMaxMs: 30_000,
@@ -327,7 +339,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   url(): string {
-    return `ws://${this.config.advertise ?? lanAddress()}:${this.config.port}`;
+    return `ws://${hostWithPort(this.config.advertise ?? lanAddress(), this.config.port)}`;
   }
 
   get rootOnline(): boolean {
@@ -654,11 +666,52 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return child.request<AgentRecord>(Methods.agentRename, { agentId: rec.agentId, removeAlias: alias });
   }
 
+  /**
+   * Root: a person's hand-set address for another Host. It beats the address that Host reports about
+   * itself, and is what the Root broadcasts to children (#75). `null` clears it.
+   */
+  setHostAddress(host: string, url: string | null): DaemonRecord {
+    if (!this.isRoot) throw new RpcError("not_root", "only the Root can set another Host's address");
+    if (host === this.host) throw new RpcError("bad_request", "this is the Root itself; set `advertise` instead");
+    const record = this.daemons().find((d) => d.host === host);
+    if (!record && !host) throw new RpcError("bad_request", "host is required");
+    if (url === null) {
+      delete this.config.pinnedDaemons[host];
+    } else {
+      this.config.pinnedDaemons[host] = assertDaemonAddress(url).replace(/^ws:\/\//, "");
+    }
+    saveConfig(this.config, this.store.home);
+    const rec = this.daemonRecords.get(host);
+    if (rec) rec.url = url === null ? rec.url : `ws://${this.config.pinnedDaemons[host]}`;
+    this.emitDaemons();
+    this.log(url === null ? `cleared pinned address for ${host}` : `pinned ${host} -> ${this.config.pinnedDaemons[host]}`);
+    return this.daemons().find((d) => d.host === host) ?? record!;
+  }
+
+  /** The pinned address if a person set one; also the only child address worth broadcasting. */
+  private pinnedAddress(host: string): string | undefined {
+    const pin = this.config.pinnedDaemons[host];
+    return pin ? `ws://${pin}` : undefined;
+  }
+
+  /** A child address has been proven reachable from this Host (pinned, or probed before saving). */
+  private verifiedAddress(host: string): string | undefined {
+    const pinned = this.pinnedAddress(host);
+    if (pinned) return pinned;
+    const known = this.config.knownDaemons[host];
+    return known ? known : undefined;
+  }
+
+  /** What another Host actually remembered for `host`, for tests and diagnosis. */
+  peerUrlFor(host: string): string | undefined {
+    return this.peerUrls.get(host);
+  }
+
   /** Reachability check from this machine to another Host's HTTP API (Web "Test"). */
   async testHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }> {
     if (host === this.host) return { host, online: true, latencyMs: 0, version: this.version };
     const rec = this.daemons().find((d) => d.host === host);
-    const url = rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
+    const url = this.pinnedAddress(host) || rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
     if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
     const started = Date.now();
     try {
@@ -681,9 +734,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!this.isRoot) throw new RpcError("not_root", "only the Root can reconnect another Host");
     if (this.children.has(host)) return this.testHost(host);
     const rec = this.daemons().find((d) => d.host === host);
-    const url = rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
+    const url = this.pinnedAddress(host) || rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
     if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
-    const me = `${this.config.advertise ?? lanAddress()}:${this.config.port}`;
+    const me = hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
     try {
       await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
         method: "POST",
@@ -806,8 +859,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (p.threadId) {
       prior = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
       if (!prior) throw new RpcError("not_found", `unknown thread ${p.threadId}`);
-      if ([...this.tracking.values()].some((x) => x.order.threadId === p.threadId && x.status === "open")) {
-        throw new RpcError("thread_busy", "the previous question in this thread is still open; wait or cancel it first");
+      const open = [...this.tracking.values()].find((x) => x.order.threadId === p.threadId && x.status === "open");
+      if (open) {
+        if (!p.replace) {
+          throw new RpcError(
+            "thread_busy",
+            `the previous question in this thread is still open; wait, run \`cafe cancel ${p.threadId}\`, or pass replace: true to ask anyway`,
+          );
+        }
+        // The person gave up on the stuck Order; record that instead of leaving it open forever (#60).
+        this.emitEvent(open.order, { type: "order.cancelled", by: "replaced" });
+        this.close(open, "cancelled");
       }
     }
     const threadId = prior?.threadId ?? ulid();
@@ -851,8 +913,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return { orderId: order.orderId, threadId: order.threadId, decision };
     }
     for (const id of decision.targets) this.dispatch(t, id);
-    if (decision.mode !== "unicast" || order.kind === "notice") {
+    // Every Order gets an upper bound (#60). Heartbeats prove the Barista is alive, not that it will
+    // answer: without a deadline a queued unicast Order left `cafe ask` hanging indefinitely.
+    // A notice is fire-and-forget and only needs to be collected, not answered.
+    if (order.kind === "notice" || decision.mode !== "unicast") {
       t.deadline = setTimeout(() => this.finishOnDeadline(t), order.deadlineMs ?? this.timing.broadcastDeadlineMs);
+    } else {
+      t.deadline = setTimeout(() => this.finishOnDeadline(t), order.deadlineMs ?? this.timing.unicastDeadlineMs);
     }
     return { orderId: order.orderId, threadId: order.threadId, decision };
   }
@@ -1230,7 +1297,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private finishOnDeadline(t: Tracking): void {
     if (t.status !== "open") return;
     if (t.order.kind === "notice") return this.close(t, "done");
-    for (const [id, s] of t.targets) if (s === "pending" || s === "acked") this.targetFailed(t, id, "deadline");
+    // A deadline is final: unlike an a refusal, there is no time left to try the next candidate.
+    for (const [id, s] of t.targets) {
+      if (s !== "pending" && s !== "acked") continue;
+      this.clearTimer(t, id);
+      t.targets.set(id, "failed");
+      this.emitEvent(t.order, { type: "order.failed", agentId: id, reason: "deadline", unavailable: true }, { skipTrack: true });
+    }
     this.maybeClose(t);
   }
 
@@ -1312,6 +1385,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Cheap counters for /api/health (dogfooding probes, #31/#34): since this Daemon started. */
   private stats = { events: 0, appendBytes: 0, metaWrites: 0, metaBytes: 0, snapshotMs: 0, searchMs: 0 };
   private loopLagMs = 0;
+  /** Cost of the last routing-hint recompute, for /api/health (#68). */
+  private hintMs = 0;
+  private hintRows = 0;
+  /** Live SSE/WebSocket clients, maintained by the server (#70). */
+  readonly streamCounts = { sse: 0, ws: 0 };
   private lagTimer?: ReturnType<typeof setInterval>;
 
   /** Append to the Thread's JSONL, keeping the byte counters for /api/health. */
@@ -1338,8 +1416,37 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** Snapshot of the counters exposed at GET /api/health. */
-  metrics(): { threads: number; events: number; appendBytes: number; metaWrites: number; metaBytes: number; snapshotMs: number; searchMs: number; eventLoopLagMs: number; cachedThreads: number; cachedOrders: number; indexedEvents: number } {
-    return { threads: this.store.countThreads(), ...this.stats, eventLoopLagMs: this.loopLagMs, cachedThreads: this.metas.size, cachedOrders: this.knownOrders.size, indexedEvents: this.store.countIndexed() };
+  metrics(): {
+    threads: number;
+    events: number;
+    appendBytes: number;
+    metaWrites: number;
+    metaBytes: number;
+    snapshotMs: number;
+    searchMs: number;
+    eventLoopLagMs: number;
+    cachedThreads: number;
+    cachedOrders: number;
+    indexedEvents: number;
+    hintMs: number;
+    hintRows: number;
+    threadListeners: number;
+    sseClients: number;
+    wsClients: number;
+  } {
+    return {
+      threads: this.store.countThreads(),
+      ...this.stats,
+      eventLoopLagMs: this.loopLagMs,
+      cachedThreads: this.metas.size,
+      cachedOrders: this.knownOrders.size,
+      indexedEvents: this.store.countIndexed(),
+      hintMs: Math.round(this.hintMs * 100) / 100,
+      hintRows: this.hintRows,
+      threadListeners: this.listenerCount("thread"),
+      sseClients: this.streamCounts.sse,
+      wsClients: this.streamCounts.ws,
+    };
   }
 
   /** Pending metadata writes, coalesced so a burst of events does not rewrite a growing row each time. */
@@ -1465,11 +1572,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private ownHints(): Record<string, RoutingHint> {
     const now = Date.now();
     if (!this.hintsDirty && now - this.localHintsAt < HINTS_MAX_AGE_MS) return this.localHints;
-    const rows = this.store.outcomes(now - HINT_WINDOW_MS).map((r) => {
-      const rec = r.identity ? undefined : (this.registry.get(r.agentId) ?? this.local.get(r.agentId));
-      return { identity: r.identity ?? (rec ? identityOf(rec) : r.agentId), kind: r.kind, at: r.at, tokens: r.tokens };
-    });
-    this.localHints = computeHints(rows, now);
+    // Grouped in SQL (#68): pulling every row of the last week into JS blocked the event loop for a
+    // quarter second on a busy Root, every 30 seconds, whether or not anything had changed.
+    const started = performance.now();
+    const rows = this.store.outcomeSummary(now - HINT_WINDOW_MS);
+    this.localHints = hintsFromSummary(rows, now);
+    this.hintMs = performance.now() - started;
+    this.hintRows = rows.length;
     this.localHintsAt = now;
     this.hintsDirty = false;
     return this.localHints;
@@ -1782,12 +1891,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.config.knownDaemons[host] = url;
     saveConfig(this.config, this.store.home);
     this.log(`known daemon ${host} -> ${url}`);
+    // Children only learn verified addresses (#75); now that this one is verified, share it.
+    this.emitDaemons();
   }
 
   /** Root: after moving to a new address, tell every known Daemon where it is now. */
   async announceRoot(): Promise<void> {
     if (!this.isRoot) return;
-    const me = `${this.config.advertise ?? lanAddress()}:${this.config.port}`;
+    const me = hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
     const targets = Object.entries(this.config.knownDaemons).filter(([host]) => !this.children.has(host));
     // Probe in parallel: one dead Daemon must not delay the others.
     const worker = async () => {
@@ -1816,7 +1927,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   connectRoot(): void {
     if (this.isRoot || !this.config.root || this.stopped) return;
     const target = this.config.root;
-    const ws = new WebSocket(`ws://${target}/ws`);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`ws://${target}/ws`);
+    } catch (err) {
+      // A persisted bad address must not crash the daemon on every boot (#76): say so and keep
+      // retrying at the normal backoff, so `cafe root set` can still repair it later.
+      this.log(`cannot dial root '${target}': ${(err as Error).message}; fix it with \`cafe root set <host:port>\``);
+      this.scheduleReconnect();
+      return;
+    }
     this.uplinkSocket = ws;
     const peer = new Peer(ws);
     ws.on("open", async () => {
@@ -1939,7 +2059,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Change the Root address at runtime (CLI `cafe root set`, or Root dial-back). Persists to config.yml. */
   setRoot(addr: string): void {
     if (this.isRoot) throw new RpcError("is_root", "this daemon is the root");
-    this.config.root = addr;
+    const clean = assertDaemonAddress(addr);
+    this.config.root = clean;
     saveConfig(this.config, this.store.home);
     this.reconnectDelay = 0;
     const old = this.uplinkSocket;
@@ -2162,6 +2283,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       self.displayName = this.displayName;
       self.aliases = this.hostAliases;
     }
+    // A hand-set address wins over what the Host reports about itself (#75): a child behind Docker
+    // only knows an address nobody else can reach.
+    for (const [host, addr] of Object.entries(this.config.pinnedDaemons)) {
+      const rec = this.daemonRecords.get(host);
+      if (rec) rec.url = `ws://${addr}`;
+    }
     return [...this.daemonRecords.values()];
   }
 
@@ -2170,7 +2297,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.emit("daemons", list);
     for (const ui of this.uis) ui.notify(Methods.daemonsChanged, list);
     // Children keep every Daemon's address so they can go direct while the Root is offline (ADR-0004).
-    if (this.isRoot) for (const child of this.children.values()) child.notify(Methods.daemonsChanged, list);
+    // Only addresses proven reachable from the Root are shared: a child behind Docker reports an
+    // address nobody else can use, and broadcasting it broke every direct link once the Root was down (#75).
+    if (this.isRoot) {
+      const verified = list.map((d) => (d.host === this.host ? d : { ...d, url: this.verifiedAddress(d.host) ?? "" }));
+      for (const child of this.children.values()) child.notify(Methods.daemonsChanged, verified);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2330,6 +2462,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
     if (webStale) checks.push({ name: "web", level: "warn", detail: "the build on disk is newer than the one served", next: "cafe daemon restart" });
 
+    // #66: the log is capped, but a person should still hear about a file that keeps hitting the cap.
+    try {
+      const logPath = join(this.store.home, "daemon.log");
+      if (existsSync(logPath) && statSync(logPath).size > 15 * 1024 * 1024) {
+        checks.push({ name: "log", level: "warn", detail: `daemon.log is ${Math.round(statSync(logPath).size / 1024 / 1024)} MB; past versions are in daemon.log.1`, next: "cafe daemon restart" });
+      }
+    } catch {
+      // no log yet
+    }
+
     const offline = this.daemons().filter((d) => d.host !== this.host && !d.online);
     if (offline.length) checks.push({ name: "machines", level: "warn", detail: `offline: ${offline.map((d) => d.displayName ?? d.host).join(", ")}`, next: "cafe daemon status" });
     else checks.push({ name: "machines", level: "ok", detail: "every known machine is online" });
@@ -2375,10 +2517,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   thread(threadId: string, opts: { limit?: number; before?: string } = {}) {
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) return undefined;
-    if (opts.limit === undefined && opts.before === undefined) return { meta, events: this.store.readEvents(meta.file), hasMore: false };
-    // Paging reads backwards from the end: opening a page no longer parses the
-    // whole JSONL (#31).
-    const limit = opts.limit === undefined ? Number.MAX_SAFE_INTEGER : Math.max(1, opts.limit);
+    // A default page rather than the whole JSONL: the Web UI, SSE replay and `cafe thread` all hit this
+    // path, and parsing a long Thread whole blocked the event loop (#31). Callers that truly need
+    // everything page backwards from the end.
+    const limit = opts.limit === undefined ? DEFAULT_THREAD_PAGE : Math.max(1, opts.limit);
     return { meta, ...this.store.readEventsPage(meta.file, limit, opts.before) };
   }
 
@@ -2425,4 +2567,33 @@ export function lanAddress(): string {
     for (const ni of list ?? []) if (ni.family === "IPv4" && !ni.internal) return ni.address;
   }
   return "127.0.0.1";
+}
+
+/** Does this look like `host:port` (rather than a bare host or an IPv6 address)? */
+function hasPort(addr: string): boolean {
+  if (addr.startsWith("[")) return /^\[[^\]]+\]:\d+$/.test(addr);
+  return /^[^:]+:\d+$/.test(addr);
+}
+
+/**
+ * `advertise` may be a bare host or already carry a port. Appending `:port` unconditionally produced
+ * `ws://127.0.0.1:4801:4801`, which was then persisted as a child's `root:` and killed it on boot (#76).
+ */
+export function hostWithPort(addr: string, port: number): string {
+  return hasPort(addr) ? addr : `${addr}:${port}`;
+}
+
+/** A Root/peer address is accepted only when it can become a WebSocket URL. */
+export function assertDaemonAddress(addr: string): string {
+  const trimmed = addr.trim();
+  if (!trimmed) throw new RpcError("bad_request", "address is required");
+  let url: URL;
+  try {
+    url = new URL(`ws://${trimmed}`);
+  } catch {
+    throw new RpcError("bad_request", `'${addr}' is not a host:port address`);
+  }
+  if (!url.hostname || !url.port) throw new RpcError("bad_request", `'${addr}' must be host:port (for example 192.168.1.20:4777)`);
+  if (url.pathname !== "/" || url.search || url.hash) throw new RpcError("bad_request", `'${addr}' must be host:port, without a path`);
+  return trimmed;
 }

@@ -87,3 +87,36 @@ describe("snapshot summaries", () => {
     expect(row.replies[0]!.text.length).toBeLessThanOrEqual(160);
   });
 });
+describe("default thread reads stay bounded (#31)", () => {
+  it("returns a page, not the whole JSONL, when no limit is given", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    const now = Date.now();
+    const file = d.daemon.store.threadFile("big", now);
+    for (let i = 0; i < 800; i++) {
+      d.daemon.store.appendEvent(file, {
+        eventId: String(i).padStart(26, "0"),
+        threadId: "big",
+        orderId: "o1",
+        host: "pc1",
+        at: now + i,
+        event: { type: "order.heartbeat", agentId: "a" },
+      } as ThreadEnvelope);
+    }
+    d.daemon.store.putThread({
+      threadId: "big",
+      orderId: "o1",
+      file,
+      status: "working",
+      createdAt: now,
+      lastActivityAt: now + 799,
+      from: { address: "cli@pc1", host: "pc1" },
+      replies: [],
+      declines: [],
+    } as never);
+    const body = (await (await fetch(`http://${d.addr}/api/threads/big`)).json()) as { events: ThreadEnvelope[]; hasMore: boolean };
+    expect(body.events.length).toBeLessThanOrEqual(200);
+    expect(body.hasMore).toBe(true);
+    expect(body.events.at(-1)!.eventId).toBe(String(799).padStart(26, "0"));
+  });
+});

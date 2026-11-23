@@ -13,7 +13,8 @@ describe("autostart service files", () => {
     expect(f.content).toContain("<string>/opt/node/bin/node</string>\n    <string>/repo/packages/cli/bin/cafe.js</string>\n    <string>daemon</string>\n    <string>run</string>");
     expect(f.content).toContain("<key>SuccessfulExit</key><false/>");
     expect(f.content).toContain("<key>CAFE_HOME</key><string>/u/.cafe</string>");
-    expect(f.content).toContain("<string>/u/.cafe/daemon.log</string>");
+    // Raw stdout/stderr goes to its own file; daemon.log is written by the daemon itself (#66).
+    expect(f.content).toContain("<string>/u/.cafe/daemon.stdout.log</string>");
     expect(f.load[0]!.slice(0, 2)).toEqual(["launchctl", "bootstrap"]);
   });
 

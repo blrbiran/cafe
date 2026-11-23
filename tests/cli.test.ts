@@ -256,3 +256,22 @@ describe("Node version precheck", () => {
   });
 });
 
+
+describe("connector command aliases (#59)", () => {
+  it("accepts `cafe connector ls` like `list`", () => {
+    const h = home();
+    const r = cafe(h, "connector", "ls");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("no connectors installed");
+  });
+
+  it("shows list|ls in every noun help that has a list subcommand", () => {
+    // Keeps the convention from drifting again (#59): every `<noun> list` must accept `ls`.
+    const h = home();
+    for (const noun of ["barista", "connector"]) {
+      const r = cafe(h, noun, "--help");
+      expect(r.status, `${noun} --help: ${r.stderr}`).toBe(0);
+      expect(r.stdout, `${noun} --help`).toContain("list|ls");
+    }
+  });
+});

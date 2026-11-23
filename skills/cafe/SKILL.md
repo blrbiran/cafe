@@ -38,7 +38,8 @@ cafe ask --notice "deploy finished"          # one-way notice, no reply expected
 - When you ask **on the user's behalf**, pass `--origin agent` so the Thread shows it was relayed, and `--via <your address>` if you are a registered Barista (`cafe agents` lists you). The web UI and MCP mark this automatically; the CLI defaults to `human`.
 - Routing is decided by the daemon: unicast to one owner, multicast to a few, or broadcast when unclear. The first lines of the output say who it went to and why.
 - A Barista may **decline** if the Order is not theirs. When every target declines or fails, the thread closes as `failed` and the command exits with code 1. Rephrase the Order, or pick a Barista from `cafe agents` and use `--to`.
-- Long tasks are fine. A Barista that has acknowledged an Order sends heartbeats, and there is no overall timeout. `cafe cancel <threadId>` stops waiting.
+- Long tasks are fine, but not unbounded: heartbeats prove the Barista is alive, not that it will answer. A unicast Order closes after 10 minutes without a final reply, and `cafe ask --timeout <seconds>` (or Ctrl-C) cancels it earlier, so a stuck follow-up never leaves `thread_busy` behind. `cafe cancel <threadId>` stops waiting; `cafe ask --thread <id> --replace "..."` asks again immediately.
+- `cafe thread <id>` now returns the newest 200 events; older pages come with `?before=`.
 
 ## Inspect / debug
 

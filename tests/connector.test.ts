@@ -296,9 +296,19 @@ describe("cafe connector CLI", () => {
       expect(start.status, start.stderr).toBe(0);
       expect(start.stdout).toContain("running");
 
+      // Wait for a real value, not the `heartbeat:` label: `cafe connector status` always prints that
+// line (with `(none)` when there is no heartbeat yet), so matching the word passed instantly and the
+// log read raced the connector's first write (#57).
       await waitFor(async () => {
         const s = await cli(home, ["connector", "status", "fixture"]);
-        return s.stdout.includes("running") && s.stdout.includes("heartbeat");
+        const line = /heartbeat:\s*(.+)/.exec(s.stdout)?.[1]?.trim();
+        return s.stdout.includes("running") && !!line && line !== "(none)";
+      }, 5_000);
+
+      // Read the log only once the connector has actually written its heartbeat.
+      await waitFor(async () => {
+        const l = await cli(home, ["connector", "logs", "fixture"]);
+        return l.stdout.includes('"type":"heartbeat"');
       }, 5_000);
 
       const logs = await cli(home, ["connector", "logs", "fixture"]);

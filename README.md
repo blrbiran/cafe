@@ -67,6 +67,8 @@ cafe agent rename billing@mac-mini billing-owner   # Agent display name; Address
 cafe agent alias billing@mac-mini invoices         # user alias (alias-first display)
 cafe agent unalias billing@mac-mini invoices
 cafe daemon rename ssh1 ssh1-docker # from the Root: rename another Daemon's display name
+cafe host address ssh1 30.251.57.17:4777   # Root only: pin the address others use for a machine
+cafe host address ssh1 --clear             # forget the pinned address
 ```
 
 Internal `host`, `agentId` and Address never change, so old Threads/statistics stay valid. Renaming no longer adds the old name to the display candidates: it goes into `legacyAliases` and keeps routing, while `aliases` are user-added and are shown first (`alias → displayName → stable name`). The Web shows both as chips; only user aliases have a remove button.
@@ -212,7 +214,16 @@ open http://127.0.0.1:4777/
 3. `cafe init` confirms the current directory has a parseable `.cafe`;
 4. `cafe doctor` prints all of the above plus the next step.
 
-Logs: `~/.cafe/daemon.log`, `~/.cafe/logs/barista-*.log`; raw Threads in `~/.cafe/sessions/<date>/<threadId>.jsonl`.
+Logs: `~/.cafe/daemon.log` (timestamped, capped at 16 MB with one `daemon.log.1`), `~/.cafe/daemon.stdout.log` (raw startup output), `~/.cafe/logs/barista-*.log`; raw Threads in `~/.cafe/sessions/<date>/<threadId>.jsonl`.
+
+### Addressing and access
+
+- The daemon answers only to a `Host` header that belongs to this machine (`localhost`, `127.0.0.1`, its own host name, `advertise` or one of its IPs). A page that reached it through DNS rebinding is refused, including its static files.
+- A request that carries a foreign `Origin` cannot write. The Web UI and CLI keep working; `curl`/MCP send no `Origin` and are unaffected. Loopback still needs no token; remote access still does.
+- `advertise` may be a bare host (`192.168.1.20`) or `host:port`. A port already in it is not doubled. `cafe root set` and `POST /api/root` reject a malformed address instead of persisting it, and a daemon that reads a broken `root:` logs it and keeps retrying instead of exiting.
+- A child whose `advertise` is unreachable from the Root (Docker/NAT) no longer poisons direct links: the Root only broadcasts addresses it has verified, and `cafe host address` (or Network → Edit address) pins a working one.
+- `cafe ask` gives up after `--timeout <seconds>` (default: no limit) and cancels the Order, and Ctrl-C cancels it too, so a stuck follow-up does not leave `thread_busy` behind. A unicast Order whose Barista only heartbeats closes after 10 minutes. A follow-up on a busy Thread can pass `--replace` to cancel the old question.
+- `POST /api/baristas` only starts `pi`, `omp`, `codex` or `claude`; it no longer accepts an arbitrary executable or argv.
 
 ## Package layout
 

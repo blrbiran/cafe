@@ -12,7 +12,7 @@
 import { writeFileSync } from "node:fs";
 import { LlmRouter, RulesRouter, TOP_K, piComplete, type Router } from "../packages/daemon/src/router.ts";
 import type { RoutingDecision } from "@cafe/protocol";
-import { EVAL_CASES, EXTRA_CASES, agentRecords, evalOrder } from "../tests/routing-fixtures.ts";
+import { EVAL_CASES, EXTRA_CASES, TEAM_CASES, agentRecords, evalOrder } from "../tests/routing-fixtures.ts";
 
 const args = process.argv.slice(2);
 const flag = (name: string): string | undefined => {
@@ -29,7 +29,10 @@ const timeoutMs = Number(flag("--timeout") ?? 15_000);
 const concurrency = Math.max(1, Number(flag("--concurrency") ?? 2));
 
 const baristas = agentRecords("eval");
-const cases = [...EVAL_CASES, ...EXTRA_CASES];
+// Team cases (#71/#72) are recorded but not scored until their decisions land: an old router cannot
+// express "ask your leader back" or "wait for everyone", so counting them would only add noise.
+const blockedTeamCases = TEAM_CASES.filter((c) => c.blocked);
+const cases = [...EVAL_CASES, ...EXTRA_CASES, ...TEAM_CASES.filter((c) => !c.blocked)];
 
 interface Attempt {
   q: string;
@@ -85,6 +88,7 @@ const report = {
   model: model ?? null,
   repeat,
   cases: cases.length,
+  blocked: blockedTeamCases.map((c) => ({ q: c.q, on: c.blocked })),
   attempts: all.length,
   accuracy: passed / all.length,
   passed,
@@ -105,6 +109,7 @@ if (json) {
   console.log(`routing eval · ${report.router}${model ? ` (${model})` : ""} · ${cases.length} cases × ${repeat}`);
   console.log(`accuracy ${passed}/${all.length} (${(report.accuracy * 100).toFixed(1)}%)${fallbacks ? ` · ${fallbacks} fell back to rules` : ""}`);
   console.log(`latency p50 ${report.p50ms}ms · p95 ${report.p95ms}ms`);
+  if (blockedTeamCases.length) console.log(`blocked team cases (not scored): ${blockedTeamCases.length} — see docs/specs/v4-5-agent-teams.md`);
   if (unstable.length) {
     console.log(`unstable across ${repeat} repeats: ${unstable.length} case(s)`);
     for (const u of unstable) console.log(`  varies: "${u.q}" → ${u.runs.join(" / ")}`);

@@ -8,6 +8,8 @@ export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const HEARTBEAT_MISSES = 3;
 export const BROADCAST_DEADLINE_MS = 120_000;
 export const MAX_ORDER_DEPTH = 4;
+/** Events a Thread read returns when the caller gives no page size (#31). */
+export const DEFAULT_THREAD_PAGE = 200;
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -202,7 +204,7 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), attachments: z.array(Attachment).optional() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
   z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional() }),
-  z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string() }),
+  z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string(), /** Operational failure (timeout), not "this topic is not mine". */ unavailable: z.boolean().optional() }),
   z.object({ type: z.literal("order.cancelled"), by: z.string() }),
   /** One Order finished. The Thread stays open for Follow-ups. */
   z.object({ type: z.literal("order.closed"), status: ThreadStatus }),
@@ -305,6 +307,11 @@ export const CreateOrderParams = z.object({
   attachments: z.array(Attachment).optional(),
   /** Ask every eligible Barista, bypassing routing (only when the customer explicitly wants it). */
   broadcast: z.boolean().optional(),
+  /**
+   * Follow-up only: cancel the Thread's still-open question and ask this one instead, instead of
+   * failing with `thread_busy`. The abandoned Order is recorded as cancelled (#60).
+   */
+  replace: z.boolean().optional(),
   /**
    * Customer-side dedupe key (a platform event id for connectors). A repeated
    * request inside the Daemon's short window returns the first Order/Thread

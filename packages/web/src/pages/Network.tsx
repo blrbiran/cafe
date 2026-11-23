@@ -21,6 +21,7 @@ export function NetworkPage() {
   const [debug, setDebug] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [editing, setEditing] = useState<Record<string, string>>({});
+  const [editingAddr, setEditingAddr] = useState<Record<string, string>>({});
   const [note, setNote] = useState<Record<string, { text: string; ok: boolean }>>({});
 
   const run = async (key: string, fn: () => Promise<void>) => {
@@ -53,6 +54,15 @@ export function NetworkPage() {
       setEditing((e) => ({ ...e, [h]: "" }));
       await refreshStore();
       setNote((n) => ({ ...n, [h]: { text: t.settingsSaved, ok: true } }));
+    });
+  const saveAddress = (h: string) =>
+    run(`addr:${h}`, async () => {
+      const url = (editingAddr[h] ?? "").trim();
+      if (!url) return;
+      await api.setHostAddress(h, url);
+      setEditingAddr((e) => ({ ...e, [h]: undefined as unknown as string }));
+      await refreshStore();
+      setNote((n) => ({ ...n, [h]: { text: t.hostAddressSaved, ok: true } }));
     });
   const copyCli = (h: string, self: boolean) => {
     const cmd = self ? "cafe daemon status" : `cafe root test ${h}`;
@@ -140,6 +150,11 @@ export function NetworkPage() {
                       {t.settingsRename}
                     </button>
                   )}
+                  {!isThis && isRoot && (
+                    <button type="button" className="btn-sm" onClick={() => setEditingAddr((e) => ({ ...e, [d.host]: e[d.host] ?? d.url.replace(/^wss?:\/\//, "") }))}>
+                      {t.hostAddressEdit}
+                    </button>
+                  )}
                   <button type="button" className="btn-sm" onClick={() => copyCli(d.host, isThis)}>
                     {t.copyCommand}
                   </button>
@@ -159,6 +174,25 @@ export function NetworkPage() {
                       }}
                     />
                     <button type="button" className="btn-sm" aria-busy={busy === `rename:${d.host}`} disabled={!(editing[d.host] ?? "").trim()} onClick={() => rename(d.host, isThis)}>
+                      {t.settingsSave}
+                    </button>
+                  </div>
+                )}
+                {editingAddr[d.host] !== undefined && (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      className="!min-h-0 min-w-0 flex-1 !py-1 !text-xs"
+                      placeholder={t.hostAddressHint}
+                      value={editingAddr[d.host]}
+                      onChange={(e) => setEditingAddr((x) => ({ ...x, [d.host]: e.target.value }))}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void saveAddress(d.host);
+                        }
+                      }}
+                    />
+                    <button type="button" className="btn-sm" aria-busy={busy === `addr:${d.host}`} disabled={!(editingAddr[d.host] ?? "").trim()} onClick={() => saveAddress(d.host)}>
                       {t.settingsSave}
                     </button>
                   </div>

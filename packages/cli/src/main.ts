@@ -94,7 +94,9 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
       if (await healthy()) return;
     }
   }
-  const out = openSync(join(home, "daemon.log"), "a");
+  // Raw startup output (before the daemon's own logger opens) goes to daemon.stdout.log; daemon.log
+  // is written by the daemon with timestamps and a cap (#66).
+  const out = openSync(join(home, "daemon.stdout.log"), "a");
   const args = ["--no-warnings", MAIN, "daemon", "run", ...(opts.root ? ["--root"] : [])];
   const child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", out, out], env: process.env });
   child.unref();
@@ -102,7 +104,7 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
     await new Promise((r) => setTimeout(r, 100));
     if (await healthy()) return;
   }
-  throw new Error(`cafe daemon did not start; see ${join(home, "daemon.log")}`);
+  throw new Error(`cafe daemon did not start; see ${join(home, "daemon.log")} and ${join(home, "daemon.stdout.log")}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,10 +144,46 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
 }
 
 /** Follow a Thread over SSE until it closes. Returns the final status. */
-async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string } = {}): Promise<string> {
+async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string; timeoutMs?: number } = {}): Promise<string> {
   const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
+  // Abort the local stream on timeout or Ctrl-C. Cancelling the Order too is the caller's job: a
+  // follow-up should not kill an answer that is just slow, but leaving `thread_busy` behind is worse (#60).
+  const abort = new AbortController();
+  let reason: "timeout" | "intr" | undefined;
+  const onInt = () => {
+    reason = "intr";
+    abort.abort();
+  };
+  process.once("SIGINT", onInt);
+  const timer = opts.timeoutMs
+    ? setTimeout(() => {
+        reason = "timeout";
+        abort.abort();
+      }, opts.timeoutMs)
+    : undefined;
+  try {
+    return await followStream(threadId, opts, agents, abort.signal);
+  } catch (err) {
+    if (!reason) throw err;
+    // The daemon already closed the Order on its own deadline, so this is often just the local
+    // stream ending late; say what happened and never leave the person without the thread id.
+    if (reason === "timeout") {
+      await api(`/api/threads/${threadId}/cancel`, { method: "POST" }).catch(() => {});
+      throw new Error(`gave up waiting on thread ${threadId} after ${Math.round((opts.timeoutMs ?? 0) / 1000)}s; it is cancelled now — check \`cafe thread ${threadId}\``);
+    }
+    await api(`/api/threads/${threadId}/cancel`, { method: "POST" }).catch(() => {});
+    console.error(`\nthread ${threadId} cancelled — it stays readable with \`cafe thread ${threadId}\``);
+    return "cancelled";
+  } finally {
+    if (timer) clearTimeout(timer);
+    process.off("SIGINT", onInt);
+  }
+}
+
+async function followStream(threadId: string, opts: { quiet?: boolean; orderId?: string }, agents: Map<string, AgentRecord>, signal: AbortSignal): Promise<string> {
   const res = await fetch(`${base()}/api/threads/${threadId}/stream${opts.orderId ? `?orderId=${opts.orderId}` : ""}`, {
     headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
+    signal,
   });
   if (!res.ok || !res.body) throw new Error(`cannot stream thread ${threadId}: ${res.status}`);
   const decoder = new TextDecoder();
@@ -479,9 +517,11 @@ program
   .option("--to <address>", "explicit Address (name, name@host, name#n@host); skips routing")
   .option("--broadcast", "ask every eligible Barista (skips routing; only when you mean it)")
   .option("--thread <threadId>", "follow-up in an existing thread (goes to whoever answered there)")
+  .option("--replace", "with --thread: cancel the thread's still-open question and ask this one instead")
   .option("--async", "return the thread id immediately")
   .option("--notice", "send a Notice (no reply expected)")
   .option("--deadline <ms>", "broadcast collection deadline", Number)
+  .option("--timeout <s>", "stop waiting after this many seconds and cancel the question (0 = no limit)", Number, 0)
   .option("--as <name>", "customer name shown to others", "cli")
   .option("--origin <kind>", "human (default) or agent: who actually asked", "human")
   .option("--via <address>", "with --origin agent: the Agent relaying the request")
@@ -500,6 +540,7 @@ program
         threadId: o.thread,
         kind: o.notice ? "notice" : "order",
         deadlineMs: o.deadline,
+        ...(o.replace ? { replace: true } : {}),
         as: o.as,
         origin: o.origin,
         ...(o.via ? { via: { address: o.via } } : {}),
@@ -508,7 +549,7 @@ program
     });
     if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision.mode}: ${res.decision.reason}`, res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
-    const status = await follow(res.threadId, { orderId: res.orderId });
+    const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}) });
     process.exitCode = status === "done" ? 0 : 1;
   });
 
@@ -808,6 +849,19 @@ host
     out(`aliases: ${rec.aliases.join(", ") || "(none)"}`, rec);
   });
 
+host
+  .command("address")
+  .argument("<host>")
+  .argument("[url]")
+  .description("Root only: set (or with --clear, forget) the host:port other Hosts use to reach <host>")
+  .option("--clear", "forget the pinned address and go back to what the Host reports")
+  .action(async (hostName: string, url: string | undefined, o: { clear?: boolean }) => {
+    if (!(await healthy())) throw new Error("cafe daemon is not running");
+    if (!o.clear && !url) throw new Error("give a host:port address, or pass --clear");
+    const rec = await api<DaemonRecord>("/api/hosts/address", { method: "POST", body: JSON.stringify({ host: hostName, url: o.clear ? null : url }) });
+    out(`${rec.host}: ${rec.url || "(no address)"}`, rec);
+  });
+
 const agent = program.command("agent").description("display names and aliases for Agents (agentId and Address stay stable)");
 agent
   .command("rename")
@@ -1003,9 +1057,15 @@ barista
     if (o.thread && !o.tui) throw new Error("--thread needs --tui");
     if (o.tui && (o.write || o.model)) throw new Error("--tui uses the session's own model and permissions; drop --write / --model");
     await ensureDaemon();
-    const spec = native
-      ? { agent: o.agent, ...(o.write ? { access: "workspace-write" } : {}), ...(o.model ? { model: o.model } : {}), ...(o.tui ? { tui: true } : {}), ...(o.thread ? { thread: o.thread } : {}) }
-      : o.agent ? { bin: o.agent } : {};
+    // The daemon accepts only cafe's own agents (#65), so the agent name is what it gets — never a
+    // free-form executable path.
+    const spec = {
+      ...(o.agent ? { agent: o.agent } : {}),
+      ...(native && o.write ? { access: "workspace-write" } : {}),
+      ...(native && o.model ? { model: o.model } : {}),
+      ...(native && o.tui ? { tui: true } : {}),
+      ...(native && o.thread ? { thread: o.thread } : {}),
+    };
     const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir), ...spec }) });
     const how = o.tui ? " (answers in the running Codex session)" : native ? (o.write ? " (may edit files)" : " (read-only)") : "";
     out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${resolve(o.dir)}${how}`, ws);

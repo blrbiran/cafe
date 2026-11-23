@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RoutingHint } from "@cafe/protocol";
 import { RulesRouter, TOP_K } from "../packages/daemon/src/router.ts";
 import { computeHints, identityOf, orderKeywords, type OutcomeRow } from "../packages/daemon/src/hints.ts";
-import { EVAL_CASES, EXTRA_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
+import { EVAL_CASES, EXTRA_CASES, TEAM_CASES, agentRecords, evalOrder } from "./routing-fixtures.ts";
 
 /**
  * Routing eval: a fixed set of Baristas and Orders with the expected receiver.
@@ -71,5 +71,14 @@ describe("routing eval (rules)", () => {
     }
     expect(acc(after)).toBeGreaterThanOrEqual(acc(before));
     expect(after.filter((r) => !r.clear).every(pass)).toBe(true);
+  });
+});
+describe("team cases (#71/#72) are recorded without changing routing", () => {
+  it("keeps every team case labelled, and marks the ones waiting on a decision", () => {
+    const blocked = TEAM_CASES.filter((c) => c.blocked).map((c) => c.blocked);
+    expect(blocked).toEqual(expect.arrayContaining(["D1-escalate", "D2-parallel", "D3-collect-all"]));
+    // The two shapes the router can already answer must not be marked blocked.
+    expect(TEAM_CASES.filter((c) => !c.blocked).length).toBeGreaterThanOrEqual(2);
+    for (const c of TEAM_CASES) if (!c.blocked) expect(c.mode).toBe("multicast");
   });
 });

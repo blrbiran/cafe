@@ -76,10 +76,17 @@ export type ClaudePluginState = "installed" | "missing" | "unknown";
 export function claudePluginState(claude = "claude"): { state: ClaudePluginState; detail: string } {
   const r = spawnSync(claude, ["plugin", "list"], { encoding: "utf8", timeout: 20_000 });
   if (r.error) {
-    const code = (r.error as NodeJS.ErrnoException).code;
-    return { state: "unknown", detail: code === "ENOENT" ? `claude not found (${claude})` : `claude plugin list failed: ${r.error.message}` };
+    const err = r.error as NodeJS.ErrnoException & { code?: string };
+    // spawnSync reports a timeout as an error *and* as a signal; name the timeout, it is actionable.
+    if (err.code === "ETIMEDOUT") return { state: "unknown", detail: `claude plugin list timed out after 20s; check that Claude Code starts (${claude})` };
+    return { state: "unknown", detail: err.code === "ENOENT" ? `claude not found (${claude})` : `claude plugin list failed: ${err.message}` };
   }
   const text = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  if (r.signal) {
+    // Killed by the system (OOM, a sandbox, code signature). `status` is null here, and "exited null"
+    // told nobody anything (#58); name the signal and what to check.
+    return { state: "unknown", detail: `claude plugin list was killed by ${r.signal}; Claude Code itself may be broken (try \`claude --version\`, or reinstall it)` };
+  }
   if (r.status !== 0) {
     const line = text.trim().split("\n").at(-1) ?? "";
     return { state: "unknown", detail: `claude plugin list exited ${r.status}${line ? `: ${line.slice(0, 120)}` : ""}` };

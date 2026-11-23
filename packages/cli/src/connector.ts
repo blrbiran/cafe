@@ -554,8 +554,10 @@ export async function superviseConnector(home: string, name: string, opts: Super
       current.once("error", (err) => r({ code: 127, signal: err.message }));
     });
     if (stopping) return;
-    if (opts.once) {
-      writeRunState({ status: exit.code === 0 ? "stopped" : "crashed", pid: undefined, childPid: undefined, stoppedAt: Date.now(), ...(exit.code ? { lastError: `exited ${exit.code}` } : {}) });
+    // A connector that ends cleanly is finished, not crashed (#56): write `stopped`, keep `restarts`
+    // as a crash counter, and leave no `error:` behind.
+    if (opts.once || exit.code === 0) {
+      writeRunState({ status: exit.code === 0 ? "stopped" : "crashed", pid: undefined, childPid: undefined, stoppedAt: Date.now(), lastError: undefined, ...(exit.code ? { lastError: `exited ${exit.code}` } : {}) });
       return;
     }
 
@@ -563,7 +565,7 @@ export async function superviseConnector(home: string, name: string, opts: Super
     recent = recent.filter((t) => now - t < windowMs);
     recent.push(now);
     if (recent.length > maxRestarts) {
-      const lastError = `crash loop: ${recent.length} exits within ${Math.round(windowMs / 1000)}s (last: ${exit.code ?? exit.signal ?? "unknown"}); not restarting. See ${logPath}`;
+      const lastError = `crash loop: ${recent.length} exits within ${Math.round(windowMs / 1000)}s (last: exited ${exit.code ?? "null"}; ${exit.signal ?? "no signal"}); not restarting. See ${logPath}`;
       writeRunState({ status: "crashed", pid: undefined, childPid: undefined, stoppedAt: now, lastError });
       process.stderr.write(`[cafe connector ${name}] ${lastError}\n`);
       process.exitCode = 1;
@@ -610,8 +612,9 @@ export async function startConnector(home: string, name: string, opts: StartOpti
   if (!child.pid) throw new Error(`could not start connector '${name}'`);
   child.unref();
 
-  const restarts = previous.startedAt ? (previous.restarts ?? 0) + 1 : (previous.restarts ?? 0);
-  writeRun(home, name, { pid: child.pid, status: "running", startedAt: Date.now(), restarts });
+  // A manual start is not a crash restart: `restarts` must stay a stability signal (#56).
+  const restarts = previous.restarts ?? 0;
+  writeRun(home, name, { pid: child.pid, status: "running", startedAt: Date.now(), restarts, lastError: undefined });
 
   await new Promise((r) => setTimeout(r, opts.waitMs ?? 150));
   if (!processAlive(child.pid)) {
@@ -845,6 +848,7 @@ export function addConnectorCommands(program: Command, out: OutFn, base: () => s
 
   connector
     .command("list")
+    .alias("ls")
     .description("installed connectors and whether their process is running")
     .action(() => {
       const rows = listConnectors(cafeHome());

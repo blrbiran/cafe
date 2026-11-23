@@ -48,7 +48,10 @@ const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
 
 export function serviceFile(spec: ServiceSpec): ServiceFile {
   const home = spec.home ?? homedir();
-  const log = join(spec.cafeHome, "daemon.log");
+  // The daemon writes its own timestamped, capped `daemon.log` (#66). These files only catch what
+  // escapes the daemon (a crash before the logger opens, a Node-level warning), so they get their
+  // own small file instead of appending raw untimed output to the real log.
+  const log = join(spec.cafeHome, "daemon.stdout.log");
   if (spec.platform === "darwin") {
     const file = join(home, "Library", "LaunchAgents", `${LABEL}.plist`);
     const uid = process.getuid?.() ?? 501;

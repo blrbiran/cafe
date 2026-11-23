@@ -65,6 +65,8 @@ cafe agent rename billing@mac-mini billing-owner   # Agent 展示名，Address �
 cafe agent alias billing@mac-mini invoices         # 用户别名（alias-first 展示）
 cafe agent unalias billing@mac-mini invoices
 cafe daemon rename ssh1 ssh1-docker # Root 上改另一台 Daemon 的展示名
+cafe host address ssh1 30.251.57.17:4777   # 仅 Root：固定其他机器访问这台机器用的地址
+cafe host address ssh1 --clear             # 清除固定的地址
 ```
 
 内部 `host`、`agentId` 和 Address 不变，旧 Thread/统计继续有效。改名不再把旧名字放进展示候选：旧名进入 `legacyAliases` 只用于路由；`aliases` 是用户显式添加的别名，展示优先级是 `alias → displayName → 稳定名`。Web 会把两类都显示为 chip，只有用户别名有删除按钮。
@@ -208,7 +210,16 @@ open http://127.0.0.1:4777/
 3. `cafe init` 确认当前目录有可解析的 `.cafe`；
 4. `cafe doctor` 会把以上结果和下一步一起打印出来。
 
-日志：`~/.cafe/daemon.log`、`~/.cafe/logs/barista-*.log`；Thread 原文在 `~/.cafe/sessions/<date>/<threadId>.jsonl`。
+日志：`~/.cafe/daemon.log`（带时间戳，上限 16 MB，保留一份 `daemon.log.1`）、`~/.cafe/daemon.stdout.log`（启动阶段的原始输出）、`~/.cafe/logs/barista-*.log`；Thread 原文在 `~/.cafe/sessions/<date>/<threadId>.jsonl`。
+
+### 地址与访问
+
+- Daemon 只接受属于本机的 `Host` 头（`localhost`、`127.0.0.1`、本机 host 名、`advertise` 或其 IP）。被 DNS rebinding 骗进本机的页面会被拒绝，连静态文件也不给。
+- 带外部 `Origin` 的请求不能写。Web UI 与 CLI 不受影响；`curl` / MCP 不带 `Origin`，照常可用。loopback 仍免 token，远程访问仍需 token。
+- `advertise` 可以只写主机（`192.168.1.20`），也可以写 `host:port`；已经带端口时不会再拼一遍。`cafe root set` 与 `POST /api/root` 会拒绝畸形地址而不是写进配置；daemon 读到坏 `root:` 时只记日志并继续重连，不再退出。
+- 子机 `advertise` 从 Root 不可达（Docker/NAT）时不再污染直连：Root 只广播验证过的地址，用 `cafe host address`（或 Network 页「改地址」）可以固定一个可用地址。
+- `cafe ask` 支持 `--timeout <秒>`（默认不限），超时会取消该 Order；Ctrl-C 也会取消，不会留下 `thread_busy`。unicast Order 的目标只发心跳不回答时，10 分钟后自动关单。Thread 忙时追问可加 `--replace` 取消旧问题。
+- `POST /api/baristas` 只接受 `pi` / `omp` / `codex` / `claude`，不再接受任意可执行文件与 argv。
 
 ## 包结构
 

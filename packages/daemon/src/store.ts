@@ -77,6 +77,9 @@ export class Store {
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
     if (!cols.has("identity")) this.db.exec("ALTER TABLE agent_events ADD COLUMN identity TEXT");
     if (!cols.has("tokens")) this.db.exec("ALTER TABLE agent_events ADD COLUMN tokens TEXT");
+    // After the migration: an older database gets `identity` just above (#68).
+    this.db.exec("CREATE INDEX IF NOT EXISTS agent_events_identity ON agent_events(identity, kind, at DESC)");
+    this.upsertIndexRows = this.prepareIndexRows();
   }
 
   threadFile(threadId: string, createdAt: number): string {
@@ -130,11 +133,31 @@ export class Store {
    * queries.
    */
   indexEvent(env: ThreadEnvelope, who: (agentId: string) => string): void {
-    if (this.db.prepare("SELECT 1 FROM search_indexed WHERE event_id = ?").get(env.eventId)) return;
+    // Only events with searchable text belong in the index (#67). Heartbeats, acks and closes made
+    // up most of the write volume and produced nothing `cafe search` could ever match.
     const hit = Store.searchable(env, who);
+    if (!hit?.text) return;
+    if (this.upsertIndexRows) {
+      this.upsertIndexRows(env, hit);
+      return;
+    }
+    if (this.db.prepare("SELECT 1 FROM search_indexed WHERE event_id = ?").get(env.eventId)) return;
     this.db.prepare("INSERT OR IGNORE INTO search_indexed(event_id, thread_id) VALUES (?, ?)").run(env.eventId, env.threadId);
-    if (!hit || !hit.text) return;
     this.db.prepare("INSERT INTO search_index(event_id, thread_id, order_id, who, at, text) VALUES (?, ?, ?, ?, ?, ?)").run(env.eventId, env.threadId, env.orderId, hit.who, env.at, hit.text);
+  }
+
+  /** Pre-compiled index statements; `indexEvent` runs on the event hot path. */
+  private upsertIndexRows?: ReturnType<Store["prepareIndexRows"]>;
+
+  private prepareIndexRows() {
+    const seen = this.db.prepare("SELECT 1 FROM search_indexed WHERE event_id = ?");
+    const mark = this.db.prepare("INSERT OR IGNORE INTO search_indexed(event_id, thread_id) VALUES (?, ?)");
+    const insert = this.db.prepare("INSERT INTO search_index(event_id, thread_id, order_id, who, at, text) VALUES (?, ?, ?, ?, ?, ?)");
+    return (env: ThreadEnvelope, hit: { who: string; text: string }) => {
+      if (seen.get(env.eventId)) return;
+      mark.run(env.eventId, env.threadId);
+      insert.run(env.eventId, env.threadId, env.orderId, hit.who, env.at, hit.text);
+    };
   }
 
   /** Whether the FTS index has an entry for this event (a Thread migrated before indexing). */
@@ -485,6 +508,52 @@ export class Store {
     return rows
       .filter((r) => r.kind === "answered" || r.kind === "declined" || r.kind === "failed")
       .map((r) => ({ agentId: r.agent_id, identity: r.identity, kind: r.kind as "answered", at: r.at, tokens: r.tokens ? r.tokens.split(" ") : [] }));
+  }
+
+  /**
+   * Grouped outcome counts for routing hints (#68). The old `outcomes()` pulled every row of the last
+   * seven days into JS (200k rows ≈ 258 ms of blocked event loop every 30 s). Counts are aggregated in
+   * SQL; only the most recent decline rows are read back for their topic keywords, bounded per identity.
+   */
+  outcomeSummary(
+    since: number,
+    opts: { declineTopicRows?: number } = {},
+  ): { identity: string; answered: number; declined: number; failed: number; declinedTopics?: string[]; declinedAt?: number }[] {
+    const declineRows = Math.max(1, opts.declineTopicRows ?? 20);
+    const rows = this.db
+      .prepare(
+        `SELECT identity,
+                SUM(kind = 'answered') AS answered,
+                SUM(kind = 'declined') AS declined,
+                SUM(kind = 'failed')   AS failed,
+                MAX(CASE WHEN kind = 'declined' THEN at END) AS declined_at
+           FROM agent_events
+          WHERE at >= ? AND identity IS NOT NULL AND kind IN ('answered','declined','failed')
+          GROUP BY identity`,
+      )
+      .all(since) as { identity: string; answered: number; declined: number; failed: number; declined_at: number | null }[];
+    const topics = this.db.prepare(
+      `SELECT tokens FROM agent_events
+        WHERE identity = ? AND kind = 'declined' AND at >= ? AND tokens IS NOT NULL
+        ORDER BY at DESC LIMIT ?`,
+    );
+    return rows.map((r) => {
+      const out: { identity: string; answered: number; declined: number; failed: number; declinedTopics?: string[]; declinedAt?: number } = {
+        identity: r.identity,
+        answered: r.answered,
+        declined: r.declined,
+        failed: r.failed,
+      };
+      if (r.declined_at !== null) out.declinedAt = r.declined_at;
+      if (r.declined > 0) {
+        const toks = new Set<string>();
+        for (const row of topics.all(r.identity, since, declineRows) as { tokens: string }[]) {
+          for (const t of row.tokens.split(" ")) if (t) toks.add(t);
+        }
+        out.declinedTopics = [...toks];
+      }
+      return out;
+    });
   }
 
   agentStats(since: number): Record<string, { answered: number; declined: number; failed: number; lastAnsweredAt?: number }> {

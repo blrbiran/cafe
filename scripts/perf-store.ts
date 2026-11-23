@@ -122,6 +122,29 @@ let ftsHits = 0;
 const searchFtsMs = ms(() => {
   ftsHits = store.searchIndex("answer 7", 20).hits.length;
 });
+// #67: heartbeats produce no searchable text, so they must not touch the index at all.
+const indexedBeforeHeartbeats = store.countIndexed();
+const heartbeatIndexMs = ms(() => {
+  for (let i = 0; i < 1000; i++) store.indexEvent({ eventId: `hb${i}`, threadId: "s0", orderId: "o", host: "root", at: now, event: { type: "order.heartbeat", agentId: "a" } } as any, who);
+});
+const heartbeatIndexRows = store.countIndexed() - indexedBeforeHeartbeats;
+
+// #68: the hint recompute used to pull every row of the last seven days into JS.
+const HINT_ROWS = 200_000;
+const hintInsert = store["db"].prepare("INSERT INTO agent_events(agent_id, kind, at, thread_id, identity, tokens) VALUES (?, ?, ?, ?, ?, ?)");
+store["db"].exec("BEGIN");
+for (let i = 0; i < HINT_ROWS; i++) hintInsert.run(`a${i % 100}`, i % 5 === 0 ? "declined" : "answered", now - (i % (7 * 24 * 3600_000)), `h${i}`, `a${i % 100}@root`, i % 5 === 0 ? "refund vat" : "readme");
+store["db"].exec("COMMIT");
+let hintRows = 0;
+const hintSummaryMs = ms(() => {
+  hintRows = store.outcomeSummary(now - 7 * 24 * 3600_000).length;
+});
+let hintOldMs = 0;
+const hintOldRowsMs = ms(() => {
+  store.outcomes(now - 7 * 24 * 3600_000);
+});
+hintOldMs = hintOldRowsMs;
+
 let registryUnchangedMs = 0;
 registryUnchangedMs = ms(() => {
   for (let i = 0; i < 1000; i++) store.saveRegistry(i, records);
@@ -152,6 +175,11 @@ console.log(
       indexEvents: scanned,
       searchFtsMs,
       ftsHits,
+      heartbeatIndexMs,
+      heartbeatIndexRows,
+      hintRows,
+      hintSummaryMs,
+      hintOldRowsMs,
     },
     null,
     2,
