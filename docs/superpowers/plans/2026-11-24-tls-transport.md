@@ -1,5 +1,9 @@
 # v4-6 TLS Transport Implementation Plan
 
+> **Status: implemented 2026-11-24** (phase 1). As-built notes are in
+> `docs/specs/v4-6-tls.md`; leaves are RSA-2048 because node-forge 1.x has no EC
+> key generation. The plan below is kept as the record of the decisions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Put cafe's daemon-to-daemon and agent transport on TLS (port 4778) with a Root-generated CA, SAN validation plus a per-peer pinned identity, TOFU-with-fingerprint enrolment, and hot leaf renewal — with no plaintext fallback.
