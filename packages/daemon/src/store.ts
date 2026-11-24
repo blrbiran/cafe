@@ -218,18 +218,79 @@ export class Store {
    * whether older events remain (#31).
    */
   readEventsPage(file: string, limit: number, before?: string): { events: ThreadEnvelope[]; hasMore: boolean } {
-    if (!existsSync(file) || limit <= 0) return { events: [], hasMore: false };
+    if (limit <= 0) return { events: [], hasMore: false };
+    let skipping = !!before;
+    const newestFirst: ThreadEnvelope[] = [];
+    let hasMore = false;
+    this.scanBackward(file, (env) => {
+      if (skipping) {
+        if (env.eventId === before) skipping = false;
+        return false;
+      }
+      if (newestFirst.length === limit) {
+        hasMore = true;
+        return true;
+      }
+      newestFirst.push(env);
+      return false;
+    });
+    return { events: newestFirst.reverse(), hasMore };
+  }
+
+  /**
+   * The events of one Order, oldest first, read backwards until its `order.created` (#31: recovery
+   * re-arms the latest Order of a Thread without parsing the whole Thread).
+   */
+  readOrderEvents(file: string, orderId: string): ThreadEnvelope[] {
+    const newestFirst: ThreadEnvelope[] = [];
+    let found = false;
+    this.scanBackward(file, (env) => {
+      if (env.orderId !== orderId) return false;
+      newestFirst.push(env);
+      return (found = env.event.type === "order.created");
+    });
+    return found ? newestFirst.reverse() : [];
+  }
+
+  /**
+   * Events whose `at` is at or after `since`, oldest first, read backwards until the first older one
+   * (#31: a backfill touches only the window the Root missed). Events are appended in arrival order, so
+   * callers pass a margin for clock skew between Hosts.
+   */
+  readEventsSince(file: string, since: number): ThreadEnvelope[] {
+    const newestFirst: ThreadEnvelope[] = [];
+    this.scanBackward(file, (env) => {
+      if (env.at < since) return true;
+      newestFirst.push(env);
+      return false;
+    });
+    return newestFirst.reverse();
+  }
+
+  /** The newest event matching `match`, read from the end; stops at the first hit (#31). */
+  findLastEvent(file: string, match: (env: ThreadEnvelope) => boolean): ThreadEnvelope | undefined {
+    let hit: ThreadEnvelope | undefined;
+    this.scanBackward(file, (env) => {
+      if (!match(env)) return false;
+      hit = env;
+      return true;
+    });
+    return hit;
+  }
+
+  /**
+   * Visit a Thread's events newest first, reading 64 KiB chunks from the end; `visit` returns true to
+   * stop. Unparseable lines are skipped.
+   */
+  private scanBackward(file: string, visit: (env: ThreadEnvelope) => boolean): void {
+    if (!existsSync(file)) return;
     const fd = openSync(file, "r");
     try {
       const size = fstatSync(fd).size;
       const chunk = 64 * 1024;
       let pos = size;
-      // The first line of a backwards chunk can be cut in half; carry it into
-      // the next (earlier) read.
+      // The first line of a backwards chunk can be cut in half; carry it into the next (earlier) read.
       let carry = "";
-      let skipping = !!before;
-      const newestFirst: ThreadEnvelope[] = [];
-      let hasMore = false;
       const take = (line: string): boolean => {
         if (!line) return false;
         let env: ThreadEnvelope;
@@ -238,16 +299,7 @@ export class Store {
         } catch {
           return false;
         }
-        if (skipping) {
-          if (env.eventId === before) skipping = false;
-          return false;
-        }
-        newestFirst.push(env);
-        if (newestFirst.length > limit) {
-          hasMore = true;
-          return true;
-        }
-        return false;
+        return visit(env);
       };
       while (pos > 0) {
         const len = Math.min(chunk, pos);
@@ -257,19 +309,14 @@ export class Store {
         const lines = (b.toString("utf8") + carry).split("\n");
         // With bytes before this chunk, its first line is incomplete.
         carry = pos > 0 ? (lines.shift() ?? "") : "";
-        for (let i = lines.length - 1; i >= 0; i--) if (take(lines[i]!)) break;
-        if (hasMore) break;
+        for (let i = lines.length - 1; i >= 0; i--) if (take(lines[i]!)) return;
       }
-      if (!hasMore && carry) take(carry);
-      if (newestFirst.length > limit) {
-        newestFirst.length = limit;
-        hasMore = true;
-      }
-      return { events: newestFirst.reverse(), hasMore };
+      if (carry) take(carry);
     } finally {
       closeSync(fd);
     }
   }
+
 
 
   /** Unfinished threads (recovery after a restart). Finished ones are never read back. */

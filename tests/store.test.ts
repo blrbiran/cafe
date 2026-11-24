@@ -55,6 +55,41 @@ describe("Store", () => {
     expect(unknown.hasMore).toBe(false);
   });
 
+  // #31: recovery and backfill read only the part of a Thread they need, from the end.
+  it("reads one Order's events from the end, stopping at its order.created", () => {
+    const home = temp();
+    const store = new Store(home);
+    const file = join(home, "sessions", "order.jsonl");
+    const ev = (i: number, orderId: string, type = "order.heartbeat") =>
+      JSON.stringify({ eventId: `E${i}`, threadId: "T", orderId, host: "h", at: i, event: type === "order.created" ? { type, order: { orderId } } : { type, agentId: "A", note: "x".repeat(1000) } });
+    const lines = [ev(0, "O1", "order.created"), ...Array.from({ length: 300 }, (_, i) => ev(i + 1, "O1")), ev(301, "O2", "order.created"), ev(302, "O1"), ev(303, "O2")];
+    writeFileSync(file, lines.join("\n") + "\n");
+    expect(store.readOrderEvents(file, "O2").map((e) => e.eventId)).toEqual(["E301", "E303"]);
+    expect(store.readOrderEvents(file, "O1")).toHaveLength(302);
+    expect(store.readOrderEvents(file, "nope")).toEqual([]);
+  });
+
+  it("reads the events at or after a time, from the end, across read chunks", () => {
+    const home = temp();
+    const store = new Store(home);
+    const file = join(home, "sessions", "since.jsonl");
+    const big = (i: number) => JSON.stringify({ ...env(i), event: { type: "order.heartbeat", agentId: "A", note: "x".repeat(1000) } });
+    writeFileSync(file, Array.from({ length: 500 }, (_, i) => big(i)).join("\n") + "\n");
+    expect(store.readEventsSince(file, 497).map((e) => e.eventId)).toEqual(["E497", "E498", "E499"]);
+    expect(store.readEventsSince(file, 0)).toHaveLength(500);
+    expect(store.readEventsSince(file, 1000)).toEqual([]);
+  });
+
+  it("finds the newest matching event from the end", () => {
+    const home = temp();
+    const store = new Store(home);
+    const file = join(home, "sessions", "last.jsonl");
+    writeFileSync(file, Array.from({ length: 50 }, (_, i) => JSON.stringify(env(i))).join("\n") + "\n");
+    expect(store.findLastEvent(file, (e) => e.at % 7 === 0)?.eventId).toBe("E49");
+    expect(store.findLastEvent(file, (e) => e.at < 3)?.eventId).toBe("E2");
+    expect(store.findLastEvent(file, () => false)).toBeUndefined();
+  });
+
   it("returns only unfinished threads for recovery", () => {
     const store = new Store(temp());
     const meta = (id: string, status: ThreadMeta["status"]): ThreadMeta => ({

@@ -81,6 +81,30 @@ describe("direct links while the Root is offline (ADR-0004)", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  it("backfills only the window the Root missed (#31): a follow-up on an older Thread", async () => {
+    const { root, a } = await network();
+    const c = await customer(a.addr);
+    cleanup.push(() => c.close());
+    const first = await c.ask({ body: "before the outage", to: "worker" });
+    await untilClosed(c, first.threadId, first.orderId);
+    await waitFor(() => root.daemon.thread(first.threadId)?.meta.status === "done", 3000);
+
+    await root.stop();
+    await waitFor(() => !a.daemon.rootOnline, 3000);
+    const outage = Date.now();
+    const follow = await c.ask({ body: "during the outage", threadId: first.threadId });
+    await untilClosed(c, first.threadId, follow.orderId);
+    const since = (a.daemon as any).store.getKv("backfillSince") as Record<string, number>;
+    expect(since[first.threadId]).toBeGreaterThanOrEqual(outage - 1000);
+
+    await root.start();
+    await waitFor(() => a.daemon.rootOnline, 5000);
+    await waitFor(() => root.daemon.thread(first.threadId)?.meta.turns === 2 && root.daemon.thread(first.threadId)?.meta.status === "done", 5000);
+    const ids = root.daemon.thread(first.threadId)!.events.map((e) => e.eventId);
+    expect(new Set(ids).size).toBe(ids.length);
+    await waitFor(() => Object.keys(((a.daemon as any).store.getKv("backfillSince") ?? {}) as object).length === 0, 3000);
+  });
+
   it("supports a follow-up and a cancel over the direct link", async () => {
     const { root, a, b } = await network();
     let release!: () => void;

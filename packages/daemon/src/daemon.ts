@@ -113,6 +113,10 @@ const MAX_META_REPLIES = 50;
 const MAX_META_DECLINES = 50;
 /** Attachments of every turn, listed on the Thread (deduplicated by id). */
 const MAX_META_ATTACHMENTS = 50;
+/** Backfill reads a little before the outage began, for clock skew between Hosts (#31). */
+const BACKFILL_SKEW_MS = 10 * 60_000;
+/** Events per threadBackfill request, so a long outage is not one huge frame. */
+const BACKFILL_BATCH = 500;
 /** In-memory caches are bounded so a long-running Daemon does not grow with history (#31). */
 function cacheLimit(name: string, fallback: number): number {
   const n = Number(process.env[name]);
@@ -254,7 +258,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Direct links taking part in each Thread (both directions). */
   private threadLinks = new Map<string, Set<Peer>>();
   /** Threads that went direct while the Root was offline; sent to the Root when it is back. */
-  private backfill = new Set<string>();
+  /** Threads the Root missed while it was offline → when that began (ms; 0 = the whole Thread). */
+  private backfill = new Map<string, number>();
   private linkSweep?: ReturnType<typeof setInterval>;
   private pruneTimer?: ReturnType<typeof setTimeout>;
   private pruneInterval?: ReturnType<typeof setInterval>;
@@ -321,7 +326,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.hintsTimer.unref?.();
     } else {
       for (const [h, u] of Object.entries(this.store.getKv<Record<string, string>>("peerUrls") ?? {})) this.peerUrls.set(h, u);
-      for (const id of this.store.getKv<string[]>("backfill") ?? []) this.backfill.add(id);
+      // `backfill` (ids) predates `backfillSince`; an id without a start is backfilled whole.
+      const since = this.store.getKv<Record<string, number>>("backfillSince") ?? {};
+      for (const id of this.store.getKv<string[]>("backfill") ?? []) this.backfill.set(id, since[id] ?? 0);
       // Show the Root's real host name before the first (re)connection.
       this.rootHost = this.store.getKv<string>("rootHost");
       this.linkSweep = setInterval(() => this.sweepLinks(), Math.min(this.timing.linkIdleMs, 60_000));
@@ -1371,19 +1378,33 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private markBackfill(threadId: string): void {
     if (this.rootOnline || this.backfill.has(threadId)) return;
-    this.backfill.add(threadId);
-    this.store.setKv("backfill", [...this.backfill]);
+    this.backfill.set(threadId, Date.now());
+    this.saveBackfill();
   }
 
-  /** After reconnecting: give the Root the Threads it missed while we went direct. */
+  private saveBackfill(): void {
+    // Both keys: an older release reads `backfill` as a list of ids.
+    this.store.setKv("backfill", [...this.backfill.keys()]);
+    this.store.setKv("backfillSince", Object.fromEntries(this.backfill));
+  }
+
+  /**
+   * After reconnecting: give the Root the Threads it missed while we went direct — only the events
+   * since the outage began (with a margin for clock skew between Hosts), in bounded batches (#31).
+   */
   private async flushBackfill(): Promise<void> {
-    for (const id of [...this.backfill]) {
+    for (const [id, since] of [...this.backfill]) {
       if (!this.rootOnline) return;
       const meta = this.metas.get(id) ?? this.store.getThread(id);
       try {
-        if (meta) await this.uplink!.request(Methods.threadBackfill, { events: this.store.readEvents(meta.file) }, 30_000);
+        if (meta) {
+          const events = since ? this.store.readEventsSince(meta.file, since - BACKFILL_SKEW_MS) : this.store.readEvents(meta.file);
+          for (let i = 0; i < events.length; i += BACKFILL_BATCH) {
+            await this.uplink!.request(Methods.threadBackfill, { events: events.slice(i, i + BACKFILL_BATCH) }, 30_000);
+          }
+        }
         this.backfill.delete(id);
-        this.store.setKv("backfill", [...this.backfill]);
+        this.saveBackfill();
       } catch (err) {
         this.log(`backfill of ${id} failed: ${(err as Error).message}`);
         return;
@@ -2076,7 +2097,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     let n = 0;
     for (const meta of this.store.openThreads(1000)) {
       if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
-      const events = this.store.readEvents(meta.file).filter((e) => e.orderId === meta.orderId);
+      // The latest Order only, read from the end of the Thread (#31).
+      const events = this.store.readOrderEvents(meta.file, meta.orderId);
       const created = events.find((e) => e.event.type === "order.created")?.event;
       if (!created || created.type !== "order.created") continue;
       const order = created.order;
@@ -2173,7 +2195,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // Skip events already on file (the Root may have restarted and lost its in-memory dedupe set).
       const first = x.events[0];
       const meta = first ? (this.metas.get(first.threadId) ?? this.store.getThread(first.threadId)) : undefined;
-      const known = new Set(meta ? this.store.readEvents(meta.file).map((e) => e.eventId) : []);
+      // Only the Root's events from that window can repeat these (#31): read the tail back to there.
+      const from = Math.min(...x.events.map((e) => e.at)) - BACKFILL_SKEW_MS;
+      const known = new Set(meta ? this.store.readEventsSince(meta.file, from).map((e) => e.eventId) : []);
       for (const env of x.events) if (!known.has(env.eventId)) this.recordEvent(env, { from: peer, skipTrack: true });
       return {};
     });
@@ -2938,17 +2962,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * stream for an old turn replays filler and never ends (#31). Every terminal path closes, so this
    * one event ends the wait.
    *
-   * Scans the file, so the live path avoids it: an Order still tracked here is open and has not closed.
+   * Reads from the end until the close, so the live path still avoids it: an Order still tracked here is open.
    */
   closingEvent(threadId: string, orderId: string): ThreadEnvelope | undefined {
     const live = this.tracking.get(orderId);
     if (live && live.status === "open") return undefined;
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) return undefined;
-    let last: ThreadEnvelope | undefined;
-    for (const env of this.store.readEvents(meta.file)) {
-      if (env.orderId === orderId && env.event.type === "order.closed") last = env;
-    }
+    const last = this.store.findLastEvent(meta.file, (env) => env.orderId === orderId && env.event.type === "order.closed");
     return last;
   }
 
