@@ -218,6 +218,8 @@ open http://127.0.0.1:4777/
 3. `cafe init` confirms the current directory has a parseable `.cafe`;
 4. `cafe doctor` prints all of the above plus the next step.
 
+A command only starts a daemon when nothing is listening on the port. If the check fails for another reason — typically a sandbox that blocks localhost, such as Codex's read-only mode — it says it cannot reach the daemon instead of starting a second one.
+
 `cafe daemon stop` / `restart` only act on the daemon of *this* `CAFE_HOME`: the daemon reports an id of its home in `/api/health`, and a daemon that belongs to another home (or a `CAFE_HOME` with no `config.yml`) is refused instead of being shut down. Read-only commands no longer create `config.yml` in an empty `CAFE_HOME`; `cafe daemon start` (or `cafe config set`) does. With `--json`, every error, including a misspelt command, is one JSON object on stdout (`{"error","message","suggestions"?}`) with exit code 1.
 
 `GET /api/health` also returns `startedAt` and scoped metrics: `*SinceStart` counters reset when the daemon restarts (`eventsSinceStart`, `appendBytesSinceStart`, `metaWritesSinceStart`, `metaBytesSinceStart`), `*Total` are what the database holds (`threadsTotal`, `indexedEventsTotal`), `last*` time the most recent operation (`lastSnapshotMs`, `lastSearchMs`); `subscribedThreads` counts live thread subscriptions. The unscoped names (`events`, `threads`, …) are kept for one release.

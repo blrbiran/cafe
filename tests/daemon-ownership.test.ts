@@ -114,3 +114,21 @@ describe("daemon stop/restart only touch this CAFE_HOME's daemon (#88)", () => {
     expect(existsSync(join(home, "config.yml"))).toBe(false);
   });
 });
+
+// Found by the #16 regression: inside Codex's sandbox the loopback check fails with something other
+// than "connection refused", the CLI concluded no daemon was running, tried to spawn a second one and
+// reported `EPERM … daemon.stdout.log`. Only "nothing is listening" may start a daemon.
+describe("an unreachable (not absent) daemon is reported, not replaced", () => {
+  it("does not spawn a daemon when the port answers but the check fails", async () => {
+    const { createServer: tcp } = await import("node:net");
+    const s = tcp((sock) => sock.destroy());
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    cleanup.push(() => new Promise((r) => s.close(() => r(undefined))));
+    const home = initHome((s.address() as any).port);
+    const r = await cafe(home, "agents");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/cannot reach the cafe daemon/);
+    expect(r.stderr).toMatch(/sandbox/);
+    expect(existsSync(join(home, "daemon.stdout.log"))).toBe(false);
+  });
+});

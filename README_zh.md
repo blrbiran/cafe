@@ -214,6 +214,8 @@ open http://127.0.0.1:4777/
 3. `cafe init` 确认当前目录有可解析的 `.cafe`；
 4. `cafe doctor` 会把以上结果和下一步一起打印出来。
 
+只有端口上确实没有服务在听时，命令才会自动启动 daemon。如果检查因为别的原因失败（典型是沙箱屏蔽了 localhost，比如 Codex 的只读模式），会直接说明连不上 daemon，而不是再启动一个。
+
 `cafe daemon stop` / `restart` 只会操作**当前 `CAFE_HOME`** 的 daemon：daemon 在 `/api/health` 里报告自己 home 的标识，属于别的 home 的 daemon（或没有 `config.yml` 的 `CAFE_HOME`）会被拒绝，而不是被关掉。只读命令不再在空的 `CAFE_HOME` 里生成 `config.yml`，只有 `cafe daemon start`（或 `cafe config set`）才会。加 `--json` 时，所有错误（包括命令拼错）都在 stdout 输出一个 JSON 对象（`{"error","message","suggestions"?}`），退出码 1。
 
 `GET /api/health` 还返回 `startedAt` 和分清口径的指标：`*SinceStart` 是本次启动以来的累计，重启归零（`eventsSinceStart`、`appendBytesSinceStart`、`metaWritesSinceStart`、`metaBytesSinceStart`）；`*Total` 是库里的总量（`threadsTotal`、`indexedEventsTotal`）；`last*` 是最近一次操作的耗时（`lastSnapshotMs`、`lastSearchMs`）；`subscribedThreads` 是当前的 thread 订阅数。旧的不带口径的名字（`events`、`threads` 等）保留一个版本。

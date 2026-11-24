@@ -52,11 +52,17 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
+/** Why the last `healthy()` check failed, as an error code (ECONNREFUSED = nothing is listening). */
+let lastHealthCode: string | undefined;
+
 async function healthy(): Promise<boolean> {
   try {
     const r = await fetch(`${base()}/api/health`, { signal: AbortSignal.timeout(800) });
+    lastHealthCode = r.ok ? undefined : `HTTP_${r.status}`;
     return r.ok;
-  } catch {
+  } catch (err) {
+    const c = (err as any)?.cause;
+    lastHealthCode = (err as any)?.name === "TimeoutError" ? "ETIMEDOUT" : (c?.code ?? c?.errors?.[0]?.code ?? (err as any)?.code ?? "UNKNOWN");
     return false;
   }
 }
@@ -162,6 +168,15 @@ async function setAndApply(key: string, value: string): Promise<{ human: string;
 async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
   if (await healthy()) return;
   if (process.env.CAFE_DAEMON) throw new Error(`cafe daemon at ${process.env.CAFE_DAEMON} is not reachable`);
+  // Only "nothing is listening" means there is no daemon to talk to. Anything else (a sandbox that
+  // blocks loopback, a reset, a timeout) means one may well be running: starting a second one would
+  // fail confusingly (EPERM on its log inside a read-only sandbox) or fight over the port.
+  if (lastHealthCode !== "ECONNREFUSED") {
+    throw new Error(
+      `cannot reach the cafe daemon at ${base()} (${lastHealthCode}), and it is not simply stopped, so a new one was not started.\n` +
+        "next: if this runs inside a sandbox (e.g. Codex read-only), allow network access to localhost or run the command outside it; otherwise check `cafe daemon status` from a normal shell",
+    );
+  }
   const home = cafeHome();
   mkdirSync(home, { recursive: true });
   // Autostart installed for this home: let launchd/systemd run it so it stays supervised.
