@@ -47,6 +47,27 @@ describe("leaf lifecycle", () => {
     expect(again.cert).toBe(first.cert);
   }, 60_000);
 
+  it("reissues a leaf that a different CA signed, even when its SANs and expiry are fine", async () => {
+    // A Host that booted on a temporary local CA (its Root was unreachable), then enrolled the real
+    // CA, keeps a leaf no peer will accept — fail-closed, and restarting used to change nothing
+    // because only the SAN set and the expiry were checked. The leaf must be replaced.
+    const home = mkdtempSync(join(tmpdir(), "cafe-tls-lifecycle-ca-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    const stranger = await generateCa();
+    const real = await generateCa();
+    const staging = await issueLeaf(stranger, ["desk", "127.0.0.1", "localhost"], 90);
+    const { writeLeaf } = await import("../packages/daemon/src/tls/store.ts");
+    writeLeaf(home, "desk", { cert: staging.cert, key: staging.key });
+
+    const next = await ensureLeaf(home, "desk", real, { host: "desk", lan: "127.0.0.1" });
+    expect(next.cert).not.toBe(staging.cert);
+    expect(new X509Certificate(next.cert).checkIssued(new X509Certificate(real.cert))).toBe(true);
+    // Same key: replacing the issuer must not change the identity a peer may have pinned.
+    expect(new X509Certificate(next.cert).publicKey.export({ type: "spki", format: "der" }).equals(
+      new X509Certificate(staging.cert).publicKey.export({ type: "spki", format: "der" }),
+    )).toBe(true);
+  }, 60_000);
+
   it("renews with no CA key by asking the issuer (a child Host)", async () => {
     const home = mkdtempSync(join(tmpdir(), "cafe-tls-lifecycle-fetch-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));

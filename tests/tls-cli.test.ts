@@ -120,4 +120,34 @@ describe("cafe daemon renew-cert", () => {
     expect(r.status).not.toBe(0);
     expect(`${r.stdout}${r.stderr}`).toMatch(/daemon|ca\.crt|renew/i);
   });
+
+  it("keeps the leaf key when it reissues on a stopped daemon", async () => {
+    // Same identity rule as the running path: a renewal must not change the key a peer pinned.
+    const h = home();
+    writeFileSync(join(h, "config.yml"), `host: desk\nport: 47821\ntoken: t0k\nsecurity:\n  mode: tls\n  tls:\n    port: 47822\n`);
+    const { generateCa, issueLeaf, keyFingerprintOf } = await import("../packages/daemon/src/tls/certs.ts");
+    const { writeLeaf, writeCa } = await (async () => {
+      const store = await import("../packages/daemon/src/tls/store.ts");
+      return {
+        writeLeaf: (home: string, cert: string, key: string) => store.writeLeaf(home, "desk", { cert, key }),
+        writeCa: async (home: string, pair: { cert: string; key: string }) => {
+          const { mkdirSync } = await import("node:fs");
+          const { join } = await import("node:path");
+          mkdirSync(join(home, "tls"), { recursive: true });
+          writeFileSync(join(home, "tls", "ca.crt"), pair.cert);
+          writeFileSync(join(home, "tls", "ca.key"), pair.key);
+        },
+      };
+    })();
+    const ca = await generateCa();
+    await writeCa(h, ca);
+    const first = await issueLeaf(ca, ["desk", "127.0.0.1", "localhost"], 90);
+    writeLeaf(h, first.cert, first.key);
+
+    const r = cafe(h, "daemon", "renew-cert");
+    expect(r.status).toBe(0);
+    const renewed = readFileSync(join(h, "tls", "desk.crt"), "utf8");
+    expect(renewed).not.toBe(first.cert);
+    expect(keyFingerprintOf(renewed)).toBe(keyFingerprintOf(first.cert));
+  });
 });

@@ -18,6 +18,8 @@ const zh = {
   navAgents: "Agents",
   navNetwork: "网络",
   navLive: "实况",
+  navResize: "拖动调整侧栏宽度",
+  navResizeReset: "双击恢复默认宽度（或用方向键调整）",
   loading: "加载中…",
 
   feedTitle: "问答",
@@ -356,6 +358,8 @@ const en: Dict = {
   navAgents: "Agents",
   navNetwork: "Network",
   navLive: "Live",
+  navResize: "Drag to resize the sidebar",
+  navResizeReset: "Double-click to restore the default width (or use the arrow keys)",
   loading: "Loading…",
 
   feedTitle: "Conversations",

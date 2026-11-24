@@ -301,3 +301,22 @@ thrown-away experiments before any test was written:
 A pin that genuinely changed (a reinstalled Host) is cleared with
 **`cafe host pin <host:port> --clear`** — the refusal message used to name
 `cafe connect … --reset-pin`, which never existed. `tests/tls-cli.test.ts`.
+
+### 10.2 Follow-up (same day): the recovery paths
+
+Three more ways the fleet could get permanently stuck, found the same way:
+
+5. **`ensureLeaf` never checked the issuer.** It kept a leaf whose SANs matched and whose expiry was
+   fine even when a different CA had signed it. A Host that booted on the temporary local CA and
+   then enrolled the real one therefore kept a leaf no peer accepts — across restarts, with no
+   rescue. `certs.ts`: `issuedBy()`; `ensureLeaf` reissues (keeping the key) when the leaf is not
+   issued by the CA in force. `tests/tls-lifecycle.test.ts`.
+6. **The documented enrolment retry did not exist.** `bootstrap.ts` said a child runs on a temporary
+   CA and "retries enrolment before the next dial to the Root", but nothing retried: a child started
+   before its Root never left the temporary CA (`network` stayed false) and never connected.
+   `daemon.ts`: `startEnrolmentRetry()` (immediate attempt, then on the leaf-check tick) calls
+   `tlsContext.enrol`, which fetches the CA, reissues the leaf for the existing key, flips
+   `network`, and re-points the uplink. `tests/tls-bootstrap.test.ts`.
+7. **`cafe daemon renew-cert` on a stopped daemon rotated the key.** It called `issueLeaf` with no
+   key, so it changed the identity exactly like the online renewal used to. It now re-signs the key
+   on disk. `tests/tls-cli.test.ts`.

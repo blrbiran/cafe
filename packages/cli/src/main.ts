@@ -10,7 +10,7 @@ import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, 
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { fingerprintOf, issueLeaf, sanList } from "../../daemon/src/tls/certs.ts";
-import { tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
+import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
@@ -458,8 +458,11 @@ daemon
       out(`reissued leaf for ${cfg.host} (fingerprint ${r.fingerprint256}); new connections use it, no restart needed`, r);
       return;
     }
-    const leaf = await issueLeaf(ca, sans);
-    writeLeaf(cafeHome(), cfg.host, { cert: leaf.cert, key: leaf.key });
+    // Re-sign the key that is already on disk. A fresh key would change this Host's identity, and a
+    // peer that pinned the old key would then refuse it — fail-closed, with no way back but a manual
+    // `cafe host pin --clear` on every peer.
+    const leaf = await issueLeaf(ca, sans, 90, readLeaf(cafeHome(), cfg.host)?.key);
+    writeLeaf(cafeHome(), cfg.host, { cert: leaf.cert, key: leaf.key || readLeaf(cafeHome(), cfg.host)?.key || "" });
     out(`reissued leaf for ${cfg.host} (fingerprint ${leaf.fingerprint256}); written to ${tlsPaths(cafeHome(), cfg.host).leafCertPath}`, leaf);
   });
 daemon

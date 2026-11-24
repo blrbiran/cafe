@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { Daemon, type DaemonOptions } from "./daemon.ts";
 import { cafeHome, loadConfig, saveConfig } from "./config.ts";
@@ -8,7 +8,7 @@ import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress, advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
 import { ensureLeaf, leafNeedsRenewal, tlsPaths, writeLeaf } from "./tls/store.ts";
-import { bootstrapCa, fetchLeafFromRoot, trustCaForClient } from "./tls/bootstrap.ts";
+import { bootstrapCa, fetchLeafFromRoot, fetchRootCa, trustCaForClient } from "./tls/bootstrap.ts";
 import { readTlsConfig } from "./tls/trust.ts";
 import { issueLeaf, publicKeyOf, sanList } from "./tls/certs.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
@@ -179,8 +179,39 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
               const next = ca.key ? await issueLeaf(ca, names, 90, prev.key) : await fetchFromRoot(names);
               swap(next.key ? { cert: next.cert, key: next.key } : { cert: next.cert, key: prev.key });
             },
+            /**
+             * A child that booted while its Root was unreachable runs on a temporary local CA; this
+             * enrols the real CA and obtains a leaf from it, in place (v4-6 §3.3 "retry enrolment
+             * before the next dial"). Without it the child never left the temporary CA, so its
+             * `wss://` links never came on and no peer accepted its leaf.
+             */
+            ...(boot.pendingRoot && config.root
+              ? {
+                  enrol: async () => {
+                    const enrolled = await fetchRootCa(config.root!, security.caFingerprint, config.token);
+                    mkdirSync(join(home, "tls"), { recursive: true });
+                    writeFileSync(tlsPaths(home, "unused").caPath, enrolled.cert, { mode: 0o644 });
+                    if (!config.security.tls.caFingerprint) {
+                      config.security.tls.caFingerprint = enrolled.fingerprint256;
+                      saveConfig(config, home);
+                    }
+                    trustCaForClient(enrolled.cert);
+                    // Reissue for the key we already use: a peer that pinned this Host keeps matching.
+                    const next = await fetchLeafFromRoot(config.root!, enrolled.cert, config.token, leafSans(), publicKeyOf(active?.cert));
+                    swap(next.key ? { cert: next.cert, key: next.key } : { cert: next.cert, key: active!.key });
+                    ca.cert = enrolled.cert;
+                    ca.fingerprint256 = enrolled.fingerprint256;
+                    daemon.tlsContext!.ca = enrolled.cert;
+                    daemon.tlsContext!.caFingerprint = enrolled.fingerprint256;
+                    daemon.tlsContext!.network = true;
+                    // Drop the current uplink so the next dial follows the new scheme (`wss://`).
+                    daemon.setRoot(config.root!);
+                  },
+                }
+              : {}),
           };
-          return { ca: leaf.ca, current: () => active!, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn) };
+          const enrol = daemon.tlsContext?.enrol;
+          return { ca: leaf.ca, current: () => active!, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn), ...(enrol ? { enrol } : {}) };
         })()
       : undefined;
   let server: ServerHandle;
@@ -199,6 +230,9 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   // A leaf nearing expiry is renewed while the Daemon keeps running, not only at the next start
   // (v4-6 §5 B): otherwise a fleet that never restarts expires together and fails closed.
   if (tls) daemon.startLeafRenewalCheck(() => leafNeedsRenewal(tls!.current().cert));
+  // A child that booted while its Root was offline runs on a temporary local CA; retry enrolment so
+  // it moves onto the real CA and its `wss://` links come on, without a restart (v4-6 §3.3).
+  if (daemon.tlsContext?.enrol && !daemon.tlsContext.network) daemon.startEnrolmentRetry();
   if (!opts.noSupervisor) {
     daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token });
     const { reaped, skipped } = await daemon.supervisor.restore();

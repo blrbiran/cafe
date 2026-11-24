@@ -1,4 +1,4 @@
-import { useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import type { AgentRecord, DaemonRecord } from "@cafe/protocol";
 import { api } from "./api.ts";
 import { isActive, refreshStore, useStore } from "./store.ts";
@@ -31,6 +31,36 @@ function GearIcon() {
 }
 
 const AGENTS_OPEN_KEY = "cafe.nav.agentsOpen";
+
+/**
+ * Sidebar width (#62). `--nav-width` is the single source of truth: the nav's own width and the
+ * wide-screen drawer geometry (`calc(100vw - var(--nav-width) - 680px)`) both read it, so they can
+ * never disagree. The person can drag the divider; the value is remembered per browser.
+ */
+const NAV_WIDTH_KEY = "cafe.nav.width";
+const NAV_WIDTH_DEFAULT = 300;
+const NAV_WIDTH_MIN = 240;
+const NAV_WIDTH_MAX = 420;
+
+const clampNavWidth = (px: number) => Math.round(Math.min(NAV_WIDTH_MAX, Math.max(NAV_WIDTH_MIN, px)));
+
+function readNavWidth(): number {
+  try {
+    const saved = Number(localStorage.getItem(NAV_WIDTH_KEY));
+    if (Number.isFinite(saved) && saved > 0) return clampNavWidth(saved);
+  } catch {
+    // private mode / storage disabled: the default still applies
+  }
+  return NAV_WIDTH_DEFAULT;
+}
+
+function saveNavWidth(px: number): void {
+  try {
+    localStorage.setItem(NAV_WIDTH_KEY, String(px));
+  } catch {
+    // the drag still works for this visit
+  }
+}
 
 function readAgentsOpen(): boolean {
   try {
@@ -154,6 +184,38 @@ export function Shell({
   const threads = useStore((s) => s.threads);
   const daemons = useStore((s) => s.daemons);
   const [theme, setTheme] = useState<Theme>(readTheme);
+  const [navWidth, setNavWidth] = useState<number>(readNavWidth);
+  const navWidthRef = useRef(navWidth);
+  navWidthRef.current = navWidth;
+  /** Drag the divider (#62): pointer moves resize; pointerup persists once, not per frame. */
+  const startNavResize = (e: React.PointerEvent<HTMLElement>) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = navWidthRef.current;
+    const move = (ev: PointerEvent) => {
+      const next = clampNavWidth(startWidth + ev.clientX - startX);
+      navWidthRef.current = next;
+      setNavWidth(next);
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      document.body.style.removeProperty("cursor");
+      document.body.style.removeProperty("user-select");
+      saveNavWidth(navWidthRef.current);
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  };
+  const resetNavWidth = () => {
+    navWidthRef.current = NAV_WIDTH_DEFAULT;
+    setNavWidth(NAV_WIDTH_DEFAULT);
+    saveNavWidth(NAV_WIDTH_DEFAULT);
+  };
   // Open by default on desktop so the registered Baristas are visible at a glance;
   // on a narrow screen it would cover the page, so it starts collapsed there.
   const [agentsOpen, setAgentsOpen] = useState(readAgentsOpen);
@@ -182,10 +244,13 @@ export function Shell({
   const liveTone = !connected ? "danger" : isRoot || rootOnline ? "ok" : "warn";
 
   return (
-    <div className={`app flex h-dvh overflow-hidden max-md:block max-md:h-auto max-md:overflow-visible ${detailOpen ? "detail-open" : ""} ${settingsOpen ? "settings-open" : ""}`}>
+    <div
+      className={`app relative flex h-dvh overflow-hidden max-md:block max-md:h-auto max-md:overflow-visible ${detailOpen ? "detail-open" : ""} ${settingsOpen ? "settings-open" : ""}`}
+      style={{ "--nav-width": `${navWidth}px` } as CSSProperties}
+    >
       <nav
         aria-label="cafe"
-        className="box-border flex h-full w-[240px] shrink-0 flex-col gap-4 overflow-y-auto border-r border-line bg-card px-3.5 py-5 max-md:sticky max-md:top-0 max-md:z-20 max-md:h-auto max-md:w-auto max-md:flex-row max-md:items-center max-md:gap-2 max-md:overflow-x-auto max-md:overflow-y-hidden max-md:border-b max-md:border-r-0 max-md:px-3 max-md:py-2"
+        className="app-nav box-border flex h-full w-[var(--nav-width)] shrink-0 flex-col gap-4 overflow-y-auto border-r border-line bg-card px-3.5 py-5 max-md:sticky max-md:top-0 max-md:z-20 max-md:h-auto max-md:w-auto max-md:flex-row max-md:items-center max-md:gap-2 max-md:overflow-x-auto max-md:overflow-y-hidden max-md:border-b max-md:border-r-0 max-md:px-3 max-md:py-2"
       >
         <div className="flex flex-col gap-2.5 px-1 max-md:shrink-0 max-md:px-0">
           <div className="flex items-center gap-2 text-fg-strong">
@@ -308,6 +373,35 @@ export function Shell({
           </div>
         </div>
       </nav>
+      {/* The divider is the only resize affordance (#62). It sits over the nav's border, is hidden on
+          narrow screens (the nav is a horizontal strip there), and double-click restores the default. */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label={t.navResize}
+        aria-valuenow={navWidth}
+        aria-valuemin={NAV_WIDTH_MIN}
+        aria-valuemax={NAV_WIDTH_MAX}
+        title={`${t.navResize} · ${t.navResizeReset}`}
+        tabIndex={0}
+        className="absolute inset-y-0 z-30 hidden w-1.5 cursor-col-resize hover:bg-accent-subtle focus-visible:bg-accent-subtle max-md:!hidden md:block"
+        style={{ left: `calc(${navWidth}px - 3px)` }}
+        onPointerDown={startNavResize}
+        onDoubleClick={resetNavWidth}
+        onKeyDown={(e) => {
+          // Keyboard parity for the drag: arrows move 16px, Home restores the default.
+          if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+            e.preventDefault();
+            const next = clampNavWidth(navWidth + (e.key === "ArrowRight" ? 16 : -16));
+            navWidthRef.current = next;
+            setNavWidth(next);
+            saveNavWidth(next);
+          } else if (e.key === "Home") {
+            e.preventDefault();
+            resetNavWidth();
+          }
+        }}
+      />
 
       <main onClick={onBlankClick} className="box-border min-w-0 flex-1 overflow-y-auto px-8 pt-7 pb-12 max-md:overflow-visible max-md:px-4 max-md:pb-16">
         <div className="mx-auto flex max-w-[1180px] flex-col gap-5 min-[1600px]:max-w-[1360px] min-[2000px]:max-w-[1560px]">

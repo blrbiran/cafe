@@ -145,6 +145,21 @@ export function sanCovers(certPem: string, name: string): boolean {
 }
 
 /**
+ * Did `caPem` issue `leafPem`? A leaf from another CA fails every peer's verification (fail-closed),
+ * and `ensureLeaf` used to keep it because only SANs and expiry were compared — a Host that booted on
+ * a temporary local CA and later enrolled the real one never recovered, even across restarts.
+ */
+export function issuedBy(caPem: string, leafPem: string): boolean {
+  try {
+    const leaf = new X509Certificate(leafPem);
+    const ca = new X509Certificate(caPem);
+    return leaf.checkIssued(ca) && leaf.verify(ca.publicKey);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Issue one Daemon leaf: RSA-2048 (node-forge 1.x has no EC key generation — see the spec's honest
  * boundaries), 90-day validity by default, signed by the CA. SANs are DNS and IP entries as the
  * names require.

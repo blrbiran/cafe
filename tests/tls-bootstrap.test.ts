@@ -60,6 +60,46 @@ describe("CA bootstrap", () => {
     expect(cfg).toContain("caFingerprint");
   }, 40_000);
 
+  it("a child that booted before its Root enrols once the Root comes up, without a restart", async () => {
+    // The documented behaviour (bootstrap.ts §3.3) is "run on a temporary local CA and retry enrolment
+    // before the next dial". The retry did not exist, so a child started first kept its temporary CA
+    // forever: its `wss://` links never came on (network stayed false) and it never fetched a real leaf.
+    const rootHome = mkdtempSync(join(tmpdir(), "cafe-ca-late-root-"));
+    const childHome = mkdtempSync(join(tmpdir(), "cafe-ca-late-child-"));
+    cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
+
+    // Reserve a port, then start the child pointed at it while nothing is listening there.
+    const { createServer } = await import("node:net");
+    const probe = createServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+    const tlsPort = (probe.address() as { port: number }).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+
+    const child = await startDaemon("latechild", {
+      home: childHome,
+      config: { root: `127.0.0.1:${tlsPort}`, security: { mode: "tls", tls: { port: 0 } } },
+      timing: { leafCheckIntervalMs: 200 },
+    });
+    cleanup.push(child.stop);
+    expect(child.daemon.rootOnline).toBe(false);
+    // Nothing was enrolled, so no CA was written and the links are not on the network CA yet.
+    expect(existsSync(join(childHome, "tls", "ca.crt"))).toBe(false);
+
+    const root = await startDaemon("lateroot", {
+      home: rootHome,
+      mode: "root",
+      config: { security: { mode: "tls", tls: { port: tlsPort } } },
+    });
+    cleanup.push(root.stop);
+
+    // The child must heal itself: enrol the Root's CA, get a leaf from it, and connect over TLS.
+    await waitFor(() => child.daemon.rootOnline, 20_000);
+    expect(readFileSync(join(childHome, "tls", "ca.crt"), "utf8")).toBe(readFileSync(join(rootHome, "tls", "ca.crt"), "utf8"));
+    const { issuedBy } = await import("../packages/daemon/src/tls/certs.ts");
+    const leaf = readFileSync(join(childHome, "tls", "latechild.crt"), "utf8");
+    expect(issuedBy(readFileSync(join(rootHome, "tls", "ca.crt"), "utf8"), leaf)).toBe(true);
+  }, 40_000);
+
   it("refuses to enrol when the configured CA fingerprint does not match the Root's", async () => {
     const rootHome = mkdtempSync(join(tmpdir(), "cafe-ca-mismatch-root-"));
     const childHome = mkdtempSync(join(tmpdir(), "cafe-ca-mismatch-child-"));

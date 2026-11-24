@@ -1,0 +1,68 @@
+name: ci
+
+# The verification gate every batch is expected to pass (handoff §3), run on every push and pull
+# request. Nothing here costs money: `routing:eval` runs the keyword rules only, and the paid
+# `--model` sample stays a local, approved action. The Claude plugin test needs the `claude` CLI, so
+# it is its own job and is allowed to be skipped on a fork without credentials.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4
+          cache: npm
+      # `npm ci` installs from package-lock.json and, on a fresh runner, the optional `node-forge`
+      # (needed by the TLS suites to generate a CA) with it.
+      - run: npm ci
+      - name: typecheck
+        run: npm run typecheck
+      - name: tests
+        run: npm test
+      - name: routing eval (rules only, no model)
+        run: npm run routing:eval
+      - name: web check
+        run: npm run check --workspace @cafe/web
+      - name: web build
+        run: npm run build:web
+      - name: release smoke test (packed tarball)
+        run: npm run test:release
+
+  claude-plugin:
+    # `cafe claude install` and the plugin's own tests need Claude Code on PATH and a login. Without
+    # credentials this job is skipped rather than red, so a fork is not blocked by a missing secret.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4
+          cache: npm
+      - run: npm ci
+      - id: probe
+        shell: bash
+        run: |
+          if command -v claude >/dev/null 2>&1; then
+            echo "have=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=" >> "$GITHUB_OUTPUT"
+            echo "::notice::Claude Code is not installed on this runner; skipping the plugin tests."
+          fi
+      - if: steps.probe.outputs.have == '1'
+        run: npm run test:claude-plugin

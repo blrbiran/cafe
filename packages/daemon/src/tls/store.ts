@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
 import { join } from "node:path";
-import { fingerprintOf, generateCa, issueLeaf, publicKeyOf, sanCovers, sanList, type CertPair } from "./certs.ts";
+import { fingerprintOf, generateCa, issuedBy, issueLeaf, publicKeyOf, sanCovers, sanList, type CertPair } from "./certs.ts";
 
 /**
  * A child Host's leaf: read `CAFE_HOME/tls/<host>.crt` + `.key`, or write a leaf the Root issued.
@@ -127,12 +127,14 @@ export async function ensureLeaf(
 ): Promise<TlsContext> {
   const sans = sanList(sansInput);
   const existing = readLeaf(home, host);
-  // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed) or the
-  // leaf is nearing expiry.
+  // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed), the leaf
+  // is nearing expiry, or a different CA signed it (a Host that booted on a temporary local CA and has
+  // since enrolled the real one would otherwise keep a leaf no peer accepts).
   if (existing) {
-    // Exact SAN match (not a prefix: `127.0.0.1` must not "cover" `127.0.0.10`), and not near expiry.
+    // Exact SAN match (not a prefix: `127.0.0.1` must not "cover" `127.0.0.10`), not near expiry, and
+    // still issued by the CA in force.
     const covered = sans.every((s) => sanCovers(existing.cert, s));
-    if (covered && !leafNeedsRenewal(existing.cert)) {
+    if (covered && issuedBy(ca.cert, existing.cert) && !leafNeedsRenewal(existing.cert)) {
       return { cert: existing.cert, key: existing.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
     }
   }

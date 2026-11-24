@@ -173,6 +173,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
      * existing key (so a peer's pin still matches) and writes through to disk.
      */
     renew?(sans?: string[]): Promise<void>;
+    /**
+     * Child only: this Host booted on a temporary local CA because its Root was unreachable. Calling
+     * this enrols the Root's real CA and obtains a leaf from it, in place (v4-6 §3.3).
+     */
+    enrol?(): Promise<void>;
   };
   readonly host: string;
   readonly version: string;
@@ -1484,6 +1489,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   readonly streamCounts = { sse: 0, ws: 0 };
   private lagTimer?: ReturnType<typeof setInterval>;
   private leafTimer?: ReturnType<typeof setInterval>;
+  private enrolTimer?: ReturnType<typeof setInterval>;
 
   /**
    * Reissue the leaf while running, once it is inside the renewal window (v4-6 §5 B). Called on a
@@ -1501,6 +1507,32 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         .catch((err) => this.log(`tls: leaf renewal failed: ${(err as Error).message}`));
     }, this.timing.leafCheckIntervalMs);
     this.leafTimer.unref?.();
+  }
+
+  /**
+   * Retry CA enrolment while this Host is still on a temporary local CA (v4-6 §3.3): the Root may
+   * have been offline at boot. Stops as soon as one attempt succeeds; a failed attempt retries on the
+   * next tick, and the temporary CA keeps TLS working meanwhile.
+   */
+  startEnrolmentRetry(): void {
+    clearInterval(this.enrolTimer);
+    const attempt = () => {
+      if (!this.tlsContext?.enrol || this.tlsContext.network) {
+        clearInterval(this.enrolTimer);
+        return;
+      }
+      void this.tlsContext
+        .enrol()
+        .then(() => {
+          clearInterval(this.enrolTimer);
+          this.log(`tls: enrolled the Root's CA (${this.tlsContext?.caFingerprint})`);
+        })
+        .catch((err) => this.log(`tls: enrolment retry failed: ${(err as Error).message}`));
+    };
+    // Try at once (the Root may already be up by the time the listeners are bound), then on the tick.
+    attempt();
+    this.enrolTimer = setInterval(attempt, this.timing.leafCheckIntervalMs);
+    this.enrolTimer.unref?.();
   }
 
   /** Append to the Thread's JSONL, keeping the byte counters for /api/health. */
@@ -2684,6 +2716,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.stagingTimer);
     clearInterval(this.lagTimer);
     clearInterval(this.leafTimer);
+    clearInterval(this.enrolTimer);
     this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
     for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();

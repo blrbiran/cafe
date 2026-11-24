@@ -68,7 +68,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below; registers the `/cafe agents|ask|status|thread|help` command (a user-owned `/cafe` wins; tools and skill still work) |
 | `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore`; fixed Shell, compact feed with whole-card click and 2-column list at ≥1800 (drawer closed), right detail drawer / three-pane at ≥1600, info rail at ≥1920, nav Agents sublist (open by default on desktop, remembered; agent rows open the rename/alias menu on right-click or Shift+F10 — no per-row ⋯ button, which used to fall onto a second grid line; menus close on outside click/Esc); Agent cards show the working directory and a separate 负责范围/scope row; Settings drawer (machines + remote rename, start/stop Baristas, routing, connection root/token hint, **pending config + health checks**), Live page, drawer open/close animation and click-outside close; feed has "load older" and full-text search; cards show `你`/`代问` provenance and **📎 attachment count**; **displayName shown in Network/Agents/Live/Shell; Network cards can test/reconnect/rename/copy CLI**; a banner appears when the built Web UI on disk is newer than the daemon's in-memory copy; long Threads load older events; Live backfills events after a WebSocket reconnect; snapshot 200-thread payload is clipped; **composer uploads 0–N files, Thread shows/downloads attachments** |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
-| `tests/` | vitest, **407 tests** (+5 mod tests via `npm run test:claude-plugin`): **TLS transport (`tls-certs|trust|server|client|child|bootstrap|renew|cli|untrusted|lifecycle|renewal-predicate|runtime-renewal|san-coverage|peer-pin`, `security-token`)**, **per-target sub-questions (`per-target-questions`)**, **web tab icon (`web-icon`)**, **scratch configs stay off 4778 (`scratch-configs`)**, identity/display names/aliases, legacy names and removal (`identity.test.ts`), provenance (`provenance.test.ts`), **attachments (`attachments.test.ts`: local, cross-host pull/proxy, limits, CLI upload/download)**, **daemon health endpoint (`doctor-api.test.ts`)**, **health metrics and search stats (`metrics.test.ts`)**, **heartbeat lease regression (`heartbeat.test.ts`)**, **routing observability and `/api/routing/stats` (`routing-observability.test.ts`), routing aggregates (`routing-stats.test.ts`)**, connector SDK/mock/CLI/idempotency/crash-restart (`connector.test.ts`, restart wait deflaked), Discord connector core + fake-platform end-to-end (`discord-connector.test.ts`), FTS search + prune index cleanup (`retention.test.ts`), bounded caches (`cache-bounds.test.ts`), claude install exit code + commands status (`commands.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), rules eval + hints (`routing-eval.test.ts` over `routing-fixtures.ts`, 53 strict + `EXTRA_CASES` overlap/morphology/multicast/top-k/variants/stability), rules decisions (`routing-rules.test.ts`), fan-out grace (`routing-grace.test.ts`), follow-up race (`until-closed.test.ts`), bounded metadata (`bounded.test.ts`), reply entry (`reply-entry.test.ts`), controlled update + drain (`update.test.ts`), global event filters, SSE resume and the WebSocket backfill endpoint (`events.test.ts`), config contract incl. pending and the write API (`config-contract.test.ts`), thread paging, limit validation, unknown-stream 404 and snapshot summaries (`thread-paging.test.ts`), client event buffer (`client-recent.test.ts`), CLI init/help/config/redaction/status/aliases (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), service retarget (`service.test.ts`), plus session host, Codex TUI, e2e (incl. the slow-ack heartbeat regression), follow-up/recovery, pi extension (incl. `/cafe`), serve (incl. preset safety), supervisor, routing hints, direct links, discovery, retention/search, client reconnect, versions, Bridges, MCP |
+| `tests/` | vitest, **428 tests** (+5 mod tests via `npm run test:claude-plugin`): **TLS transport (`tls-certs|trust|server|client|child|bootstrap|renew|cli|untrusted|lifecycle|renewal-predicate|runtime-renewal|san-coverage|peer-pin`, `security-token`)**, **per-target sub-questions (`per-target-questions`)**, **web tab icon (`web-icon`), resizable sidebar (`web-nav-width`)**, **scratch configs stay off 4778 (`scratch-configs`)**, identity/display names/aliases, legacy names and removal (`identity.test.ts`), provenance (`provenance.test.ts`), **attachments (`attachments.test.ts`: local, cross-host pull/proxy, limits, CLI upload/download)**, **daemon health endpoint (`doctor-api.test.ts`)**, **health metrics and search stats (`metrics.test.ts`)**, **heartbeat lease regression (`heartbeat.test.ts`)**, **routing observability and `/api/routing/stats` (`routing-observability.test.ts`), routing aggregates (`routing-stats.test.ts`)**, connector SDK/mock/CLI/idempotency/crash-restart (`connector.test.ts`, restart wait deflaked), Discord connector core + fake-platform end-to-end (`discord-connector.test.ts`), FTS search + prune index cleanup (`retention.test.ts`), bounded caches (`cache-bounds.test.ts`), claude install exit code + commands status (`commands.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), rules eval + hints (`routing-eval.test.ts` over `routing-fixtures.ts`, 53 strict + `EXTRA_CASES` overlap/morphology/multicast/top-k/variants/stability), rules decisions (`routing-rules.test.ts`), fan-out grace (`routing-grace.test.ts`), follow-up race (`until-closed.test.ts`), bounded metadata (`bounded.test.ts`), reply entry (`reply-entry.test.ts`), controlled update + drain (`update.test.ts`), global event filters, SSE resume and the WebSocket backfill endpoint (`events.test.ts`), config contract incl. pending and the write API (`config-contract.test.ts`), thread paging, limit validation, unknown-stream 404 and snapshot summaries (`thread-paging.test.ts`), client event buffer (`client-recent.test.ts`), CLI init/help/config/redaction/status/aliases (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), service retarget (`service.test.ts`), plus session host, Codex TUI, e2e (incl. the slow-ack heartbeat regression), follow-up/recovery, pi extension (incl. `/cafe`), serve (incl. preset safety), supervisor, routing hints, direct links, discovery, retention/search, client reconnect, versions, Bridges, MCP |
 
 **pi extension behaviour**
 - Orders queue (FIFO), are acked and heartbeated on arrival, and are injected only when idle with `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
@@ -83,7 +83,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 407 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
+npm test                   # vitest; all 428 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
 npm run routing:eval       # offline rules eval: 65 scored cases, 3 blocked team cases, no model cost
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
@@ -120,7 +120,9 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ### 2026-11-24 (late) — TLS: 续期×pin 互相打架的四个缺陷已修
 
-- **为什么修。** 昨夜 #61 的三项「加固」彼此冲突，只有在真实滚动网络里才会暴露。四个缺陷，全部先做
+- **一句话**：昨夜 #61 的「自动续期 + 每 peer 叶子 pin + SAN」三项彼此冲突，只有在真实滚动网络里才会
+  暴露；连同两条救援路径，一共修了 **7 个真实缺陷**，每个都先用实验确认、再写会失败的测试。
+- **为什么修。** 三个「加固」彼此冲突，只有在真实滚动网络里才会暴露。全部先做
   一次性实验确认、再写会失败的测试（RED），最后修复：
   1. **自定义 `checkServerIdentity` 关掉了 SAN 校验。** Node 只要收到这个选项就**替换**默认身份校验，
      不会叠加。于是 pin 检查让每条 Daemon↔Daemon `wss://` 都跳过了 SAN：实测「签给
@@ -130,26 +132,45 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
   2. **续期会换密钥 → 轮换当天全网被 pin 拒绝。** `issueLeaf` 每次都新生成 RSA 密钥，而 pin 钉整张证书；
      任何一次续期（启动窗口 / 6h tick / `renew-cert`）都会让已 pin 的 peer 全体拒绝，fail-closed 下没有
      明文救援。现在 `issueLeaf(ca, sans, days, key?)` **复用原密钥重签**（child 可只发 SPKI 公钥回来），
-     `ensureLeaf` / `renew` / `POST /api/tls/leaf` 全链路传递。测试 `tls-key-continuity`、
-     `tls-renewal-keeps-key`、`tls-peer-pin` 的「真续期后不断连」用例。
+     `ensureLeaf` / `renew` / `POST /api/tls/leaf` / `cafe daemon renew-cert` 全链路传递。测试
+     `tls-key-continuity`、`tls-renewal-keeps-key`、`tls-peer-pin` 的「真续期后不断连」用例。
   3. **pin 改钉公钥（SPKI）而非整张证书。** 证书指纹每次续期都变、公钥不变。旧证书 pin 在其叶子未变时
      仍被接受，并在该次连接里**就地升级**为公钥 pin（`checkPeerPin` 返回 `upgrade`），升级不会锁死已有
      网络。`certs.ts`: `keyFingerprintOf`。
   4. **`POST /api/tls/renew` 只换内存不落盘。** 重启后又回到旧（可能将过期的）叶子。现在走
      `tlsContext.renew`，写穿透到磁盘，返回的仍是证书指纹。
+  5. **`ensureLeaf` 不检查签发者。** 只要 SAN 与有效期合适就保留叶子，哪怕它是另一个 CA 签的。子节点
+     在临时本地 CA 上启动、之后入网真实 CA，就会永远带着一张没人接受的叶子，重启也修不好。现在
+     `issuedBy()`（`certs.ts`）不匹配就重签（保留密钥）。
+  6. **文档里的 enrolment 重试根本不存在。** `bootstrap.ts` 写着「Root 不可达时用临时本地 CA，下次拨号
+     前重试 enrolment」，但没有任何重试：先于 Root 启动的子节点永远停在临时 CA（`network` 恒 false），
+     永远连不上。现在 `daemon.startEnrolmentRetry()`：立即试一次，之后按叶子检查 tick 重试；
+     `tlsContext.enrol` 取真实 CA、用原密钥重签叶子、翻转 `network`、重连 Root。
+  7. **`cafe daemon renew-cert` 在 daemon 停着时会换密钥**（同样打掉 pin），现在复用磁盘上的密钥。
 - **新增命令 `cafe host pin [host:port] [--clear]`。** 旧拒绝信息让人跑 `cafe connect --reset-pin`，这参数
   根本不存在（全仓只有这一句文案）。现在真正能清除 pin：运行中的 daemon 走 `POST /api/tls/pins`
   （热生效），同时改写 `config.yml`。`tests/tls-cli.test.ts`。
-- **验证。** typecheck；**420 tests ×2**（新增 3 个测试文件 + 7 个用例）；`routing:eval` 67/67；web
-  check + `build:web`。用户 Root 已重启在新代码上（pid 41515，4777 + 4778，`:4778/api/health` 返回 200），
-  叶子与重启前**逐字节相同**（89.7 天），本机 `pins: {}` 为空。
+- **验证。** typecheck；**428 tests ×2**（新增 4 个测试文件 + 11 个用例）；`routing:eval` 67/67；web
+  check + `build:web`；`npm run test:release` 全绿。用户 Root 已重启在新代码上（4777 + 4778，
+  `:4778/api/health` 返回 200），叶子与重启前**逐字节相同**（89.7 天），本机 `pins: {}` 为空。
+  新增的真实模型基线见下（本轮已获准付费运行）。
 - **spec / 文档。** `docs/specs/v4-6-tls.md` 新增 §10.1（as-built 记录这四项）；README / README_zh /
   SKILL 的 TLS 段改为「续期保留密钥、公钥 pin、`cafe host pin --clear`」。
+- **#62 侧栏可调宽（用户早先要求「加 1/4」）。** 宽度收成单一来源 `--nav-width`（默认 300px，
+  240–420 可拖）；`Shell.tsx` 用 `w-[var(--nav-width)]`，宽屏 drawer 的
+  `calc(100vw - var(--nav-width) - 680px)` 自动跟随。拖拽手柄在侧栏右边界（`role="separator"`，
+  方向键 ±16px、Home/双击复位），宽度存 `localStorage["cafe.nav.width"]`，`max-md` 下隐藏手柄。
+  侧栏窄于 290px 时用容器查询隐藏 kind tag，让 Agent 名先显示。测试 `tests/web-nav-width.test.ts`
+  锁住「不许再出现第二处 `240px`」。浏览器实测：1440/1920 拖拽与复位、刷新保持、390 移动端无手柄、
+  drawer 几何 `1920-420-680=820px` 正确。截图 `output/playwright/nav-1440-360.png`、
+  `nav-1920-360.png`、`nav-390.png`（供你复核样式）。
+- **CI（新增）。** `.github/workflows/ci.yml`：typecheck、全量测试、`routing:eval`、web check/build、
+  `test:release`；Claude plugin 测试单列一个 job，runner 上没有 `claude` 时跳过而不是红。
 - **仍需你本人**（与上一批相同）：真实 Discord attachment DM + 重启去重；付费模型运行逐个批准；推送 +
-  发版。
-- **下一候选**：#62 侧栏可调宽（需先出原型给你批）；snapshot 分页（`/api/threads?before=` 已有，Web
-  「加载更早」可用）；`appendEvent` 异步化（有丢数据风险，我倾向不做）；#71/#72 团队与编排（需
-  brainstorming + spec）；TLS phase 2（mTLS、ECDSA）。
+  发版。CI 第一次运行要等你推送后才会触发。
+- **下一候选**：snapshot 分页（`/api/threads?before=` 已有，Web「加载更早」可用）；`appendEvent`
+  异步化（有丢数据风险，我倾向不做）；#71/#72 团队与编排（需 brainstorming + spec）；TLS phase 2
+  （mTLS、ECDSA）；#18 token 写入。
 
 ### 2026-11-24 (night) — TLS hardening, Web小修, 测试去抖, 打包/ sim 修复
 
