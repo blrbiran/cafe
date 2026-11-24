@@ -63,7 +63,7 @@ cafe status                                           # daemon / router / root /
 cafe doctor                                           # daemon, identity, extension, skill, Claude command, router, root
 cafe root set 192.168.1.10:4777                       # Root moved; updates config and the live connection
 cafe root show                                        # the Root this Host uses + its CA fingerprint to enrol others
-cafe connect 192.168.1.10:4778 --token <t> --ca-fingerprint sha256:AA:BB…  # join a Root; pins its CA (TLS, v4-6)
+cafe connect 192.168.1.10:4777 --token <t> --ca-fingerprint sha256:AA:BB…  # join a Root by its main address; pins its CA, then links over wss (TLS, v4-6)
 cafe daemon renew-cert                                # reissue this Host's TLS leaf (renewal keeps the key, so pins survive), no restart
 cafe host pin                                         # per-peer leaf-key pins; `cafe host pin <host:port> --clear` after a reinstall
 cafe config set router.model anthropic/claude-haiku-4-5  # LLM routing via pi auth; unset = keyword rules

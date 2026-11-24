@@ -320,3 +320,53 @@ Three more ways the fleet could get permanently stuck, found the same way:
 7. **`cafe daemon renew-cert` on a stopped daemon rotated the key.** It called `issueLeaf` with no
    key, so it changed the identity exactly like the online renewal used to. It now re-signs the key
    on disk. `tests/tls-cli.test.ts`.
+### 10.3 Joining by the main address, and TLS addresses between Daemons (2026-11-25, dogfooding #79 #80 #81A)
+
+**Problem.** Two gaps left the Daemon↔Daemon traffic in plaintext under the default `security.mode: tls`:
+
+- **#79 enrolment was fail-open.** `root:` holds the address people type: the Root's *main* port (what
+  `cafe daemon status` prints, what README tells `cafe connect` to use). Enrolment sent HTTPS to that
+  port, which speaks plaintext, so it always failed (`wrong version number`); the child then started on a
+  temporary CA, `network` stayed false, and `connectRoot()` dialled `ws://` in plaintext. The Root showed
+  it online. The retry reused the 6-hour leaf-check tick and the same wrong port.
+- **#80 the address model never carried TLS.** `url()` was always `ws://<advertise>:<main port>`, so
+  `/api/daemons`, `knownDaemons` and the children's `peerUrls` were plaintext; `link()` kept the stored
+  scheme, so direct links (ADR-0004) were `ws://` even on an enrolled network and never checked a pin.
+
+**Decision (owner: "按你的建议", 2026-11-24).**
+
+1. **`root:` stays the main address.** Nobody has to know a second port. `GET /api/tls` (public, served
+   on both listeners) now also returns `tlsPort`. A child discovers the Root's TLS port from the main
+   address, over plaintext — safe, because the CA it receives is checked against `caFingerprint`
+   (or recorded on first use, exactly as before) and the TLS port is only ever dialled with that CA.
+   A `root:` that already names the TLS port keeps working (discovery tries HTTPS on it when plaintext
+   fails), so existing configs are not broken.
+2. **Fail-closed while not enrolled.** With `security.mode: tls` and a `root`, a child that has not
+   enrolled the network CA does **not** dial the Root at all. It keeps serving its own machine (Web UI,
+   local Agents) and reports "waiting to join the network: <reason>" in the log, `cafe doctor`,
+   `/api/health` (`tls`) and `cafe daemon status`. Enrolment retries with backoff, 5 s doubling to 5 min
+   (`timing.enrolRetryBaseMs` / `enrolRetryMaxMs`), not on the 6-hour leaf tick.
+3. **A Daemon's address names its TLS endpoint.** On an enrolled network `url()` is
+   `wss://<advertise>:<tls port>`; plaintext mode keeps `ws://<advertise>:<main port>`. Root records,
+   `knownDaemons` and `peerUrls` therefore carry `wss://` once the Daemons run the new code.
+4. **Every outgoing Daemon connection resolves its address the same way.** One resolver is used by
+   `connectRoot()`, `link()` and the Root's probes (`Test connection`, address verification, reconnect,
+   announce): `wss://` is used as is; a `ws://` or bare `host:port` (a hand-set pin, an address learnt
+   from an older Daemon) is upgraded by discovering that Host's TLS port. On an enrolled network it never
+   falls back to plaintext; an address whose TLS port cannot be found is an error, not a downgrade.
+   HTTP probes follow it (`wss` → `https` with the network CA), so the token no longer crosses the LAN in
+   plaintext on those paths either.
+5. **Diagnosis (#81A).** `cafe doctor` / `GET /api/doctor` add a `tls` check: mode, TLS port, network CA
+   fingerprint, leaf expiry (warn inside the 21-day window with `cafe daemon renew-cert`), whether the
+   leaf's SAN covers `advertise` / the LAN address, and — on a child — enrolled vs waiting (with the
+   reason). Plaintext mode says TLS is off instead of staying silent. Supervised Baristas that gave up
+   (#82) are reported there too.
+
+**Not changed.** The CA pin and the per-peer leaf-key pin stay separate; the pin key is the `host:port`
+actually dialled (the TLS port). Plaintext 4777 still serves the Web UI and loopback. Mutual TLS and
+ECDSA leaves remain phase 2.
+
+**Upgrade note.** A child that used to run "connected" in plaintext because its `root:` named the main
+port will, after upgrading, either join over TLS (the normal case) or show as waiting with the reason —
+for example a Root still on an older release (no `tlsPort` in `/api/tls`, so only a `root:` naming the
+TLS port works), or a container that cannot reach the Root's TLS port.

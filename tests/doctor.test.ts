@@ -126,3 +126,49 @@ describe("cafe doctor", () => {
     expect(readFileSync(own, "utf8")).toBe("my command");
   });
 });
+
+// #81A: `cafe doctor` said nothing about TLS, so "connected, but in plaintext" could not be seen.
+describe("cafe doctor reports TLS (#81A)", () => {
+  function dirs() {
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-tls-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const cwd = join(tmp, "work");
+    const userHome = join(tmp, "user-home");
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(userHome, { recursive: true });
+    return { tmp, cwd, userHome };
+  }
+
+  it("shows the TLS port and leaf lifetime of a TLS daemon", async () => {
+    const root = await startDaemon("root", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const { tmp, cwd, userHome } = dirs();
+    const r = await doctor(cwd, join(tmp, "cafe-home"), root.addr, userHome);
+    expect(r.stdout).toMatch(new RegExp(`tls\\s+on :${root.server.tlsPort}`));
+    expect(r.stdout).toMatch(/leaf valid \d+ more days/);
+  });
+
+  it("says TLS is off instead of staying silent", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const { tmp, cwd, userHome } = dirs();
+    const r = await doctor(cwd, join(tmp, "cafe-home"), root.addr, userHome);
+    expect(r.stdout).toMatch(/tls\s+TLS is off/);
+  });
+});
+
+describe("cafe daemon status shows TLS (#81A)", () => {
+  it("prints the TLS port and whether daemon links use wss", async () => {
+    const root = await startDaemon("root", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-status-tls-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const r = await new Promise<{ stdout: string }>((done) => {
+      const p = spawn(process.execPath, [BIN, "daemon", "status"], { env: { ...process.env, CAFE_HOME: tmp, CAFE_DAEMON: root.addr, CAFE_TOKEN: "t0k" } });
+      let stdout = "";
+      p.stdout.on("data", (d) => (stdout += d));
+      p.on("close", () => done({ stdout }));
+    });
+    expect(r.stdout).toMatch(new RegExp(`tls:\\s+on :${root.server.tlsPort} \\(daemon links use wss\\)`));
+  });
+});

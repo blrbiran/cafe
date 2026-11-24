@@ -330,7 +330,10 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         if (isWrite(req.method) && !originAllowed(req, daemon)) {
           return send(res, 403, { error: "forbidden_origin", message: "cross-site requests cannot change this daemon; use the Web UI or the CLI" });
         }
-        if (!isLoopback(req) && tokenOf(req) !== daemon.config.token) {
+        // GET /api/tls is public: the CA certificate and the TLS port are what a joining Host needs
+        // *before* it may send its token anywhere, and neither is secret (v4-6 §10.3).
+        const publicTls = req.method === "GET" && path === "/api/tls";
+        if (!publicTls && !isLoopback(req) && tokenOf(req) !== daemon.config.token) {
           return send(res, 401, { error: "unauthorized", message: "token mismatch or wrong Root address; compare `cafe config get token` on both hosts" });
         }
         return await api(daemon, req, res, url, webStale, recent);
@@ -488,7 +491,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
 
-  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus(), metrics: daemon.metrics() });
+  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, tls: daemon.tlsStatus(), isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus(), metrics: daemon.metrics() });
   if (m === "GET" && path === "/api/router/models") {
     return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });
   }
@@ -538,7 +541,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     // The trust anchor a person or a child Host needs to enrol: the CA and its fingerprint. Public
     // on purpose (a CA certificate is not a secret); the private key never appears here.
     return daemon.tlsContext
-      ? send(res, 200, { ca: daemon.tlsContext.ca, fingerprint256: daemon.tlsContext.caFingerprint })
+      ? send(res, 200, { ca: daemon.tlsContext.ca, fingerprint256: daemon.tlsContext.caFingerprint, ...(daemon.tlsPort ? { tlsPort: daemon.tlsPort } : {}) })
       : send(res, 200, { ca: null, fingerprint256: null, note: "TLS is off (security.mode: plaintext)" });
   }
   if (m === "POST" && path === "/api/tls/leaf") {

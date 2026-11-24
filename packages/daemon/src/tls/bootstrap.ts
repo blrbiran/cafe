@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { request } from "node:https";
+import { request as httpRequest } from "node:http";
 import { setDefaultCACertificates, getCACertificates } from "node:tls";
 import { ensureCaAsync, tlsPaths } from "./store.ts";
 import { enrollFingerprint, type TlsConfig } from "./trust.ts";
@@ -95,47 +96,103 @@ export async function bootstrapCa(opts: CaBootstrapOptions): Promise<CaBootstrap
   return { ca, fetchedFromRoot: false, enroll: ca.fingerprint256 };
 }
 
-/**
- * Fetch the Root's `ca.crt`. The TLS verification on this single request is deliberately off — a
- * server's CA is what we are fetching, so it cannot be verified by that same CA — and the
- * fingerprint check replaces it: with a configured pin, a wrong CA is refused; without one, this is
- * the documented TOFU first contact.
- */
-export async function fetchRootCa(root: string, expected: string | undefined, token: string): Promise<CertPair> {
-  const body = await new Promise<{ ca?: string; fingerprint256?: string }>((resolve, reject) => {
-    const req = request(
+/** Default TLS port when a Daemon's `/api/tls` predates `tlsPort` (older release). */
+export const DEFAULT_TLS_PORT = 4778;
+
+function splitAddr(addr: string): { host: string; port: number | undefined } {
+  const clean = addr.replace(/^wss?:\/\//, "").replace(/\/.*$/, "");
+  const m = /^(.*?)(?::(\d+))?$/.exec(clean)!;
+  return { host: m[1]!.replace(/^\[|\]$/g, ""), port: m[2] ? Number(m[2]) : undefined };
+}
+
+/** `host:port` with IPv6 brackets restored. */
+export function joinAddr(host: string, port: number): string {
+  return `${host.includes(":") ? `[${host}]` : host}:${port}`;
+}
+
+function getJson(mod: typeof httpRequest | typeof request, addr: string, path: string, opts: { token?: string; ca?: string; insecure?: boolean; timeoutMs?: number }): Promise<{ status: number; body: any }> {
+  const { host, port } = splitAddr(addr);
+  return new Promise((resolve, reject) => {
+    const req = mod(
       {
-        host: root.replace(/:\d+$/, "").replace(/^\[|\]$/g, ""),
-        port: Number(/:(\d+)$/.exec(root)?.[1] ?? 4778),
-        path: "/api/tls",
+        host,
+        port,
+        path,
         method: "GET",
-        headers: { authorization: `Bearer ${token}` },
-        rejectUnauthorized: false,
-      },
+        headers: opts.token ? { authorization: `Bearer ${opts.token}` } : {},
+        ...(mod === request ? (opts.insecure ? { rejectUnauthorized: false } : opts.ca ? { ca: opts.ca } : {}) : {}),
+      } as any,
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c: Buffer) => chunks.push(c));
         res.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
-          if ((res.statusCode ?? 0) !== 200) return reject(new Error(`the Root at ${root} did not return its CA (HTTP ${res.statusCode})`));
           try {
-            resolve(JSON.parse(text));
+            resolve({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
           } catch {
-            reject(new Error(`the Root at ${root} returned an unreadable CA response`));
+            reject(new Error(`unreadable response from ${addr}${path}`));
           }
         });
       },
     );
-    req.on("error", (err) => reject(new Error(`could not reach the Root at ${root} to fetch its CA: ${err.message}`)));
-    req.setTimeout(10_000, () => req.destroy(new Error("timed out fetching the Root's CA")));
+    req.on("error", reject);
+    req.setTimeout(opts.timeoutMs ?? 5_000, () => req.destroy(new Error(`timed out reaching ${addr}`)));
     req.end();
   });
+}
+
+/**
+ * What a Daemon at `addr` says about its TLS endpoint (v4-6 §10.3): its public CA and the port its TLS
+ * listener is on. `addr` is normally the address people type — the main (plaintext) port — so this asks
+ * over plaintext first; the answer carries nothing secret, the CA is checked against the pinned
+ * fingerprint by the caller, and the TLS port is only ever dialled with that CA. An `addr` that already
+ * names the TLS port (configs written before §10.3) answers over HTTPS instead.
+ */
+export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?: number } = {}): Promise<{ ca?: string; fingerprint256?: string; tlsPort: number }> {
+  const { port } = splitAddr(addr);
+  let first: Error | undefined;
+  try {
+    const r = await getJson(httpRequest, addr, "/api/tls", { timeoutMs: opts.timeoutMs });
+    if (r.status === 200) return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, tlsPort: r.body.tlsPort ?? DEFAULT_TLS_PORT };
+    first = new Error(`HTTP ${r.status}`);
+  } catch (err) {
+    first = err as Error;
+    // Nothing listens there, or the name does not resolve: HTTPS on the same port will not help.
+    if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|timed out/.test(`${(err as any).code ?? ""} ${first.message}`)) throw first;
+  }
+  try {
+    // Verify with the network CA when we have it; enrolment (no CA yet) relies on the fingerprint check.
+    const r = await getJson(request, addr, "/api/tls", { ...(opts.ca ? { ca: opts.ca } : { insecure: true }), timeoutMs: opts.timeoutMs });
+    if (r.status === 200) return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, tlsPort: r.body.tlsPort ?? port ?? DEFAULT_TLS_PORT };
+    throw new Error(`HTTP ${r.status}`);
+  } catch {
+    throw first;
+  }
+}
+
+/** `host:tlsPort` for the Daemon at `addr` (its main or its TLS address). */
+export async function tlsAddressOf(addr: string, opts: { ca?: string } = {}): Promise<string> {
+  const { tlsPort } = await discoverTls(addr, opts);
+  return joinAddr(splitAddr(addr).host, tlsPort);
+}
+
+/**
+ * Fetch the Root's `ca.crt` from the address in `root:` (its main address; a TLS address still works).
+ * The CA is authenticated by the fingerprint, not by the transport: with a configured pin a wrong CA is
+ * refused; without one this is the documented TOFU first contact.
+ */
+export async function fetchRootCa(root: string, expected: string | undefined, _token?: string): Promise<CertPair & { tlsPort: number }> {
+  let body: { ca?: string; tlsPort: number };
+  try {
+    body = await discoverTls(root, { timeoutMs: 10_000 });
+  } catch (err) {
+    throw new Error(`could not reach the Root at ${root} to fetch its CA: ${(err as Error).message}`);
+  }
   if (!body.ca) {
     throw new Error(`the Root at ${root} has TLS disabled; set security.mode: plaintext on this Host, or enable TLS on the Root`);
   }
   const check = enrollFingerprint(fingerprintOf(body.ca), expected);
   if (!check.ok) throw new Error(check.reason);
-  return { cert: body.ca, key: "", fingerprint256: fingerprintOf(body.ca) };
+  return { cert: body.ca, key: "", fingerprint256: fingerprintOf(body.ca), tlsPort: body.tlsPort };
 }
 
 /**
@@ -147,7 +204,8 @@ export async function fetchRootCa(root: string, expected: string | undefined, to
  * child's identity, so peers that pinned this Host's leaf keep accepting it (v4-6 §5 A/B). With no
  * `publicKey` this is a first issuance and the Root generates a key pair.
  */
-export function fetchLeafFromRoot(root: string, caPem: string, token: string, sans: string[], publicKey?: string): Promise<{ cert: string; key: string }> {
+export function fetchLeafFromRoot(rootTls: string, caPem: string, token: string, sans: string[], publicKey?: string): Promise<{ cert: string; key: string }> {
+  const root = rootTls;
   const payload = JSON.stringify({ sans, ...(publicKey ? { publicKey } : {}) });
   return new Promise((resolve, reject) => {
     const req = request(

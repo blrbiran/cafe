@@ -8,7 +8,7 @@ import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress, advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
 import { ensureLeaf, leafNeedsRenewal, tlsPaths, writeLeaf } from "./tls/store.ts";
-import { bootstrapCa, fetchLeafFromRoot, fetchRootCa, trustCaForClient } from "./tls/bootstrap.ts";
+import { bootstrapCa, fetchLeafFromRoot, fetchRootCa, tlsAddressOf, trustCaForClient } from "./tls/bootstrap.ts";
 import { readTlsConfig } from "./tls/trust.ts";
 import { issueLeaf, publicKeyOf, sanList } from "./tls/certs.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
@@ -118,9 +118,12 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
           // The leaf in force, set below. `fetchFromRoot` runs during the boot issuance too, when no
           // active leaf exists yet: then it is a first issuance and no key is sent.
           let active: { cert: string; key: string } | undefined;
-          /** Ask the Root (over TLS with our token) for a leaf, for a Host that holds no CA key. */
-          const fetchFromRoot = (sans?: string[]) =>
-            fetchLeafFromRoot(config.root!, ca.cert, config.token, sans?.length ? sans : leafSans(), publicKeyOf(active?.cert));
+          /**
+           * Ask the Root (over TLS with our token) for a leaf, for a Host that holds no CA key. `root:`
+           * is the Root's main address; its TLS endpoint is looked up first (v4-6 §10.3).
+           */
+          const fetchFromRoot = async (sans?: string[]) =>
+            fetchLeafFromRoot(await tlsAddressOf(config.root!, { ca: ca.cert }), ca.cert, config.token, sans?.length ? sans : leafSans(), publicKeyOf(active?.cert));
           const leaf = await ensureLeaf(
             home,
             config.host,
@@ -197,7 +200,8 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
                     }
                     trustCaForClient(enrolled.cert);
                     // Reissue for the key we already use: a peer that pinned this Host keeps matching.
-                    const next = await fetchLeafFromRoot(config.root!, enrolled.cert, config.token, leafSans(), publicKeyOf(active?.cert));
+                    const rootTls = `${config.root!.replace(/:\d+$/, "")}:${enrolled.tlsPort}`;
+                    const next = await fetchLeafFromRoot(rootTls, enrolled.cert, config.token, leafSans(), publicKeyOf(active?.cert));
                     swap(next.key ? { cert: next.cert, key: next.key } : { cert: next.cert, key: active!.key });
                     ca.cert = enrolled.cert;
                     ca.fingerprint256 = enrolled.fingerprint256;
@@ -210,6 +214,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
                 }
               : {}),
           };
+          if (boot.pendingRoot) daemon.tlsWaiting = boot.pendingRoot.reason;
           const enrol = daemon.tlsContext?.enrol;
           return { ca: leaf.ca, current: () => active!, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn), ...(enrol ? { enrol } : {}) };
         })()
@@ -223,6 +228,8 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
     throw e;
   }
   tls = tlsOpts && server.tlsPort !== undefined ? { tlsPort: server.tlsPort, current: tlsOpts.current } : undefined;
+  // Our TLS endpoint, for `url()` and `/api/tls` (v4-6 §10.3).
+  if (tls) daemon.tlsPort = tls.tlsPort;
   config.port = server.port;
   daemon.log(`listening on :${server.port} as ${config.mode} (${daemon.url()})`);
   if (tls) daemon.log(`tls on :${tls.tlsPort} (ca ${daemon.tlsContext?.caFingerprint})`);

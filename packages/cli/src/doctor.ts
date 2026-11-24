@@ -128,5 +128,18 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
     }
   }
 
+  // Transport and supervised-Barista state live in the daemon (v4-6 §10.3 #81A, #82): show its view.
+  if (daemonInfo) {
+    try {
+      const res = await get(`${opts.base}/api/doctor`, { signal: AbortSignal.timeout(1500), headers });
+      if (res.ok) {
+        const remote = ((await res.json()) as { checks?: DoctorCheck[] }).checks ?? [];
+        for (const c of remote) if (c.name === "tls" || c.name === "barista") checks.push(c);
+      }
+    } catch {
+      // An older daemon without /api/doctor: nothing more to add.
+    }
+  }
+
   return { ok: checks.every((c) => c.level !== "fail"), checks };
 }

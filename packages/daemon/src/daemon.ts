@@ -7,6 +7,8 @@ import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
 import { pinnedIdentityCheck } from "./tls/trust.ts";
+import { tlsAddressOf } from "./tls/bootstrap.ts";
+import { sanCovers } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -81,6 +83,10 @@ export interface Timing {
   linkIdleMs: number;
   /** How often to check the TLS leaf's expiry while running (v4-6 §5 B). */
   leafCheckIntervalMs: number;
+  /** A child waiting to join a TLS network retries enrolment after this, doubling (v4-6 §10.3). */
+  enrolRetryBaseMs: number;
+  /** …up to this. */
+  enrolRetryMaxMs: number;
 }
 
 /** Recompute hints at least this often even without new outcomes, so time decay shows. */
@@ -282,6 +288,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       linkConnectTimeoutMs: 3000,
       linkIdleMs: 5 * 60_000,
       leafCheckIntervalMs: 6 * 3600_000,
+      enrolRetryBaseMs: 5_000,
+      enrolRetryMaxMs: 5 * 60_000,
       ...opts.timing,
     };
     this.router = opts.router ?? new RulesRouter();
@@ -378,18 +386,89 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return { ok: false, router: restored.router, ...(restored.model ? { model: restored.model } : {}), error: applied.error };
   }
 
+  /**
+   * The address other Daemons use for this one. On a TLS network it names the TLS endpoint
+   * (`wss://<advertise>:<tls port>`), so Root records, `knownDaemons` and the children's direct-link
+   * addresses carry TLS too (v4-6 §10.3, #80). Plaintext mode keeps `ws://<advertise>:<port>`.
+   */
   url(): string {
-    return `ws://${hostWithPort(this.config.advertise ?? lanAddress(), this.config.port)}`;
+    const advertised = this.config.advertise ?? lanAddress();
+    if (this.tlsContext?.network && this.tlsPort) return `wss://${hostWithPort(bareHost(advertised), this.tlsPort)}`;
+    return `ws://${hostWithPort(advertised, this.config.port)}`;
   }
 
-  /** Scheme for outgoing Daemon-to-Daemon sockets (v4-6): `wss://` once a network CA is enrolled. */
-  private linkScheme(): "ws" | "wss" {
-    return this.tlsContext?.network ? "wss" : "ws";
+  /** The TLS listener's port (set by `runDaemon`); advertised in `/api/tls` and in `url()`. */
+  tlsPort?: number;
+  /** Why this child has not joined the TLS network yet (v4-6 §10.3); cleared once it has. */
+  tlsWaiting?: string;
+
+  /** Transport state for `/api/health`, `cafe doctor` and `cafe daemon status`. */
+  tlsStatus(): { mode: "plaintext" | "tls"; port?: number; network?: boolean; caFingerprint?: string; waiting?: string } {
+    if (!this.tlsContext) return { mode: "plaintext" };
+    const network = !!this.tlsContext.network;
+    return {
+      mode: "tls",
+      ...(this.tlsPort ? { port: this.tlsPort } : {}),
+      network,
+      caFingerprint: this.tlsContext.caFingerprint,
+      ...(!network ? { waiting: this.tlsWaiting ?? "enrolling the network CA" } : {}),
+    };
   }
 
-  /** WebSocket URL for another Daemon's `host:port`-style address, following the TLS mode. */
-  private wsUrlTo(addr: string): string {
-    return `${this.linkScheme()}://${addr}/ws`;
+  /**
+   * The WebSocket base URL (no `/ws`) to dial another Daemon at `addr` — a `wss://` / `ws://` URL or a
+   * bare `host:port` (v4-6 §10.3). On a TLS network a plaintext address (a hand-set pin, the Root's main
+   * address, an older Daemon's self-report) is upgraded by asking that Host for its TLS port; it is
+   * never dialled in plaintext. A Host still waiting to join the network dials nothing.
+   */
+  private async resolveDaemonUrl(addr: string): Promise<string> {
+    const trimmed = addr.replace(/\/+$/, "").replace(/\/ws$/, "");
+    if (!this.tlsContext) return /^wss?:\/\//.test(trimmed) ? trimmed : `ws://${trimmed}`;
+    if (!this.tlsContext.network) throw new Error(`not on the TLS network yet (${this.tlsWaiting ?? "enrolling"}); nothing is sent in plaintext`);
+    if (trimmed.startsWith("wss://")) return trimmed;
+    const plain = trimmed.replace(/^ws:\/\//, "");
+    try {
+      return `wss://${await tlsAddressOf(plain, { ca: this.tlsContext.ca })}`;
+    } catch (err) {
+      throw new Error(`cannot find the TLS port of ${plain}: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * `fetch` for another Daemon's API. An `https://` target is verified against *this network's* CA
+   * explicitly (and its SAN, by Node's default identity check), not the process-wide trust store,
+   * which holds one extra CA at a time and would make a probe depend on whichever Daemon set it last.
+   */
+  private async daemonFetch(url: string, init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal } = {}): Promise<{ ok: boolean; status: number; json(): Promise<any> }> {
+    if (!url.startsWith("https://") || !this.tlsContext) return fetch(url, init);
+    const { request } = await import("node:https");
+    const u = new URL(url);
+    return new Promise((resolve, reject) => {
+      const req = request(
+        { host: u.hostname.replace(/^\[|\]$/g, ""), port: Number(u.port), path: u.pathname + u.search, method: init.method ?? "GET", headers: init.headers, ca: this.tlsContext!.ca, servername: /^[\d.]+$|:/.test(u.hostname) ? undefined : u.hostname },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            const status = res.statusCode ?? 0;
+            resolve({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(text) });
+          });
+          res.on("error", reject);
+        },
+      );
+      req.on("error", reject);
+      if (init.signal) {
+        if (init.signal.aborted) req.destroy(init.signal.reason as Error);
+        init.signal.addEventListener("abort", () => req.destroy(init.signal!.reason as Error), { once: true });
+      }
+      req.end(init.body);
+    });
+  }
+
+  /** `http(s)://host:port` for a Daemon's HTTP API, following the same rule as `resolveDaemonUrl`. */
+  private async httpBase(addr: string): Promise<string> {
+    return (await this.resolveDaemonUrl(addr)).replace(/^ws/, "http");
   }
 
   /** `ws` client options for a Daemon link: trust exactly the network's CA, never disable verification. */
@@ -809,7 +888,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
     const started = Date.now();
     try {
-      const res = await fetch(`${url.replace(/^ws/, "http")}/api/health`, {
+      const res = await this.daemonFetch(`${await this.httpBase(url)}/api/health`, {
         headers: { authorization: `Bearer ${this.config.token}` },
         signal: AbortSignal.timeout(2500),
       });
@@ -832,7 +911,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
     const me = hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
     try {
-      await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
+      await this.daemonFetch(`${await this.httpBase(url)}/api/root`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
         body: JSON.stringify({ root: me }),
@@ -1144,11 +1223,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const pending = this.linking.get(host);
     if (pending) return pending;
-    const url = this.peerUrls.get(host);
-    if (!url) return Promise.reject(new Error(`no address for ${host}`));
-    const attempt = new Promise<Peer>((resolve, reject) => {
-      // `url` is a stored `ws(s)://host:port`; keep its scheme, add the CA when it is TLS.
-      const ws = new WebSocket(`${url}/ws`, this.linkOptions(`${host}:${new URL(url).port}`));
+    const stored = this.peerUrls.get(host);
+    if (!stored) return Promise.reject(new Error(`no address for ${host}`));
+    const attempt = this.resolveDaemonUrl(stored).then((url) => new Promise<Peer>((resolve, reject) => {
+      // On a TLS network `url` is always `wss://` (a plaintext address was upgraded above); the pin is
+      // keyed by the TLS endpoint dialled, like the uplink's.
+      const ws = new WebSocket(`${url}/ws`, this.linkOptions(url.replace(/^wss?:\/\//, "")));
       const peer = new Peer(ws);
       peer.meta.kind = "peer";
       peer.meta.host = host;
@@ -1179,7 +1259,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           reject(err as Error);
         }
       });
-    }).finally(() => this.linking.delete(host));
+    })).finally(() => this.linking.delete(host));
     this.linking.set(host, attempt);
     return attempt;
   }
@@ -1500,7 +1580,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   readonly streamCounts = { sse: 0, ws: 0 };
   private lagTimer?: ReturnType<typeof setInterval>;
   private leafTimer?: ReturnType<typeof setInterval>;
-  private enrolTimer?: ReturnType<typeof setInterval>;
+  private enrolTimer?: ReturnType<typeof setTimeout>;
 
   /**
    * Reissue the leaf while running, once it is inside the renewal window (v4-6 §5 B). Called on a
@@ -1521,29 +1601,36 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /**
-   * Retry CA enrolment while this Host is still on a temporary local CA (v4-6 §3.3): the Root may
-   * have been offline at boot. Stops as soon as one attempt succeeds; a failed attempt retries on the
-   * next tick, and the temporary CA keeps TLS working meanwhile.
+   * Retry CA enrolment while this Host is waiting to join the TLS network (v4-6 §3.3, §10.3): the Root
+   * may have been offline at boot, or not reachable yet. Backs off from `enrolRetryBaseMs` to
+   * `enrolRetryMaxMs` — a Root coming up should be noticed in seconds, not on the 6-hour leaf tick.
+   * Until it succeeds the Host does not dial its Root (no plaintext fallback).
    */
   startEnrolmentRetry(): void {
-    clearInterval(this.enrolTimer);
+    clearTimeout(this.enrolTimer);
+    let delay = this.timing.enrolRetryBaseMs;
     const attempt = () => {
-      if (!this.tlsContext?.enrol || this.tlsContext.network) {
-        clearInterval(this.enrolTimer);
-        return;
-      }
+      if (this.stopped || !this.tlsContext?.enrol || this.tlsContext.network) return;
       void this.tlsContext
         .enrol()
         .then(() => {
-          clearInterval(this.enrolTimer);
-          this.log(`tls: enrolled the Root's CA (${this.tlsContext?.caFingerprint})`);
+          this.tlsWaiting = undefined;
+          this.waitingLogged = false;
+          this.log(`tls: joined the network (ca ${this.tlsContext?.caFingerprint})`);
+          // Our own address now names the TLS endpoint; tell the UIs (and, via the uplink, the Root).
+          this.emitDaemons();
         })
-        .catch((err) => this.log(`tls: enrolment retry failed: ${(err as Error).message}`));
+        .catch((err) => {
+          const reason = (err as Error).message;
+          if (reason !== this.tlsWaiting) this.log(`tls: waiting to join the network: ${reason}`);
+          this.tlsWaiting = reason;
+          if (this.stopped) return;
+          this.enrolTimer = setTimeout(attempt, delay);
+          this.enrolTimer.unref?.();
+          delay = Math.min(this.timing.enrolRetryMaxMs, delay * 2);
+        });
     };
-    // Try at once (the Root may already be up by the time the listeners are bound), then on the tick.
     attempt();
-    this.enrolTimer = setInterval(attempt, this.timing.leafCheckIntervalMs);
-    this.enrolTimer.unref?.();
   }
 
   /** Append to the Thread's JSONL, keeping the byte counters for /api/health. */
@@ -2055,9 +2142,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private async rememberChildUrl(host: string, url: string): Promise<{ verified: boolean; error?: string; code?: string }> {
     if (this.config.knownDaemons[host] === url) return { verified: true };
     try {
-      const res = await fetch(`${url.replace(/^ws/, "http")}/api/health`, {
+      const res = await this.daemonFetch(`${await this.httpBase(url)}/api/health`, {
         headers: { authorization: `Bearer ${this.config.token}` },
-        signal: AbortSignal.timeout(1000),
+        signal: AbortSignal.timeout(2000),
       });
       if (!res.ok) {
         const error = res.status === 401 ? "unauthorized: the hosts use different tokens" : `HTTP ${res.status}`;
@@ -2088,7 +2175,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       for (let next = targets.shift(); next; next = targets.shift()) {
         const [host, url] = next;
         try {
-          const res = await fetch(`${url.replace(/^ws/, "http")}/api/root`, {
+          const res = await this.daemonFetch(`${await this.httpBase(url)}/api/root`, {
             method: "POST",
             headers: { "content-type": "application/json", authorization: `Bearer ${this.config.token}` },
             body: JSON.stringify({ root: me }),
@@ -2109,11 +2196,38 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   connectRoot(): void {
     if (this.isRoot || !this.config.root || this.stopped) return;
-    const target = this.config.root;
+    // Fail-closed (v4-6 §10.3, #79): a TLS Host that has not enrolled the network CA does not dial its
+    // Root at all — a plaintext uplink is exactly the downgrade TLS exists to prevent. The enrolment
+    // retry reconnects once it succeeds.
+    if (this.tlsContext && !this.tlsContext.network) {
+      if (!this.waitingLogged) this.log(`tls: not connecting to root ${this.config.root} until this Host joins the TLS network (${this.tlsWaiting ?? "enrolling"})`);
+      this.waitingLogged = true;
+      return;
+    }
+    const gen = ++this.dialGen;
+    void this.dialRoot(this.config.root, gen);
+  }
+
+  private dialGen = 0;
+  private waitingLogged = false;
+
+  private async dialRoot(target: string, gen: number): Promise<void> {
+    let url: string;
+    try {
+      // `root:` is the Root's main address; on a TLS network this finds its TLS endpoint (v4-6 §10.3).
+      url = await this.resolveDaemonUrl(target);
+    } catch (err) {
+      if (gen !== this.dialGen || this.stopped) return;
+      this.log(`cannot reach root ${target}: ${(err as Error).message}`);
+      this.scheduleReconnect();
+      return;
+    }
+    // A newer dial (setRoot, a reconnect) superseded this one while we were resolving.
+    if (gen !== this.dialGen || this.stopped || this.config.root !== target) return;
     let ws: WebSocket;
     try {
-      // Pin the Root's leaf by the `host:port` this Host dials (v4-6 §5 A).
-      ws = new WebSocket(this.wsUrlTo(target), this.linkOptions(target));
+      // Pin the Root's leaf by the TLS `host:port` this Host dials (v4-6 §5 A).
+      ws = new WebSocket(`${url}/ws`, this.linkOptions(url.replace(/^wss?:\/\//, "")));
     } catch (err) {
       // A persisted bad address must not crash the daemon on every boot (#76): say so and keep
       // retrying at the normal backoff, so `cafe root set` can still repair it later.
@@ -2649,6 +2763,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
     if (webStale) checks.push({ name: "web", level: "warn", detail: "the build on disk is newer than the one served", next: "cafe daemon restart" });
 
+    checks.push(this.tlsCheck());
+
+    // #82: a supervised Barista that gave up says why, instead of only failing in its own log.
+    for (const w of this.supervisor?.list() ?? []) {
+      if (w.state !== "failed") continue;
+      checks.push({ name: "barista", level: "fail", detail: `${w.dir}#${w.slot} (${w.agent}) gave up: ${w.lastError?.split("\n")[0] ?? "it kept exiting"} — log: ${w.log}`, next: `cafe barista start --dir ${w.dir}${w.agent !== "pi" ? ` --agent ${w.agent}` : ""}` });
+    }
+
     // #66: the log is capped, but a person should still hear about a file that keeps hitting the cap.
     try {
       const logPath = join(this.store.home, "daemon.log");
@@ -2664,6 +2786,35 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     else checks.push({ name: "machines", level: "ok", detail: "every known machine is online" });
 
     return { ok: !checks.some((c) => c.level === "fail"), checks };
+  }
+
+  /** TLS state for `cafe doctor` (v4-6 §10.3, #81A): mode, port, network, leaf expiry and SAN. */
+  private tlsCheck(): { name: string; level: "ok" | "warn" | "fail"; detail: string; next?: string } {
+    const st = this.tlsStatus();
+    if (st.mode === "plaintext") {
+      return { name: "tls", level: "warn", detail: "TLS is off (security.mode: plaintext): traffic between machines is not encrypted", next: "cafe config set security.mode tls && cafe daemon restart" };
+    }
+    const port = st.port ? `:${st.port}` : "(no TLS port)";
+    if (!st.network) {
+      return {
+        name: "tls",
+        level: "fail",
+        detail: `TLS on ${port}, but not on the network yet — not connecting to the hub until it is: ${st.waiting}`,
+        next: /fingerprint/i.test(st.waiting ?? "") ? "cafe root show (on the hub) and compare the CA fingerprint" : "cafe root test",
+      };
+    }
+    try {
+      const leaf = new X509Certificate(this.tlsContext!.current().cert);
+      const days = Math.floor((Date.parse(leaf.validTo) - Date.now()) / 86_400_000);
+      const advertised = (this.config.advertise ?? lanAddress()).replace(/^\[|\]$/g, "").replace(/:\d+$/, "");
+      const covers = sanCovers(this.tlsContext!.current().cert, advertised);
+      const base = `on ${port}, ca ${st.caFingerprint?.slice(0, 11)}…, leaf valid ${days} more days`;
+      if (days < 21) return { name: "tls", level: "warn", detail: `${base} (renews automatically within 21 days; renewal has not happened yet)`, next: "cafe daemon renew-cert" };
+      if (!covers) return { name: "tls", level: "warn", detail: `${base}, but the leaf does not name ${advertised} (other machines dialling it will be refused)`, next: "cafe daemon renew-cert" };
+      return { name: "tls", level: "ok", detail: base };
+    } catch (err) {
+      return { name: "tls", level: "warn", detail: `TLS on ${port}; cannot read the leaf: ${(err as Error).message}`, next: "cafe daemon renew-cert" };
+    }
   }
 
   /** List views need the latest outcome, not the whole reply text. */
@@ -2756,7 +2907,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.stagingTimer);
     clearInterval(this.lagTimer);
     clearInterval(this.leafTimer);
-    clearInterval(this.enrolTimer);
+    clearTimeout(this.enrolTimer);
     this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
     for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();
@@ -2790,6 +2941,12 @@ function hasPort(addr: string): boolean {
  */
 export function hostWithPort(addr: string, port: number): string {
   return hasPort(addr) ? addr : `${addr}:${port}`;
+}
+
+/** `advertise` without any port it carries (the TLS address uses the TLS port instead). */
+export function bareHost(addr: string): string {
+  if (!hasPort(addr)) return addr;
+  return addr.replace(/:\d+$/, "");
 }
 
 /** The address this Host tells other machines to dial: `advertise` (if set) or the LAN IP, plus the port. */

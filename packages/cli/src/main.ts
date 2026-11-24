@@ -97,6 +97,14 @@ async function assertNotForeign(home: string): Promise<boolean> {
   return true;
 }
 
+/** One line about transport security for `cafe status` / `cafe daemon status` (v4-6 §10.3). */
+function tlsLine(t: { mode?: string; port?: number; network?: boolean; waiting?: string } | undefined): string {
+  if (!t) return "unknown (older daemon)";
+  if (t.mode !== "tls") return "off (security.mode: plaintext)";
+  if (!t.network) return `on :${t.port ?? "?"}, NOT on the network yet — not connecting to the hub: ${t.waiting ?? "enrolling"}`;
+  return `on :${t.port ?? "?"} (daemon links use wss)`;
+}
+
 /** The daemon is on this machine (its directories are ours), not a remote CAFE_DAEMON. */
 function localDaemon(): boolean {
   const target = process.env.CAFE_DAEMON;
@@ -368,6 +376,7 @@ program
       `daemon:  ${h.host}${h.isRoot ? " (root)" : ""} at ${base()}, cafe ${h.version}`,
       `router:  ${h.router}${h.model ? ` (${h.model})` : ""}${h.error ? ` — ${h.error}` : ""}`,
       `root:    ${h.isRoot ? "this machine is the hub" : `${h.root ?? "none"}${h.rootOnline ? " (online)" : " (offline)"}`}`,
+      `tls:     ${tlsLine(h.tls)}`,
       `traffic: ${snap.threads.length} recent thread(s), ${snap.agents.length} agent(s), ${snap.daemons.length} machine(s)`,
     ];
     if (pending.length) {
@@ -606,6 +615,7 @@ daemon
         `url:       ${base()}`,
         `advertise: ${loadConfig().advertise ?? "(not set; other machines use lanAddress)"}`,
         `root:      ${s.isRoot ? "self" : loadConfig().root ? `${loadConfig().root} (${s.rootOnline ? "online" : "offline"})` : "mDNS discovery"}`,
+        `tls:       ${tlsLine(h.tls)}`,
         `router:    ${h.router}${h.model ? ` (${h.model})` : ""}`,
         `agents:    ${s.agents.length} (registry v${s.registryVersion})`,
         `threads:   ${s.threads.length}`,
