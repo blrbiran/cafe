@@ -172,6 +172,27 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
   公钥指纹」和「`root:` 填主地址；未入网的子节点不再明文连接」）；**ssh1 子节点**要升级到新版本，
   并确认容器能出站访问 Root 的 4778，否则升级后会显示「还没加入网络」；真实 Discord 附件和重启去重
   （测试步骤见上一轮对话：附件私信、稳态重启、回答途中重启）。
+- **用户审核结果（同日）**：#83 两张截图、#84 圆角、侧栏 240–420 都「当前没问题」，不改。
+- **用户实测 Discord 附件私信，发现两个问题（下个 session 修，先 RED 再修）**：
+  1. **Claude Code 会话 Barista 收到的问题里没有附件的本地路径**。Discord 图片随 follow-up 传过来，
+     blob 已落在 `~/.cafe/artifacts/01M84JS89850YKJJYNJF0NB7Q7/01M86ZP905DBZ03VZWP84DKGVE-image.png`，
+     但注入 Claude Code 的 `[cafe order …]` 提示里没有它，我是自己翻目录找到的。先查
+     `packages/cli/src/bridge/session-host.ts` 和 `claude-plugin/hooks/register.ts` 组 prompt 时有没有用
+     `order.attachments[].path`（pi 扩展和 Bridge 是怎么做的，可以对照 `buildPrompt`）。
+  2. **Conversations 页「没看到这轮对话」，但数据其实在**：`GET /api/threads/01M84JS89850YKJJYNJF0NB7Q7`
+     有 2 轮，两次 `order.replied` 都在。线索：(a) 卡片按设计用第一个问题当标题（「cafe 项目是做什么用的？」），
+     追问不会生成新卡片；(b) snapshot 里这个 thread 的 `updatedAt` 是 `None`，所以追问没有把卡片顶到前面，
+     还显示「10 小时前」；(c) `meta.attachments` 是 0，卡片没有 📎。先确认用户看的是哪个页面、哪张卡，
+     再修 (b)(c)：追问应该刷新 `updatedAt`，追问里的附件也要进 thread 的 meta。
+  - 稳态重启去重和「回答途中重启」还没测。
+- **发布说明草稿（发版时用）**：
+  - TLS 的对端 pin 由「证书指纹」改为「公钥指纹」：证书自动续期时公钥不变，所以 pin 不会再失效；旧的证书 pin
+    会在第一次连接时自动升级，不需要手动处理。
+  - `root:` 填 Root 的主地址（例如 `192.168.1.10:4777`）。子节点从主地址取得 CA 和 TLS 端口后走 `wss`；
+    还没加入网络的子节点不再走明文连接，`cafe doctor` / `cafe daemon status` 会显示原因。子节点要和 Root
+    一起升级，并且要能访问 Root 的 TLS 端口（默认 4778）。
+  - `cafe daemon stop/restart` 只操作当前 `CAFE_HOME` 的 daemon；`barista start` 会等到注册成功，失败时直接报原因；
+    `/api/health` 的 metrics 新增带口径的字段名（旧名保留一个版本）。
 - **下一候选**：Network 页把「在线（它连着我）」和「地址可达（我连得到它）」分开显示（#83 第 4 点，没做）；
   CLI `cafe doctor` 的 root 探测仍用明文带 token（应改为读 daemon 自己的状态）；#71/#72 brainstorm；
   TLS phase 2；snapshot 分页 / Web 虚拟列表。
