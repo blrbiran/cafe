@@ -640,7 +640,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, {
       root: daemon.config.root,
       tokenSet: !!token,
-      ...(token ? { tokenHint: `${"•".repeat(Math.max(0, token.length - 4))}${token.slice(-4)}` } : {}),
+      // The last 4 characters help tell tokens apart; a short token would be shown whole, so mask it all.
+      ...(token ? { tokenHint: token.length >= 12 ? `${"•".repeat(token.length - 4)}${token.slice(-4)}` : "•".repeat(8) } : {}),
+      // How another machine joins this Root (#18): the address and CA pin, never the token itself.
+      ...(daemon.isRoot ? { join: daemon.joinHint() } : {}),
     });
   }
   if (m === "GET" && path === "/api/config") return send(res, 200, daemon.runtimeConfig());

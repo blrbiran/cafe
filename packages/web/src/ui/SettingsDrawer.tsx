@@ -28,7 +28,8 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [dir, setDir] = useState("");
   const [agentKind, setAgentKind] = useState("pi");
   const [write, setWrite] = useState(false);
-  const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean }>();
+  const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: { address: string; caFingerprint?: string } }>();
+  const [joinCopied, setJoinCopied] = useState(false);
   const [rt, setRt] = useState<RuntimeConfig>();
   const [advertise, setAdvertise] = useState("");
   const [retention, setRetention] = useState("");
@@ -549,6 +550,33 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
           </div>
           <div className="mono mt-2 text-xs text-warn">cafe daemon restart</div>
         </section>
+
+        {conn?.join && (
+          <section>
+            <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsJoinTitle}</h3>
+            <p className="mt-1 mb-2 text-xs text-muted">{t.settingsJoinDesc}</p>
+            {(() => {
+              const cmd = `cafe connect ${conn.join.address} --token <token>${conn.join.caFingerprint ? ` --ca-fingerprint ${conn.join.caFingerprint}` : ""}`;
+              return (
+                <div className="well flex flex-col gap-2 text-xs">
+                  <code className="mono break-all text-fg-strong">{cmd}</code>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted">{t.settingsJoinToken}</span>
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(cmd).then(() => setJoinCopied(true), () => {});
+                      }}
+                    >
+                      {joinCopied ? t.copied : t.settingsJoinCopy}
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+          </section>
+        )}
       </div>
 
       <div className="flex justify-end gap-2 border-t border-line bg-card px-4 py-3">

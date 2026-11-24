@@ -55,6 +55,8 @@ cafe barista list         # headless Baristas supervised by this daemon
 - Web UI: `http://127.0.0.1:4777/`. It has pages for Agents, Threads and Network.
 - Logs: `~/.cafe/daemon.log` and `~/.cafe/logs/barista-*.log`.
 - Thread files: `~/.cafe/sessions/<date>/<threadId>.jsonl`.
+- `claude·bg` in `cafe agents` is a Claude Code session running in the background (no terminal); attach and exit, or `/cafe off` in it, to take it offline.
+- "port … is already in use" from `cafe daemon start`: a second Daemon on one machine needs its own `port` and `security.tls.port`.
 
 ## Configure
 
@@ -62,7 +64,7 @@ cafe barista list         # headless Baristas supervised by this daemon
 cafe status                                           # daemon / router / root / traffic / pending config / next command
 cafe doctor                                           # daemon, identity, extension, skill, Claude command, router, root
 cafe root set 192.168.1.10:4777                       # Root moved; updates config and the live connection
-cafe root show                                        # the Root this Host uses + its CA fingerprint to enrol others
+cafe root show                                        # the Root this Host uses + its CA fingerprint; on the Root, the cafe connect command for a new machine
 cafe connect 192.168.1.10:4777 --token <t> --ca-fingerprint sha256:AA:BB…  # join a Root by its main address; pins its CA, then links over wss (TLS, v4-6)
 cafe daemon renew-cert                                # reissue this Host's TLS leaf (renewal keeps the key, so pins survive), no restart
                                                       # a TLS hub refuses plaintext Daemon links: `cafe doctor` shows them under tls-links

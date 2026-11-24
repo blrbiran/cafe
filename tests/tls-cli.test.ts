@@ -49,6 +49,21 @@ describe("cafe root show", () => {
     expect(r.stdout).toMatch(/sha256/i);
   });
 
+  // #18 (narrowed): the Root says how another machine joins it; the token is named, never printed.
+  it("on the Root, prints the cafe connect command for another machine without the token", async () => {
+    const h = home();
+    const ca = await generateCa();
+    writeFileSync(join(h, "config.yml"), `host: desk\nport: 47821\ntoken: s3cret-token-value\nmode: root\nadvertise: 10.1.2.3\nsecurity:\n  mode: tls\n  tls:\n    port: 47822\n`);
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(join(h, "tls"), { recursive: true });
+    writeFileSync(join(h, "tls", "ca.crt"), ca.cert);
+    const r = cafe(h, "root", "show");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`cafe connect 10.1.2.3:47821 --token <token> --ca-fingerprint sha256:${ca.fingerprint256}`);
+    expect(r.stdout).toContain("cafe config get token");
+    expect(r.stdout).not.toContain("s3cret-token-value");
+  });
+
   it("says there is no CA when TLS is off", () => {
     const h = home();
     writeFileSync(join(h, "config.yml"), `host: desk\nport: 47821\ntoken: t0k\nsecurity:\n  mode: plaintext\n`);

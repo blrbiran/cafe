@@ -418,6 +418,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private refusedPlaintext = new Map<string, { host: string; kind: "daemon" | "peer"; at: number; version?: string }>();
 
   /** Transport state for `/api/health`, `cafe doctor` and `cafe daemon status`. */
+  /** This Daemon's main (plaintext-port) address as other machines reach it: what `root:` / `cafe connect` take. */
+  mainAddress(): string {
+    return hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
+  }
+
+  /** What another machine needs to join this Root with `cafe connect` (the token is read on the Root). */
+  joinHint(): { address: string; caFingerprint?: string } {
+    const fp = this.tlsStatus().caFingerprint;
+    return { address: this.mainAddress(), ...(fp ? { caFingerprint: `sha256:${fp}` } : {}) };
+  }
+
   tlsStatus(): {
     mode: "plaintext" | "tls";
     port?: number;
@@ -970,7 +981,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const rec = this.daemons().find((d) => d.host === host);
     const url = this.pinnedAddress(host) || rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
     if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
-    const me = hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
+    const me = this.mainAddress();
     try {
       await this.daemonFetch(`${await this.httpBase(url)}/api/root`, {
         method: "POST",
@@ -2249,7 +2260,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Root: after moving to a new address, tell every known Daemon where it is now. */
   async announceRoot(): Promise<void> {
     if (!this.isRoot) return;
-    const me = hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
+    const me = this.mainAddress();
     const targets = Object.entries(this.config.knownDaemons).filter(([host]) => !this.children.has(host));
     // Probe in parallel: one dead Daemon must not delay the others.
     const worker = async () => {
