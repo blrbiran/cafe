@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
-import { createHash } from "node:crypto";
+import { createHash, X509Certificate } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
+import { checkPeerPin } from "./tls/trust.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -77,6 +78,8 @@ export interface Timing {
   linkConnectTimeoutMs: number;
   /** Direct links: close an outgoing link after this long without traffic. */
   linkIdleMs: number;
+  /** How often to check the TLS leaf's expiry while running (v4-6 §5 B). */
+  leafCheckIntervalMs: number;
 }
 
 /** Recompute hints at least this often even without new outcomes, so time decay shows. */
@@ -163,6 +166,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
      * Root for one over TLS with its token (`POST /api/tls/leaf`).
      */
     issue?(sans: string[]): Promise<{ cert: string; key: string }>;
+    /**
+     * Reissue this Host's leaf and swap it in (v4-6 §5 B). A long-running Daemon would otherwise
+     * outlive its 90-day leaf and the whole fleet would fail closed at once.
+     */
+    renew?(): Promise<void>;
   };
   readonly host: string;
   readonly version: string;
@@ -265,6 +273,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       hintsIntervalMs: 30_000,
       linkConnectTimeoutMs: 3000,
       linkIdleMs: 5 * 60_000,
+      leafCheckIntervalMs: 6 * 3600_000,
       ...opts.timing,
     };
     this.router = opts.router ?? new RulesRouter();
@@ -376,8 +385,34 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** `ws` client options for a Daemon link: trust exactly the network's CA, never disable verification. */
-  private linkOptions(): { ca?: string } {
-    return this.tlsContext?.network ? { ca: this.tlsContext.ca } : {};
+  private linkOptions(peerAddr?: string): import("ws").ClientOptions {
+    if (!this.tlsContext?.network) return {};
+    // Per-peer leaf pin (v4-6 §5 A): the CA pin authenticates the trust anchor; a separate pin per
+    // `host:port` catches an unexpected leaf issued under that CA (a compromised CA key, or the wrong
+    // machine answering on an address). First contact records the leaf; after that a different leaf
+    // is refused, naming both values so a person can verify the change out of band.
+    const check = peerAddr
+      ? (_host: string, cert: import("node:tls").PeerCertificate): Error | undefined => {
+          if (!cert?.raw) return new Error("the peer did not present a certificate");
+          // Use the same `AA:BB:…` form `checkPeerPin` and `cafe root show` print.
+          const fp = new X509Certificate(cert.raw).fingerprint256;
+          const verdict = checkPeerPin(peerAddr, fp, this.config.security.tls.pins);
+          if (!verdict.ok) return new Error(verdict.reason);
+          if (verdict.firstSeen) this.recordPeerPin(peerAddr, fp);
+          return undefined;
+        }
+      : undefined;
+    // `ws` types `checkServerIdentity` as Node's older `CertMeta` signature, but it passes the option
+    // straight to `tls.connect`, where it receives a `PeerCertificate` (the shape we use).
+    return { ca: this.tlsContext.ca, ...(check ? { checkServerIdentity: check as unknown as import("ws").ClientOptions["checkServerIdentity"] } : {}) };
+  }
+
+  /** Persist a peer leaf pin learned on first contact (TOFU); later contacts are checked against it. */
+  private recordPeerPin(peer: string, fingerprint: string): void {
+    if (this.config.security.tls.pins[peer] === fingerprint) return;
+    this.config.security.tls.pins[peer] = fingerprint;
+    saveConfig(this.config, this.store.home);
+    this.log(`tls: pinned ${peer} leaf ${fingerprint}`);
   }
 
   get rootOnline(): boolean {
@@ -1100,7 +1135,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!url) return Promise.reject(new Error(`no address for ${host}`));
     const attempt = new Promise<Peer>((resolve, reject) => {
       // `url` is a stored `ws(s)://host:port`; keep its scheme, add the CA when it is TLS.
-      const ws = new WebSocket(`${url}/ws`, this.linkOptions());
+      const ws = new WebSocket(`${url}/ws`, this.linkOptions(`${host}:${new URL(url).port}`));
       const peer = new Peer(ws);
       peer.meta.kind = "peer";
       peer.meta.host = host;
@@ -1449,6 +1484,25 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Live SSE/WebSocket clients, maintained by the server (#70). */
   readonly streamCounts = { sse: 0, ws: 0 };
   private lagTimer?: ReturnType<typeof setInterval>;
+  private leafTimer?: ReturnType<typeof setInterval>;
+
+  /**
+   * Reissue the leaf while running, once it is inside the renewal window (v4-6 §5 B). Called on a
+   * timer and safe to call repeatedly: the renewal path is idempotent when the leaf is still fresh
+   * only if the caller guards; here we always ask the issuer, and `ensureLeaf`-style freshness is
+   * checked by the caller before invoking `renew`.
+   */
+  startLeafRenewalCheck(needsRenewal: () => boolean): void {
+    clearInterval(this.leafTimer);
+    this.leafTimer = setInterval(() => {
+      if (!this.tlsContext?.renew || !needsRenewal()) return;
+      void this.tlsContext
+        .renew()
+        .then(() => this.log("tls: leaf renewed before expiry"))
+        .catch((err) => this.log(`tls: leaf renewal failed: ${(err as Error).message}`));
+    }, this.timing.leafCheckIntervalMs);
+    this.leafTimer.unref?.();
+  }
 
   /** Append to the Thread's JSONL, keeping the byte counters for /api/health. */
   private appendEvent(file: string, env: ThreadEnvelope): void {
@@ -1987,7 +2041,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const target = this.config.root;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(this.wsUrlTo(target), this.linkOptions());
+      // Pin the Root's leaf by the `host:port` this Host dials (v4-6 §5 A).
+      ws = new WebSocket(this.wsUrlTo(target), this.linkOptions(target));
     } catch (err) {
       // A persisted bad address must not crash the daemon on every boot (#76): say so and keep
       // retrying at the normal backoff, so `cafe root set` can still repair it later.
@@ -2629,6 +2684,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.pullTimer);
     clearInterval(this.stagingTimer);
     clearInterval(this.lagTimer);
+    clearInterval(this.leafTimer);
     this.store.setKv("pendingPulls", [...this.pendingPulls.values()]);
     for (const l of this.links.values()) l.ws.close();
     this.uplinkSocket?.close();

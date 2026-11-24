@@ -7,7 +7,7 @@ import { Supervisor } from "./supervisor.ts";
 import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { lanAddress, advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
-import { ensureLeaf, tlsPaths } from "./tls/store.ts";
+import { ensureLeaf, leafNeedsRenewal, tlsPaths, writeLeaf } from "./tls/store.ts";
 import { bootstrapCa, fetchLeafFromRoot, trustCaForClient } from "./tls/bootstrap.ts";
 import { readTlsConfig } from "./tls/trust.ts";
 import { issueLeaf, sanList } from "./tls/certs.ts";
@@ -132,6 +132,16 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
           // `current()` reads run through this closure: a later renewal swaps it in place.
           let active = { cert: leaf.cert, key: leaf.key };
           const renewListeners = new Set<() => void>();
+          const leafSans = () => sanList({ host: config.host, advertise: config.advertise, lan: lanAddress() });
+          /** Ask the Root (over TLS with our token) for a leaf, for a Host that holds no CA key. */
+          const fetchFromRoot = () => fetchLeafFromRoot(config.root!, ca.cert, config.token, leafSans());
+          // Write-through: a leaf issued here or by the Root replaces the on-disk one too, so a
+          // restart after a renewal uses the fresh leaf instead of a stale file.
+          const swap = (next: { cert: string; key: string }) => {
+            writeLeaf(home, config.host, next);
+            active = next;
+            for (const fn of renewListeners) fn();
+          };
           daemon.tlsContext = {
             ca: leaf.ca,
             caFingerprint: leaf.caFingerprint,
@@ -154,6 +164,13 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
                   },
                 }
               : {}),
+            // A running Daemon renews its own leaf before expiry (v4-6 §5 B). The Root signs locally;
+            // a child asks the Root, which needs the Root reachable — if it is not, the next timer
+            // tick tries again, and the existing (not-yet-expired) leaf keeps working meanwhile.
+            renew: async () => {
+              const next = ca.key ? await issueLeaf(ca, leafSans()) : await fetchFromRoot();
+              swap({ cert: next.cert, key: next.key });
+            },
           };
           return { ca: leaf.ca, current: () => active, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn) };
         })()
@@ -171,6 +188,9 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   daemon.log(`listening on :${server.port} as ${config.mode} (${daemon.url()})`);
   if (tls) daemon.log(`tls on :${tls.tlsPort} (ca ${daemon.tlsContext?.caFingerprint})`);
   else daemon.log("tls disabled (security.mode: plaintext)");
+  // A leaf nearing expiry is renewed while the Daemon keeps running, not only at the next start
+  // (v4-6 §5 B): otherwise a fleet that never restarts expires together and fails closed.
+  if (tls) daemon.startLeafRenewalCheck(() => leafNeedsRenewal(tls!.current().cert));
   if (!opts.noSupervisor) {
     daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token });
     const { reaped, skipped } = await daemon.supervisor.restore();

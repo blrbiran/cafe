@@ -99,9 +99,24 @@ export async function ensureCaAsync(home: string, opts: CaOptions): Promise<Cert
   return ca;
 }
 
+/** A leaf counts as needing renewal once it has less than this much validity left (v4-6 §5 B). */
+export const LEAF_RENEW_BEFORE_MS = 21 * 86_400_000;
+
+/** True when `cert` expires within `withinMs` (or is already expired / unreadable). */
+export function leafNeedsRenewal(certPem: string, now = Date.now(), withinMs = LEAF_RENEW_BEFORE_MS): boolean {
+  try {
+    const notAfter = Date.parse(new X509Certificate(certPem).validTo);
+    return !Number.isFinite(notAfter) || notAfter - now <= withinMs;
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Load this Daemon's leaf, or issue one from the CA when it is missing. `sans` is recomputed on
- * every start so an `advertise`/LAN change is reflected in a reissued leaf.
+ * every start so an `advertise`/LAN change is reflected in a reissued leaf, and a leaf close to
+ * expiry is renewed too: a 90-day leaf with no renewal would fail closed for the whole fleet
+ * (v4-6 §5 B).
  */
 export async function ensureLeaf(
   home: string,
@@ -112,12 +127,13 @@ export async function ensureLeaf(
 ): Promise<TlsContext> {
   const sans = sanList(sansInput);
   const existing = readLeaf(home, host);
-  // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed).
+  // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed) or the
+  // leaf is nearing expiry.
   if (existing) {
     const cert = new X509Certificate(existing.cert);
     const sanText = cert.subjectAltName ?? "";
     const covered = sans.every((s) => sanText.includes(/^\d/.test(s) ? `IP Address:${s}` : `DNS:${s}`));
-    if (covered) {
+    if (covered && !leafNeedsRenewal(existing.cert)) {
       return { cert: existing.cert, key: existing.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
     }
   }
