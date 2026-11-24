@@ -124,7 +124,87 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-24 (newest) — Discord 两个问题 + #89 + #31 冷路径（三批，均已提交，未推送）
+### 2026-11-25 (newest) — 台账复核后三批：#90 乱码、#31 关、端口/后台会话、#33 Web 空转、#18 收窄、daemon 启动
+
+- **一句话**：按 `../cafe_dogfooding/issue-20261119.md` 重新核对开放项（以代码为准），用户裁定「先修 #90、发版时机
+  他定；#31 按同步写关闭；#18 去掉 Web 改 token；做批 1–3」。全部做完并提交，**未推送、未发版**（`git log
+  origin/main..main` 查看）。上一轮的提交在本轮开始时已经在 origin 上。
+- **#90（P1 数据损坏）**：`store.ts: scanBackward` 先把 64 KiB 块解码成字符串再拼半行，跨边界的中文/emoji 变
+  `U+FFFD`。**比台账写的更早更广**：`f327922`（11-20）起 `readEventsPage` 就是这样读，所以 Web/CLI 详情首页、SSE 首页、
+  追问的 history（交给 agent 的上下文）都受影响；`c607bd1` 又把它带到回填（**会把乱码写进 Root**）、recover、
+  closingEvent。修法：携带原始字节、按 `0x0A` 切、整行解码。测试覆盖 64 个相位 × 四条读路径（修前 256 处损坏）。
+  100k 中文事件 `readEventsPage(50)` 0.51ms。本机 `~/.cafe` 只有 2 个小 Thread，没触发。
+- **#31**：补了判据 2 的回归测试：100 events/s 时 meta 每秒最多约 7 次（150ms 合并），变异检查（每事件写 meta）165 次被抓到。
+  同步 append 按用户裁定不改 → 台账可关。
+- **端口冲突**：`EADDRINUSE` 变成「TLS port 4778 is already in use … `cafe config set security.tls.port`」；
+  `cafe daemon start` 不再等满 5s 只说 see log，而是立刻打印 daemon 的原因。
+- **后台会话**：session-host 检测祖先进程 `claude[.exe] --bg-pty-host`，注册 `background: true`（可选字段，旧
+  daemon 会丢掉）。Agents 页显示「后台会话（没有打开的终端）」+ 下线办法，`cafe agents` 显示 `claude·bg`。实测本机
+  后台 orca 会话判为 true、前台为 false；**已在跑的 session-host 要等会话重载后才带上这个标记**。
+- **#33（Web 空转）**：用 CDP 实测空闲页的主线程耗时。最大头是「进行中」小圆点用 `box-shadow` 动画，每帧重绘：
+  Feed 174 → ~6 ms/s，活跃 Thread 207 → ~10 ms/s，Live 2.6 → 1.4。改成 `::after` + transform/opacity；
+  Conversation 只让「已处理 X 秒」那段每秒刷新（`OutcomeText`），Live 的「X 秒前同步」独立刷新，搜索结果 30s。
+  测试 `web-pulse` 保证无限动画只用 transform/opacity。虚拟列表没做（DOM 规模目前不是瓶颈）。
+- **#18 收窄**：Web 不改 token。Root 的设置抽屉新增「加入另一台机器」（`cafe connect <主地址> --token <token>
+  --ca-fingerprint sha256:…` + 复制），`cafe root show` 在 Root 上打印同一条命令；token 从不出现在 API。顺带修了
+  `tokenHint`：≤4 字符的 token 原样显示，现在 12 位以下全遮。截图 `output/playwright/settings-join-1440.png` /
+  `-390.png`（**待审**，这次没先出原型）。
+- **daemon 启动（本轮实测发现）**：pi 模型运行时加载偶尔要 26–47s（平时 <1s），期间 daemon 不开端口 → Web/Agents/CLI
+  全断。现在先开端口，router 后台加载，加载中到达的 Order 等它（路由结果不变）；`/api/health.routerLoading`、
+  `cafe status`/`router status` 显示 loading，doctor 为 warn；加载中切换模型以新的为准。CLI：spawn 出的 daemon
+  还活着就继续等（最多 60s，`CAFE_DAEMON_START_WAIT_MS`）；锁被另一个活进程持有（还在启动，或 session-host 抢先
+  自动启动）就等它，不再报「did not start / already running」。实测 stop+start 连续两次都成功。
+- **验证**：typecheck；**506 tests ×2**；`routing:eval` 67/67；web check + `build:web`；`test:release` 17/17；
+  `test:claude-plugin` 5/5。本机 Root 已重启到新代码，doctor 全绿，三个会话都已重连。
+- **仍需你本人**：审 `settings-join-*.png`；推送与发版（建议 0.1.5，说明见下）；Discord 实测（附件私信、`/new`、
+  6h 新 thread、稳态重启去重、回答途中重启）；ssh1 升级后 `security.mode: tls` 并重启。
+- **发布说明要点（0.1.5）**：#90 修复（中文/emoji 长对话的乱码，含跨机回填）；TLS Root 会拒绝明文连接的子节点；
+  端口占用/daemon 启动的报错与等待；后台会话标记；Web 空闲 CPU 大降；Root 设置页「加入另一台机器」。
+- **需要讨论 / brainstorm（没动代码）**：Web 局域网用 `http://…?token=` 仍是明文（#61 尾巴；https 要处理浏览器信任
+  CA）；#27 全网升级提示（Network 页标出版本落后的机器）；#18 只读 token（需 spec）；#71–#73。
+- **给测试者的清单**（纯文本，可直接转发）见本节末尾的代码块。
+
+```
+cafe 台账更新建议（2026-11-25）
+
+一、请落状态
+1. #16 → 已修。判据：按软约束接受（owner 5 次付费回归 5/5 首个工具调用是 cafe 命令）。
+2. #84 → 已修。判据放宽为「白底 + 深棕线在 Chrome 深色标签栏下可辨」；圆角导致四角透明属于设计取舍。
+3. #39 → 观察。domain guard 和 multicast 子任务暂不做，有误投实例时再记录。
+4. #31 → 决定不改（写侧）/ 关闭。读侧判据已达成；判据 2 由 tests/metrics.test.ts「metadata writes under an event burst」覆盖（100 events/s 时 meta ≤ ~7 次/秒）；appendFileSync 同步写是有意的取舍。
+5. #90 → 请按判据复核后关闭。修复提交 "fix(store): backward reads keep multi-byte text intact"。
+
+二、#90 复核要点
+1. 本条比原文更广：f327922（11-20）起 readEventsPage 就按块解码，Web/CLI 详情首页、SSE 首页、追问 history 都受影响，不只是 c607bd1 的三条路径。
+2. 判据 1/2/3：tests/store.test.ts「keeps CJK and emoji text intact whatever byte the read boundary falls on」覆盖 64 个相位 × readEventsSince / readEventsPage / readOrderEvents / findLastEvent，修前 256 处损坏，修后 0。也请用你的 /tmp/utf8-real2.ts 复跑。
+3. 判据 4：100k 中文事件 readEventsPage(50) 实测 0.51ms。
+4. 你的机器上若已有被回填污染的 Thread（Root 上），请只读扫一遍：grep -rl $'\xef\xbf\xbd' ~/.cafe/sessions/ （正文本来就含 U+FFFD 的会误报）。
+
+三、#18 请按收窄后的范围复核
+1. Web 不再计划改 token（改 token 会让所有子节点同时掉线）。
+2. Root 的设置抽屉有「加入另一台机器」：cafe connect <主地址> --token <token> --ca-fingerprint sha256:…，带复制按钮；cafe root show 在 Root 上打印同一条命令。
+3. GET /api/settings 不含 token；tokenHint 对 12 位以下的 token 全遮（原来 ≤4 位的 token 会原样显示）。
+4. 剩余：只读 token（需要 spec）。
+
+四、#33 请实测后收窄
+1. 空闲 CPU：用 CDP Performance.getMetrics 量空闲 10 秒的 TaskDuration。owner 实测 Feed 174 → ~6 ms/s，活跃 Thread 207 → ~10 ms/s，Live 2.6 → 1.4。主因是「进行中」圆点的 box-shadow 动画每帧重绘。
+2. 已做：事件合并 set、无全量排序、ThreadCard memo、按需 tick（活跃 1s / 其余 30s）、Conversation 只刷新耗时文本。
+3. 未做：虚拟列表（判据 5）。
+
+五、#34 请按判据实测后关闭或收窄
+已落地：announceRoot 并发 8 路 / 1.5s 超时；registry 增量写；snapshot 用精简 meta；Web 能分页加载更早的对话。
+
+六、#61 请收窄为两项
+1. perf:tls 基准（判据 5）。
+2. 局域网 http://…?token= 打开 Web 仍是明文（服务端只认 Bearer，判据 7 的服务端部分已满足）。
+
+七、新的可复核行为（不在台账里，测试时顺手看）
+1. 同机第二个 daemon 的 TLS 端口冲突：cafe daemon start 立刻报「TLS port 4778 is already in use … cafe config set security.tls.port」。
+2. cafe agents 里后台 Claude Code 会话显示 claude·bg，Agents 页显示「后台会话」。
+3. 重启后 daemon 先开端口；cafe status 在 router 加载完前显示 router: loading；cafe daemon stop 后立刻 start 不再报 already running。
+```
+
+### 2026-11-24 — Discord 两个问题 + #89 + #31 冷路径（三批，均已提交）
 
 - **一句话**：用户裁定 Q1=A、Q2=C(6h)、Q3/Q4 同意、Q5 按批 1→2→3，三批都做完，都是先 RED 再修。
   三个提交：`fix: Discord attachments and conversations …`、`fix(tls): a TLS Daemon refuses plaintext …`、
@@ -747,6 +827,9 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - Web: maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
 
 ## 8. Traps already found
+- **Backward reads must split bytes, not strings (#90)**: a fixed-size chunk boundary can cut a UTF-8 character; decoding a chunk before joining the carried half line turns it into U+FFFD while the JSON stays valid, so counts and ids look fine. Any test of a reader must use CJK/emoji text and assert the text, not only ids.
+- **Several processes start the daemon at once**: Claude Code session-hosts auto-start it when it goes away, so `cafe daemon stop && cafe daemon start` races them; losers exit with "already running" (see `daemon.stdout.log`). The CLI now waits for the lock holder. Loading pi's model runtime has taken 26–47 s; the ports open first and Orders wait for the router.
+- **Infinite CSS animations must stay on transform/opacity**: a `box-shadow` pulse cost ~170 ms/s of main-thread work on an idle page (`tests/web-pulse.test.ts`). Measure idle pages with CDP `Performance.getMetrics` (TaskDuration over 10 s) against a scratch daemon, not the user's.
 - **FTS trigram index**: `search_index` is FTS5 with `tokenize='trigram'` (case-insensitive substring). Altering its columns needs a rebuild (drop + recreate + backfill); `search_indexed` tracks indexed event ids. `search()` trusts results for 3+ chars only.
 
 - **`npx tsc` is rewritten by the user's rtk hook** to an old global tsc. Use `npm run typecheck` or `node_modules/.bin/tsc`.

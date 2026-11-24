@@ -98,7 +98,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   const log = opts.log ?? ((m: string) => logFile!(m));
   const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, timing: opts.timing, log, version: opts.version });
   // Load the router in the background: loading pi's model runtime has taken tens of seconds, and the
-  // Web, the Agents and the CLI must not wait for it. An Order that arrives meanwhile waits (#33 follow-up).
+  // Web, the Agents and the CLI must not wait for it. An Order that arrives meanwhile waits for it.
   daemon.startRouter();
   // Transport security (v4-6 #61). The Root owns the CA; every Daemon presents a leaf signed by it.
   const security = readTlsConfig(config);
