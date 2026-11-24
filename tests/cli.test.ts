@@ -413,3 +413,60 @@ describe("cafe daemon start reports why the daemon did not start", () => {
     expect(Date.now() - t0).toBeLessThan(4_500);
   }, 20_000);
 });
+
+// A daemon whose startup is slow (the LLM router can take tens of seconds to load) holds the lock but does
+// not answer yet. `cafe daemon start` used to give up after 5 s ("did not start"), and a second try spawned
+// another daemon that died with "already running". Wait for the one that is starting, and say so.
+describe("cafe daemon start with a daemon still starting", () => {
+  it("waits for the lock holder instead of spawning a second daemon, then names it", async () => {
+    const { createServer } = await import("node:net");
+    const free = createServer();
+    await new Promise<void>((r) => free.listen(0, "127.0.0.1", r));
+    const port = (free.address() as { port: number }).port;
+    await new Promise<void>((r) => free.close(() => r()));
+    const h = home();
+    writeFileSync(join(h, "config.yml"), stringify({ host: "slow", token: "t0k", port, mode: "root", security: { mode: "plaintext" } }));
+    // Stand-in for a daemon that is still loading: alive, holds the lock, not listening.
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"]);
+    cleanup.push(() => void holder.kill());
+    writeFileSync(join(h, "daemon.lock"), String(holder.pid));
+    const r = await new Promise<{ code: number | null; stderr: string }>((resolveP) => {
+      const p = spawn(process.execPath, [BIN, "daemon", "start"], { env: { ...process.env, CAFE_HOME: h, CAFE_DAEMON: "", CAFE_TOKEN: "", CAFE_DAEMON_START_WAIT_MS: "1500" } });
+      let stderr = "";
+      p.stderr.on("data", (d) => (stderr += d));
+      p.on("exit", (code) => resolveP({ code, stderr }));
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain(`pid ${holder.pid}`);
+    expect(r.stderr).toMatch(/still starting|not answering/);
+    // No second daemon was spawned: nothing wrote "already running".
+    expect(existsSync(join(h, "daemon.stdout.log")) ? readFileSync(join(h, "daemon.stdout.log"), "utf8") : "").not.toContain("already running");
+  }, 20_000);
+});
+
+describe("cafe daemon start right after a stop", () => {
+  it("starts a new daemon once the old lock holder exits", async () => {
+    const { createServer } = await import("node:net");
+    const free = createServer();
+    await new Promise<void>((r) => free.listen(0, "127.0.0.1", r));
+    const port = (free.address() as { port: number }).port;
+    await new Promise<void>((r) => free.close(() => r()));
+    const h = home();
+    writeFileSync(join(h, "config.yml"), stringify({ host: "restart", token: "t0k", port, mode: "root", security: { mode: "plaintext" } }));
+    // Stand-in for a daemon that is shutting down: holds the lock for 3 s (longer than the CLI takes to boot), then exits.
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"]);
+    writeFileSync(join(h, "daemon.lock"), String(holder.pid));
+    await new Promise<void>((r) => holder.once("spawn", () => r()));
+    const r = await new Promise<{ code: number | null; stderr: string }>((resolveP) => {
+      const p = spawn(process.execPath, [BIN, "daemon", "start"], { env: { ...process.env, CAFE_HOME: h, CAFE_DAEMON: "", CAFE_TOKEN: "" } });
+      let stderr = "";
+      p.stderr.on("data", (d) => (stderr += d));
+      p.on("exit", (code) => resolveP({ code, stderr }));
+    });
+    cleanup.push(() => void spawnSync(process.execPath, [BIN, "daemon", "stop"], { env: { ...process.env, CAFE_HOME: h, CAFE_DAEMON: "", CAFE_TOKEN: "" } }));
+    expect(r.stderr).toBe("");
+    expect(r.code).toBe(0);
+    const health = await fetch(`http://127.0.0.1:${port}/api/health`);
+    expect(health.status).toBe(200);
+  }, 30_000);
+});

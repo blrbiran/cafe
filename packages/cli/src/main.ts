@@ -179,6 +179,18 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
   }
   const home = cafeHome();
   mkdirSync(home, { recursive: true });
+  const waitMs = Number(process.env.CAFE_DAEMON_START_WAIT_MS) || 60_000;
+  // A daemon for this home holds the lock but does not answer yet: it is still starting (the LLM router
+  // can take tens of seconds to load). Wait for it; a second daemon would only die with "already running".
+  const starting = lockHolder(home);
+  if (starting) {
+    if (await untilHealthy(waitMs, () => alivePid(starting))) return;
+    // It exited while we waited (it was stopping, not starting): start a new one below.
+    if (alivePid(starting)) throw new Error(
+      `a cafe daemon (pid ${starting}) holds ${join(home, "daemon.lock")} but is not answering on ${base()}; it may still be starting.\n` +
+        `next: wait a moment and run \`cafe daemon status\`; see ${join(home, "daemon.log")}`,
+    );
+  }
   // Autostart installed for this home: let launchd/systemd run it so it stays supervised.
   if (startInstalledService(home)) {
     for (let i = 0; i < 50; i++) {
@@ -196,14 +208,53 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
   let exited = false;
   child.once("exit", () => (exited = true));
   child.unref();
-  for (let i = 0; i < 50 && !exited; i++) {
-    await new Promise((r) => setTimeout(r, 100));
-    if (await healthy()) return;
+  // Wait while the daemon is alive: a slow start is not a failed one.
+  if (await untilHealthy(waitMs, () => !exited, child.pid)) return;
+  if (!exited) {
+    throw new Error(
+      `the cafe daemon (pid ${child.pid}) is still starting after ${Math.round(waitMs / 1000)} s and not answering on ${base()}.\n` +
+        `next: run \`cafe daemon status\` in a moment; see ${join(home, "daemon.log")}`,
+    );
   }
   // A daemon that exits at once (port in use, bad config) printed its reason; show it here instead of
   // only pointing at the log.
   const reason = startupReason(stdoutLog, from);
   throw new Error(`cafe daemon did not start${reason ? `: ${reason}` : ""}\nsee ${join(home, "daemon.log")} and ${stdoutLog}`);
+}
+
+/** Poll health every 100 ms for up to `ms` while `alive()`; after 5 s, say once that it is still starting. */
+async function untilHealthy(ms: number, alive: () => boolean, pid?: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  let told = false;
+  const started = Date.now();
+  while (Date.now() < deadline && alive()) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (await healthy()) return true;
+    if (!told && Date.now() - started > 5_000) {
+      told = true;
+      process.stderr.write(`cafe daemon${pid ? ` (pid ${pid})` : ""} is still starting…\n`);
+    }
+  }
+  return false;
+}
+
+/** The live pid holding this home's daemon.lock, if any. */
+function lockHolder(home: string): number | undefined {
+  try {
+    const pid = Number(readFileSync(join(home, "daemon.lock"), "utf8").trim());
+    return pid && alivePid(pid) ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function alivePid(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 /** The daemon's own `cafe: …` error line written to daemon.stdout.log since byte `from`, if any. */
