@@ -26,3 +26,18 @@ export function savedAddressNote(t: Dict, p: HostProbe): { text: string; ok: boo
   if (p.verified === false) return { text: t.hostAddressUnverified(reason(t, p) ?? p.error ?? t.hostUnreachable), ok: false };
   return { text: t.hostAddressSaved, ok: true };
 }
+
+/**
+ * The status pill of a machine on the Network page. "Online" means it is connected to the hub (it
+ * dialled us); whether we can reach its address is what the Test button checks (#83). A machine whose
+ * plaintext connection a TLS hub refused says so, with the fix (#89).
+ */
+export function hostStatus(
+  t: Dict,
+  d: { online: boolean; refused?: { reason: "plaintext"; at: number } },
+  name: string,
+): { tone: "ok" | "danger" | undefined; label: string; title?: string; detail?: string } {
+  if (d.refused) return { tone: "danger", label: t.hostRefused, detail: t.hostRefusedBody(name) };
+  if (d.online) return { tone: "ok", label: t.online, title: t.onlineHint };
+  return { tone: undefined, label: t.mOffline };
+}

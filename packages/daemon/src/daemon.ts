@@ -404,8 +404,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Why this child has not joined the TLS network yet (v4-6 §10.3); cleared once it has. */
   tlsWaiting?: string;
 
+  /**
+   * Hosts whose Daemon link arrived on the plaintext port while TLS is on, and was refused (#89).
+   * Cleared when that Host next connects over TLS.
+   */
+  private refusedPlaintext = new Map<string, { host: string; kind: "daemon" | "peer"; at: number; version?: string }>();
+
   /** Transport state for `/api/health`, `cafe doctor` and `cafe daemon status`. */
-  tlsStatus(): { mode: "plaintext" | "tls"; port?: number; network?: boolean; caFingerprint?: string; waiting?: string } {
+  tlsStatus(): {
+    mode: "plaintext" | "tls";
+    port?: number;
+    network?: boolean;
+    caFingerprint?: string;
+    waiting?: string;
+    refused?: Array<{ host: string; kind: "daemon" | "peer"; at: number; version?: string }>;
+  } {
     if (!this.tlsContext) return { mode: "plaintext" };
     const network = !!this.tlsContext.network;
     return {
@@ -414,7 +427,42 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       network,
       caFingerprint: this.tlsContext.caFingerprint,
       ...(!network ? { waiting: this.tlsWaiting ?? "enrolling the network CA" } : {}),
+      ...(this.refusedPlaintext.size ? { refused: [...this.refusedPlaintext.values()] } : {}),
     };
+  }
+
+  /**
+   * Fail-closed on the accepting side (#89): with TLS on, a Daemon↔Daemon handshake (a child's
+   * uplink, a direct link) must arrive on the TLS port. The token in that `initialize` frame has
+   * already crossed the network in the clear, so the link is refused, not tolerated.
+   */
+  private refusePlaintextLink(p: InitializeParams): never {
+    const host = p.host ?? "unknown host";
+    const kind = p.kind === "daemon" ? "daemon" : "peer";
+    const first = !this.refusedPlaintext.has(host);
+    this.refusedPlaintext.set(host, { host, kind, at: Date.now(), ...(p.cafeVersion ? { version: p.cafeVersion } : {}) });
+    if (kind === "daemon" && this.isRoot && p.host) {
+      // Show the Host as refused rather than letting it vanish; its plaintext address is not kept.
+      const now = Date.now();
+      const prev = this.daemonRecords.get(p.host);
+      if (!prev || !prev.online || this.children.get(p.host) === undefined) {
+        this.daemonRecords.set(p.host, {
+          ...(prev ?? { host: p.host, hostId: p.host, displayName: p.displayName ?? p.host, aliases: [], legacyAliases: [], url: "", isRoot: false }),
+          online: false,
+          lastSeenAt: now,
+          ...(p.cafeVersion ? { version: p.cafeVersion } : {}),
+          refused: { reason: "plaintext", at: now },
+        });
+        this.emitDaemons();
+      }
+    }
+    if (first) this.log(`tls: refused a plaintext ${kind === "daemon" ? "uplink" : "direct link"} from ${host}${p.cafeVersion ? ` (cafe ${p.cafeVersion})` : ""}; it must connect over TLS`);
+    const tlsPort = this.tlsPort ? ` (TLS port ${this.tlsPort})` : "";
+    throw new RpcError(
+      "tls_required",
+      `${this.host} requires TLS${tlsPort}, but ${host} connected in plaintext. On ${host}: upgrade cafe to ${this.version} or later, ` +
+        "set security.mode to tls (cafe config set security.mode tls), and restart it (cafe daemon restart); it then joins over wss automatically",
+    );
   }
 
   /**
@@ -510,7 +558,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // -------------------------------------------------------------------------
 
   /** Attach a freshly accepted socket. `local` = loopback (no token required). */
-  accept(ws: WebSocket, local: boolean): void {
+  accept(ws: WebSocket, local: boolean, secure = false): void {
     const peer = new Peer(ws);
     ws.on("message", (data) => void peer.receive(data.toString()));
     ws.on("close", () => {
@@ -522,6 +570,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const p = InitializeParams.parse(raw);
       if (!local && p.token !== this.config.token) throw new RpcError("unauthorized", "bad token");
       if (p.protocolVersion !== PROTOCOL_VERSION) throw new RpcError("protocol_mismatch", this.mismatchMessage(p));
+      if ((p.kind === "daemon" || p.kind === "peer") && this.tlsContext) {
+        if (!secure) this.refusePlaintextLink(p);
+        if (p.host) this.refusedPlaintext.delete(p.host);
+      }
       peer.meta.kind = p.kind;
       if (p.kind === "daemon") return this.onChildDaemon(peer, p);
       if (p.kind === "peer") {
@@ -2769,6 +2821,19 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (webStale) checks.push({ name: "web", level: "warn", detail: "the build on disk is newer than the one served", next: "cafe daemon restart" });
 
     checks.push(this.tlsCheck());
+    if (this.tlsContext) {
+      const refused = [...this.refusedPlaintext.values()];
+      checks.push(
+        refused.length
+          ? {
+              name: "tls-links",
+              level: "fail",
+              detail: `refused plaintext links from ${refused.map((r) => `${r.host}${r.version ? ` (cafe ${r.version})` : ""}`).join(", ")}; they stay off the network until they connect over TLS`,
+              next: "on each: upgrade cafe, cafe config set security.mode tls, cafe daemon restart",
+            }
+          : { name: "tls-links", level: "ok", detail: "every Daemon link uses TLS" },
+      );
+    }
 
     // #82: a supervised Barista that gave up says why, instead of only failing in its own log.
     for (const w of this.supervisor?.list() ?? []) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { dictFor } from "../packages/web/src/i18n.ts";
-import { hostFailure, savedAddressNote } from "../packages/web/src/hostReason.ts";
+import { hostFailure, hostStatus, savedAddressNote } from "../packages/web/src/hostReason.ts";
 
 // #83: the Network page showed "Unreachable: fetch failed" for every cause, and "Address saved"
 // even when the Root had just failed to reach the new address.
@@ -35,5 +35,24 @@ describe("Network page host diagnostics (#83)", () => {
     expect(savedAddressNote(zh, { verified: true })).toEqual({ text: zh.hostAddressSaved, ok: true });
     // An older daemon without the field: keep the previous wording.
     expect(savedAddressNote(zh, {})).toEqual({ text: zh.hostAddressSaved, ok: true });
+  });
+});
+
+// #89 and #83 (4): "online" means the machine is connected to the hub; a machine whose plaintext
+// connection the TLS hub refused says so, with what to do, instead of looking merely offline.
+describe("Network page host status", () => {
+  const zh = dictFor("zh");
+  const en = dictFor("en");
+  it("names a refused plaintext machine and how to fix it", () => {
+    const s = hostStatus(zh, { online: false, refused: { reason: "plaintext", at: 1 } }, "ssh1");
+    expect(s.tone).toBe("danger");
+    expect(s.label).toBe(zh.hostRefused);
+    expect(s.detail).toContain("ssh1");
+    expect(s.detail).toContain("cafe config set security.mode tls");
+  });
+  it("keeps online and offline plain, and explains what online means", () => {
+    expect(hostStatus(en, { online: true }, "pc1")).toMatchObject({ tone: "ok", label: en.online, title: en.onlineHint });
+    expect(hostStatus(en, { online: false }, "pc1")).toMatchObject({ tone: undefined, label: en.mOffline });
+    expect(hostStatus(en, { online: false }, "pc1").detail).toBeUndefined();
   });
 });

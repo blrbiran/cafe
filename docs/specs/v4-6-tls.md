@@ -370,3 +370,27 @@ ECDSA leaves remain phase 2.
 port will, after upgrading, either join over TLS (the normal case) or show as waiting with the reason —
 for example a Root still on an older release (no `tlsPort` in `/api/tls`, so only a `root:` naming the
 TLS port works), or a container that cannot reach the Root's TLS port.
+
+### 10.4 The accepting side is fail-closed too (2026-11-24, dogfooding #89)
+
+§10.3 made every *dial* TLS, but a TLS Daemon still accepted a Daemon link on its plaintext port:
+a child left on `security.mode: plaintext` (or an older build) joined a TLS Root over `ws://`, with the
+token in its `initialize` frame, and showed as online. Both listeners share one upgrade handler, so the
+handler now passes whether the socket is encrypted (`req.socket.encrypted`) to `Daemon.accept()`.
+
+- With TLS on, an `initialize` of kind `daemon` or `peer` on the plaintext port is refused with
+  `tls_required`; the message names the TLS port and the fix (upgrade, `security.mode: tls`, restart).
+  `ui` and Agent connections are unchanged (the Web UI and loopback tools stay on the main port).
+- The Root records the refused Host: `DaemonRecord.refused = { reason: "plaintext", at }` (offline, no
+  address kept), `/api/health.tls.refused`, and a `tls-links` doctor check (fail) naming each Host and
+  its cafe version. A later TLS join replaces the record and clears the refusal.
+- The CLI `cafe doctor` no longer probes `http://<root>/api/health` with the token when TLS is on; it
+  reports the hub as the local daemon sees it (the daemon holds the wss uplink), and says it cannot
+  check while the daemon is down. Plaintext mode keeps the direct probe (the person chose plaintext).
+- Web: the Network page shows "Refused: not encrypted" with the fix; "Online" now explains that it means
+  connected to the hub, and Test reports "Reachable from this machine" (#83 point 4).
+- Upgrade note: a child must be upgraded together with its Root; until then the Root refuses it.
+
+Tests: `tests/tls-accept.test.ts` (refused uplink + reason, refused `peer`, `ui` still served, plaintext
+Daemon unaffected, a refused Host that rejoins over TLS), `tests/doctor.test.ts` ("cafe doctor on a TLS
+machine"), `tests/web-host-reason.test.ts`.

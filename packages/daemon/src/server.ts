@@ -387,7 +387,8 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       const counts = daemon.streamCounts;
       counts.ws++;
       ws.on("close", () => (counts.ws = Math.max(0, counts.ws - 1)));
-      daemon.accept(ws, isLoopback(req));
+      // The same handler serves both listeners; only a socket from the TLS listener is encrypted (#89).
+      daemon.accept(ws, isLoopback(req), (req.socket as { encrypted?: boolean }).encrypted === true);
     });
   };
 

@@ -103,10 +103,16 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
     );
   }
 
+  let rootFromDaemon = false;
   if (cfg.mode === "root") {
     checks.push({ name: "root", level: "ok", detail: "this daemon is the Root" });
   } else if (!cfg.root) {
     checks.push({ name: "root", level: "warn", detail: "no root configured; mDNS discovery may find one on the LAN", next: "cafe root set <host:port>" });
+  } else if (cfg.security.mode !== "plaintext") {
+    // TLS invariant (v4-6 §10.3): the CLI never dials the Root in plaintext with the token. The daemon
+    // holds the encrypted uplink, so its own view of the hub is reported below (from /api/doctor).
+    if (!daemonInfo) checks.push({ name: "root", level: "warn", detail: `${cfg.root}: cannot check the hub while the daemon is not running (it holds the encrypted link)`, next: "cafe daemon start" });
+    else rootFromDaemon = true;
   } else {
     try {
       const res = await get(`http://${cfg.root}/api/health`, { signal: AbortSignal.timeout(1500), headers });
@@ -134,12 +140,19 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
       const res = await get(`${opts.base}/api/doctor`, { signal: AbortSignal.timeout(1500), headers });
       if (res.ok) {
         const remote = ((await res.json()) as { checks?: DoctorCheck[] }).checks ?? [];
-        for (const c of remote) if (c.name === "tls" || c.name === "barista") checks.push(c);
+        for (const c of remote) {
+          if (c.name === "tls" || c.name === "tls-links" || c.name === "barista") checks.push(c);
+          else if (c.name === "root" && rootFromDaemon) {
+            checks.push(c);
+            rootFromDaemon = false;
+          }
+        }
       }
     } catch {
       // An older daemon without /api/doctor: nothing more to add.
     }
   }
+  if (rootFromDaemon) checks.push({ name: "root", level: "warn", detail: `${cfg.root}: this daemon does not report the hub's state (older cafe)`, next: "cafe daemon status" });
 
   return { ok: checks.every((c) => c.level !== "fail"), checks };
 }

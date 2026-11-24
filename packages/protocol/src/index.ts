@@ -92,6 +92,8 @@ export const DaemonRecord = z.object({
   lastSeenAt: z.number(),
   /** cafe release running on that Host (absent: older than this field). */
   version: z.string().optional(),
+  /** Its last connection was refused (#89: plaintext link to a TLS Root); cleared when it joins. */
+  refused: z.object({ reason: z.literal("plaintext"), at: z.number() }).optional(),
 });
 export type DaemonRecord = z.infer<typeof DaemonRecord>;
 

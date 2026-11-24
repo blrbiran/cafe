@@ -172,3 +172,62 @@ describe("cafe daemon status shows TLS (#81A)", () => {
     expect(r.stdout).toMatch(new RegExp(`tls:\\s+on :${root.server.tlsPort} \\(daemon links use wss\\)`));
   });
 });
+
+// TLS invariant: the CLI never talks to the Root in plaintext. With TLS on, `cafe doctor` reports the
+// hub as the local daemon sees it (it holds the wss uplink) instead of dialling http://<root> with the token.
+describe("cafe doctor on a TLS machine", () => {
+  async function fakeRoot() {
+    const hits: string[] = [];
+    const fake = createServer((req, res) => {
+      hits.push(`${req.url} ${req.headers.authorization ?? ""}`);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ host: "root", isRoot: true }));
+    });
+    await new Promise<void>((ok) => fake.listen(0, "127.0.0.1", () => ok()));
+    cleanup.push(() => new Promise<void>((ok) => fake.close(() => ok())));
+    return { hits, port: (fake.address() as { port: number }).port };
+  }
+  function tlsHome(rootPort: number) {
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-tls-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const home = join(tmp, "cafe-home");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "config.yml"), `port: 0\nroot: 127.0.0.1:${rootPort}\ntoken: t0k\nsecurity:\n  mode: tls\n`);
+    const userHome = join(tmp, "user-home");
+    mkdirSync(userHome, { recursive: true });
+    return { tmp, home, userHome };
+  }
+
+  it("reports the hub from the daemon's view and never sends the token to the Root in plaintext", async () => {
+    const local = await startDaemon("child");
+    cleanup.push(local.stop);
+    const root = await fakeRoot();
+    const { tmp, home, userHome } = tlsHome(root.port);
+    const r = await doctor(tmp, home, local.addr, userHome);
+    expect(root.hits).toEqual([]);
+    expect(r.stdout).toMatch(/root\s+hub offline/);
+  });
+
+  it("says it cannot check the hub while the daemon is down, still without dialling it", async () => {
+    const root = await fakeRoot();
+    const { tmp, home, userHome } = tlsHome(root.port);
+    const r = await doctor(tmp, home, "127.0.0.1:1", userHome);
+    expect(root.hits).toEqual([]);
+    expect(r.stdout).toMatch(/root\s+.*daemon is not running/);
+  });
+
+  it("shows the plaintext links a TLS hub refused (#89)", async () => {
+    const root = await startDaemon("root", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const child = await startDaemon("oldbox", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    const until = Date.now() + 10_000;
+    while (!root.daemon.tlsStatus().refused && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const userHome = join(tmp, "user-home");
+    mkdirSync(userHome, { recursive: true });
+    const r = await doctor(tmp, join(tmp, "cafe-home"), root.addr, userHome);
+    expect(r.stdout).toMatch(/fail\s+tls-links\s+refused plaintext links from oldbox/);
+    expect(r.status).toBe(1);
+  });
+});

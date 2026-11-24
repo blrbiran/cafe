@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { hostFailure, savedAddressNote } from "../hostReason.ts";
+import { hostFailure, hostStatus, savedAddressNote } from "../hostReason.ts";
 import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
@@ -107,6 +107,7 @@ export function NetworkPage() {
             const isThis = d.host === host;
             // A child daemon only knows the hub as a synthetic "root" record.
             const name = !isThis && d.isRoot && d.host === "root" ? t.hub : hostLabel(d.host, daemons);
+            const status = hostStatus(t, d, name);
             const badges = [d.isRoot || (isThis && isRoot) ? t.hub : undefined, isThis ? t.thisMachine : undefined].filter(Boolean) as string[];
             return (
               <article key={`${d.host}-${d.isRoot}`} className="card flex flex-col gap-2.5 p-4">
@@ -115,7 +116,9 @@ export function NetworkPage() {
                     <span className="mono truncate text-base text-fg-strong">{name}</span>
                     {name !== d.host && <span className="mono truncate text-[11px] text-muted">{d.host}</span>}
                   </div>
-                  <Pill tone={d.online ? "ok" : undefined}>{d.online ? t.online : t.mOffline}</Pill>
+                  <span title={status.title}>
+                    <Pill tone={status.tone}>{status.label}</Pill>
+                  </span>
                 </div>
                 {badges.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
@@ -130,18 +133,23 @@ export function NetworkPage() {
                   rows={[
                     [t.address, <span className="mono">{d.url.replace(/^wss?:\/\//, "") || "—"}</span>],
                     ["Agents", d.host === "root" && !isThis ? "—" : String(count(d.host))],
-                    [t.since, d.online ? ago(t, d.connectedAt, now) : t.lostAt(ago(t, d.lastSeenAt, now))],
+                    [t.since, d.refused ? t.refusedAt(ago(t, d.refused.at, now)) : d.online ? ago(t, d.connectedAt, now) : t.lostAt(ago(t, d.lastSeenAt, now))],
                     [
                       t.version,
                       <span className={`mono ${mixed && d.online && d.version !== target ? "font-semibold text-warn" : ""}`}>{d.version ?? t.versionUnknown}</span>,
                     ],
                   ]}
                 />
+                {status.detail && (
+                  <div role="status" className="text-xs leading-relaxed text-danger">
+                    {status.detail}
+                  </div>
+                )}
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button type="button" className="btn-sm" aria-busy={busy === `test:${d.host}`} onClick={() => test(d.host)}>
                     {busy === `test:${d.host}` ? t.hostTesting : t.hostTest}
                   </button>
-                  {!isThis && isRoot && !d.online && (
+                  {!isThis && isRoot && !d.online && !d.refused && (
                     <button type="button" className="btn-sm" aria-busy={busy === `reconnect:${d.host}`} onClick={() => reconnect(d.host)}>
                       {t.hostReconnect}
                     </button>
