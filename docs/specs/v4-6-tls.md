@@ -237,4 +237,31 @@ renewal path is proven.
   pinning / hot-renewal numbers on this machine.
 - Not verified: absolute latency over a real network; `SNICallback` behaviour on
   Windows/macOS differences; `node-forge` long-term compatibility past 22.23.1.
-- Not done: no product code changed for this spec.
+
+## 10. As built (2026-11-24)
+
+Phase 1 is implemented. Three §5 requirements were missing from the first cut and
+were closed on 2026-11-24 night, each with a test that failed first:
+
+- **Leaf renewal (§5 B).** A leaf is valid 90 days. Renewal used to be manual
+  (`cafe daemon renew-cert`) and `ensureLeaf` only reissued when the SAN set
+  changed, so a restart kept an expiring leaf and a fleet that never restarts
+  would expire together under fail-closed. Now a leaf inside 21 days is reissued
+  at start, and a running Daemon checks every 6 hours and renews in place
+  (`setSecureContext`, written through to disk). A child with no CA key asks the
+  Root and retries next tick if the Root is unreachable. `tls/store.ts`:
+  `leafNeedsRenewal`; `daemon.ts`: `startLeafRenewalCheck`,
+  `tlsContext.renew`; `index.ts` wires both.
+- **Per-peer leaf pin (§5 A).** `security.tls.pins` and `checkPeerPin` existed
+  with no production caller, so an unexpected leaf issued under the trusted CA was
+  accepted. Daemon-to-daemon `wss://` now passes `checkServerIdentity`: first
+  contact records the leaf under `host:port` (persisted), a different leaf is
+  refused. `daemon.ts`: `linkOptions(peerAddr)`, `recordPeerPin`.
+- **Exact SAN coverage.** `ensureLeaf` decided "already covered" with a substring
+  test, so `127.0.0.1` covered `127.0.0.10` and `desk` covered `desk.example`; the
+  stale leaf was kept and the new name failed with
+  `ERR_TLS_CERT_ALTNAME_INVALID`. `certs.ts`: `sanCovers()` compares whole
+  `subjectAltName` entries.
+
+Still phase 2: mutual TLS (client certs per peer) and ECDSA leaves
+(`node-forge` 1.x has no EC keygen).
