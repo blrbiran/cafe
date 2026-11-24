@@ -87,6 +87,7 @@ cafe connector start mock                              # mock: feed events on st
 cafe connector install packages/connector/discord      # Discord: set `token`, allowlists, start; needs the Message Content intent
                                                       # attachments are opt-in: allowAttachments true; only https URLs on
                                                       # attachmentHosts (Discord CDN) are fetched, capped by attachmentMaxMb
+                                                      # one channel = one Thread; quiet for newThreadAfterHours (6) or `/new` starts a new one
 cafe serve --preset claude --dir ~/code/billing       # one `claude -p` per question, no session (or --preset codex)
                                                       # presets are read-only by default; --write widens them
 cafe serve --exec "./answer.sh" --dir .               # any command: prompt on stdin (or {prompt_file}), answer on stdout;

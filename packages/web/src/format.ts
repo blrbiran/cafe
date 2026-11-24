@@ -37,6 +37,11 @@ export function useNow(intervalMs = 1_000): number {
   );
 }
 
+/** The time a Conversation card shows: its latest activity, so a follow-up moves it to "just now". */
+export function cardTime(meta: { createdAt: number; lastActivityAt?: number }): number {
+  return meta.lastActivityAt ?? meta.createdAt;
+}
+
 export function relTime(at: number | undefined, nowMs: number): string {
   if (!at) return "—";
   const s = Math.round((nowMs - at) / 1000);

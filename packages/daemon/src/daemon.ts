@@ -111,6 +111,8 @@ interface Tracking {
 /** Metadata keeps only recent reply/decline summaries; the JSONL log has the full history. */
 const MAX_META_REPLIES = 50;
 const MAX_META_DECLINES = 50;
+/** Attachments of every turn, listed on the Thread (deduplicated by id). */
+const MAX_META_ATTACHMENTS = 50;
 /** In-memory caches are bounded so a long-running Daemon does not grow with history (#31). */
 function cacheLimit(name: string, fallback: number): number {
   const n = Number(process.env[name]);
@@ -1962,7 +1964,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (firstTurn) {
           meta.summary = summarize(ev.order.body);
           meta.summaryTurn = ev.order.turn;
-          if (ev.order.attachments?.length) meta.attachments = ev.order.attachments;
+        }
+        for (const a of ev.order.attachments ?? []) {
+          const list = (meta.attachments ??= []);
+          if (list.length < MAX_META_ATTACHMENTS && !list.some((x) => x.id === a.id)) list.push(a);
         }
         meta.turnStartedAt = ev.order.createdAt;
         meta.reason = undefined;

@@ -170,6 +170,26 @@ describe("attachments", () => {
     expect(await got.text()).toBe("remote bytes");
   });
 
+  it("a follow-up's attachments are added to the Thread's list (the card counts them all)", async () => {
+    const d = await startDaemon("pc1");
+    cleanup.push(d.stop);
+    await barista(d.addr, identity("helper", { description: "reads files" }), async (h) => {
+      await h.ack();
+      await h.reply("read it");
+    });
+    const c = await customer(d.addr);
+    const one = (await upload(d.addr, "one.log", "1")).attachment;
+    const a = await c.ask({ body: "look at this", attachments: [one] });
+    await untilClosed(c, a.threadId, a.orderId);
+    const two = (await upload(d.addr, "two.png", "2")).attachment;
+    const f = await c.ask({ body: "and this", threadId: a.threadId, attachments: [two, one] });
+    await untilClosed(c, f.threadId, f.orderId);
+    const meta = d.daemon.thread(a.threadId)!.meta;
+    expect(meta.attachments?.map((x) => x.name)).toEqual(["one.log", "two.png"]);
+    // The title is still the first question.
+    expect(meta.summary).toBe("look at this");
+  });
+
   it("rejects an empty upload and a path-traversal name", async () => {
     const d = await startDaemon("pc1");
     cleanup.push(d.stop);

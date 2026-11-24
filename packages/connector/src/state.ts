@@ -40,6 +40,13 @@ export class ThreadMap {
     this.save();
   }
 
+  /** Forget the mapping so the next message on this platform thread starts a new cafe Thread. */
+  delete(platformThreadId: string): void {
+    if (!(platformThreadId in this.map)) return;
+    delete this.map[platformThreadId];
+    this.save();
+  }
+
   all(): Record<string, string> {
     return { ...this.map };
   }

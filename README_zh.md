@@ -166,6 +166,8 @@ cafe connector logs discord --follow
 
 在 guild 里机器人只回答 @ 它的消息（`requireMention` 默认开）；`allowDMs` 打开私聊。回复发回同一频道，按 Discord 2000 字符上限切分；每段带稳定的 nonce，崩溃恢复重发不会把同一条回答发两遍。`allowGuilds`/`allowChannels`/`allowUsers` 默认为空 = 全部允许，共享服务器请设置白名单。安装时会把 `discord.js` 装进 connector 自己的目录（不是 cafe 的依赖）。
 
+**对话。** 同一个频道（或私信）里的消息会接在同一个 cafe Thread 上，追问能保留上下文。频道空闲超过 `newThreadAfterHours`（默认 6 小时，从 Thread 最后一次活动算起）后，下一条消息会开一个新 Thread，标题就是这条消息。发送 `/new` 可以手动开新对话（`/new <问题>` 直接在新 Thread 里提问）；在服务器频道里照常先 @ 机器人。
+
 **附件需要显式开启。** 设置 `cafe connector config discord allowAttachments true` 后，消息里的文件会被下载、上传到本地 daemon 并挂到 Order 上；Barista 只看到文字和本地路径，永远拿不到文件内容。由于消息里的 URL 属于不可信输入，只有当 URL 是 `https`、且主机名精确列在 `attachmentHosts`（默认 `cdn.discordapp.com`、`media.discordapp.net`）时才下载，单文件上限 `attachmentMaxMb`（默认 25）。开启附件后，只有文件没有文字的消息也会被接收。
 
 connector 是一个目录：`cafe-connector.json`（name / entry / permissions / configSchema）+ 一个用 `@cafe/connector` 的 `defineConnector` 写的入口。状态在 `CAFE_HOME/connector-data/<name>/`，日志在 `CAFE_HOME/logs/connector-<name>.log`。`install` 复制目录并把 SDK 链接进它的 `node_modules`；SDK 随发布包分发（`connector/`），所以从已发布 cafe 安装的 connector 也能解析 `@cafe/connector`。connector 由监管器托管：意外退出会退避重启，1 分钟内退出 5 次则停在 `crashed`（看 `cafe connector logs`），不会无限重启。可用 `CAFE_CONNECTOR_MAX_RESTARTS` / `CAFE_CONNECTOR_WINDOW_MS` / `CAFE_CONNECTOR_BACKOFF_MS` 调整。

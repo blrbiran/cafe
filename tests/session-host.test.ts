@@ -139,6 +139,30 @@ describe("cafe session-host (an interactive session as a Barista)", () => {
     await waitFor(() => falcon()?.status === "idle");
   });
 
+  it("the question and a follow-up both carry the local paths of their attachments", async () => {
+    const { root, orders, c, socket } = await setup();
+    const upload = async (name: string, body: string) => {
+      const res = await fetch(`http://${root.addr}/api/artifacts?name=${name}&mime=text/plain`, { method: "POST", body });
+      return ((await res.json()) as { attachment: any }).attachment;
+    };
+    const first = await upload("serial.log", "boot ok");
+    const a = await c.ask({ body: "what does the log say?", to: "falcon", attachments: [first] });
+    await waitFor(() => orders().length === 1);
+    expect(orders()[0]!.text).toMatch(/serial\.log \(text\/plain, 7 bytes\): \/.+serial\.log/);
+    const aDone = untilClosed(c, a.threadId, a.orderId);
+    await post(socket, "/done", { orderId: orders()[0]!.orderId, text: "boot ok" });
+    await aDone;
+
+    const second = await upload("screen.png", "PNGDATA");
+    const f = await c.ask({ body: "and this one?", threadId: a.threadId, attachments: [second] });
+    await waitFor(() => orders().length === 2);
+    expect(orders()[1]!.text).toContain("Follow-up from");
+    expect(orders()[1]!.text).toMatch(/screen\.png \(text\/plain, 7 bytes\): \/.+screen\.png/);
+    const fDone = untilClosed(c, f.threadId, f.orderId);
+    await post(socket, "/done", { orderId: orders()[1]!.orderId, text: "ok" });
+    await fDone;
+  });
+
   it("without a .cafe Barista identity it says so and does not register", async () => {
     const { msgs, root } = await setup({ cafe: "" });
     expect(msgs).toEqual([expect.objectContaining({ type: "none" })]);

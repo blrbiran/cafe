@@ -93,7 +93,7 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     next.stopBeat(); // `current` takes over with its own heartbeat
     const h = next.h;
     const self = { address: client.record?.address ?? cafe.name, description: cafe.description };
-    const body = answered.has(h.order.threadId) ? buildFollowup(h.order) : buildPrompt(h.order, self, REPLY_NOTE);
+    const body = answered.has(h.order.threadId) ? buildFollowup(h.order, h.attachments) : buildPrompt(h.order, self, REPLY_NOTE, h.attachments);
     const marker = orderMarker(h.order.orderId);
     current = { h, started: false, cancelled: false, stopBeat: keepAlive(h) };
     current.timer = setTimeout(() => {

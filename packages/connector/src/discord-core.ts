@@ -72,6 +72,8 @@ export interface DiscordConfig {
   attachmentHosts: string[];
   /** Per-file cap; also bounded by the Daemon's attachments.maxMb. */
   attachmentMaxMb: number;
+  /** A channel quiet for this long starts a new cafe Thread with its next message. */
+  newThreadAfterHours: number;
 }
 
 /** Only Discord's own CDN by default: a message URL is attacker-controlled input. */
@@ -95,6 +97,7 @@ export function readConfig(config: Record<string, unknown>): DiscordConfig {
     allowAttachments: !!config.allowAttachments,
     attachmentHosts: (config.attachmentHosts === undefined ? DEFAULT_ATTACHMENT_HOSTS : stringList(config.attachmentHosts)).map((h) => h.toLowerCase()),
     attachmentMaxMb: positive(config.attachmentMaxMb, 25),
+    newThreadAfterHours: positive(config.newThreadAfterHours, 6),
   };
 }
 
@@ -134,6 +137,36 @@ export function filterReason(m: PlatformMessage, c: DiscordConfig): string | und
   if (!allows(c.allowUsers, m.userId)) return `user ${m.userId} is not in allowUsers`;
   if (c.requireMention && !m.mentionsBot && m.guildId) return "message does not mention the bot (requireMention)";
   return useReason(m, c);
+}
+
+/**
+ * `/new` (optionally after the bot mention) starts a new conversation in this channel. Returns the
+ * question that follows it ("" for a bare `/new`), or undefined when the message is not a `/new`.
+ */
+export function newCommand(text: string): string | undefined {
+  const m = /^(?:\s*<@!?\d+>)*\s*\/new(?:\s+([\s\S]*))?$/i.exec(text);
+  return m ? (m[1] ?? "").trim() : undefined;
+}
+
+export const NEW_CONVERSATION_REPLY = "OK, your next message starts a new conversation. / 好的，下一条消息会开始新的对话。";
+
+/**
+ * The cafe Thread this channel's next message continues, or undefined to start a new one: the channel
+ * has none yet, the Thread is gone, or it has been quiet for `newThreadAfterHours`.
+ */
+async function currentThread(ctx: ConnectorContext, channelId: string, now = Date.now()): Promise<string | undefined> {
+  const known = ctx.threads.get(channelId);
+  if (!known) return undefined;
+  const quietMs = readConfig(ctx.config).newThreadAfterHours * 3_600_000;
+  try {
+    const { meta } = await ctx.cafe.getThread(known, { limit: 1 });
+    const last = Number(meta.lastActivityAt ?? meta.createdAt);
+    if (Number.isFinite(last) && now - last < quietMs) return known;
+    ctx.log(`channel ${channelId}: thread ${known} quiet for ${Math.round((now - last) / 60_000)} min; starting a new one`);
+  } catch (err) {
+    ctx.log(`channel ${channelId}: thread ${known} unavailable (${(err as Error).message}); starting a new one`);
+  }
+  return undefined;
 }
 
 /** Split a reply into Discord-sized chunks at a word or newline boundary where possible. */
@@ -199,10 +232,10 @@ export async function followAndSend(ctx: ConnectorContext, platform: DiscordPlat
   ctx.outbox.markDelivered(item.eventId);
 }
 
-async function sendAndFollow(ctx: ConnectorContext, platform: DiscordPlatform, m: PlatformMessage): Promise<void> {
+async function sendAndFollow(ctx: ConnectorContext, platform: DiscordPlatform, m: PlatformMessage, fresh?: string): Promise<void> {
   try {
-    const known = ctx.threads.get(m.channelId);
-    const { text, attachments } = await orderAttachments(ctx, platform, m);
+    const known = fresh === undefined ? await currentThread(ctx, m.channelId) : undefined;
+    const { text, attachments } = await orderAttachments(ctx, platform, fresh === undefined ? m : { ...m, text: fresh });
     const created = await ctx.cafe.sendOrder({
       body: text.trim() ? text : "Please see the attached file.",
       ...(known ? { threadId: known } : {}),
@@ -240,8 +273,16 @@ export async function handleMessage(ctx: ConnectorContext, platform: DiscordPlat
     if (!existing.delivered) await followAndSend(ctx, platform, existing).catch((err) => ctx.error(`event ${m.eventId}: ${(err as Error).message}`));
     return;
   }
+  const fresh = newCommand(m.text);
+  if (fresh !== undefined) ctx.threads.delete(m.channelId);
+  if (fresh === "" && !m.attachments?.length) {
+    // A bare `/new` is not a question: confirm and wait for the next message.
+    ctx.seen.add(m.eventId);
+    await platform.send(m.channelId, NEW_CONVERSATION_REPLY, { nonce: chunkNonce(m.eventId, 0) }).catch((err) => ctx.error(`event ${m.eventId}: ${(err as Error).message}`));
+    return;
+  }
   const item = ctx.outbox.add({ eventId: m.eventId, channel: m.channelId, user: m.userId, text: m.text, status: "pending" });
-  await sendAndFollow(ctx, platform, m);
+  await sendAndFollow(ctx, platform, m, fresh);
   void item;
 }
 

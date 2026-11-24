@@ -114,8 +114,9 @@ export class CafeHttpClient {
     return attachment;
   }
 
-  getThread(threadId: string): Promise<ThreadResponse> {
-    return this.request<ThreadResponse>(`/api/threads/${encodeURIComponent(threadId)}`);
+  getThread(threadId: string, opts: { limit?: number } = {}): Promise<ThreadResponse> {
+    const query = opts.limit !== undefined ? `?limit=${opts.limit}` : "";
+    return this.request<ThreadResponse>(`/api/threads/${encodeURIComponent(threadId)}${query}`);
   }
 
   /** Follow a Thread over SSE until the server closes the stream (the Order closed). */

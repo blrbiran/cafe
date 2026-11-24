@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "reac
 import type { ThreadMeta } from "@cafe/protocol";
 import { api } from "../api.ts";
 import { ago, useT } from "../i18n.ts";
-import { useNow } from "../format.ts";
+import { cardTime, useNow } from "../format.ts";
 import { bucketOf, outcome, askerOf, whoAddress, whyText } from "../outcome.ts";
 import { agentAddress, agentLabel } from "../display.ts";
 import { navigate, type Filter } from "../route.ts";
@@ -125,7 +125,7 @@ function SearchResults({ filter }: { filter: Filter }) {
             <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
               <span className="mono text-fg">{ask.who}</span>
               <span>{ask.verb}</span>
-              <span>· {ago(t, meta.createdAt, now)}</span>
+              <span>· {ago(t, cardTime(meta), now)}</span>
             </div>
             <button type="button" className="qbtn" onClick={open}>
               <Highlight text={meta.summary || "—"} q={q} />
@@ -236,7 +236,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
         <div className="flex min-w-0 items-center gap-1.5 text-muted">
           <span className="mono truncate text-fg">{ask.who}</span>
           <span>{ask.verb}</span>
-          <span>· {ago(t, meta.createdAt, now)}</span>
+          <span>· {ago(t, cardTime(meta), now)}</span>
           {meta.turns > 1 && <span>· {t.turns(meta.turns)}</span>}
           {meta.attachments?.length ? <span>· 📎 {meta.attachments.length}</span> : null}
         </div>

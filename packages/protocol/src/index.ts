@@ -261,7 +261,7 @@ export const ThreadMeta = z.object({
   turns: z.number().int().default(1),
   /** When the latest Order (turn) was created. */
   turnStartedAt: z.number().optional(),
-  /** Files on the first question, so list views can show "2 attachments". */
+  /** Files on every turn (first seen first, deduplicated), so list views can show "2 attachments". */
   attachments: z.array(Attachment).optional(),
   /** Routing Decision of the latest Order. */
   reason: z.string().optional(),

@@ -384,3 +384,66 @@ describe("discord connector end to end (fake platform)", () => {
     await runP.catch(() => {});
   }, 20_000);
 });
+// A Discord channel used to map to one cafe Thread forever: a message the next day became a follow-up of
+// yesterday's question, and the Web card still showed yesterday's title. Now a channel that has been quiet
+// for `newThreadAfterHours` (default 6) starts a new Thread, and `/new` starts one by hand.
+describe("discord conversations: when a message starts a new Thread", () => {
+  async function start(config: Record<string, unknown>) {
+    const d = await daemonWithBarista();
+    const stateDir = tempDir("cafe-discord-new-");
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ token: "x", allowChannels: ["c1"], ...config }));
+    const fake = fakePlatform();
+    const main = createDiscordConnector({
+      platform: async () => fake.platform,
+      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
+      heartbeatMs: 0,
+    });
+    const runP = main.run();
+    cleanups.push(async () => {
+      main.stop();
+      await runP.catch(() => {});
+    });
+    await fake.ready;
+    const threads = async () =>
+      ((await (await fetch(`http://${d.addr}/api/threads?limit=50`)).json()) as Array<{ summary: string; turns: number }>).sort((a, b) => a.summary.localeCompare(b.summary));
+    const ask = async (eventId: string, text: string) => {
+      await fake.push(baseMsg({ eventId, text }));
+    };
+    return { ...fake, threads, ask };
+  }
+
+  it("a message soon after is a follow-up; one after the channel was quiet starts a new Thread", async () => {
+    const { ask, sent, threads } = await start({ newThreadAfterHours: 0.0003 }); // ~1 s
+    await ask("e1", "first topic");
+    await waitFor(() => sent.some((s) => s.text === "answered: first topic"), 8_000);
+    await ask("e2", "more on it");
+    await waitFor(() => sent.some((s) => s.text === "answered: more on it"), 8_000);
+    expect(await threads()).toMatchObject([{ summary: "first topic", turns: 2 }]);
+
+    await new Promise((r) => setTimeout(r, 1_300));
+    await ask("e3", "a new topic");
+    await waitFor(() => sent.some((s) => s.text === "answered: a new topic"), 8_000);
+    expect(await threads()).toMatchObject([{ summary: "a new topic", turns: 1 }, { summary: "first topic", turns: 2 }]);
+  }, 20_000);
+
+  it("/new on its own confirms and the next message starts a new Thread; /new <question> asks it in a new Thread", async () => {
+    const { ask, sent, threads } = await start({});
+    await ask("e1", "first topic");
+    await waitFor(() => sent.some((s) => s.text === "answered: first topic"), 8_000);
+
+    await ask("e2", "<@42> /new");
+    await waitFor(() => sent.some((s) => /new conversation/i.test(s.text)), 8_000);
+    expect(await threads()).toHaveLength(1); // /new alone is not a question
+
+    await ask("e3", "second topic");
+    await waitFor(() => sent.some((s) => s.text === "answered: second topic"), 8_000);
+    await ask("e4", "/new third topic");
+    await waitFor(() => sent.some((s) => s.text === "answered: third topic"), 8_000);
+    expect(await threads()).toMatchObject([
+      { summary: "first topic", turns: 1 },
+      { summary: "second topic", turns: 1 },
+      { summary: "third topic", turns: 1 },
+    ]);
+  }, 20_000);
+});
