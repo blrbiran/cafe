@@ -53,6 +53,8 @@ export const AgentIdentity = CafeFile.extend({
   command: z.string().optional(),
   cwd: z.string(),
   pid: z.number().int().optional(),
+  /** A TUI session running in the background (e.g. Claude Code `--bg`): no terminal shows it. Display only. */
+  background: z.boolean().optional(),
   /** On reconnect: ask to keep the agentId/Address from the previous connection. */
   resumeAgentId: z.string().optional(),
 });

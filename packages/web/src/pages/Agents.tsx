@@ -118,7 +118,11 @@ function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; 
       t.runsCommand(a.command)
     ) : (
       <>
-        {{ tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode]}
+        {a.mode === "tui" && a.background ? (
+          <span title={t.modeBackgroundHint}>{t.modeBackground}</span>
+        ) : (
+          { tui: t.modeTui, headless: t.modeHeadless, cli: t.modeCli, web: t.modeWeb }[a.mode]
+        )}
         {a.access && " · "}
         {a.access === "read-only" && <span className="text-muted">{t.readOnly}</span>}
         {a.access === "write" && <span className="text-warn">{t.canWrite}</span>}

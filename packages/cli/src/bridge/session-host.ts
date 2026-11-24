@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -41,6 +42,8 @@ export interface SessionHostOptions {
   token?: string;
   /** pid of the interactive session (registered as the Agent's pid). */
   pid?: number;
+  /** The session runs in the background with no terminal (default: detected from the process tree). */
+  background?: boolean;
   /** How long a handed-over Order may wait to start (default CAFE_INJECT_TIMEOUT_MS or 120 s). */
   injectTimeoutMs?: number;
   /** Where the control socket goes (default: the OS temp dir). */
@@ -53,6 +56,36 @@ const REPLY_NOTE = "Answer in this conversation; your final message of this turn
 
 /** The line that starts every injected Order, so the session's turn can be matched to it. */
 export const orderMarker = (orderId: string) => `[cafe order ${orderId}]`;
+
+type ProcInfo = { ppid: number; command: string } | undefined;
+
+function psInfo(pid: number): ProcInfo {
+  const r = spawnSync("ps", ["-o", "ppid=,command=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 });
+  const m = /^\s*(\d+)\s+(.*)$/.exec(r.stdout?.trim() ?? "");
+  return m ? { ppid: Number(m[1]), command: m[2]! } : undefined;
+}
+
+/** `claude --bg-pty-host …`: the executable is claude and the flag is its own argument. */
+const BG_HOST = /^(?:\S*\/)?claude(?:\.exe)?(?:\s+\S+)*?\s+--bg-pty-host(?:\s|$)/;
+
+/**
+ * Whether the session `pid` runs in the background: Claude Code's `--bg` runs the session under a
+ * `claude --bg-pty-host …` process, with no terminal the user can switch to. Looks a few ancestors up;
+ * any failure means "not known to be background".
+ */
+export function isBackgroundSession(pid: number, read: (pid: number) => ProcInfo = psInfo): boolean {
+  try {
+    for (let p = pid, i = 0; p > 1 && i < 4; i++) {
+      const info = read(p);
+      if (!info) return false;
+      if (BG_HOST.test(info.command)) return true;
+      p = info.ppid;
+    }
+  } catch {
+    // ps missing or refused: unknown.
+  }
+  return false;
+}
 
 export async function runSessionHost(opts: SessionHostOptions): Promise<{ client?: CafeClient; socket?: string; stop: () => Promise<void> }> {
   const log = opts.log ?? ((m: string) => console.error(`[cafe session] ${m}`));
@@ -171,7 +204,9 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     if (ready) opts.send({ type: "status", address: rec?.address, paused });
   });
 
-  const identity = () => ({ ...cafe, mode: "tui" as const, agent: opts.agent, cwd: dir, pid: opts.pid ?? process.ppid });
+  const pid = opts.pid ?? process.ppid;
+  const background = opts.background ?? isBackgroundSession(pid);
+  const identity = () => ({ ...cafe, mode: "tui" as const, agent: opts.agent, cwd: dir, pid, ...(background ? { background } : {}) });
 
   // Control socket for the mod. Unix socket, owner-only.
   const socket = join(opts.socketDir ?? tmpdir(), `cafe-session-${process.pid}-${Math.random().toString(36).slice(2, 8)}.sock`);

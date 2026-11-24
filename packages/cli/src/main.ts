@@ -832,10 +832,11 @@ program
   });
 
 /** Short "what runs it" column for `cafe agents`: the agent kind (pi, omp, codex, claude, command), `·tui` when
- * someone is using it in a terminal, `·ro` / `·rw` for Bridges. Falls back to the mode for agents that do not report a kind. */
-function runsAs(a: Pick<AgentRecord, "mode" | "agent" | "access">): string {
+ * someone is using it in a terminal (`·bg` when that session runs in the background with no terminal),
+ * `·ro` / `·rw` for Bridges. Falls back to the mode for agents that do not report a kind. */
+function runsAs(a: Pick<AgentRecord, "mode" | "agent" | "access" | "background">): string {
   if (!a.agent) return a.mode;
-  return [a.agent, a.mode === "tui" ? "tui" : undefined, a.access === "read-only" ? "ro" : a.access === "write" ? "rw" : undefined].filter(Boolean).join("·");
+  return [a.agent, a.mode === "tui" ? (a.background ? "bg" : "tui") : undefined, a.access === "read-only" ? "ro" : a.access === "write" ? "rw" : undefined].filter(Boolean).join("·");
 }
 
 const printThreads = (list: ThreadMeta[], agents: Map<string, AgentRecord>) =>
