@@ -60,16 +60,42 @@ describe("per-peer identity pin", () => {
   const leaf = "11:22:33";
 
   it("records the leaf on first contact with that peer", () => {
-    expect(checkPeerPin("desk:4778", leaf, {})).toEqual({ ok: true, firstSeen: true });
+    expect(checkPeerPin("desk:4778", { keyFingerprint: leaf }, {})).toEqual({ ok: true, firstSeen: true });
   });
 
   it("accepts the same leaf again", () => {
-    expect(checkPeerPin("desk:4778", leaf, { "desk:4778": "112233" })).toEqual({ ok: true, firstSeen: false });
+    expect(checkPeerPin("desk:4778", { keyFingerprint: leaf }, { "desk:4778": "112233" })).toEqual({ ok: true, firstSeen: false });
   });
 
   it("refuses a different leaf for a pinned peer", () => {
-    const r = checkPeerPin("desk:4778", leaf, { "desk:4778": "99:88:77" });
+    const r = checkPeerPin("desk:4778", { keyFingerprint: leaf }, { "desk:4778": "99:88:77" });
     expect(r.ok).toBe(false);
     expect(r.reason).toMatch(/pinned/);
+  });
+
+  it("accepts a renewal: the key is unchanged, so the pin still matches", () => {
+    // Renewal keeps the key and changes the certificate, so a key pin survives rotation (v4-6 §5 B).
+    const pins = { "desk:4778": "11:22:33" };
+    expect(checkPeerPin("desk:4778", { keyFingerprint: "11:22:33", certFingerprint: "FF:EE" }, pins)).toEqual({
+      ok: true,
+      firstSeen: false,
+    });
+  });
+
+  it("accepts a pin recorded before the switch that named the certificate fingerprint, and upgrades it", () => {
+    // Existing networks upgraded in place: their pin is a certificate fingerprint. While that leaf is
+    // unchanged it must still be accepted, otherwise the upgrade itself locks everyone out. The key is
+    // reported as `upgrade` so the caller rewrites the pin before the leaf next rotates.
+    const pins = { "desk:4778": "AB:CD:EF" };
+    expect(checkPeerPin("desk:4778", { keyFingerprint: "11:22:33", certFingerprint: "AB:CD:EF" }, pins)).toEqual({
+      ok: true,
+      firstSeen: false,
+      upgrade: "11:22:33",
+    });
+  });
+
+  it("names a command that exists when it refuses", () => {
+    const r = checkPeerPin("desk:4778", { keyFingerprint: "11:22:33" }, { "desk:4778": "99:88:77" });
+    expect(r.reason).toMatch(/cafe host pin/);
   });
 });

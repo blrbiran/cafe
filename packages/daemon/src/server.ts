@@ -512,13 +512,27 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     // Reissue this Host's leaf and swap it for new connections. Only the Root holds the CA key.
     if (!daemon.isRoot) return send(res, 400, { error: "not_root", message: "only the Root signs leaves; restart this Host to request one from the Root" });
     const ca = daemon.tlsContext;
-    if (!ca) return send(res, 400, { error: "tls_off", message: "TLS is off (security.mode: plaintext)" });
+    if (!ca?.renew) return send(res, 400, { error: "tls_off", message: "TLS is off (security.mode: plaintext)" });
     const body = await readJson(req);
     const sans = Array.isArray(body.sans) ? body.sans.filter((s: unknown): s is string => typeof s === "string" && !!s) : [];
-    const issued = await ca.issue?.(sans.length ? sans : ["127.0.0.1", "localhost"]);
-    if (!issued) return send(res, 400, { error: "not_root", message: "this Host cannot sign a leaf" });
-    ca.replace(issued);
-    return send(res, 200, { ok: true, fingerprint256: new (await import("node:crypto")).X509Certificate(issued.cert).fingerprint256 });
+    // `renew` keeps the existing key and writes through to disk: a swap that only changed memory
+    // would be undone by the next restart, which then serves the stale (possibly expiring) leaf.
+    await ca.renew(sans.length ? sans : undefined);
+    const current = ca.current();
+    // Report the certificate's own fingerprint, the value `cafe daemon renew-cert` prints.
+    const fp = new (await import("node:crypto")).X509Certificate(current.cert).fingerprint256;
+    return send(res, 200, { ok: true, fingerprint256: fp });
+  }
+  if (m === "POST" && path === "/api/tls/pins") {
+    // Clear one peer's leaf-key pin so the next connection pins its current key (a deliberate
+    // reinstall, or a key that was replaced out of band). Pins are a hot setting: nothing the listener
+    // owns changes, so no restart is needed.
+    const { peer, clear } = await readJson(req);
+    if (typeof peer !== "string" || !peer) throw new RpcError("bad_request", "peer is required (host:port)");
+    if (clear !== true) throw new RpcError("bad_request", "only clearing a pin is supported; set clear: true");
+    delete daemon.config.security.tls.pins[peer];
+    saveConfig(daemon.config, daemon.store.home);
+    return send(res, 200, { ok: true, peer, pins: daemon.config.security.tls.pins });
   }
   if (m === "GET" && path === "/api/tls") {
     // The trust anchor a person or a child Host needs to enrol: the CA and its fingerprint. Public
@@ -531,10 +545,15 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     // A child Host with this network's token asks the Root to issue its leaf. Only the Root has the
     // CA key; every other Host gets a clear refusal instead of a fake certificate.
     if (!daemon.isRoot || !daemon.tlsContext?.issue) return send(res, 400, { error: "not_root", message: "only the Root issues leaf certificates; set security.tls.ca to the Root's ca.crt on this Host" });
+    const issue = daemon.tlsContext.issue;
     const body = await readJson(req);
     const sans = Array.isArray(body.sans) ? body.sans.filter((s: unknown): s is string => typeof s === "string" && !!s) : [];
     if (!sans.length) throw new RpcError("bad_request", "sans must be a non-empty string array");
-    return send(res, 200, await daemon.tlsContext.issue(sans));
+    const publicKey = typeof body.publicKey === "string" && body.publicKey.includes("PUBLIC KEY") ? body.publicKey : undefined;
+    const issued = await issue(sans, publicKey);
+    // A reissue for the caller's own key returns the certificate only: the Root must never send a
+    // private key. The child keeps the key it already has.
+    return send(res, 200, publicKey ? { cert: issued.cert } : issued);
   }
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {

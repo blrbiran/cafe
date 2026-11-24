@@ -10,7 +10,7 @@ import { daemonLog } from "./proc/daemonLog.ts";
 import { ensureLeaf, leafNeedsRenewal, tlsPaths, writeLeaf } from "./tls/store.ts";
 import { bootstrapCa, fetchLeafFromRoot, trustCaForClient } from "./tls/bootstrap.ts";
 import { readTlsConfig } from "./tls/trust.ts";
-import { issueLeaf, sanList } from "./tls/certs.ts";
+import { issueLeaf, publicKeyOf, sanList } from "./tls/certs.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
@@ -114,27 +114,32 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             config.security.tls.caFingerprint = boot.enroll;
             saveConfig(config, home);
           }
+          const leafSans = () => sanList({ host: config.host, advertise: config.advertise, lan: lanAddress() });
+          // The leaf in force, set below. `fetchFromRoot` runs during the boot issuance too, when no
+          // active leaf exists yet: then it is a first issuance and no key is sent.
+          let active: { cert: string; key: string } | undefined;
+          /** Ask the Root (over TLS with our token) for a leaf, for a Host that holds no CA key. */
+          const fetchFromRoot = (sans?: string[]) =>
+            fetchLeafFromRoot(config.root!, ca.cert, config.token, sans?.length ? sans : leafSans(), publicKeyOf(active?.cert));
           const leaf = await ensureLeaf(
             home,
             config.host,
             ca,
             { host: config.host, advertise: config.advertise, lan: lanAddress() },
             {
-              // A child Host holds the CA certificate but not its key; the Root issues the leaf.
-              fetchLeaf: async () => {
+              // A child Host holds the CA certificate but not its key; the Root issues the leaf. The
+              // request carries the public key the child already has, so a reissue keeps its identity.
+              fetchLeaf: async (sans: string[]) => {
                 if (!config.root) throw new Error("no leaf for this Host and no Root configured to issue one");
                 // Trust the enrolled CA for this one call. A dedicated `https` request with `ca` is
                 // deterministic; the process-wide default store could be racing other Daemons in tests.
-                return fetchLeafFromRoot(config.root, ca.cert, config.token, sanList({ host: config.host, advertise: config.advertise, lan: lanAddress() }));
+                return fetchFromRoot(sans);
               },
             },
           );
           // `current()` reads run through this closure: a later renewal swaps it in place.
-          let active = { cert: leaf.cert, key: leaf.key };
+          active = { cert: leaf.cert, key: leaf.key };
           const renewListeners = new Set<() => void>();
-          const leafSans = () => sanList({ host: config.host, advertise: config.advertise, lan: lanAddress() });
-          /** Ask the Root (over TLS with our token) for a leaf, for a Host that holds no CA key. */
-          const fetchFromRoot = () => fetchLeafFromRoot(config.root!, ca.cert, config.token, leafSans());
           // Write-through: a leaf issued here or by the Root replaces the on-disk one too, so a
           // restart after a renewal uses the fresh leaf instead of a stale file.
           const swap = (next: { cert: string; key: string }) => {
@@ -147,7 +152,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             caFingerprint: leaf.caFingerprint,
             /** Daemon-to-daemon links use TLS only once a *network* CA is enrolled (not a temp local one). */
             network: !boot.pendingRoot,
-            current: () => active,
+            current: () => active!,
             replace: (next) => {
               active = next;
               for (const fn of renewListeners) fn();
@@ -158,8 +163,9 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             },
             ...(isRoot
               ? {
-                  issue: async (sans: string[]) => {
-                    const fresh = await issueLeaf(ca, sans);
+                  issue: async (sans: string[], publicKey?: string) => {
+                    // A child that sends its public key keeps it; otherwise this is a first issuance.
+                    const fresh = await issueLeaf(ca, sans, 90, publicKey);
                     return { cert: fresh.cert, key: fresh.key };
                   },
                 }
@@ -167,12 +173,14 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             // A running Daemon renews its own leaf before expiry (v4-6 §5 B). The Root signs locally;
             // a child asks the Root, which needs the Root reachable — if it is not, the next timer
             // tick tries again, and the existing (not-yet-expired) leaf keeps working meanwhile.
-            renew: async () => {
-              const next = ca.key ? await issueLeaf(ca, leafSans()) : await fetchFromRoot();
-              swap({ cert: next.cert, key: next.key });
+            renew: async (sans?: string[]) => {
+              const names = sans?.length ? sans : leafSans();
+              const prev = active!;
+              const next = ca.key ? await issueLeaf(ca, names, 90, prev.key) : await fetchFromRoot(names);
+              swap(next.key ? { cert: next.cert, key: next.key } : { cert: next.cert, key: prev.key });
             },
           };
-          return { ca: leaf.ca, current: () => active, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn) };
+          return { ca: leaf.ca, current: () => active!, onRenew: (fn: () => void) => daemon.tlsContext!.onRenew(fn) };
         })()
       : undefined;
   let server: ServerHandle;

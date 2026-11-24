@@ -118,6 +118,39 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
+### 2026-11-24 (late) — TLS: 续期×pin 互相打架的四个缺陷已修
+
+- **为什么修。** 昨夜 #61 的三项「加固」彼此冲突，只有在真实滚动网络里才会暴露。四个缺陷，全部先做
+  一次性实验确认、再写会失败的测试（RED），最后修复：
+  1. **自定义 `checkServerIdentity` 关掉了 SAN 校验。** Node 只要收到这个选项就**替换**默认身份校验，
+     不会叠加。于是 pin 检查让每条 Daemon↔Daemon `wss://` 都跳过了 SAN：实测「签给
+     `somewhere.invalid` 的叶子拨 `127.0.0.1` 被接受」。`trust.ts` 新增 `pinnedIdentityCheck`：先跑
+     Node 的 `tls.checkServerIdentity`，再比 pin。测试 `tests/tls-pinned-san.test.ts`（并把旧行为作为
+     回归基线钉住）。
+  2. **续期会换密钥 → 轮换当天全网被 pin 拒绝。** `issueLeaf` 每次都新生成 RSA 密钥，而 pin 钉整张证书；
+     任何一次续期（启动窗口 / 6h tick / `renew-cert`）都会让已 pin 的 peer 全体拒绝，fail-closed 下没有
+     明文救援。现在 `issueLeaf(ca, sans, days, key?)` **复用原密钥重签**（child 可只发 SPKI 公钥回来），
+     `ensureLeaf` / `renew` / `POST /api/tls/leaf` 全链路传递。测试 `tls-key-continuity`、
+     `tls-renewal-keeps-key`、`tls-peer-pin` 的「真续期后不断连」用例。
+  3. **pin 改钉公钥（SPKI）而非整张证书。** 证书指纹每次续期都变、公钥不变。旧证书 pin 在其叶子未变时
+     仍被接受，并在该次连接里**就地升级**为公钥 pin（`checkPeerPin` 返回 `upgrade`），升级不会锁死已有
+     网络。`certs.ts`: `keyFingerprintOf`。
+  4. **`POST /api/tls/renew` 只换内存不落盘。** 重启后又回到旧（可能将过期的）叶子。现在走
+     `tlsContext.renew`，写穿透到磁盘，返回的仍是证书指纹。
+- **新增命令 `cafe host pin [host:port] [--clear]`。** 旧拒绝信息让人跑 `cafe connect --reset-pin`，这参数
+  根本不存在（全仓只有这一句文案）。现在真正能清除 pin：运行中的 daemon 走 `POST /api/tls/pins`
+  （热生效），同时改写 `config.yml`。`tests/tls-cli.test.ts`。
+- **验证。** typecheck；**420 tests ×2**（新增 3 个测试文件 + 7 个用例）；`routing:eval` 67/67；web
+  check + `build:web`。用户 Root 已重启在新代码上（pid 41515，4777 + 4778，`:4778/api/health` 返回 200），
+  叶子与重启前**逐字节相同**（89.7 天），本机 `pins: {}` 为空。
+- **spec / 文档。** `docs/specs/v4-6-tls.md` 新增 §10.1（as-built 记录这四项）；README / README_zh /
+  SKILL 的 TLS 段改为「续期保留密钥、公钥 pin、`cafe host pin --clear`」。
+- **仍需你本人**（与上一批相同）：真实 Discord attachment DM + 重启去重；付费模型运行逐个批准；推送 +
+  发版。
+- **下一候选**：#62 侧栏可调宽（需先出原型给你批）；snapshot 分页（`/api/threads?before=` 已有，Web
+  「加载更早」可用）；`appendEvent` 异步化（有丢数据风险，我倾向不做）；#71/#72 团队与编排（需
+  brainstorming + spec）；TLS phase 2（mTLS、ECDSA）。
+
 ### 2026-11-24 (night) — TLS hardening, Web小修, 测试去抖, 打包/ sim 修复
 
 - **Current checkout.** `git status --short --branch`、`git log --oneline -6`
@@ -641,7 +674,9 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - **TLS (v4-6) traps.** `tests/helpers.startDaemon` defaults to `security: { mode: "plaintext" }` because production defaults to TLS and the fixed 4778 port would collide across dozens of parallel test daemons; a TLS suite opts in with an explicit `security` block. **Any script that writes its own scratch `config.yml` must also declare `security.mode: plaintext`** — the release smoke and `scripts/sim-hosts.sh` did not and died on `EADDRINUSE 0.0.0.0:4778` whenever a real Root was running (`tests/scratch-configs.test.ts` now guards both). `setDefaultCACertificates`/`applyCa` are **process-wide and additive** — a same-file test that trusts a CA makes a later "untrusted peer" test pass for the wrong reason, so the fail-closed check lives in its own file (`tests/tls-untrusted.test.ts`) and the child-link test in `tests/tls-child.test.ts`. Daemon-to-daemon links use `wss://` only when `tlsContext.network` is true (a real network CA is enrolled, not the temporary local CA a child falls back to when its Root is unreachable). `createTlsServer` reads the leaf through `tls.current()` and swaps it via `setSecureContext` on `onRenew`; a keep-alive client reuses the old socket, so renewal tests use `keepAlive: false`. `node-forge` 1.x has **no EC keygen** — leaves are RSA-2048. A `POST /api/tls/leaf` is the only way a child gets a leaf; it is Root-only and token-authed over TLS.
 - **Leaf lifecycle (v4-6 §5 B).** A leaf is valid 90 days; `ensureLeaf` reissues when it is inside `LEAF_RENEW_BEFORE_MS` (21 days) **or** the SAN set changed, and a running Daemon checks every `timing.leafCheckIntervalMs` (6 h prod, tunable in tests) and renews in place (write-through to disk + `setSecureContext`). A child with no CA key renews by asking the Root; if the Root is unreachable the tick retries and the not-yet-expired leaf keeps serving. Do not shorten validity or remove the renewal path — fail-closed means an expired fleet has no rescue.
 - **SAN coverage is exact.** `sanCovers()` compares whole `subjectAltName` entries. A substring test let `127.0.0.1` "cover" `127.0.0.10` and `desk` cover `desk.example`, which kept a stale leaf and made the new name fail closed with `ERR_TLS_CERT_ALTNAME_INVALID`.
-- **Per-peer leaf pin.** `security.tls.pins[host:port]` is enforced via `checkServerIdentity` on Daemon-to-Daemon `wss://` (TOFU on first contact, persisted to config); it is separate from the CA fingerprint and must never be compared to it. The CA pin authenticates the trust anchor; the leaf pin catches an unexpected leaf issued under that CA.
+- **Per-peer leaf-key pin.** `security.tls.pins[host:port]` is enforced via `checkServerIdentity` on Daemon-to-Daemon `wss://` (TOFU on first contact, persisted to config); it is separate from the CA fingerprint and must never be compared to it. The CA pin authenticates the trust anchor; the pin catches an unexpected leaf issued under that CA. **The pin names the leaf's public key (SPKI), not its certificate** — a certificate fingerprint changes on every renewal and would reject a Host that merely rotated. Old certificate pins are accepted while that leaf is unchanged and upgraded in place. Clear one with `cafe host pin <host:port> --clear` (hot, `POST /api/tls/pins`).
+- **A custom `checkServerIdentity` disables Node's SAN check.** Node *replaces* the default identity check when the option is supplied; it does not add to it. `trust.ts`'s `pinnedIdentityCheck` runs `tls.checkServerIdentity` first and the pin second — never pass a pin-only function here, or every `wss://` link stops checking SANs (`tests/tls-pinned-san.test.ts` pins the old bug down).
+- **Renewal must keep the leaf key.** `issueLeaf(ca, sans, days, key?)` re-signs the existing key (or an SPKI a child sends in `POST /api/tls/leaf`); `ensureLeaf`, `tlsContext.renew`, and `cafe daemon renew-cert` all pass it. `POST /api/tls/renew` goes through `renew` so the leaf is written through; do not swap only the in-memory leaf.
 - **`Order.variants` (#39)**: delivery-only. `dispatch()` sends `body = variants[agentId] ?? body` with `variants` stripped; do not write per-variant text into `history()` or `order.created`, and do not attach variants to a unicast. The rules split is deliberately narrow (explicit two-clause punctuation only).
 
 ## 9. Working with this user

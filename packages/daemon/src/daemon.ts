@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
-import { checkPeerPin } from "./tls/trust.ts";
+import { pinnedIdentityCheck } from "./tls/trust.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -163,14 +163,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     onRenew(fn: () => void): () => void;
     /**
      * Root only: issue a leaf for a child Host (has the CA key). Absent on a child, which asks the
-     * Root for one over TLS with its token (`POST /api/tls/leaf`).
+     * Root for one over TLS with its token (`POST /api/tls/leaf`). `publicKey` (SPKI PEM) makes a
+     * reissue keep the caller's key, so a peer's pin on that Host still matches.
      */
-    issue?(sans: string[]): Promise<{ cert: string; key: string }>;
+    issue?(sans: string[], publicKey?: string): Promise<{ cert: string; key: string }>;
     /**
      * Reissue this Host's leaf and swap it in (v4-6 §5 B). A long-running Daemon would otherwise
-     * outlive its 90-day leaf and the whole fleet would fail closed at once.
+     * outlive its 90-day leaf and the whole fleet would fail closed at once. The renewal keeps the
+     * existing key (so a peer's pin still matches) and writes through to disk.
      */
-    renew?(): Promise<void>;
+    renew?(sans?: string[]): Promise<void>;
   };
   readonly host: string;
   readonly version: string;
@@ -387,27 +389,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** `ws` client options for a Daemon link: trust exactly the network's CA, never disable verification. */
   private linkOptions(peerAddr?: string): import("ws").ClientOptions {
     if (!this.tlsContext?.network) return {};
-    // Per-peer leaf pin (v4-6 §5 A): the CA pin authenticates the trust anchor; a separate pin per
+    // Per-peer leaf-key pin (v4-6 §5 A): the CA pin authenticates the trust anchor; a separate pin per
     // `host:port` catches an unexpected leaf issued under that CA (a compromised CA key, or the wrong
-    // machine answering on an address). First contact records the leaf; after that a different leaf
-    // is refused, naming both values so a person can verify the change out of band.
+    // machine answering on an address). First contact records the key; after that a different key is
+    // refused, naming both values so a person can verify the change out of band. `pinnedIdentityCheck`
+    // also runs Node's SAN check — a custom `checkServerIdentity` replaces it, it does not add to it.
     const check = peerAddr
-      ? (_host: string, cert: import("node:tls").PeerCertificate): Error | undefined => {
-          if (!cert?.raw) return new Error("the peer did not present a certificate");
-          // Use the same `AA:BB:…` form `checkPeerPin` and `cafe root show` print.
-          const fp = new X509Certificate(cert.raw).fingerprint256;
-          const verdict = checkPeerPin(peerAddr, fp, this.config.security.tls.pins);
-          if (!verdict.ok) return new Error(verdict.reason);
-          if (verdict.firstSeen) this.recordPeerPin(peerAddr, fp);
-          return undefined;
-        }
+      ? pinnedIdentityCheck(
+          peerAddr,
+          () => this.config.security.tls.pins,
+          (peer, keyFingerprint) => this.recordPeerPin(peer, keyFingerprint),
+        )
       : undefined;
     // `ws` types `checkServerIdentity` as Node's older `CertMeta` signature, but it passes the option
     // straight to `tls.connect`, where it receives a `PeerCertificate` (the shape we use).
     return { ca: this.tlsContext.ca, ...(check ? { checkServerIdentity: check as unknown as import("ws").ClientOptions["checkServerIdentity"] } : {}) };
   }
 
-  /** Persist a peer leaf pin learned on first contact (TOFU); later contacts are checked against it. */
+  /** Persist a peer leaf-key pin learned on first contact (TOFU); later contacts are checked against it. */
   private recordPeerPin(peer: string, fingerprint: string): void {
     if (this.config.security.tls.pins[peer] === fingerprint) return;
     this.config.security.tls.pins[peer] = fingerprint;

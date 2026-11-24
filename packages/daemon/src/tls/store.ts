@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
 import { join } from "node:path";
-import { fingerprintOf, generateCa, issueLeaf, sanCovers, sanList, type CertPair } from "./certs.ts";
+import { fingerprintOf, generateCa, issueLeaf, publicKeyOf, sanCovers, sanList, type CertPair } from "./certs.ts";
 
 /**
  * A child Host's leaf: read `CAFE_HOME/tls/<host>.crt` + `.key`, or write a leaf the Root issued.
@@ -123,7 +123,7 @@ export async function ensureLeaf(
   host: string,
   ca: CertPair,
   sansInput: { host: string; advertise?: string; lan?: string },
-  opts: { fetchLeaf?: () => Promise<{ cert: string; key: string }> } = {},
+  opts: { fetchLeaf?: (sans: string[], publicKey?: string) => Promise<{ cert: string; key: string }> } = {},
 ): Promise<TlsContext> {
   const sans = sanList(sansInput);
   const existing = readLeaf(home, host);
@@ -138,10 +138,15 @@ export async function ensureLeaf(
   }
   let leaf: { cert: string; key: string };
   if (ca.key) {
-    leaf = await issueLeaf(ca, sans);
+    // Reissue for the existing key so the leaf's identity (which a peer may have pinned) survives.
+    leaf = await issueLeaf(ca, sans, 90, existing?.key);
   } else if (opts.fetchLeaf) {
-    // A child Host never holds the CA key: the Root issues the leaf over TLS with our token.
-    leaf = await opts.fetchLeaf();
+    // A child Host never holds the CA key: the Root issues the leaf over TLS with our token, for the
+    // public key the child already has so its identity is unchanged. A first issuance (no existing
+    // key) comes back with a generated key.
+    const fetched = await opts.fetchLeaf(sans, publicKeyOf(existing?.cert));
+    leaf = { cert: fetched.cert, key: fetched.key || existing?.key || "" };
+    if (!leaf.key) throw new Error(`the Root returned a leaf for ${host} without a private key and no local key exists`);
   } else {
     throw new Error(`no leaf for ${host} and this Host cannot issue one (no CA key); run \`cafe daemon renew-cert\``);
   }

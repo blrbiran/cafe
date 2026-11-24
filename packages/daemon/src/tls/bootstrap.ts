@@ -142,9 +142,13 @@ export async function fetchRootCa(root: string, expected: string | undefined, to
  * Request this Host's leaf from the Root (a child with the network token but no CA key). A dedicated
  * `https` request with `ca` is deliberate: it verifies against the enrolled CA without depending on
  * the process-wide default trust store, which several Daemons in one process would otherwise share.
+ *
+ * `publicKey` (SPKI PEM) is the key the child already uses. Sending it makes a reissue keep the
+ * child's identity, so peers that pinned this Host's leaf keep accepting it (v4-6 §5 A/B). With no
+ * `publicKey` this is a first issuance and the Root generates a key pair.
  */
-export function fetchLeafFromRoot(root: string, caPem: string, token: string, sans: string[]): Promise<{ cert: string; key: string }> {
-  const payload = JSON.stringify({ sans });
+export function fetchLeafFromRoot(root: string, caPem: string, token: string, sans: string[], publicKey?: string): Promise<{ cert: string; key: string }> {
+  const payload = JSON.stringify({ sans, ...(publicKey ? { publicKey } : {}) });
   return new Promise((resolve, reject) => {
     const req = request(
       {

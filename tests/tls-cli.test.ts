@@ -81,6 +81,36 @@ describe("cafe connect --ca-fingerprint", () => {
   });
 });
 
+describe("cafe host pin", () => {
+  it("lists the pins currently recorded", () => {
+    const h = home();
+    writeFileSync(
+      join(h, "config.yml"),
+      `host: desk\nport: 47821\ntoken: t0k\nsecurity:\n  mode: tls\n  tls:\n    port: 47822\n    pins:\n      "hub:4778": "AA:BB"\n`,
+    );
+    const r = cafe(h, "host", "pin");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("hub:4778");
+    expect(r.stdout).toContain("AA:BB");
+  });
+
+  it("clears one peer's pin with --clear, so a reinstalled Host can be re-pinned", async () => {
+    const h = home();
+    writeFileSync(
+      join(h, "config.yml"),
+      `host: desk\nport: 47821\ntoken: t0k\nsecurity:\n  mode: tls\n  tls:\n    port: 47822\n    pins:\n      "hub:4778": "AA:BB"\n      "other:4778": "CC:DD"\n`,
+    );
+    const r = cafe(h, "host", "pin", "hub:4778", "--clear");
+    expect(r.status).toBe(0);
+    const cfg = parse(readFileSync(join(h, "config.yml"), "utf8"));
+    expect(readTlsConfig(cfg).pins).toEqual({ "other:4778": "CC:DD" });
+    // The reason `checkPeerPin` gives must name a command that actually exists.
+    const { checkPeerPin } = await import("../packages/daemon/src/tls/trust.ts");
+    const reason = checkPeerPin("hub:4778", { keyFingerprint: "11:22" }, { "hub:4778": "AA:BB" }).reason ?? "";
+    expect(reason).toMatch(/cafe host pin/);
+  });
+});
+
 describe("cafe daemon renew-cert", () => {
   it("reissues the leaf from the CA without asking for the Root's key on a child", () => {
     const h = home();

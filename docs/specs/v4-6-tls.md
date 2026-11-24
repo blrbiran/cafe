@@ -265,3 +265,39 @@ were closed on 2026-11-24 night, each with a test that failed first:
 
 Still phase 2: mutual TLS (client certs per peer) and ECDSA leaves
 (`node-forge` 1.x has no EC keygen).
+
+### 10.1 Follow-up (2026-11-24, same day): rotation × pin, and the SAN gap
+
+The three fixes above interacted in ways that would only show up in a real
+rolling network. Four defects were found by reading the code and confirmed with
+thrown-away experiments before any test was written:
+
+1. **The custom `checkServerIdentity` disabled SAN verification.** Node
+   *replaces* the default identity check when this option is supplied; it does
+   not run both. The pin checker therefore made every Daemon-to-Daemon `wss://`
+   link skip SAN verification — a leaf for `somewhere.invalid` was accepted when
+   dialling `127.0.0.1`, undoing the exact-SAN fix above. `pinnedIdentityCheck`
+   now calls Node's `tls.checkServerIdentity` first and the pin second.
+   `tests/tls-pinned-san.test.ts` (which also pins the old behaviour down as the
+   regression).
+2. **Renewal changed the leaf key, so pins would reject the fleet on rotation.**
+   `issueLeaf` always generated a new RSA key pair; the pin named the whole
+   certificate, so the first renewal (start window, 6 h tick, or `renew-cert`)
+   made every pinned peer refuse. `issueLeaf(ca, sans, days, key?)` now re-signs
+   the existing key (or an SPKI sent by a child), and `ensureLeaf` / `renew` /
+   `POST /api/tls/leaf` all pass it through. `tests/tls-key-continuity.test.ts`,
+   `tests/tls-renewal-keeps-key.test.ts`.
+3. **Pins now name the key (SPKI), not the certificate.** Certificate
+   fingerprints change on every renewal; the key does not. Old certificate pins
+   are still accepted while that leaf is unchanged and are **upgraded in place**
+   to the key pin on that connection (`checkPeerPin` returns `upgrade`), so an
+   upgrade never locks a network out. `certs.ts`: `keyFingerprintOf`; `trust.ts`:
+   `checkPeerPin`, `pinnedIdentityCheck`.
+4. **`POST /api/tls/renew` did not write the leaf to disk.** It swapped memory
+   only, so the next restart served the stale (possibly expiring) leaf again. It
+   now goes through `tlsContext.renew`, which writes through. The printed
+   fingerprint is still the certificate's.
+
+A pin that genuinely changed (a reinstalled Host) is cleared with
+**`cafe host pin <host:port> --clear`** — the refusal message used to name
+`cafe connect … --reset-pin`, which never existed. `tests/tls-cli.test.ts`.

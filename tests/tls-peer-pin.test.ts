@@ -44,8 +44,13 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     const saved = (await import("yaml")).parse(readFileSync(join(childHome, "config.yml"), "utf8"));
     const pin = saved.security?.tls?.pins?.[rootAddr];
     expect(pin, "the child should pin the Root's leaf on first contact").toBeTruthy();
-    // The pin names the leaf the Root actually serves (not the CA).
+    // The pin is the leaf's **key** fingerprint, so a renewal (same key, new certificate) keeps it.
+    const { keyFingerprintOf } = await import("../packages/daemon/src/tls/certs.ts");
+    const served = readFileSync(join(rootHome, "tls", "pinroot.crt"), "utf8");
     expect(pin).toMatch(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
+    expect(pin).toBe(keyFingerprintOf(served));
+    // And it is not the certificate fingerprint, which changes on every renewal.
+    expect(pin).not.toBe(new X509Certificate(served).fingerprint256);
   }, 40_000);
 
   it("refuses a peer whose leaf does not match the stored pin", async () => {
@@ -66,5 +71,60 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     // Give the child several reconnect attempts; it must never come online.
     await new Promise((r) => setTimeout(r, 2_500));
     expect(child.daemon.rootOnline).toBe(false);
+  }, 40_000);
+
+  it("keeps the link up across a real renewal of the Root's leaf", async () => {
+    // The whole point of the key pin: a renewal reshapes the certificate but not the key, so the
+    // child's pin still matches and the live link (and the next reconnect) keep working.
+    const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-renew-root-"));
+    const childHome = mkdtempSync(join(tmpdir(), "cafe-pin-renew-child-"));
+    cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
+    const root = await startDaemon("pinrenewroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
+    const child = await startDaemon("pinrenewchild", {
+      home: childHome,
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0 } } },
+    });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline, 10_000);
+    const before = readFileSync(join(rootHome, "tls", "pinrenewroot.crt"), "utf8");
+
+    // Renew the Root's served leaf the way the timer would.
+    await root.daemon.tlsContext!.renew!();
+    const after = readFileSync(join(rootHome, "tls", "pinrenewroot.crt"), "utf8");
+    expect(after).not.toBe(before);
+
+    // Force a fresh dial: re-point at the same Root, which drops the uplink and reconnects through the pin.
+    child.daemon.setRoot(rootAddr);
+    await waitFor(() => child.daemon.rootOnline, 10_000);
+    expect(child.daemon.rootOnline).toBe(true);
+  }, 40_000);
+
+  it("forgets a pin on request so a reinstalled Host can be trusted again", async () => {
+    const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-clear-root-"));
+    const childHome = mkdtempSync(join(tmpdir(), "cafe-pin-clear-child-"));
+    cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
+    const root = await startDaemon("pinclearroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
+    const child = await startDaemon("pinclearchild", {
+      home: childHome,
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0 } } },
+    });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline, 10_000);
+    expect(child.daemon.config.security.tls.pins[rootAddr]).toBeTruthy();
+
+    const res = await fetch(`http://${child.addr}/api/tls/pins`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer: rootAddr, clear: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(child.daemon.config.security.tls.pins[rootAddr]).toBeUndefined();
+    // Persisted: the running config and config.yml agree.
+    const saved = (await import("yaml")).parse(readFileSync(join(childHome, "config.yml"), "utf8"));
+    expect(saved.security?.tls?.pins?.[rootAddr]).toBeUndefined();
   }, 40_000);
 });

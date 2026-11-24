@@ -916,6 +916,37 @@ host
     out(`${rec.host}: ${rec.url || "(no address)"}`, rec);
   });
 
+host
+  .command("pin")
+  .argument("[peer]")
+  .description("list the per-peer leaf-key pins another Host is held to (host:port); with --clear, forget one")
+  .option("--clear", "forget this peer's pin so the next connection pins its current key (TOFU again)")
+  .action(async (peer: string | undefined, o: { clear?: boolean }) => {
+    const pins = loadConfig().security.tls.pins;
+    if (!peer) {
+      const rows = Object.entries(pins);
+      out(rows.length ? rows.map(([k, v]) => `${k}  ${v}`).join("\n") : "(no peer pins yet; each is recorded on first contact)", rows);
+      if (o.clear) throw new Error("name the peer to clear (e.g. cafe host pin hub:4778 --clear)");
+      return;
+    }
+    if (!o.clear) {
+      const v = pins[peer];
+      out(v ? `${peer}  ${v}` : `${peer} is not pinned`, { peer, pin: v ?? null });
+      return;
+    }
+    // A running daemon reads the pins from its own config object, so it must clear them in memory too;
+    // otherwise the next connection would still compare against the stale pin until a restart.
+    if (await healthy()) {
+      await api("/api/tls/pins", { method: "POST", body: JSON.stringify({ peer, clear: true }) });
+    }
+    if (peer in pins) {
+      const next = loadConfig();
+      delete next.security.tls.pins[peer];
+      saveConfig(next, cafeHome());
+    }
+    out(`cleared the pin for ${peer}; the next connection pins its current key`, { peer, cleared: true });
+  });
+
 const agent = program.command("agent").description("display names and aliases for Agents (agentId and Address stay stable)");
 agent
   .command("rename")

@@ -5,7 +5,7 @@
  * needs forge when it first issues its own leaf. `CafeClient` and `server.ts` use Node's built-in
  * `node:tls` / `node:https` — forge never runs on the hot path.
  */
-import { X509Certificate } from "node:crypto";
+import { X509Certificate, createHash } from "node:crypto";
 
 export interface CertPair {
   /** PEM certificate. */
@@ -21,7 +21,41 @@ export function fingerprintOf(certPem: string): string {
   return new X509Certificate(certPem).fingerprint256;
 }
 
+/**
+ * The certificate's public key as SPKI PEM, or "" for input that is not a certificate. This is what
+ * a renewal carries so the leaf keeps its identity: the key is what a peer's pin names, and it
+ * outlives any single certificate.
+ */
+export function publicKeyOf(certPem: string | undefined): string | undefined {
+  if (!certPem) return undefined;
+  try {
+    return new X509Certificate(certPem).publicKey.export({ type: "spki", format: "pem" }).toString();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The stable identity of a leaf: SHA-256 over its SPKI, in Node's `AA:BB:…` form. A renewal keeps
+ * this value; the certificate fingerprint changes. Per-peer pins name this, so rotation is invisible
+ * to a peer that already trusts the Host.
+ */
+export function keyFingerprintOf(certPem: string): string {
+  return spkiFingerprint(new X509Certificate(certPem).publicKey.export({ type: "spki", format: "der" }));
+}
+
+/** `keyFingerprintOf` from a certificate's DER (`PeerCertificate.raw` in a TLS callback). */
+export function keyFingerprintFromRaw(certDer: Buffer): string {
+  return spkiFingerprint(new X509Certificate(certDer).publicKey.export({ type: "spki", format: "der" }));
+}
+
+function spkiFingerprint(spkiDer: Buffer): string {
+  return createHash("sha256").update(spkiDer).digest("hex").toUpperCase().match(/.{1,2}/g)!.join(":");
+}
+
 type Forge = typeof import("node-forge");
+/** A forge public key (`pki.rsa.setPublicKey(...)` / `pki.publicKeyFromPem(...)`). */
+type ForgeKey = ReturnType<Forge["pki"]["publicKeyFromPem"]>;
 
 async function forge(): Promise<Forge> {
   try {
@@ -115,16 +149,36 @@ export function sanCovers(certPem: string, name: string): boolean {
  * boundaries), 90-day validity by default, signed by the CA. SANs are DNS and IP entries as the
  * names require.
  *
+ * `key` is the leaf's existing private key (PEM) or public key (SPKI PEM) when a **renewal** must
+ * keep its identity: a fresh key would change what the per-peer pin names, and every peer that
+ * already pinned this Host would refuse the renewed leaf — fail-closed, so there is no rescue
+ * (v4-6 §5 A/B). With no `key`, this is a first issuance and a new key pair is generated.
+ *
  * RSA costs ~23% more handshake CPU than ECDSA P-256 (spec §2), which is paid once per connection
  * and per reconnect; cafe keeps one long-lived WebSocket, so steady-state cost is unchanged.
  */
-export async function issueLeaf(ca: CertPair, sans: string[], days = 90): Promise<CertPair> {
+export async function issueLeaf(ca: CertPair, sans: string[], days = 90, key?: string): Promise<CertPair> {
   const { pki, md } = await forge();
   const caCert = pki.certificateFromPem(ca.cert);
   const caKey = pki.privateKeyFromPem(ca.key);
-  const keys = pki.rsa.generateKeyPair(2048);
+  // A private key is re-used as-is; a public key (SPKI) only signs the certificate, so the caller
+  // keeps the private half. No key at all means first issuance.
+  let publicKey: ForgeKey;
+  let privateKeyPem: string;
+  if (key?.includes("PRIVATE KEY")) {
+    const priv = pki.privateKeyFromPem(key);
+    publicKey = pki.rsa.setPublicKey(priv.n, priv.e);
+    privateKeyPem = key;
+  } else if (key) {
+    publicKey = pki.publicKeyFromPem(key);
+    privateKeyPem = "";
+  } else {
+    const keys = pki.rsa.generateKeyPair(2048);
+    publicKey = keys.publicKey;
+    privateKeyPem = pki.privateKeyToPem(keys.privateKey);
+  }
   const cert = pki.createCertificate();
-  cert.publicKey = keys.publicKey;
+  cert.publicKey = publicKey;
   cert.serialNumber = randomSerial();
   cert.validity.notBefore = new Date(Date.now() - 60_000);
   cert.validity.notAfter = new Date(Date.now() + days * 86_400_000);
@@ -138,5 +192,5 @@ export async function issueLeaf(ca: CertPair, sans: string[], days = 90): Promis
   ]);
   cert.sign(caKey, md.sha256.create());
   const certPem = pki.certificateToPem(cert);
-  return { cert: certPem, key: pki.privateKeyToPem(keys.privateKey), fingerprint256: fingerprintOf(certPem) };
+  return { cert: certPem, key: privateKeyPem, fingerprint256: fingerprintOf(certPem) };
 }
