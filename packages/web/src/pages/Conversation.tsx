@@ -77,6 +77,16 @@ function turnOutcome(t: Dict, turn: Turn, active: boolean, agents: Record<string
   return { tone: "danger", text: t.noAnswer };
 }
 
+/**
+ * The outcome text of a turn. Only this ticks every second while the turn is working, so a long
+ * conversation is not re-rendered each second just to advance one duration (#33).
+ */
+function OutcomeText({ turn, active, agents, meta }: { turn: Turn; active: boolean; agents: Record<string, AgentRecord>; meta: ThreadMeta }) {
+  const t = useT();
+  const now = useNow(active ? 1_000 : 30_000);
+  return <>{turnOutcome(t, turn, active, agents, meta, now).text}</>;
+}
+
 function clockOf(at: number): string {
   return new Date(at).toLocaleTimeString([], { hour12: false });
 }
@@ -87,7 +97,8 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   const agents = useStore((s) => s.agents);
   const threadStatus = detail?.meta.status ?? "";
   const threadActive = isActive(threadStatus);
-  const now = useNow(threadActive ? 1_000 : 30_000);
+  // Relative times ("3 min ago") only; live durations tick in <OutcomeText>.
+  const now = useNow(30_000);
   const [showLog, setShowLog] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>();
@@ -124,7 +135,9 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   const { meta } = detail;
   const first = turns[0];
   const last = turns.at(-1);
-  const lastOutcome = last ? turnOutcome(t, last, threadActive, agents, meta, now) : undefined;
+  // The tone does not depend on the clock; the text ticks on its own in <OutcomeText>.
+  const lastTone = last ? turnOutcome(t, last, threadActive, agents, meta, now).tone : undefined;
+  const lastOutcome = last ? <OutcomeText turn={last} active={threadActive} agents={agents} meta={meta} /> : undefined;
   const participants = [...new Set([meta.from.address, ...turns.flatMap((turn) => turn.replies.map((r) => whoAddress(r.agentId, agents, meta)))])];
   const routerText = last?.decision ? (t.router[last.decision.router] ?? last.decision.router) : "—";
 
@@ -146,7 +159,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
         <div className="thread-summary well grid grid-cols-2 gap-x-4 gap-y-2 px-3 py-2.5 text-xs min-[900px]:grid-cols-4">
           <div>
             <div className="cap">{t.ctxStatus}</div>
-            <div className="text-fg-strong">{lastOutcome?.text ?? t.loading}</div>
+            <div className="text-fg-strong">{lastOutcome ?? t.loading}</div>
           </div>
           <div>
             <div className="cap">{t.ctxPeople}</div>
@@ -202,7 +215,9 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
               )}
               <AttachmentList items={turn.order?.attachments} />
               <div className="flex flex-wrap items-center gap-2.5">
-                <Pill tone={o.tone}>{o.text}</Pill>
+                <Pill tone={o.tone}>
+                  <OutcomeText turn={turn} active={active} agents={agents} meta={meta} />
+                </Pill>
                 {active && (
                   <button type="button" className="btn-sm btn-danger" aria-busy={busy} onClick={() => void stop()}>
                     {t.stopWaiting}
@@ -259,7 +274,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
     <aside className="thread-rail" aria-label={t.navFeed}>
       <div className="card flex flex-col gap-1.5 p-3 text-xs">
         <div className="cap">{t.ctxStatus}</div>
-        <div className="text-fg-strong">{lastOutcome?.text ?? "—"}</div>
+        <div className="text-fg-strong">{lastOutcome ?? "—"}</div>
         <div className="text-muted">
           {t.ctxRouter}: {routerText}
         </div>
@@ -290,7 +305,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
             <div className="mono truncate text-[11px] text-muted">{meta.threadId}</div>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            {lastOutcome && <Pill tone={lastOutcome.tone}>{lastOutcome.text}</Pill>}
+            {lastOutcome && <Pill tone={lastTone}>{lastOutcome}</Pill>}
             <button type="button" className="btn-sm whitespace-nowrap max-md:hidden" onClick={copy}>
               {copied ? t.copied : t.copyId}
             </button>

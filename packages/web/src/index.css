@@ -110,7 +110,13 @@
   &[data-dot="ok"] { background: var(--ok); opacity: 1; }
   &[data-dot="warn"] { background: var(--warn); opacity: 1; }
   &[data-dot="danger"] { background: var(--danger); opacity: 1; }
-  &[data-dot="info"] { background: var(--info); opacity: 1; animation: dot-pulse 1.6s infinite; }
+  /* The pulse is a ring scaled and faded on the compositor; animating box-shadow repainted every frame (#33). */
+  &[data-dot="info"] { background: var(--info); opacity: 1; position: relative; }
+  &[data-dot="info"]::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
+    background: color-mix(in srgb, var(--info) 55%, transparent); will-change: transform, opacity;
+    animation: dot-pulse 1.6s infinite;
+  }
 }
 @utility card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
 @utility card-live { border-color: color-mix(in srgb, var(--info) 40%, var(--border)); }

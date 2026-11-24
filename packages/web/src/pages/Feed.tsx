@@ -105,7 +105,8 @@ export function FeedPage({ filter }: { filter: Filter }) {
 
 function SearchResults({ filter }: { filter: Filter }) {
   const t = useT();
-  const now = useNow();
+  // Relative times only ("3 min ago"); a 1 s tick re-rendered every result (#33).
+  const now = useNow(30_000);
   const agents = useStore((s) => s.agents);
   const search = useStore((s) => s.search);
   const q = search.q.trim();

@@ -47,6 +47,13 @@ function tagClass(type: string): string {
   return "text-muted bg-well border-line-strong";
 }
 
+/** "Synced 3 s ago": ticks every second on its own, so the event list does not re-render with it (#33). */
+function SyncedAgo({ latest }: { latest: number | undefined }) {
+  const t = useT();
+  const now = useNow(1_000);
+  return <>{t.liveSynced(latest ? ago(t, latest, now) : t.justNow)}</>;
+}
+
 export function LivePage() {
   const t = useT();
   const events = useStore((s) => s.events);
@@ -56,7 +63,6 @@ export function LivePage() {
   const [failedOnly, setFailedOnly] = useState(false);
   const [paused, setPaused] = useState(false);
   const [frozen, setFrozen] = useState<ThreadEnvelope[]>([]);
-  const now = useNow(1_000);
 
   const shown = paused ? frozen : events;
   const rows = shown.filter((e) => (!host || e.host === host) && (!failedOnly || FAILED.has(e.event.type)));
@@ -89,7 +95,7 @@ export function LivePage() {
         <div className="grow" />
         <span className="hint flex items-center gap-1.5">
           <span className="dot" data-dot={paused ? undefined : "ok"} />
-          {t.liveSynced(latest ? ago(t, latest, now) : t.justNow)}
+          <SyncedAgo latest={latest} />
         </span>
         <button type="button" className="btn-sm" onClick={togglePause}>
           {paused ? t.liveResume : t.livePause}
