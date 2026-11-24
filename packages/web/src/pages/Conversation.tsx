@@ -143,7 +143,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   const main = (
     <div className="thread-main flex flex-col gap-5">
       {drawer && (
-        <div className="well grid grid-cols-2 gap-x-4 gap-y-2 px-3 py-2.5 text-xs min-[900px]:grid-cols-4">
+        <div className="thread-summary well grid grid-cols-2 gap-x-4 gap-y-2 px-3 py-2.5 text-xs min-[900px]:grid-cols-4">
           <div>
             <div className="cap">{t.ctxStatus}</div>
             <div className="text-fg-strong">{lastOutcome?.text ?? t.loading}</div>
@@ -251,6 +251,10 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
     </div>
   );
 
+  // Wide screens show the rail (status, people, router, turns) beside the thread. The thread summary
+// grid in the body carries the same four facts and is hidden at ≥1920 px (`.thread-summary` in
+// index.css), so nothing is rendered twice (#64). The thread id stays in the header and the
+// delivery log in the body's disclosure; the rail does not repeat them.
   const rail = (
     <aside className="thread-rail" aria-label={t.navFeed}>
       <div className="card flex flex-col gap-1.5 p-3 text-xs">
@@ -270,17 +274,6 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
             {p}
           </div>
         ))}
-      </div>
-      <div className="card flex flex-col gap-1 p-3 text-xs">
-        <div className="cap">{t.ctxThread}</div>
-        <div className="mono break-all">{meta.threadId}</div>
-        <button type="button" className="btn-sm mt-1" onClick={copy}>
-          {copied ? t.copied : t.copyId}
-        </button>
-      </div>
-      <div className="card flex flex-col gap-1.5 p-3 text-xs">
-        <div className="cap">{t.ctxLog}</div>
-        <DeliveryLog events={events.slice(-12)} meta={meta} />
       </div>
     </aside>
   );

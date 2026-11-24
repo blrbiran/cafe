@@ -205,6 +205,9 @@
 @media (min-width: 1920px) {
   .thread-body { display: grid; grid-template-columns: minmax(0, 1fr) 260px; justify-content: center; gap: 24px; align-items: start; }
   .thread-main { width: 100%; max-width: none; margin: 0; }
+  /* The rail repeats status / people / turns / routing; hide the body's summary grid so the same
+     facts are not on screen twice (#64). */
+  .thread-summary { display: none; }
   .thread-rail { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 0; }
 }
 /* Feed gets two columns on very wide screens, but only while the drawer is closed. */
