@@ -309,9 +309,9 @@ describe("cafe connector CLI", () => {
         'process.stdout.write(JSON.stringify({ type: "hello", crashedBefore: existsSync(marker) }) + "\\n");',
         "if (!existsSync(marker)) { writeFileSync(marker, \"1\"); process.stderr.write(\"first run fails on purpose\\n\"); process.exit(1); }",
         'const beat = () => process.stdout.write(JSON.stringify({ type: "heartbeat", at: Date.now(), ok: true }) + "\\n");',
-        "beat();",
-        "const timer = setInterval(beat, 150);",
-        'process.on("SIGTERM", () => { clearInterval(timer); process.exit(0); });',
+        // The restarted child says hello at once but only beats 1.2 s later, so a test that reads the
+        // log the instant `restarts: 1` appears races the first heartbeat write (#78, same class as #57).
+"setTimeout(() => { beat(); setInterval(beat, 150); }, 1_200);",
       ].join("\n"),
     );
     return dir;
@@ -407,6 +407,12 @@ describe("cafe connector CLI", () => {
       }, 8_000);
       const status = await cli(home, ["connector", "status", "crasher"]);
       expect(status.stdout).toContain("running");
+      // `restarts: 1` only means the supervisor relaunched the child; the restarted process says
+      // hello first and beats later. Read the log after the heartbeat, not the instant of restart (#78).
+      await waitFor(async () => {
+        const l = await cli(home, ["connector", "logs", "crasher"]);
+        return l.stdout.includes('"type":"heartbeat"');
+      }, 5_000);
       const logs = await cli(home, ["connector", "logs", "crasher"]);
       expect(logs.stdout).toContain('"type":"heartbeat"');
     } finally {

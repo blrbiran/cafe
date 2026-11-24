@@ -10,7 +10,9 @@ TOKEN=simtoken0123456789
 cafe() { node "$REPO/packages/cli/bin/cafe.js" "$@"; }
 mk() { # name port extra
   mkdir -p "$W/$1"
-  printf 'port: %s\nhost: %s\nadvertise: 127.0.0.1\ntoken: %s\ndiscovery: false\n%s' "$2" "$1" "$TOKEN" "$3" > "$W/$1/config.yml"
+  # Tests and local simulations use plaintext: the production default is TLS on a fixed port
+  # (4778), and these scratch Daemons must not fight the real Root or each other for it.
+  printf 'port: %s\nhost: %s\nadvertise: 127.0.0.1\ntoken: %s\ndiscovery: false\nsecurity:\n  mode: plaintext\n%s' "$2" "$1" "$TOKEN" "$3" > "$W/$1/config.yml"
 }
 mk A 47831 $'mode: root\n'
 mk B 47832 $'root: 127.0.0.1:47831\n'

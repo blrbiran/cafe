@@ -76,7 +76,7 @@ try {
   mkdirSync(home);
   mkdirSync(fakeHome);
   const port = await freePort();
-  writeFileSync(join(home, "config.yml"), `port: ${port}\nhost: release-test\nmode: root\ndiscovery: false\n${withOptional ? "router:\n  model: none/none\n" : ""}`);
+  writeFileSync(join(home, "config.yml"), `port: ${port}\nhost: release-test\nmode: root\ndiscovery: false\nsecurity:\n  mode: plaintext\n${withOptional ? "router:\n  model: none/none\n" : ""}`);
   const codexState = join(work, "codex-state");
   mkdirSync(codexState);
   // The fake `codex app-server` from the tests: exercises the native Codex Barista without a model.
