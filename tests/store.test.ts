@@ -90,6 +90,30 @@ describe("Store", () => {
     expect(store.findLastEvent(file, () => false)).toBeUndefined();
   });
 
+  // #90: a 64 KiB read boundary can split a multi-byte character; every phase must decode intact.
+  it("keeps CJK and emoji text intact whatever byte the read boundary falls on", () => {
+    const home = temp();
+    const store = new Store(home);
+    const text = (i: number) => `第${i}轮：根因在字节切分🙂。`.repeat(1 + (i % 7));
+    const reply = (i: number) =>
+      JSON.stringify({ eventId: `E${i}`, threadId: "T", orderId: "O", host: "h", at: i, event: { type: "order.replied", agentId: "A", text: text(i), final: false } });
+    let bad = 0;
+    for (let pad = 0; pad < 64; pad++) {
+      const file = join(home, "sessions", `utf8-${pad}.jsonl`);
+      const body = Array.from({ length: 900 }, (_, i) => reply(i)).join("\n") + "\n";
+      writeFileSync(file, "x".repeat(pad) + "\n" + body);
+      const check = (envs: ThreadEnvelope[]) => {
+        for (const e of envs) if (e.event.type === "order.replied" && e.event.text !== text(e.at)) bad++;
+      };
+      check(store.readEventsSince(file, 0));
+      check(store.readEventsPage(file, 900).events);
+      check(store.readOrderEvents(file, "O"));
+      const hit = store.findLastEvent(file, (e) => e.at === 3);
+      if (hit) check([hit]);
+    }
+    expect(bad).toBe(0);
+  });
+
   it("returns only unfinished threads for recovery", () => {
     const store = new Store(temp());
     const meta = (id: string, status: ThreadMeta["status"]): ThreadMeta => ({

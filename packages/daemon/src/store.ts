@@ -289,13 +289,16 @@ export class Store {
       const size = fstatSync(fd).size;
       const chunk = 64 * 1024;
       let pos = size;
-      // The first line of a backwards chunk can be cut in half; carry it into the next (earlier) read.
-      let carry = "";
-      const take = (line: string): boolean => {
-        if (!line) return false;
+      // The first line of a backwards chunk can be cut in half; carry its bytes into the next (earlier)
+      // read. Lines are split on the 0x0A byte and decoded whole: a chunk boundary can fall inside a
+      // multi-byte UTF-8 character, and decoding a chunk before joining would turn it into U+FFFD (#90).
+      // 0x0A never occurs inside a multi-byte sequence, so splitting the raw bytes is safe.
+      let carry: Buffer = Buffer.alloc(0);
+      const take = (line: Buffer): boolean => {
+        if (!line.length) return false;
         let env: ThreadEnvelope;
         try {
-          env = JSON.parse(line) as ThreadEnvelope;
+          env = JSON.parse(line.toString("utf8")) as ThreadEnvelope;
         } catch {
           return false;
         }
@@ -306,12 +309,18 @@ export class Store {
         pos -= len;
         const b = Buffer.allocUnsafe(len);
         readSync(fd, b, 0, len, pos);
-        const lines = (b.toString("utf8") + carry).split("\n");
-        // With bytes before this chunk, its first line is incomplete.
-        carry = pos > 0 ? (lines.shift() ?? "") : "";
-        for (let i = lines.length - 1; i >= 0; i--) if (take(lines[i]!)) return;
+        const buf = carry.length ? Buffer.concat([b, carry]) : b;
+        // Walk the lines newest first; `end` is the exclusive end of the current line.
+        let end = buf.length;
+        for (let nl = buf.lastIndexOf(0x0a, end - 1); nl >= 0; nl = buf.lastIndexOf(0x0a, end - 1)) {
+          if (take(buf.subarray(nl + 1, end))) return;
+          end = nl;
+          if (end === 0) break;
+        }
+        // Whatever precedes the first newline is incomplete when there are bytes before this chunk.
+        carry = buf.subarray(0, end);
+        if (pos === 0 && take(carry)) return;
       }
-      if (carry) take(carry);
     } finally {
       closeSync(fd);
     }
