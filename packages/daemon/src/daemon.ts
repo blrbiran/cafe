@@ -358,21 +358,46 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.routerFactory ??
         (async (m: string) =>
           new LlmRouter(await piComplete(m), new RulesRouter(), { timeoutMs: this.config.router.timeoutMs, concurrency: this.config.router.concurrency }));
-      this.router = await build(model);
+      const built = await build(model);
+      // The model was switched while this one loaded (a slow startup load): the newer choice stands.
+      if (this.config.router.model !== model) return { ok: true, router: this.router.name, ...(this.routerModel ? { model: this.routerModel } : {}) };
+      this.router = built;
       this.routerModel = model;
       this.lastRouterError = undefined;
       this.log(`router: llm (${model})`);
       return { ok: true, router: this.router.name, model };
     } catch (err) {
+      if (this.config.router.model !== model) return { ok: true, router: this.router.name, ...(this.routerModel ? { model: this.routerModel } : {}) };
       this.lastRouterError = (err as Error).message;
       this.log(`router: llm unavailable (${this.lastRouterError}); using ${this.router.name}`);
       return { ok: false, router: this.router.name, model, error: this.lastRouterError };
     }
   }
 
+  /** The startup router load, while it runs; routing waits for it so decisions do not change. */
+  private routerLoading?: Promise<unknown>;
+
+  /** Start loading the configured router without waiting for it (daemon startup). */
+  startRouter(): void {
+    const loading = this.initRouter().finally(() => {
+      if (this.routerLoading === loading) this.routerLoading = undefined;
+    });
+    this.routerLoading = loading;
+  }
+
+  /** Wait until the startup router load (if any) has finished. */
+  private async routerReady(): Promise<void> {
+    if (this.routerLoading) await this.routerLoading;
+  }
+
   /** What the router is actually doing now (config may differ from it). */
-  routerStatus(): { router: string; model?: string; error?: string } {
-    return { router: this.router.name, ...(this.routerModel ? { model: this.routerModel } : {}), ...(this.lastRouterError ? { error: this.lastRouterError } : {}) };
+  routerStatus(): { router: string; model?: string; error?: string; routerLoading?: true } {
+    return {
+      router: this.router.name,
+      ...(this.routerModel ? { model: this.routerModel } : {}),
+      ...(this.lastRouterError ? { error: this.lastRouterError } : {}),
+      ...(this.routerLoading ? { routerLoading: true as const } : {}),
+    };
   }
 
   /**
@@ -1221,6 +1246,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         candidates: [],
       };
     }
+    await this.routerReady();
     if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
       try {
         return await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId), broadcast }, 60_000);
@@ -2214,6 +2240,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[]; broadcast?: boolean }) => {
       const cands = x.candidates.map((id) => this.registry.get(id)).filter((r): r is AgentRecord => !!r);
+      await this.routerReady();
       return this.router.decide({ order: x.order, candidates: cands, hints: this.hintsFor(cands), broadcast: x.broadcast });
     });
     this.emitDaemons();
@@ -2838,6 +2865,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
     const configured = this.config.router.model;
     if (!configured) checks.push({ name: "router", level: "ok", detail: "rules (no router.model configured)", next: "cafe config set router.model <provider/model>" });
+    else if (this.routerLoading) checks.push({ name: "router", level: "warn", detail: `loading ${configured}; Orders wait for it`, next: "cafe doctor (again in a moment)" });
     else if (this.router.name !== "llm" || this.routerModel !== configured) {
       checks.push({ name: "router", level: "fail", detail: `configured ${configured}, running ${this.routerModel ?? this.router.name}${this.lastRouterError ? ` (${this.lastRouterError})` : ""}`, next: `cafe router set ${configured}` });
     } else checks.push({ name: "router", level: "ok", detail: `llm (${configured})` });

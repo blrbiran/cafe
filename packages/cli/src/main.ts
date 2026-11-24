@@ -464,7 +464,7 @@ program
     const pending: Array<{ key: string; mode: string }> = cfg?.pending ?? [];
     const lines = [
       `daemon:  ${h.host}${h.isRoot ? " (root)" : ""} at ${base()}, cafe ${h.version}`,
-      `router:  ${h.router}${h.model ? ` (${h.model})` : ""}${h.error ? ` — ${h.error}` : ""}`,
+      `router:  ${h.routerLoading ? "loading (Orders wait for it)" : `${h.router}${h.model ? ` (${h.model})` : ""}`}${h.error ? ` — ${h.error}` : ""}`,
       `root:    ${h.isRoot ? "this machine is the hub" : `${h.root ?? "none"}${h.rootOnline ? " (online)" : " (offline)"}`}`,
       `tls:     ${tlsLine(h.tls)}`,
       `traffic: ${snap.threads.length} recent thread(s), ${snap.agents.length} agent(s), ${snap.daemons.length} machine(s)`,
@@ -706,7 +706,7 @@ daemon
         `advertise: ${loadConfig().advertise ?? "(not set; other machines use lanAddress)"}`,
         `root:      ${s.isRoot ? "self" : loadConfig().root ? `${loadConfig().root} (${s.rootOnline ? "online" : "offline"})` : "mDNS discovery"}`,
         `tls:       ${tlsLine(h.tls)}`,
-        `router:    ${h.router}${h.model ? ` (${h.model})` : ""}`,
+        `router:    ${h.routerLoading ? "loading (Orders wait for it)" : `${h.router}${h.model ? ` (${h.model})` : ""}`}`,
         `agents:    ${s.agents.length} (registry v${s.registryVersion})`,
         `threads:   ${s.threads.length}`,
         ...(pending.length
@@ -1306,7 +1306,7 @@ router
     const running: any = (await healthy()) ? await api("/api/health") : { router: "daemon not running" };
     const lines = [
       `configured: ${c.router.model ? `llm (${c.router.model})` : "rules"}`,
-      `running:    ${running.router}${running.model ? ` (${running.model})` : ""}`,
+      `running:    ${running.routerLoading ? "loading (Orders wait for it)" : `${running.router}${running.model ? ` (${running.model})` : ""}`}`,
       ...(running.error ? [`last error: ${running.error}`] : []),
     ];
     out(lines.join("\n"), { configured: c.router.model ?? null, running });
