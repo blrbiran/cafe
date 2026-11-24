@@ -119,8 +119,50 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - Routing LLM: routing only; the Order text passes through unmodified; rules fallback must work without an LLM. **Per-target variants (#39) only customise the delivered prompt text** — they never change routing, the recorded `body`, or history.
 - **TLS is fail-closed (v4-6).** Never add a plaintext fallback on a handshake error, never disable certificate verification to "make it connect", and keep the CA fingerprint (trust anchor) distinct from the per-peer leaf pin. `security.mode: plaintext` is only ever chosen explicitly by a person.
 - Data safety: nothing is deleted automatically unless the user sets `retention.days`; `cafe prune` is a dry run unless `--yes`.
+- **TLS fail-closed holds on the accepting side too (#89).** With TLS on, a `daemon`/`peer` `initialize` on the plaintext port is refused (`tls_required`); never relax this for "compatibility". The CLI never probes the Root over `http://` with the token while TLS is on.
+- **Discord: one channel = one Thread, until** the channel is quiet for `newThreadAfterHours` (default 6, from the Thread's `lastActivityAt`) or the person sends `/new` (user decision 2026-11-24). Conversation cards show the latest activity time; the title stays the first question.
 
 ## 5. Waiting on the user (start the next session here)
+
+### 2026-11-24 (newest) — Discord 两个问题 + #89 + #31 冷路径（三批，均已提交，未推送）
+
+- **一句话**：用户裁定 Q1=A、Q2=C(6h)、Q3/Q4 同意、Q5 按批 1→2→3，三批都做完，都是先 RED 再修。
+  三个提交：`fix: Discord attachments and conversations …`、`fix(tls): a TLS Daemon refuses plaintext …`、
+  `perf(store): recovery, backfill and closing reads …`（以 `git log --oneline -5` 为准）。**都没推送**。
+- **批 1**：(1) `session-host.ts` 组 prompt 时漏了 `h.attachments`，Claude Code 会话收不到附件路径（Bridge/
+  Codex TUI/pi 都有）；(2) `ThreadMeta.attachments` 现在收集每一轮的附件（按 id 去重，上限 50）；(3) 卡片时间
+  改为 `lastActivityAt`（`format.ts: cardTime`）。**更正上一轮**：根本没有 `updatedAt` 字段，`lastActivityAt`
+  一直有刷新，所以「追问不刷新」是查错了字段；真正的原因是卡片显示创建时间，加上 Discord 一个频道永远对应
+  一个 Thread。(4) Discord：频道空闲 `newThreadAfterHours`（默认 6）后开新 Thread，`/new` 手动开新，`/new <问题>`
+  直接提问（`discord-core.ts: newCommand/currentThread`，空闲时间取 daemon 上的 `lastActivityAt`）。
+- **批 2（#89）**：`server.ts` 把 `req.socket.encrypted` 传给 `Daemon.accept()`；TLS 开启时，明文端口上的
+  `daemon`/`peer` 握手一律拒绝，返回 `tls_required`（文案含 TLS 端口和修复步骤），`ui` 和 Agent 不受影响。
+  Root 记录被拒的机器：`DaemonRecord.refused`、`/api/health.tls.refused`、doctor `tls-links`(fail)；同一台
+  机器之后用 TLS 加入就会清掉。CLI `cafe doctor` 在 TLS 下不再明文带 token 探测 Root，改用 daemon 自己的
+  视角。Network 页显示「未加密，已拒绝」和修复步骤；「在线」加了说明，「测试连接」改为「本机能连到它」（#83 第 4 点）。
+  spec `v4-6-tls.md` §10.4；README / README_zh / SKILL 已同步。隔离实测（TLS Root 4851/4861 + 明文子节点
+  4852）：拒绝、日志、doctor、Web 都正确；子节点切到 TLS 并重启后以 `wss://…:4862` 加入，拒绝标记清掉。
+  截图 `output/playwright/network-refused-1440.png`、`network-refused-390.png`（**待你审核 UI**）。
+- **批 3（#31）**：`Store.scanBackward()` 统一反向读；`readOrderEvents`（recover）、`readEventsSince`
+  （回填窗口和 Root 端去重）、`findLastEvent`（closingEvent）读到需要的就停。子节点记录 `backfillSince`
+  （旧键 `backfill` 照写，回退到旧版本不会崩），只发断线后的窗口（留 10 分钟时钟偏差余量），每批 500 条。
+  10 万事件：全量读 197ms，新读法 0.08–0.17ms。**仍是全量读、决定不改**：短查询（少于 3 字）的搜索回退、
+  一次性的搜索索引回填。`appendEvent` 同步写入维持不改（异步有丢数据风险）。
+- **验证**：typecheck；**490 tests ×2**（471 → 490）；`routing:eval` 67/67；web check + `build:web`；
+  `test:release` 17/17。本机 Root 已重启到新代码，doctor 全绿（`tls-links` ok）；Discord connector 已单独
+  `cafe connector restart discord`（**connector 不会随 daemon 重启**，之前一直跑着批 1 之前的旧代码）。
+- **用户同步问到的 orca#1**：不是残留记录。pid 43364 是一个**后台** Claude Code 会话
+  （父进程 `claude --bg-pty-host /tmp/cc-daemon-501/…`，21:57 启动，cwd `~/code/skills/orca/Orca`），它的
+  `cafe session-host`（pid 44276）也活着。要它下线：接回这个后台会话后退出，或在会话里 `/cafe off`。我没有动它。
+  候选改进：Agents 页显示 pid 或「后台会话」。
+- **台账口径（台账在仓库外，没改）**：#89 可以按判据复核；#31 可以收窄到「同步 append（决定不改）+ 短查询
+  回退」；用户已同意 #16 关闭、#84 放宽判据后关闭、#39 改为观察，请测试者在台账里落状态。
+- **仍需你本人**：审 Network 页两张截图；推送 4 个本地提交并决定是否发版；**ssh1 升级后必须
+  `security.mode: tls` 并重启**，否则会显示「未加密，已拒绝」（发布说明加一句「TLS Root 会拒绝明文子节点」）；
+  Discord 实测：附件私信（Claude Code 会话应能看到路径）、`/new`、隔 6h 的新 Thread、稳态重启去重、回答途中重启。
+- **下一候选**：同机第二个 daemon 的 TLS 端口冲突只报 `EADDRINUSE 0.0.0.0:4778`，提示可以更友好（指向
+  `security.tls.port`）；Agents 页标出后台会话；Web 通过 LAN `http://…?token=` 仍是明文（单独议题）；#33/#34
+  虚拟列表与 snapshot 分页；#18 只读 token（需 spec）；#27、#71–#73（需 brainstorm）；TLS phase 2。
 
 ### 2026-11-24 (latest) — 台账复核后的两批修复：A 批 7 项 + B 批 TLS 入网（#79 #80 #81A）+ #16 回归
 
@@ -781,6 +823,9 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - **Per-peer leaf-key pin.** `security.tls.pins[host:port]` is enforced via `checkServerIdentity` on Daemon-to-Daemon `wss://` (TOFU on first contact, persisted to config); it is separate from the CA fingerprint and must never be compared to it. The CA pin authenticates the trust anchor; the pin catches an unexpected leaf issued under that CA. **The pin names the leaf's public key (SPKI), not its certificate** — a certificate fingerprint changes on every renewal and would reject a Host that merely rotated. Old certificate pins are accepted while that leaf is unchanged and upgraded in place. Clear one with `cafe host pin <host:port> --clear` (hot, `POST /api/tls/pins`).
 - **A custom `checkServerIdentity` disables Node's SAN check.** Node *replaces* the default identity check when the option is supplied; it does not add to it. `trust.ts`'s `pinnedIdentityCheck` runs `tls.checkServerIdentity` first and the pin second — never pass a pin-only function here, or every `wss://` link stops checking SANs (`tests/tls-pinned-san.test.ts` pins the old bug down).
 - **Renewal must keep the leaf key.** `issueLeaf(ca, sans, days, key?)` re-signs the existing key (or an SPKI a child sends in `POST /api/tls/leaf`); `ensureLeaf`, `tlsContext.renew`, and `cafe daemon renew-cert` all pass it. `POST /api/tls/renew` goes through `renew` so the leaf is written through; do not swap only the in-memory leaf.
+- **Connectors survive a daemon restart.** They are detached processes; after changing `packages/connector/**` run `cafe connector restart <name>` too (Discord ran stale code for hours on 2026-11-24).
+- **A second local TLS daemon collides on 4778.** An isolated test daemon on the same machine as the real Root must set `security.tls.port` (only `EADDRINUSE` is printed otherwise).
+- **playwright-cli `goto` to the same URL with a new hash does not reload** the page: after a rebuild, `reload` before taking screenshots.
 - **`Order.variants` (#39)**: delivery-only. `dispatch()` sends `body = variants[agentId] ?? body` with `variants` stripped; do not write per-variant text into `history()` or `order.created`, and do not attach variants to a unicast. The rules split is deliberately narrow (explicit two-clause punctuation only).
 
 ## 9. Working with this user
