@@ -157,7 +157,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
   候选改进：Agents 页显示 pid 或「后台会话」。
 - **台账口径（台账在仓库外，没改）**：#89 可以按判据复核；#31 可以收窄到「同步 append（决定不改）+ 短查询
   回退」；用户已同意 #16 关闭、#84 放宽判据后关闭、#39 改为观察，请测试者在台账里落状态。
-- **仍需你本人**：审 Network 页两张截图；推送 4 个本地提交并决定是否发版；**ssh1 升级后必须
+- **仍需你本人**：审 Network 页两张截图；推送本地提交（`git log origin/main..main`）并决定是否发版；**ssh1 升级后必须
   `security.mode: tls` 并重启**，否则会显示「未加密，已拒绝」（发布说明加一句「TLS Root 会拒绝明文子节点」）；
   Discord 实测：附件私信（Claude Code 会话应能看到路径）、`/new`、隔 6h 的新 Thread、稳态重启去重、回答途中重启。
 - **下一候选**：同机第二个 daemon 的 TLS 端口冲突只报 `EADDRINUSE 0.0.0.0:4778`，提示可以更友好（指向
