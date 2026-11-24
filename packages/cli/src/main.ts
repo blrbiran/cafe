@@ -216,6 +216,12 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
         `next: run \`cafe daemon status\` in a moment; see ${join(home, "daemon.log")}`,
     );
   }
+  // Lost a race: another starter (a Claude Code session-host auto-starts the daemon too) took the lock
+  // first, so ours exited with "already running". Wait for the winner instead of failing.
+  const winner = lockHolder(home);
+  if (winner && winner !== child.pid) {
+    if (await untilHealthy(waitMs, () => alivePid(winner), winner)) return;
+  }
   // A daemon that exits at once (port in use, bad config) printed its reason; show it here instead of
   // only pointing at the log.
   const reason = startupReason(stdoutLog, from);
