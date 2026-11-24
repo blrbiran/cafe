@@ -84,7 +84,8 @@ function isIp(name: string): boolean {
 export function sanList(input: { host: string; advertise?: string; lan?: string }): string[] {
   const out: string[] = [];
   const add = (v: string | undefined) => {
-    const name = v?.split(":")[0]?.trim();
+    // `advertise` may be `host:port`; IPv6 hosts already strip their brackets from `split(":")[0]`.
+    const name = v?.trim().replace(/^\[|\]$/g, "").split(":")[0]?.trim();
     if (name && !out.includes(name)) out.push(name);
   };
   add(input.host);
@@ -93,6 +94,20 @@ export function sanList(input: { host: string; advertise?: string; lan?: string 
   add("127.0.0.1");
   add("localhost");
   return out;
+}
+
+/**
+ * Does `certPem` carry a SAN entry for exactly `name`? A substring test is wrong: `IP Address:127.0.0.1`
+ * is a prefix of `IP Address:127.0.0.10` and `DNS:desk` of `DNS:desk.example`, so an address change
+ * would keep the stale leaf and every connection to the new name would fail closed with
+ * `ERR_TLS_CERT_ALTNAME_INVALID`.
+ */
+export function sanCovers(certPem: string, name: string): boolean {
+  const sanText = new X509Certificate(certPem).subjectAltName ?? "";
+  const kind = /^\d+\.\d+\.\d+\.\d+$/.test(name) || name.includes(":") ? "IP Address" : "DNS";
+  // Node prints SANs as a comma-separated list; an entry ends at the separator, so require the exact
+  // `Kind:name` token rather than a prefix of a longer one.
+  return sanText.split(/,\s*/).some((entry) => entry === `${kind}:${name}`);
 }
 
 /**

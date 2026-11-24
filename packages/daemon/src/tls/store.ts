@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
 import { join } from "node:path";
-import { fingerprintOf, generateCa, issueLeaf, sanList, type CertPair } from "./certs.ts";
+import { fingerprintOf, generateCa, issueLeaf, sanCovers, sanList, type CertPair } from "./certs.ts";
 
 /**
  * A child Host's leaf: read `CAFE_HOME/tls/<host>.crt` + `.key`, or write a leaf the Root issued.
@@ -130,9 +130,8 @@ export async function ensureLeaf(
   // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed) or the
   // leaf is nearing expiry.
   if (existing) {
-    const cert = new X509Certificate(existing.cert);
-    const sanText = cert.subjectAltName ?? "";
-    const covered = sans.every((s) => sanText.includes(/^\d/.test(s) ? `IP Address:${s}` : `DNS:${s}`));
+    // Exact SAN match (not a prefix: `127.0.0.1` must not "cover" `127.0.0.10`), and not near expiry.
+    const covered = sans.every((s) => sanCovers(existing.cert, s));
     if (covered && !leafNeedsRenewal(existing.cert)) {
       return { cert: existing.cert, key: existing.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
     }
