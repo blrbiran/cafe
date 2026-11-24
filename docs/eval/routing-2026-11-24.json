@@ -1,0 +1,51 @@
+{
+  "router": "llm",
+  "model": "magpie/group/smart",
+  "repeat": 2,
+  "cases": 67,
+  "blocked": [
+    {
+      "q": "which part of the acceptance test should I extend first?",
+      "on": "D1-escalate"
+    },
+    {
+      "q": "implement the three independent screens",
+      "on": "D2-parallel"
+    },
+    {
+      "q": "write the code and the tests for the parser",
+      "on": "D3-collect-all"
+    }
+  ],
+  "attempts": 134,
+  "accuracy": 1,
+  "passed": 134,
+  "fallbacks": 0,
+  "p50ms": 3802,
+  "p95ms": 5983,
+  "unstable": [
+    {
+      "q": "what is the meaning of life",
+      "runs": [
+        "multicast:db,docs",
+        "multicast:docs,mobile",
+        "multicast:docs,search"
+      ]
+    },
+    {
+      "q": "帮我随便看看",
+      "runs": [
+        "multicast:docs,mobile,web",
+        "multicast:db,docs"
+      ]
+    },
+    {
+      "q": "hello",
+      "runs": [
+        "multicast:docs,mobile",
+        "multicast:billing,docs,mobile"
+      ]
+    }
+  ],
+  "misses": []
+}

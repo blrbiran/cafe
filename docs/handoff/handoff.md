@@ -84,13 +84,17 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
 npm test                   # vitest; all 428 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
-npm run routing:eval       # offline rules eval: 65 scored cases, 3 blocked team cases, no model cost
+npm run routing:eval       # offline rules eval: 67 scored cases, 3 blocked team cases, no model cost
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
 npm run test:release       # only when packaging/paths changed; ~1 min, no model
 node packages/cli/bin/cafe.js daemon start --root     # or `npm link --workspace @cafe/cli` then `cafe ...`
 open http://127.0.0.1:4777/
 ```
+
+The same gate runs in CI (`.github/workflows/ci.yml`) on every push/PR: typecheck, the full test
+suite, `routing:eval` (rules only), web check + build, and `test:release`. The Claude plugin test is a
+separate job that is skipped when `claude` is not on the runner.
 
 Scratch home for experiments (never touch the user's `~/.cafe`); turn discovery off so it does not answer on the LAN:
 
@@ -118,12 +122,11 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-24 (late) — TLS: 续期×pin 互相打架的四个缺陷已修
+### 2026-11-24 (late) — TLS：续期 × pin × SAN 互相打架的 7 个缺陷已修；#62 侧栏可调宽；CI
 
-- **一句话**：昨夜 #61 的「自动续期 + 每 peer 叶子 pin + SAN」三项彼此冲突，只有在真实滚动网络里才会
-  暴露；连同两条救援路径，一共修了 **7 个真实缺陷**，每个都先用实验确认、再写会失败的测试。
-- **为什么修。** 三个「加固」彼此冲突，只有在真实滚动网络里才会暴露。全部先做
-  一次性实验确认、再写会失败的测试（RED），最后修复：
+- **一句话**：昨夜 #61 的「自动续期 + 每 peer 叶子 pin + 精确 SAN」三项彼此冲突，只有在真实滚动网络里
+  才会暴露；连同两条救援路径一共修了 **7 个真实缺陷**，每个都先用一次性实验确认、再写会失败的测试。
+- **为什么修。** 全部先做一次性实验确认、再写会失败的测试（RED），最后修复：
   1. **自定义 `checkServerIdentity` 关掉了 SAN 校验。** Node 只要收到这个选项就**替换**默认身份校验，
      不会叠加。于是 pin 检查让每条 Daemon↔Daemon `wss://` 都跳过了 SAN：实测「签给
      `somewhere.invalid` 的叶子拨 `127.0.0.1` 被接受」。`trust.ts` 新增 `pinnedIdentityCheck`：先跑
@@ -153,7 +156,12 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - **验证。** typecheck；**428 tests ×2**（新增 4 个测试文件 + 11 个用例）；`routing:eval` 67/67；web
   check + `build:web`；`npm run test:release` 全绿。用户 Root 已重启在新代码上（4777 + 4778，
   `:4778/api/health` 返回 200），叶子与重启前**逐字节相同**（89.7 天），本机 `pins: {}` 为空。
-  新增的真实模型基线见下（本轮已获准付费运行）。
+- **真实模型基线（本轮已获准付费，`magpie/group/smart`，67 题 × 2 次）**：两次采样分别
+  **133/134 = 99.3%**（p50 3718ms，p95 5546ms，1 个不稳定用例）与 **134/134 = 100%**（p50 3802ms，
+  p95 5983ms，3 个不稳定用例）；两次都 0 fallback。波动全部落在无明确 owner 的短句上
+  （`what is the meaning of life`、`帮我随便看看`、`hello`），top-k 在 docs/db/search/mobile 间摇摆。
+  提交的 `docs/eval/routing-2026-11-24.json` 是第二次；#39 per-target 变体落地后的新基线，
+  旧的 2026-11-21 基线（124/126）仅作历史对照。
 - **spec / 文档。** `docs/specs/v4-6-tls.md` 新增 §10.1（as-built 记录这四项）；README / README_zh /
   SKILL 的 TLS 段改为「续期保留密钥、公钥 pin、`cafe host pin --clear`」。
 - **#62 侧栏可调宽（用户早先要求「加 1/4」）。** 宽度收成单一来源 `--nav-width`（默认 300px，
@@ -611,7 +619,7 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 
 - Multi-level Daemon hierarchy (codex `parent`/AgentPath idea) — not started; only two levels exist.
 - **Attachments (#20)**: phases 1 and 2 are implemented (Order and Barista reply attachments, cross-host pull/proxy). Remaining: `cafe reply` for arbitrary external processes, a Bridge/serve file producer, a pull-later queue for offline Customers, upload progress, orphan staging cleanup. Spec is `docs/specs/v4-1-attachments.md`.
-- LLM routing: rules are 67/67 offline and the LLM has policy/stability/caching (`docs/specs/v4-4-routing-accuracy.md`). A post-change real-model baseline was run (`docs/eval/routing-2026-11-21.json`, 124/126 = 98.4%, 1 unstable top-k case). Per-target sub-questions are now implemented (#39, `Order.variants`), so renew this baseline when a paid run is approved; `confidence`/`whyNot`/fanout are still not exposed.
+- LLM routing: rules are 67/67 offline and the LLM has policy/stability/caching (`docs/specs/v4-4-routing-accuracy.md`). The current real-model baseline is `docs/eval/routing-2026-11-24.json` — **134/134 = 100%** in the committed run (a second run of the same model: 133/134), p50 ~3.7–3.8 s, 0 fallbacks, and 1–3 unstable no-owner cases (`what is the meaning of life`, `帮我随便看看`, `hello`) — taken after the #39 per-target variants landed. (`routing-2026-11-21.json`, 124/126, is historical.) `confidence`/`whyNot`/fanout are still not exposed in the UI.
 - Full event store and web virtualization (dogfooding #31/#33/#34) — tail-read Thread paging, bounded metadata, snapshot summaries, Thread pagination, an **FTS5 trigram search index**, **LRU-bounded `metas`/`knownOrders`**, incremental registry saves and store batched deletes are in. Still open: **Web list virtualization** (Feed/Conversation), snapshot `since`/paging (the snapshot is still a fixed 200; `/api/threads?before=` pages older ones and the Web "load older" uses it), a `cafe prune` dry-run that does not stat every stale file, and **`appendEvent` is still a synchronous `appendFileSync`** on the hot path (making it async risks losing events on a crash; it is a deliberate perf item, not a bug). Baseline: `npm run perf:store`.
 - pi/omp `/cafe` slash commands are in (#11); `cafe commands` installs the Claude `/cafe-ask` file; `$cafe` stays for Codex. Config diff/apply, pending config, the stale-web-build banner and Web doctor are in (#21/#18).
 - **Update/rollback (#27)** has a decided spec at `docs/specs/v4-2-update-rollback.md`; the MVP is implemented (service-aware `apply`/`rollback`, drain, health, auto-rollback). **Connector SDK (#28)** is implemented through the **Discord** platform (`docs/specs/v4-3-connector-sdk.md`): `cafe connector install|list|status|start|stop|restart|logs|config|remove`, the `@cafe/connector` SDK (thread map / seen events / outbox, atomic writes, stdout heartbeat protocol), a mock connector, a **Discord connector** (`discord-core.ts` core + `discordjs.ts` adapter; allowlists, `requireMention`, `allowDMs`, @everyone rejection, 2000-char chunking, idempotent event → Order → SSE follow), the optional `POST /api/orders` `idempotencyKey`, a **crash-restart supervisor** (`cafe connector supervise`, backoff + crash-loop give-up), and the SDK **packaged in the release** (`connector/`). Still open: a **real Discord end-to-end run** (needs the user's bot token + the Message Content intent), attachment support, and nonce/`enforce_nonce` outbound dedup for Discord.
