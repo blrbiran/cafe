@@ -153,9 +153,9 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - **新增命令 `cafe host pin [host:port] [--clear]`。** 旧拒绝信息让人跑 `cafe connect --reset-pin`，这参数
   根本不存在（全仓只有这一句文案）。现在真正能清除 pin：运行中的 daemon 走 `POST /api/tls/pins`
   （热生效），同时改写 `config.yml`。`tests/tls-cli.test.ts`。
-- **验证。** typecheck；**428 tests ×2**（新增 4 个测试文件 + 11 个用例）；`routing:eval` 67/67；web
+- **验证。** typecheck；**428 tests ×2**（407 → 428，新增 4 个测试文件 + 21 个用例）；`routing:eval` 67/67；web
   check + `build:web`；`npm run test:release` 全绿。用户 Root 已重启在新代码上（4777 + 4778，
-  `:4778/api/health` 返回 200），叶子与重启前**逐字节相同**（89.7 天），本机 `pins: {}` 为空。
+  `:4778/api/health` 返回 200），叶子与重启前**逐字节相同**（89.6 天），本机 `pins: {}` 为空。
 - **真实模型基线（本轮已获准付费，`magpie/group/smart`，67 题 × 2 次）**：两次采样分别
   **133/134 = 99.3%**（p50 3718ms，p95 5546ms，1 个不稳定用例）与 **134/134 = 100%**（p50 3802ms，
   p95 5983ms，3 个不稳定用例）；两次都 0 fallback。波动全部落在无明确 owner 的短句上
