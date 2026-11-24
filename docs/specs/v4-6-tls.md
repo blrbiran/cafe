@@ -320,7 +320,7 @@ Three more ways the fleet could get permanently stuck, found the same way:
 7. **`cafe daemon renew-cert` on a stopped daemon rotated the key.** It called `issueLeaf` with no
    key, so it changed the identity exactly like the online renewal used to. It now re-signs the key
    on disk. `tests/tls-cli.test.ts`.
-### 10.3 Joining by the main address, and TLS addresses between Daemons (2026-11-25, dogfooding #79 #80 #81A)
+### 10.3 Joining by the main address, and TLS addresses between Daemons (2026-11-24, dogfooding #79 #80 #81A)
 
 **Problem.** Two gaps left the Daemon↔Daemon traffic in plaintext under the default `security.mode: tls`:
 

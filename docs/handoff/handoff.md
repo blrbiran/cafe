@@ -1,6 +1,6 @@
 # cafe — handoff
 
-Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs are in [`docs/specs/`](../specs/). See §5 first for the newest batch (Discord live test, #39 per-target questions, TLS #61). Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
+Read this document first if you are taking over cafe. It records what exists, why it is that way, how to run and test it, what is waiting on the user, and the traps already found. Vocabulary is in [`GLOSSARY.md`](../../GLOSSARY.md). Architecture decisions are in [`docs/adr/`](../adr/). Feature specs are in [`docs/specs/`](../specs/). See §5 first for the newest batch. Usage is in [`README.md`](../../README.md) and [`skills/cafe/SKILL.md`](../../skills/cafe/SKILL.md).
 
 > Start with the newest entry in §5 and the operational notes in §8. Run `git status --short --branch` and `git log --oneline -5` to establish the checkout and recent commits. Run `cafe daemon status` separately to check the process that is serving requests.
 
@@ -18,7 +18,7 @@ cafe is an agent network. A message (an **Order**) is routed to the agent or age
 - While the Root is online, every Order goes through it (ADR-0001), so the Root's web UI shows all traffic. **While the Root is offline, cross-host Orders go over a direct Daemon-to-Daemon link** and are backfilled to the Root when it returns (ADR-0004).
 - On a LAN a Daemon without `root` finds the Root over mDNS. `cafe daemon install` gives autostart (launchd / systemd --user).
 - Daemons exchange their cafe version in `initialize`: a different `PROTOCOL_VERSION` is refused with `protocol_mismatch` and an upgrade hint; a different cafe version on the same protocol only warns (`cafe daemon status`, Network page). Published as the npm package `@blrbiran/cafe` (command `cafe`).
-- **Transport security (v4-6 #61).** `security.mode: tls` is the default. A Root generates a CA once (`~/.cafe/tls/ca.crt` + `ca.key` 0600) and each Daemon presents a leaf signed by it on `security.tls.port` (default **4778**); plaintext **4777** keeps serving the Web UI and loopback. Verification is fail-closed (no plaintext fallback); **exact SAN** and a separate **per-peer leaf pin** (`security.tls.pins`, TOFU on first Daemon link) are both checked; `caFingerprint` authenticates the trust anchor at enrolment (TOFU, `cafe connect --ca-fingerprint`). `cafe root show` prints the fingerprint; `cafe daemon renew-cert` reissues a leaf on demand, and a leaf is also renewed automatically before expiry (inside 21 days, checked every 6 h while running).
+- **Transport security (v4-6 #61).** `security.mode: tls` is the default. A Root generates a CA once (`~/.cafe/tls/ca.crt` + `ca.key` 0600) and each Daemon presents a leaf signed by it on `security.tls.port` (default **4778**); plaintext **4777** keeps serving the Web UI and loopback. Verification is fail-closed (no plaintext fallback); **exact SAN** and a separate **per-peer leaf pin** (`security.tls.pins`, TOFU on first Daemon link) are both checked; **`root:` is the Root's main address** — a child learns the TLS port from public `GET /api/tls`, does not dial the Root at all until it has joined (enrolment retries 5 s→5 min), and on a TLS network every Daemon address is `wss://<host>:<tls port>` (v4-6 §10.3); `caFingerprint` authenticates the trust anchor at enrolment (TOFU, `cafe connect --ca-fingerprint`). `cafe root show` prints the fingerprint; `cafe daemon renew-cert` reissues a leaf on demand, and a leaf is also renewed automatically before expiry (inside 21 days, checked every 6 h while running).
 - Ways to be a Barista: pi with the cafe extension (TUI or headless `pi --mode rpc`, supervised by the Daemon); the same extension inside **oh-my-pi** (`--agent omp`); **native Codex / Claude Code** (`cafe barista start --agent codex|claude`, a **Bridge** process supervised by the Daemon, read-only by default, follow-ups continue the same Codex thread / Claude session; ADR-0005); `cafe serve --exec/--preset claude|codex` for any prompt-in / answer-out command (no session); **a running Claude Code session** (the cafe Claude Code plugin, a mod, installed with `cafe claude install`; ADR-0006; the plugin's `/cafe-barista off|on` pauses/resumes, while `/cafe` is the Customer command) and **a running Codex session** (`cafe barista start --agent codex --tui`, Orders go into the session's queue; ADR-0006).
 - Ways to be a Customer: any agent, **`cafe mcp`** (MCP stdio server: `cafe_agents`, `cafe_ask`, `cafe_wait`, `cafe_cancel`; `cafe mcp install` registers it with Claude Code / Codex), the `cafe` CLI plus skill, the web UI, or **`cafe connector`** (out-of-process platform connectors; the SDK, supervisor and a mock connector are implemented, Discord is the first real platform).
 - First use: `cafe init` writes a commented `.cafe` (interactive or `--yes --name …`), `cafe extension install` puts the extension into pi's settings and links it with omp, `cafe doctor` checks daemon / identity / extension / skill / router / root and prints the next command. `cafe config get` prints `(not set)` for unset known keys and fails for unknown ones.
@@ -68,7 +68,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 | `packages/pi-extension/src/index.ts` | pi extension; also runs under oh-my-pi (`isOmp()`), see below; registers the `/cafe agents|ask|status|thread|help` command (a user-owned `/cafe` wins; tools and skill still work) |
 | `packages/web/` | React 19 + Vite 6 + Tailwind v4; zh/en; single store with `useSyncExternalStore`; fixed Shell, compact feed with whole-card click and 2-column list at ≥1800 (drawer closed), right detail drawer / three-pane at ≥1600, info rail at ≥1920, nav Agents sublist (open by default on desktop, remembered; agent rows open the rename/alias menu on right-click or Shift+F10 — no per-row ⋯ button, which used to fall onto a second grid line; menus close on outside click/Esc); Agent cards show the working directory and a separate 负责范围/scope row; Settings drawer (machines + remote rename, start/stop Baristas, routing, connection root/token hint, **pending config + health checks**), Live page, drawer open/close animation and click-outside close; feed has "load older" and full-text search; cards show `你`/`代问` provenance and **📎 attachment count**; **displayName shown in Network/Agents/Live/Shell; Network cards can test/reconnect/rename/copy CLI**; a banner appears when the built Web UI on disk is newer than the daemon's in-memory copy; long Threads load older events; Live backfills events after a WebSocket reconnect; snapshot 200-thread payload is clipped; **composer uploads 0–N files, Thread shows/downloads attachments** |
 | `skills/cafe/SKILL.md` | Skill for Claude Code / Codex / pi; `cafe skill install` symlinks it |
-| `tests/` | vitest, **428 tests** (+5 mod tests via `npm run test:claude-plugin`): **TLS transport (`tls-certs|trust|server|client|child|bootstrap|renew|cli|untrusted|lifecycle|renewal-predicate|runtime-renewal|san-coverage|peer-pin`, `security-token`)**, **per-target sub-questions (`per-target-questions`)**, **web tab icon (`web-icon`), resizable sidebar (`web-nav-width`)**, **scratch configs stay off 4778 (`scratch-configs`)**, identity/display names/aliases, legacy names and removal (`identity.test.ts`), provenance (`provenance.test.ts`), **attachments (`attachments.test.ts`: local, cross-host pull/proxy, limits, CLI upload/download)**, **daemon health endpoint (`doctor-api.test.ts`)**, **health metrics and search stats (`metrics.test.ts`)**, **heartbeat lease regression (`heartbeat.test.ts`)**, **routing observability and `/api/routing/stats` (`routing-observability.test.ts`), routing aggregates (`routing-stats.test.ts`)**, connector SDK/mock/CLI/idempotency/crash-restart (`connector.test.ts`, restart wait deflaked), Discord connector core + fake-platform end-to-end (`discord-connector.test.ts`), FTS search + prune index cleanup (`retention.test.ts`), bounded caches (`cache-bounds.test.ts`), claude install exit code + commands status (`commands.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), rules eval + hints (`routing-eval.test.ts` over `routing-fixtures.ts`, 53 strict + `EXTRA_CASES` overlap/morphology/multicast/top-k/variants/stability), rules decisions (`routing-rules.test.ts`), fan-out grace (`routing-grace.test.ts`), follow-up race (`until-closed.test.ts`), bounded metadata (`bounded.test.ts`), reply entry (`reply-entry.test.ts`), controlled update + drain (`update.test.ts`), global event filters, SSE resume and the WebSocket backfill endpoint (`events.test.ts`), config contract incl. pending and the write API (`config-contract.test.ts`), thread paging, limit validation, unknown-stream 404 and snapshot summaries (`thread-paging.test.ts`), client event buffer (`client-recent.test.ts`), CLI init/help/config/redaction/status/aliases (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), service retarget (`service.test.ts`), plus session host, Codex TUI, e2e (incl. the slow-ack heartbeat regression), follow-up/recovery, pi extension (incl. `/cafe`), serve (incl. preset safety), supervisor, routing hints, direct links, discovery, retention/search, client reconnect, versions, Bridges, MCP |
+| `tests/` | vitest, **471 tests** (+5 mod tests via `npm run test:claude-plugin`): **TLS transport (`tls-certs|trust|server|client|child|bootstrap|renew|cli|untrusted|lifecycle|renewal-predicate|runtime-renewal|san-coverage|peer-pin`, `security-token`)**, **per-target sub-questions (`per-target-questions`)**, **web tab icon (`web-icon`), resizable sidebar (`web-nav-width`)**, **scratch configs stay off 4778 (`scratch-configs`)**, identity/display names/aliases, legacy names and removal (`identity.test.ts`), provenance (`provenance.test.ts`), **attachments (`attachments.test.ts`: local, cross-host pull/proxy, limits, CLI upload/download)**, **daemon health endpoint (`doctor-api.test.ts`)**, **health metrics and search stats (`metrics.test.ts`)**, **heartbeat lease regression (`heartbeat.test.ts`)**, **routing observability and `/api/routing/stats` (`routing-observability.test.ts`), routing aggregates (`routing-stats.test.ts`)**, connector SDK/mock/CLI/idempotency/crash-restart (`connector.test.ts`, restart wait deflaked), Discord connector core + fake-platform end-to-end (`discord-connector.test.ts`), FTS search + prune index cleanup (`retention.test.ts`), bounded caches (`cache-bounds.test.ts`), claude install exit code + commands status (`commands.test.ts`), `knownDaemons` reachability (`known-daemons.test.ts`), router control/timeout/concurrency (`router-control.test.ts`), rules eval + hints (`routing-eval.test.ts` over `routing-fixtures.ts`, 53 strict + `EXTRA_CASES` overlap/morphology/multicast/top-k/variants/stability), rules decisions (`routing-rules.test.ts`), fan-out grace (`routing-grace.test.ts`), follow-up race (`until-closed.test.ts`), bounded metadata (`bounded.test.ts`), reply entry (`reply-entry.test.ts`), controlled update + drain (`update.test.ts`), global event filters, SSE resume and the WebSocket backfill endpoint (`events.test.ts`), config contract incl. pending and the write API (`config-contract.test.ts`), thread paging, limit validation, unknown-stream 404 and snapshot summaries (`thread-paging.test.ts`), client event buffer (`client-recent.test.ts`), CLI init/help/config/redaction/status/aliases (`cli-init.test.ts`, `cli.test.ts`), extension/doctor (`extension.test.ts`, `doctor.test.ts`), thread summaries (`thread-summary.test.ts`), `.cafe` discovery (`cafe-file.test.ts`), store tail/recovery (`store.test.ts`), service retarget (`service.test.ts`), plus session host, Codex TUI, e2e (incl. the slow-ack heartbeat regression), follow-up/recovery, pi extension (incl. `/cafe`), serve (incl. preset safety), supervisor, routing hints, direct links, discovery, retention/search, client reconnect, versions, Bridges, MCP |
 
 **pi extension behaviour**
 - Orders queue (FIFO), are acked and heartbeated on arrival, and are injected only when idle with `sendMessage({customType:"cafe-order"}, {triggerTurn, deliverAs:"followUp"})`.
@@ -83,7 +83,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 428 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
+npm test                   # vitest; all 471 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
 npm run routing:eval       # offline rules eval: 67 scored cases, 3 blocked team cases, no model cost
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
@@ -121,6 +121,60 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - Data safety: nothing is deleted automatically unless the user sets `retention.days`; `cafe prune` is a dry run unless `--yes`.
 
 ## 5. Waiting on the user (start the next session here)
+
+### 2026-11-24 (latest) — 台账复核后的两批修复：A 批 7 项 + B 批 TLS 入网（#79 #80 #81A）+ #16 回归
+
+- **一句话**：按 `../cafe_dogfooding/issue-20261119.md` 复核开放项（以代码为准），用户批准「按推荐」后
+  做完 A、B 两批，加上 #16 的付费行为回归（本 session 获准）。三个提交在本轮 handoff 提交之前：
+  `fix: dogfooding batch A …`、`fix(tls): join by the Root's main address …`、`fix(cli): do not start a
+  second daemon …`（以 `git log --oneline -5` 为准）。**都没有推送**。
+- **A 批（全部先 RED 再修）**：
+  - **#88** `daemon stop/restart/start` 先确认 daemon 属于当前 `CAFE_HOME`：`/api/health` 新增
+    `homeId`（home 路径的哈希），旧 daemon 退回比较 host；空 home（没有 `config.yml`）直接拒绝。
+    `loadConfig(home, { persist })`：只有 daemon（`runDaemon`）和 `config set` 才会生成 `config.yml`。
+    测试 `tests/daemon-ownership.test.ts`（用假 HTTP 服务冒充别人的 daemon，绝不碰 4777）。
+  - **#85** peer 断开时一并删掉订阅表里的空 key；metrics 新增 `subscribedThreads`。`tests/subscribers.test.ts`。
+  - **#83** 新模块 `daemon/src/net-errors.ts` 的 `describeFetchError()` 读 `err.cause`。测试连接、
+    保存地址都返回 `code` + 可读原因；保存时带 `verified`。Web 端 `web/src/hostReason.ts` 加 i18n
+    `hostReasons` 翻成人话；不可达时不再显示「地址已保存」。截图
+    `output/playwright/network-test-refused-1440.png`、`network-save-unverified-1440.png`（待你审核）。
+    本机 DNS 是 fake-IP（任何名字都能解析），所以 ENOTFOUND 只用构造的错误测。
+  - **#82** `barista start --agent codex --tui` 在 CLI 侧先做 probe；所有 `barista start` 都会等到
+    注册成功，或者一启动就失败时报出 worker 自己的报错和日志路径并清理掉（等待上限
+    `CAFE_BARISTA_START_WAIT_MS`，默认 15 s）。supervisor 连续 3 次快速失败（30 s 内退出）后停止重试，
+    `WorkerInfo` 新增 `state/lastError/log`，并写进 `daemon.log`；再 start 一次会替换 failed 的 worker。
+    `cafe doctor` 也会报 failed 的 Barista。
+  - **#87** 顶层命令拼错给 Did-you-mean；`--json` 下所有错误都在 stdout 输出 JSON
+    `{error,message,suggestions?}`，退出码 1（Commander 用 `exitOverride`）。
+  - **#84** favicon 加了白色圆角底板（rx=5）。**偏差**：16px 下四个角像素是透明的，这是圆角造成的，
+    不满足台账「四角 alpha 255」那条判据；深色标签栏下已清晰。要直角请说一声。
+  - **#86** `/api/health` 新增 `startedAt`，metrics 新增 `*SinceStart` / `*Total` / `last*`；旧字段名保留一个版本（已获批）。
+- **B 批（spec `docs/specs/v4-6-tls.md` §10.3，已获批「按推荐」）**：`root:` 永远填主地址；公开的
+  `GET /api/tls` 返回 `tlsPort`，`bootstrap.ts` 的 `discoverTls()` 先走明文、失败再试 HTTPS（兼容
+  `root:` 已经写 TLS 端口的旧配置）。未入网的子节点**完全不拨 Root**（`connectRoot` fail-closed），
+  enrolment 按 5 s→5 min 退避（`timing.enrolRetryBaseMs/MaxMs`）。入网后 `url()` 是
+  `wss://<advertise>:<tlsPort>`。`resolveDaemonUrl()` 统一处理上行、直连和 Root 的探测：明文地址
+  会先查 TLS 端口再升级，绝不按明文拨号。探测通过 `daemonFetch()` 显式带上网络 CA（进程级信任库
+  只装得下一个额外 CA）。doctor 新增 `tls` 检查；`/api/health.tls`；`cafe status` / `daemon status`
+  多一行 `tls:`。测试 `tests/tls-join.test.ts`（7 个）和 `doctor.test.ts`。**行为变化**：直连 pin 的 key 从
+  `<hostname>:<port>` 改成实际拨号的 `<address>:<tlsPort>`，旧 key 会重新 TOFU 一次。
+- **#16 回归（付费，本 session 获准）**：在 cafe 仓库用 `codex exec --json -s read-only` 跑固定的 `$cafe`
+  问题 5 次，**5/5 第一个工具调用都是 cafe 命令**（1 次 `cafe ask`、4 次 `cafe agents`）。建议把 #16
+  按「软约束已按设计工作」关闭。顺带发现：Codex 沙箱会屏蔽 localhost，CLI 误以为没有 daemon，去启动
+  第二个，报出误导性的 `EPERM daemon.stdout.log`。已修：只有 ECONNREFUSED 才自动启动，其他情况明确
+  说连不上并提示沙箱。在真实沙箱里 Codex 仍然问不通 cafe，要么给 Codex 打开网络，要么让它走 `cafe mcp`。
+- **验证**：typecheck；**471 tests ×2**（428 → 471）；`routing:eval` 67/67；web check + `build:web`；
+  `test:release` 17/17。本机 Root 已 stop/start 到新代码：`tls: on :4778 (daemon links use wss)`，doctor
+  全绿，cafe#1、orca#1 和 Discord connector 都重新连上了。
+- **台账结论（台账在仓库外，没有改）**：#88 #85 #83 #82 #87 #86 #79 #80 #81A 可以按判据复核；#84 见上面的偏差；
+  #81B 不是缺陷（npmjs 已有 1.4.4，CI `npm ci` 绿）；#16 建议关闭；#39 建议改成「观察」。
+- **仍需你本人**：审 #83 的两张截图、#84 圆角；推送三个提交并决定是否发版（发布说明要写「pin 改为
+  公钥指纹」和「`root:` 填主地址；未入网的子节点不再明文连接」）；**ssh1 子节点**要升级到新版本，
+  并确认容器能出站访问 Root 的 4778，否则升级后会显示「还没加入网络」；真实 Discord 附件和重启去重
+  （测试步骤见上一轮对话：附件私信、稳态重启、回答途中重启）。
+- **下一候选**：Network 页把「在线（它连着我）」和「地址可达（我连得到它）」分开显示（#83 第 4 点，没做）；
+  CLI `cafe doctor` 的 root 探测仍用明文带 token（应改为读 daemon 自己的状态）；#71/#72 brainstorm；
+  TLS phase 2；snapshot 分页 / Web 虚拟列表。
 
 ### 2026-11-24 (late) — TLS：续期 × pin × SAN 互相打架的 7 个缺陷已修；#62 侧栏可调宽；CI
 
