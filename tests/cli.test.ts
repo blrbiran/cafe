@@ -383,3 +383,33 @@ describe("unknown commands suggest and honour --json (#87)", () => {
     expect(r.status).toBe(1);
   });
 });
+
+// A daemon that cannot bind used to leave `cafe daemon start` waiting 5 s and then saying only "see
+// daemon.log"; the reason (which port, which setting moves it) was in daemon.stdout.log.
+describe("cafe daemon start reports why the daemon did not start", () => {
+  it("prints the port-in-use reason without waiting for the full timeout", async () => {
+    const { createServer } = await import("node:net");
+    const blocker = createServer();
+    await new Promise<void>((r) => blocker.listen(0, "0.0.0.0", r));
+    cleanup.push(() => new Promise<void>((r) => blocker.close(() => r())));
+    const port = (blocker.address() as { port: number }).port;
+    // A free main port (bind, read, release) and the TLS port taken: the second-daemon-on-one-machine case.
+    const free = createServer();
+    await new Promise<void>((r) => free.listen(0, "127.0.0.1", r));
+    const main = (free.address() as { port: number }).port;
+    await new Promise<void>((r) => free.close(() => r()));
+    const h = home();
+    writeFileSync(join(h, "config.yml"), stringify({ host: "busy", token: "t0k", port: main, mode: "root", security: { mode: "tls", tls: { port } } }));
+    const t0 = Date.now();
+    const r = await new Promise<{ code: number | null; stderr: string }>((resolveP) => {
+      const p = spawn(process.execPath, [BIN, "daemon", "start"], { env: { ...process.env, CAFE_HOME: h, CAFE_DAEMON: "", CAFE_TOKEN: "" } });
+      let stderr = "";
+      p.stderr.on("data", (d) => (stderr += d));
+      p.on("exit", (code) => resolveP({ code, stderr }));
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain(`TLS port ${port} is already in use`);
+    expect(r.stderr).toContain("cafe config set security.tls.port");
+    expect(Date.now() - t0).toBeLessThan(4_500);
+  }, 20_000);
+});

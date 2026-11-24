@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -188,15 +188,33 @@ async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
   }
   // Raw startup output (before the daemon's own logger opens) goes to daemon.stdout.log; daemon.log
   // is written by the daemon with timestamps and a cap (#66).
-  const out = openSync(join(home, "daemon.stdout.log"), "a");
+  const stdoutLog = join(home, "daemon.stdout.log");
+  const out = openSync(stdoutLog, "a");
+  const from = fstatSync(out).size;
   const args = ["--no-warnings", MAIN, "daemon", "run", ...(opts.root ? ["--root"] : [])];
   const child = spawn(process.execPath, args, { detached: true, stdio: ["ignore", out, out], env: process.env });
+  let exited = false;
+  child.once("exit", () => (exited = true));
   child.unref();
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 50 && !exited; i++) {
     await new Promise((r) => setTimeout(r, 100));
     if (await healthy()) return;
   }
-  throw new Error(`cafe daemon did not start; see ${join(home, "daemon.log")} and ${join(home, "daemon.stdout.log")}`);
+  // A daemon that exits at once (port in use, bad config) printed its reason; show it here instead of
+  // only pointing at the log.
+  const reason = startupReason(stdoutLog, from);
+  throw new Error(`cafe daemon did not start${reason ? `: ${reason}` : ""}\nsee ${join(home, "daemon.log")} and ${stdoutLog}`);
+}
+
+/** The daemon's own `cafe: …` error line written to daemon.stdout.log since byte `from`, if any. */
+function startupReason(file: string, from: number): string | undefined {
+  try {
+    const text = readFileSync(file).subarray(from).toString("utf8");
+    const line = text.split("\n").reverse().find((l) => l.startsWith("cafe: "));
+    return line?.slice("cafe: ".length).trim();
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------

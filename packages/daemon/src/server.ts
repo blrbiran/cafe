@@ -396,7 +396,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
   server.on("upgrade", handleUpgrade);
 
   return new Promise((resolveP, reject) => {
-    server.once("error", reject);
+    server.once("error", (err) => reject(portInUse(err, "port", opts.port)));
     server.listen(opts.port, opts.bind ?? "0.0.0.0", () => {
       const addr = server.address();
       const httpPort = typeof addr === "object" && addr ? addr.port : opts.port;
@@ -432,7 +432,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       }
       tlsServer.once("error", (err) => {
         server.close();
-        reject(err);
+        reject(portInUse(err, "security.tls.port", opts.tlsPort));
       });
       tlsServer.listen(opts.tlsPort ?? 0, opts.bind ?? "0.0.0.0", () => {
         const a = tlsServer.address();
@@ -440,6 +440,22 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       });
     });
   });
+}
+
+/**
+ * A bind failure in words the user can act on: which port, what it is for, and the setting that moves it
+ * (a second Daemon on one machine collides on 4777 and the TLS port 4778).
+ */
+function portInUse(err: Error, key: "port" | "security.tls.port", port: number | undefined): Error {
+  if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") return err;
+  const what = key === "port" ? "port" : "TLS port";
+  const out = new Error(
+    `${what} ${port} is already in use (another cafe daemon on this machine, or another program). ` +
+      `Stop it, or give this CAFE_HOME its own: cafe config set ${key} <free port>` +
+      (key === "security.tls.port" ? " (or security.mode: plaintext for a throwaway test daemon)" : ""),
+  );
+  (out as NodeJS.ErrnoException).code = "EADDRINUSE";
+  return out;
 }
 
 /**
