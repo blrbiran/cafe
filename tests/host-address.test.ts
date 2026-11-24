@@ -103,3 +103,32 @@ describe("host address overrides (#75)", () => {
     expect(other.daemon.peerUrlFor("pc1")).toBe(`ws://${child.addr}`);
   });
 });
+// #83: saving an unreachable address said "Address saved" and Test said only "fetch failed".
+describe("host address diagnostics (#83)", () => {
+  it("reports a pin that the Root cannot reach, with the reason", async () => {
+    const { createServer } = await import("node:net");
+    const s = createServer();
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    const dead = `127.0.0.1:${(s.address() as any).port}`;
+    await new Promise((r) => s.close(r));
+
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const child = await startDaemon("pc1", { config: { root: root.addr } });
+    cleanup.push(child.stop);
+    await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1"));
+
+    const saved = await post(root.addr, "/api/hosts/address", { host: "pc1", url: dead });
+    expect(saved.status).toBe(200);
+    expect(saved.body).toMatchObject({ host: "pc1", verified: false, code: "ECONNREFUSED" });
+    expect(saved.body.error).toContain("ECONNREFUSED");
+
+    const tested = await post(root.addr, "/api/hosts/test", { host: "pc1" });
+    expect(tested.body).toMatchObject({ online: false, code: "ECONNREFUSED" });
+    expect(tested.body.error).not.toBe("fetch failed");
+
+    const good = await post(root.addr, "/api/hosts/address", { host: "pc1", url: child.addr });
+    expect(good.body).toMatchObject({ verified: true });
+    expect(good.body.error).toBeUndefined();
+  });
+});

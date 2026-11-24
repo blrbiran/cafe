@@ -14,7 +14,7 @@ import { issueLeaf, publicKeyOf, sanList } from "./tls/certs.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
-export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configPath, diffConfig, loadConfig, saveConfig, setConfigValue } from "./config.ts";
+export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configInitialized, configPath, diffConfig, homeId, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";
@@ -85,7 +85,7 @@ export interface Running {
 
 export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   const home = opts.home ?? cafeHome();
-  const config = loadConfig(home);
+  const config = loadConfig(home, { persist: true });
   if (opts.mode) config.mode = opts.mode;
   if (opts.port !== undefined) config.port = opts.port;
   if (opts.root) config.root = opts.root;
@@ -234,7 +234,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   // it moves onto the real CA and its `wss://` links come on, without a restart (v4-6 §3.3).
   if (daemon.tlsContext?.enrol && !daemon.tlsContext.network) daemon.startEnrolmentRetry();
   if (!opts.noSupervisor) {
-    daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token });
+    daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token, log: (m) => daemon.log(m) });
     const { reaped, skipped } = await daemon.supervisor.restore();
     if (reaped) daemon.log(`reaped ${reaped} barista worker group(s) left by a previous daemon`);
     for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);

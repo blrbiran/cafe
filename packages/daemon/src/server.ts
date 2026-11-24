@@ -14,7 +14,7 @@ import { WebSocketServer } from "ws";
 import { CreateOrderParams, Methods, type ThreadEnvelope } from "@cafe/protocol";
 import { RpcError } from "@cafe/protocol/peer";
 import type { Daemon } from "./daemon.ts";
-import { loadConfig, saveConfig } from "./config.ts";
+import { homeId, loadConfig, saveConfig } from "./config.ts";
 import { eventMatches, parseEventFilter, replayAfter } from "./events.ts";
 import { listRouterModels } from "./router.ts";
 import { connectorStatuses } from "./connector-status.ts";
@@ -488,7 +488,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   const m = req.method ?? "GET";
   let match: RegExpExecArray | null;
 
-  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus(), metrics: daemon.metrics() });
+  if (m === "GET" && path === "/api/health") return send(res, 200, { ok: true, host: daemon.host, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...daemon.routerStatus(), metrics: daemon.metrics() });
   if (m === "GET" && path === "/api/router/models") {
     return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });
   }

@@ -169,6 +169,17 @@ const zh = {
   hostAddressEdit: "改地址",
   hostAddressHint: "其他机器访问这台机器用的地址（host:port）",
   hostAddressSaved: "地址已保存",
+  hostAddressUnverified: (why: string) => `地址已保存，但中心节点现在连不上它：${why}。其他机器继续使用上一个能连上的地址。`,
+  hostReasons: {
+    ECONNREFUSED: "这个地址上没有 cafe 在监听。如果那台机器跑在 Docker 里，请填容器能被访问到的地址，或先在宿主机上发布端口",
+    ENOTFOUND: "找不到这个主机名，请检查拼写或改用 IP 地址",
+    ETIMEDOUT: "连接超时：地址可能不对，或被防火墙拦住了",
+    EHOSTUNREACH: "这台机器到不了那个网络",
+    ENETUNREACH: "这台机器到不了那个网络",
+    ECONNRESET: "对方接通后马上断开了，可能端口填错了",
+    UNAUTHORIZED: "两台机器的 token 不一致",
+    TLS: "证书校验没有通过",
+  } as Record<string, string>,
   settingsMachines: "网络中的机器",
   settingsMachinesDesc: "中心节点可以直接给远程机器改名；旧名字会保留为别名。",
   settingsUpdate: "升级与回滚",
@@ -509,6 +520,17 @@ const en: Dict = {
   hostAddressEdit: "Edit address",
   hostAddressHint: "Address other machines use to reach this one (host:port)",
   hostAddressSaved: "Address saved",
+  hostAddressUnverified: (why: string) => `Address saved, but the hub cannot reach it right now: ${why}. Other machines keep using the last address that worked.`,
+  hostReasons: {
+    ECONNREFUSED: "Nothing is listening for cafe at this address. If that machine runs in Docker, use an address the container can be reached at, or publish the port on the host",
+    ENOTFOUND: "This host name does not resolve; check the spelling or use an IP address",
+    ETIMEDOUT: "Timed out: the address may be wrong, or a firewall is blocking it",
+    EHOSTUNREACH: "This machine cannot reach that network",
+    ENETUNREACH: "This machine cannot reach that network",
+    ECONNRESET: "Something answered and hung up straight away; the port may be wrong",
+    UNAUTHORIZED: "The two machines use different tokens",
+    TLS: "The certificate was not accepted",
+  },
   settingsMachines: "Machines on the network",
   settingsMachinesDesc: "The hub can rename a remote machine directly; the old name stays as an alias.",
   settingsUpdate: "Update & rollback",
@@ -684,12 +706,17 @@ function initial(): Lang {
     const v = localStorage.getItem(KEY);
     if (v === "zh" || v === "en") return v;
   } catch {}
-  return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+  return (typeof navigator === "undefined" ? "" : navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
 }
 
 let lang: Lang = initial();
 const listeners = new Set<() => void>();
-document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+if (typeof document !== "undefined") document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+
+/** The dictionary for a language, outside React (pure helpers and their tests). */
+export function dictFor(l: Lang): Dict {
+  return DICTS[l];
+}
 
 export function setLang(l: Lang): void {
   lang = l;

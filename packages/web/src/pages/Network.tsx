@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { hostFailure, savedAddressNote } from "../hostReason.ts";
 import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
@@ -37,13 +38,13 @@ export function NetworkPage() {
   const test = (h: string) =>
     run(`test:${h}`, async () => {
       const r = await api.testHost(h);
-      setNote((n) => ({ ...n, [h]: r.online ? { text: `${t.hostReachable}${r.latencyMs !== undefined ? ` · ${r.latencyMs}ms` : ""}`, ok: true } : { text: `${t.hostUnreachable}: ${r.error ?? ""}`, ok: false } }));
+      setNote((n) => ({ ...n, [h]: r.online ? { text: `${t.hostReachable}${r.latencyMs !== undefined ? ` · ${r.latencyMs}ms` : ""}`, ok: true } : { text: hostFailure(t, r), ok: false } }));
     });
   const reconnect = (h: string) =>
     run(`reconnect:${h}`, async () => {
       const r = await api.reconnectHost(h);
       await refreshStore();
-      setNote((n) => ({ ...n, [h]: r.online ? { text: t.hostReachable, ok: true } : { text: `${t.hostUnreachable}: ${r.error ?? ""}`, ok: false } }));
+      setNote((n) => ({ ...n, [h]: r.online ? { text: t.hostReachable, ok: true } : { text: hostFailure(t, r), ok: false } }));
     });
   const rename = (h: string, self: boolean) =>
     run(`rename:${h}`, async () => {
@@ -59,10 +60,10 @@ export function NetworkPage() {
     run(`addr:${h}`, async () => {
       const url = (editingAddr[h] ?? "").trim();
       if (!url) return;
-      await api.setHostAddress(h, url);
+      const saved = await api.setHostAddress(h, url);
       setEditingAddr((e) => ({ ...e, [h]: undefined as unknown as string }));
       await refreshStore();
-      setNote((n) => ({ ...n, [h]: { text: t.hostAddressSaved, ok: true } }));
+      setNote((n) => ({ ...n, [h]: savedAddressNote(t, saved) }));
     });
   const copyCli = (h: string, self: boolean) => {
     const cmd = self ? "cafe daemon status" : `cafe root test ${h}`;

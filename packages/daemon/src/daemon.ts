@@ -43,6 +43,7 @@ import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
 import { Store } from "./store.ts";
 import { summarize } from "./summary.ts";
+import { describeFetchError } from "./net-errors.ts";
 
 export interface DaemonOptions {
   config: CafeConfig;
@@ -463,7 +464,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private onPeerClosed(peer: Peer): void {
     this.uis.delete(peer);
     if (peer.meta.kind === "peer") this.dropLink(peer);
-    for (const subs of this.subscribers.values()) subs.delete(peer);
+    // Drop the key with its last subscriber, as dropLink() does for threadLinks; otherwise every
+    // thread ever subscribed keeps an empty Set for the life of the process (#85).
+    for (const [threadId, subs] of this.subscribers) {
+      subs.delete(peer);
+      if (subs.size === 0) this.subscribers.delete(threadId);
+    }
     // A Root shutting down does not mark its children's Agents offline: they may keep working over direct links.
     if (peer.meta.kind === "daemon" && peer.meta.host && !this.stopped) {
       const host = peer.meta.host as string;
@@ -747,7 +753,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * Root: a person's hand-set address for another Host. It beats the address that Host reports about
    * itself, and — once proven reachable — is what the Root broadcasts to children (#75). `null` clears it.
    */
-  async setHostAddress(host: string, url: string | null): Promise<DaemonRecord> {
+  async setHostAddress(host: string, url: string | null): Promise<DaemonRecord & { verified?: boolean; error?: string; code?: string }> {
     if (!this.isRoot) throw new RpcError("not_root", "only the Root can set another Host's address");
     if (host === this.host) throw new RpcError("bad_request", "this is the Root itself; set `advertise` instead");
     const record = this.daemons().find((d) => d.host === host);
@@ -765,8 +771,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.log(url === null ? `cleared pinned address for ${host}` : `pinned ${host} -> ${this.config.pinnedDaemons[host]}`);
     // Prove the new address before it reaches the children: a hand-typed Docker address is as useless
     // to them as a self-reported one (#75).
-    if (url !== null) await this.rememberChildUrl(host, `ws://${this.config.pinnedDaemons[host]}`);
-    return this.daemons().find((d) => d.host === host) ?? record!;
+    // The probe result goes back to the caller, so "saved" is never shown for an address the Root
+    // just failed to reach (#83).
+    const probe = url !== null ? await this.rememberChildUrl(host, `ws://${this.config.pinnedDaemons[host]}`) : undefined;
+    const result = this.daemons().find((d) => d.host === host) ?? record!;
+    return probe ? { ...result, ...probe } : result;
   }
 
   /** The pinned address if a person set one; also the only child address worth broadcasting. */
@@ -793,7 +802,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** Reachability check from this machine to another Host's HTTP API (Web "Test"). */
-  async testHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }> {
+  async testHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string; code?: string }> {
     if (host === this.host) return { host, online: true, latencyMs: 0, version: this.version };
     const rec = this.daemons().find((d) => d.host === host);
     const url = this.pinnedAddress(host) || rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
@@ -810,12 +819,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const info = (await res.json()) as { version?: string };
       return { host, online: true, latencyMs: Date.now() - started, ...(info.version ? { version: info.version } : {}) };
     } catch (err) {
-      return { host, online: false, error: (err as Error).message };
+      return { host, online: false, ...describeFetchError(err, url.replace(/^wss?:\/\//, "")) };
     }
   }
 
   /** Root: ask a known Host to dial back (used by the Web Network page). */
-  async reconnectHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string }> {
+  async reconnectHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string; code?: string }> {
     if (!this.isRoot) throw new RpcError("not_root", "only the Root can reconnect another Host");
     if (this.children.has(host)) return this.testHost(host);
     const rec = this.daemons().find((d) => d.host === host);
@@ -1480,6 +1489,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Entry point for every event, local or relayed. Idempotent on eventId. */
   private seen = new Set<string>();
   /** Cheap counters for /api/health (dogfooding probes, #31/#34): since this Daemon started. */
+  /** When this daemon process started (ms); the *SinceStart metrics count from here. */
+  readonly startedAt = Date.now();
   private stats = { events: 0, appendBytes: 0, metaWrites: 0, metaBytes: 0, snapshotMs: 0, searchMs: 0 };
   private loopLagMs = 0;
   /** Cost of the last routing-hint recompute, for /api/health (#68). */
@@ -1574,19 +1585,42 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     hintMs: number;
     hintRows: number;
     threadListeners: number;
+    subscribedThreads: number;
     sseClients: number;
     wsClients: number;
+    eventsSinceStart: number;
+    appendBytesSinceStart: number;
+    metaWritesSinceStart: number;
+    metaBytesSinceStart: number;
+    threadsTotal: number;
+    indexedEventsTotal: number;
+    lastSnapshotMs: number;
+    lastSearchMs: number;
   } {
+    const threads = this.store.countThreads();
+    const indexed = this.store.countIndexed();
     return {
-      threads: this.store.countThreads(),
+      // Scoped names (#86): *SinceStart reset when the daemon restarts (see startedAt in /api/health),
+      // *Total are what the database holds, last* time the most recent operation. The unscoped
+      // names below are the same values, kept for one release for existing readers.
+      eventsSinceStart: this.stats.events,
+      appendBytesSinceStart: this.stats.appendBytes,
+      metaWritesSinceStart: this.stats.metaWrites,
+      metaBytesSinceStart: this.stats.metaBytes,
+      threadsTotal: threads,
+      indexedEventsTotal: indexed,
+      lastSnapshotMs: this.stats.snapshotMs,
+      lastSearchMs: this.stats.searchMs,
+      threads,
       ...this.stats,
       eventLoopLagMs: this.loopLagMs,
       cachedThreads: this.metas.size,
       cachedOrders: this.knownOrders.size,
-      indexedEvents: this.store.countIndexed(),
+      indexedEvents: indexed,
       hintMs: Math.round(this.hintMs * 100) / 100,
       hintRows: this.hintRows,
       threadListeners: this.listenerCount("thread"),
+      subscribedThreads: this.subscribers.size,
       sseClients: this.streamCounts.sse,
       wsClients: this.streamCounts.ws,
     };
@@ -2018,24 +2052,30 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * in Docker/NAT often reports a container-internal IP that is unreachable from
    * the Root; writing it would poison `knownDaemons` and announceRoot forever.
    */
-  private async rememberChildUrl(host: string, url: string): Promise<void> {
-    if (this.config.knownDaemons[host] === url) return;
+  private async rememberChildUrl(host: string, url: string): Promise<{ verified: boolean; error?: string; code?: string }> {
+    if (this.config.knownDaemons[host] === url) return { verified: true };
     try {
       const res = await fetch(`${url.replace(/^ws/, "http")}/api/health`, {
         headers: { authorization: `Bearer ${this.config.token}` },
         signal: AbortSignal.timeout(1000),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const error = res.status === 401 ? "unauthorized: the hosts use different tokens" : `HTTP ${res.status}`;
+        this.log(`not saving ${host} address ${url}: ${error}`);
+        return { verified: false, error, code: res.status === 401 ? "UNAUTHORIZED" : `HTTP_${res.status}` };
+      }
     } catch (err) {
-      this.log(`not saving ${host} address ${url}: not reachable from the Root (${(err as Error).message}); set advertise on ${host} if the Root must dial back`);
-      return;
+      const why = describeFetchError(err, url.replace(/^wss?:\/\//, ""));
+      this.log(`not saving ${host} address ${url}: not reachable from the Root (${why.error}); set advertise on ${host} if the Root must dial back`);
+      return { verified: false, ...why };
     }
-    if (this.config.knownDaemons[host] === url) return;
+    if (this.config.knownDaemons[host] === url) return { verified: true };
     this.config.knownDaemons[host] = url;
     saveConfig(this.config, this.store.home);
     this.log(`known daemon ${host} -> ${url}`);
     // Children only learn verified addresses (#75); now that this one is verified, share it.
     this.emitDaemons();
+    return { verified: true };
   }
 
   /** Root: after moving to a new address, tell every known Daemon where it is now. */

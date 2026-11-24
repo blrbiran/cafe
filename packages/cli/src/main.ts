@@ -5,10 +5,10 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Command } from "commander";
+import { Command, CommanderError } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
-import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
+import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { fingerprintOf, issueLeaf, sanList } from "../../daemon/src/tls/certs.ts";
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
@@ -20,6 +20,7 @@ import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
 import { BRIDGED_AGENTS, runBridge, type AgentKind } from "./bridge/barista.ts";
 import { runSessionHost, type HostMessage } from "./bridge/session-host.ts";
+import { CodexTuiEngine } from "./bridge/codex-tui.ts";
 import { runInit } from "./init.ts";
 import { extensionPackageDir, installPiExtension, ompExtensionCommand, ompExtensionState, piExtensionState, removePiExtension, summarizeProcessError } from "./extension.ts";
 import { runDoctor } from "./doctor.ts";
@@ -58,6 +59,68 @@ async function healthy(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Refuse to act on a daemon that is not this CAFE_HOME's (#88). Without this, an empty or
+ * deleted CAFE_HOME falls back to the default port and `cafe daemon stop` shuts down whichever
+ * daemon answers there — usually the person's real Root. An explicit CAFE_DAEMON target is the
+ * caller's choice and is not second-guessed.
+ * Returns false when nothing is listening.
+ */
+async function ownDaemonRunning(): Promise<boolean> {
+  if (process.env.CAFE_DAEMON) return healthy();
+  const home = cafeHome();
+  if (!configInitialized(home)) {
+    throw new Error(`this CAFE_HOME (${home}) is not initialized: there is no config.yml, so it has no daemon to stop.\nnext: check CAFE_HOME, or run \`cafe daemon start\` to create one`);
+  }
+  return assertNotForeign(home);
+}
+
+/** True when a daemon answers on this home's port; throws if it belongs to another home. */
+async function assertNotForeign(home: string): Promise<boolean> {
+  let h: { host?: string; homeId?: string; pid?: number };
+  try {
+    const r = await fetch(`${base()}/api/health`, { signal: AbortSignal.timeout(800) });
+    if (!r.ok) return false;
+    h = await r.json();
+  } catch {
+    return false;
+  }
+  const mine = h.homeId ? h.homeId === homeId(home) : h.host === loadConfig().host;
+  if (!mine) {
+    throw new Error(
+      `the daemon on ${base()} (host ${h.host ?? "?"}, pid ${h.pid ?? "?"}) belongs to another CAFE_HOME, not ${home}; refusing to touch it.\n` +
+        `next: check CAFE_HOME and the port in ${join(home, "config.yml")}`,
+    );
+  }
+  return true;
+}
+
+/** The daemon is on this machine (its directories are ours), not a remote CAFE_DAEMON. */
+function localDaemon(): boolean {
+  const target = process.env.CAFE_DAEMON;
+  if (!target) return true;
+  const host = target.replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+/**
+ * After `barista start`: wait until an Agent from `dir` registers, or a worker for it exits with an
+ * error. A worker that fails at once is reported instead of being called "started" (#82).
+ */
+async function awaitBarista(dir: string, timeoutMs = Number(process.env.CAFE_BARISTA_START_WAIT_MS) || 15_000): Promise<{ agent?: string; failed?: { lastError?: string; log?: string } }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ws = await api<any[]>("/api/baristas").catch(() => []);
+    const failed = ws.find((w) => w.dir === dir && !w.running && (w.state === "failed" || w.lastError));
+    if (failed) return { failed };
+    const agents = await api<any[]>("/api/agents").catch(() => []);
+    const mine = agents.find((a) => a.cwd === dir && a.status !== "offline");
+    if (mine) return { agent: mine.address ?? mine.name };
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return {};
 }
 
 /** Upload one file to the local daemon; the returned metadata goes on the Order. */
@@ -409,6 +472,8 @@ daemon
   .description("start the daemon in the background if not running")
   .option("--root", "run as the Root Daemon (also persisted to config)")
   .action(async (o) => {
+    // Never report another CAFE_HOME's daemon on this port as "running" (#88).
+    if (!process.env.CAFE_DAEMON) await assertNotForeign(cafeHome());
     if (o.root) setConfigValue("mode", "root");
     await ensureDaemon({ root: o.root });
     const h = await api("/api/health");
@@ -418,7 +483,7 @@ daemon
   .command("stop")
   .description("stop the background daemon")
   .action(async () => {
-    if (!(await healthy())) return out("cafe daemon is not running", { running: false });
+    if (!(await ownDaemonRunning())) return out("cafe daemon is not running", { running: false });
     await api("/api/shutdown", { method: "POST" });
     out("cafe daemon stopping", { stopping: true });
   });
@@ -427,7 +492,7 @@ daemon
   .description("stop and start the daemon (config changes marked restart required)")
   .action(async () => {
     const cfg = loadConfig();
-    if (await healthy()) {
+    if (await ownDaemonRunning()) {
       await api("/api/shutdown", { method: "POST" });
       for (let i = 0; i < 50 && (await healthy()); i++) await new Promise((r) => setTimeout(r, 100));
     }
@@ -1168,6 +1233,16 @@ barista
     if (o.thread && !o.tui) throw new Error("--thread needs --tui");
     if (o.tui && (o.write || o.model)) throw new Error("--tui uses the session's own model and permissions; drop --write / --model");
     await ensureDaemon();
+    const dir = resolve(o.dir);
+    // A TUI Barista is only useful next to a running Codex session. Check here, where the person is
+    // looking, instead of only inside the supervised worker whose error nobody sees (#82). A remote
+    // daemon's directory is not on this machine, so only a local daemon is checked here.
+    if (o.tui && localDaemon()) {
+      const engine = new CodexTuiEngine({ dir, thread: o.thread, access: "read-only" });
+      const probe = await engine.probe();
+      await engine.close().catch(() => {});
+      if (!probe.ok) throw new Error(`cannot start a Codex TUI barista: ${probe.error}\nnext: start codex in ${dir} (or pass --thread <id>) and run this command again`);
+    }
     // The daemon accepts only cafe's own agents (#65), so the agent name is what it gets — never a
     // free-form executable path.
     const spec = {
@@ -1177,9 +1252,16 @@ barista
       ...(native && o.tui ? { tui: true } : {}),
       ...(native && o.thread ? { thread: o.thread } : {}),
     };
-    const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: resolve(o.dir), ...spec }) });
+    const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir, ...spec }) });
     const how = o.tui ? " (answers in the running Codex session)" : native ? (o.write ? " (may edit files)" : " (read-only)") : "";
-    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${resolve(o.dir)}${how}`, ws);
+    // "started" must mean it came up: wait for it to register, or report how it failed (#82).
+    const outcome = await awaitBarista(dir);
+    if (outcome.failed) {
+      await api(`/api/baristas?dir=${encodeURIComponent(dir)}`, { method: "DELETE" }).catch(() => {});
+      throw new Error(`the ${o.agent ?? "pi"} Barista in ${dir} could not start:\n${outcome.failed.lastError ?? "it exited at once"}\nlog: ${outcome.failed.log}`);
+    }
+    const ready = outcome.agent ? `; registered as ${outcome.agent}` : "; not registered yet (check `cafe barista list` and `cafe agents`)";
+    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${dir}${how}${ready}`, ws);
   });
 barista
   .command("stop")
@@ -1193,7 +1275,13 @@ barista
   .action(async () => {
     const ws = await api<any[]>("/api/baristas");
     if (ws.length) {
-      out(ws.map((w) => `${w.running ? "running" : "waiting"} ${String(w.agent ?? "pi").padEnd(6)} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`).join("\n"), ws);
+      const line = (w: any) => {
+        const head = `${w.state ?? (w.running ? "running" : "waiting")} ${String(w.agent ?? "pi").padEnd(6)} pid=${w.pid ?? "-"} restarts=${w.restarts} ${w.dir}#${w.slot}`;
+        // A failed or restarting worker says why, in its own words, and where the full log is (#82).
+        const why = !w.running && w.lastError ? `\n    ${String(w.lastError).split("\n").join("\n    ")}\n    log: ${w.log}` : "";
+        return head + why;
+      };
+      out(ws.map(line).join("\n"), ws);
       return;
     }
     // A TUI / session-host Agent is registered directly, not supervised: say so instead of a bare (none).
@@ -1558,19 +1646,73 @@ function lstatSafe(p: string) {
 // the pi/omp Barista extensions (`cafe extension`).
 addConnectorCommands(program, out, base);
 
+// --json is read from argv here because an error can happen before any action's preAction hook
+// sets JSON_OUT (a misspelt command never reaches one).
+const WANTS_JSON = process.argv.slice(2).includes("--json");
+
+/** Under --json every failure is one JSON object on stdout (#87); otherwise text on stderr. */
+function fail(error: string, message: string, extra: { suggestions?: string[]; hint?: string } = {}): never {
+  if (WANTS_JSON) {
+    console.log(JSON.stringify({ error, message, ...(extra.suggestions ? { suggestions: extra.suggestions } : {}) }));
+  } else {
+    console.error(`cafe: ${message}${extra.hint ? `\n${extra.hint}` : ""}`);
+  }
+  process.exit(1);
+}
+
+function editDistance(a: string, b: string): number {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/** Commands within a small edit distance (or sharing a prefix), nearest first. */
+function similar(word: string, names: string[]): string[] {
+  return names
+    .map((n) => ({ n, d: n.startsWith(word) || word.startsWith(n) ? 1 : editDistance(word, n) }))
+    .filter((x) => x.d <= Math.max(2, Math.floor(word.length / 3)))
+    .sort((x, y) => x.d - y.d)
+    .map((x) => x.n);
+}
+
 // Commander falls back to the top-level help (exit 0) for `cafe <typo> --help`.
 // Check the first positional ourselves so a misspelt command always fails.
-const commandNames = new Set(program.commands.map((c) => c.name()));
+const commandNames = new Set(program.commands.flatMap((c) => [c.name(), ...c.aliases()]));
 for (const arg of process.argv.slice(2)) {
   if (["--json", "-V", "--version", "-h", "--help"].includes(arg) || arg.startsWith("-")) continue;
   if (arg !== "help" && !commandNames.has(arg)) {
-    console.error(`cafe: unknown command '${arg}'`);
-    process.exit(1);
+    const suggestions = similar(arg, program.commands.map((c) => c.name()));
+    fail("unknown_command", `unknown command '${arg}'`, {
+      suggestions,
+      hint: `${suggestions.length ? `  did you mean: ${suggestions.map((n) => `cafe ${n}`).join(", ")}\n` : ""}next: cafe --help`,
+    });
   }
   break;
 }
 
+// Commander's own parse errors (a misspelt subcommand, a missing argument) become JSON under
+// --json instead of plain text. Text mode keeps Commander's wording, including "Did you mean".
+if (WANTS_JSON) {
+  const quiet = (c: Command): void => {
+    c.exitOverride();
+    c.configureOutput({ writeErr: () => {}, outputError: () => {} });
+    c.commands.forEach(quiet);
+  };
+  quiet(program);
+}
+
 program.parseAsync().catch((err) => {
-  console.error(`cafe: ${(err as Error).message}`);
-  process.exit(1);
+  if (err instanceof CommanderError) {
+    if (err.exitCode === 0) process.exit(0); // --help / --version under exitOverride
+    const raw = err.message.replace(/^error: /, "");
+    const message = raw.split("\n")[0];
+    const suggestions = [...raw.matchAll(/Did you mean (?:one of )?([^?]+)\?/g)].flatMap((m) => m[1].split(",").map((x) => x.trim()));
+    fail(err.code === "commander.unknownCommand" ? "unknown_command" : err.code.replace(/^commander\./, ""), message, suggestions.length ? { suggestions } : {});
+  }
+  fail("failed", (err as Error).message);
 });

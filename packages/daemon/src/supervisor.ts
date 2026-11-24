@@ -35,6 +35,15 @@ interface Worker {
   launchedAt?: number;
   timer?: ReturnType<typeof setTimeout>;
   stopping: boolean;
+  /** Consecutive exits soon after launch; resets after a healthy run. */
+  quickFailures: number;
+  /** Gave up restarting (#82); `start()` again replaces it. */
+  failed: boolean;
+  /** The worker's own explanation of its last failure (its last stderr lines). */
+  lastError?: string;
+  /** Recent output lines, to explain a failure. */
+  tail: string[];
+  logPath: string;
 }
 
 export interface WorkerInfo {
@@ -46,6 +55,12 @@ export interface WorkerInfo {
   restarts: number;
   startedAt?: number;
   running: boolean;
+  /** running, waiting (between restarts) or failed (gave up; see lastError). */
+  state: "running" | "waiting" | "failed";
+  /** Why the worker last exited, in its own words (e.g. "cafe: … / next: …"). */
+  lastError?: string;
+  /** The per-worker log with the full output. */
+  log: string;
 }
 
 /** One live worker group as persisted in `baristas.runtime.json`. */
@@ -69,6 +84,12 @@ export interface SupervisorOptions {
   backoffBaseMs?: number;
   /** `bin/cafe.js` that runs `cafe barista run` for Codex / Claude Baristas (default: found next to this package). */
   cliBin?: string;
+  /** Lifecycle lines for the daemon log (a worker that keeps failing, or gives up). */
+  log?: (msg: string) => void;
+  /** Give up after this many consecutive failed starts (default 3). */
+  failAfter?: number;
+  /** An exit this soon after launch counts as a failed start (default 30s). */
+  quickExitMs?: number;
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -119,6 +140,9 @@ export class Supervisor {
   private readonly graceMs: number;
   private readonly backoffBaseMs: number;
   private readonly cliBin: string;
+  private readonly log: (msg: string) => void;
+  private readonly failAfter: number;
+  private readonly quickExitMs: number;
 
   constructor(opts: SupervisorOptions) {
     this.file = join(opts.home, "baristas.json");
@@ -129,6 +153,9 @@ export class Supervisor {
     this.graceMs = opts.graceMs ?? 5000;
     this.backoffBaseMs = opts.backoffBaseMs ?? 1000;
     this.cliBin = opts.cliBin ?? defaultCliBin();
+    this.log = opts.log ?? (() => {});
+    this.failAfter = opts.failAfter ?? 3;
+    this.quickExitMs = opts.quickExitMs ?? 30_000;
     this.env = {
       ...process.env,
       CAFE_DAEMON: opts.daemonAddr,
@@ -160,11 +187,15 @@ export class Supervisor {
 
   start(spec: BaristaSpec, persist = true): WorkerInfo[] {
     const dir = resolve(spec.dir);
-    if (this.workers.some((w) => w.spec.dir === dir)) throw new Error(`barista already running in ${dir}`);
+    const existing = this.workers.filter((w) => w.spec.dir === dir);
+    // A Barista that gave up (#82) is replaced by a new start; a live one is not.
+    if (existing.length && !existing.every((w) => w.failed)) throw new Error(`barista already running in ${dir}`);
+    if (existing.length) this.workers = this.workers.filter((w) => w.spec.dir !== dir);
     const { cafe } = loadIdentity(dir);
+    const name = dir.split(/[\\/]/).filter(Boolean).pop() ?? "barista";
     // A running session answers one question at a time: one worker per TUI Barista.
     for (let slot = 1; slot <= (spec.tui ? 1 : cafe.concurrency); slot++) {
-      const w: Worker = { spec: { ...spec, dir }, slot, restarts: 0, stopping: false };
+      const w: Worker = { spec: { ...spec, dir }, slot, restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${slot}.log`) };
       this.workers.push(w);
       this.launch(w);
     }
@@ -190,6 +221,9 @@ export class Supervisor {
       restarts: w.restarts,
       startedAt: w.launchedAt,
       running: !!w.child && w.child.exitCode === null && w.child.signalCode === null,
+      state: w.failed ? ("failed" as const) : w.child && w.child.exitCode === null && w.child.signalCode === null ? ("running" as const) : ("waiting" as const),
+      ...(w.lastError ? { lastError: w.lastError } : {}),
+      log: w.logPath,
     }));
   }
 
@@ -205,10 +239,10 @@ export class Supervisor {
 
   private launch(w: Worker): void {
     mkdirSync(this.logDir, { recursive: true });
-    const name = w.spec.dir.split(/[\\/]/).filter(Boolean).pop() ?? "barista";
     let log: CappedLineFile | undefined;
+    w.tail = [];
     try {
-      log = openWorkerLog(join(this.logDir, `barista-${name}-${w.slot}.log`));
+      log = openWorkerLog(w.logPath);
     } catch {
       // Logging must never stop a worker from running.
     }
@@ -245,6 +279,9 @@ export class Supervisor {
     w.launchedAt = Date.now();
     w.startedAt = undefined;
     const sink = (chunk: Buffer) => {
+      // Keep the last lines in memory: they are the worker's own account of why it stopped.
+      for (const line of chunk.toString("utf8").split("\n")) if (line.trim()) w.tail.push(line.trimEnd());
+      if (w.tail.length > 20) w.tail.splice(0, w.tail.length - 20);
       try {
         log?.write(chunk);
       } catch {
@@ -279,6 +316,19 @@ export class Supervisor {
         this.saveRuntime();
       }
       if (w.stopping) return;
+      const failedStart = (code ?? 1) !== 0 && !!w.launchedAt && Date.now() - w.launchedAt < this.quickExitMs;
+      if (code !== 0 || signal) {
+        w.lastError = explain(w.tail, code === EXIT_NOT_FOUND ? `agent executable not found: ${bin}` : `exited code=${code} signal=${signal}`);
+      }
+      w.quickFailures = failedStart ? w.quickFailures + 1 : 0;
+      if (w.quickFailures >= this.failAfter) {
+        // Same failure every time: retrying forever only hides it (#82).
+        w.failed = true;
+        note(`gave up after ${w.quickFailures} failed starts`);
+        this.log(`barista ${w.spec.dir}#${w.slot} gave up after ${w.quickFailures} failed starts: ${w.lastError?.split("\n")[0] ?? "no output"} (log: ${w.logPath})`);
+        return;
+      }
+      if (failedStart && w.quickFailures === 1) this.log(`barista ${w.spec.dir}#${w.slot} failed to start: ${w.lastError?.split("\n")[0] ?? "no output"}; retrying (log: ${w.logPath})`);
       // Reset backoff after a healthy minute; never hot-loop (a missing binary backs off like any crash).
       if (w.launchedAt && Date.now() - w.launchedAt > 60_000) w.restarts = 0;
       const delay = Math.min(60_000, this.backoffBaseMs * 2 ** w.restarts++);
@@ -358,6 +408,17 @@ function writeAtomic(path: string, text: string): void {
   } catch {
     // best effort
   }
+}
+
+/**
+ * The worker's own explanation: from its last `cafe:` line to the end (that is where `cafe barista
+ * run` prints the problem and the `next:` step), else its last few lines, else the exit status.
+ */
+function explain(tail: string[], fallback: string): string {
+  const lines = tail.filter((l) => !l.startsWith("[cafe] "));
+  const at = lines.map((l) => l.startsWith("cafe:")).lastIndexOf(true);
+  const picked = at >= 0 ? lines.slice(at) : lines.slice(-3);
+  return picked.length ? picked.join("\n").slice(0, 800) : fallback;
 }
 
 function sleep(ms: number): Promise<void> {

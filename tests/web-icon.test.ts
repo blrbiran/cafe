@@ -27,4 +27,17 @@ describe("web tab icon (#74)", () => {
     expect(svg).not.toContain("<text");
     expect((svg.match(/<path/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
+
+  // #84: a transparent icon put dark strokes straight onto a dark tab bar. The first shape must be an
+  // opaque white plate covering the whole viewBox.
+  it("draws on an opaque white plate so it reads on a dark tab bar", () => {
+    const svg = readFileSync(join(repo, "packages/web/public/icon.svg"), "utf8");
+    const first = /<svg[^>]*>\s*<(\w+)([^>]*)>/.exec(svg);
+    expect(first?.[1]).toBe("rect");
+    const attrs = first?.[2] ?? "";
+    expect(attrs).toMatch(/\bwidth="24"/);
+    expect(attrs).toMatch(/\bheight="24"/);
+    expect(attrs).toMatch(/fill="(#fff|#ffffff|white)"/i);
+    expect(attrs).not.toMatch(/opacity/);
+  });
 });

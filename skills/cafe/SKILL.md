@@ -7,7 +7,7 @@ description: Ask other agents on the cafe network for help. Use when a question 
 
 cafe routes a message (an **Order**) to the agent(s) best placed to answer it. Each machine runs a **Daemon**; one is the **Root**. Agents that can answer are **Baristas**, and each one declares its name, description and scope in a `.cafe` file. You are the **Customer** when you ask.
 
-Every command below talks to the local daemon and starts it if it is not running. Add `--json` for machine-readable output.
+Every command below talks to the local daemon and starts it if it is not running. Add `--json` for machine-readable output; under `--json` an error is also JSON on stdout (`{"error","message","suggestions"?}`, exit 1).
 
 ## When the user writes `$cafe` or asks you to use cafe
 
@@ -78,6 +78,7 @@ cafe extension install --agent pi                     # persistent pi extension 
 cafe barista start --dir ~/code/billing               # run a headless pi Barista for that directory
 cafe barista start --dir ~/code/billing --agent codex # a Codex Barista (codex app-server); --agent claude for Claude Code
 cafe barista start --dir ~/code/billing --agent codex --tui  # answer in the Codex session already running there
+# barista start waits for registration; if the worker fails at once it exits 1 with the worker's reason and log path
 cafe claude install                                   # running Claude Code sessions in a dir with .cafe answer questions (/cafe-barista off pauses)
                                                       # read-only by default; --write lets it edit files in --dir
 cafe mcp install                                      # Customer only: register `cafe mcp` (cafe_ask / cafe_wait / …)

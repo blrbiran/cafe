@@ -109,6 +109,8 @@ cafe barista start --dir ~/code/billing            # pi
 cafe barista start --dir ~/code/billing --agent omp
 ```
 
+`barista start` waits until the Barista registers and prints its address. If it fails at once (a missing executable, no Codex session for `--tui`, a broken `.cafe`), the command fails with the worker's own message and its log path and leaves nothing running. A worker that fails three quick starts in a row stops retrying; `cafe barista list` shows it as `failed` with the reason, and running `barista start` again replaces it.
+
 ### Codex / Claude Code (native sessions, supervised by the Daemon)
 
 ```bash
@@ -215,6 +217,12 @@ open http://127.0.0.1:4777/
 2. the host must restart to reload extensions; `cafe daemon status` shows whether the Daemon is running;
 3. `cafe init` confirms the current directory has a parseable `.cafe`;
 4. `cafe doctor` prints all of the above plus the next step.
+
+`cafe daemon stop` / `restart` only act on the daemon of *this* `CAFE_HOME`: the daemon reports an id of its home in `/api/health`, and a daemon that belongs to another home (or a `CAFE_HOME` with no `config.yml`) is refused instead of being shut down. Read-only commands no longer create `config.yml` in an empty `CAFE_HOME`; `cafe daemon start` (or `cafe config set`) does. With `--json`, every error, including a misspelt command, is one JSON object on stdout (`{"error","message","suggestions"?}`) with exit code 1.
+
+`GET /api/health` also returns `startedAt` and scoped metrics: `*SinceStart` counters reset when the daemon restarts (`eventsSinceStart`, `appendBytesSinceStart`, `metaWritesSinceStart`, `metaBytesSinceStart`), `*Total` are what the database holds (`threadsTotal`, `indexedEventsTotal`), `last*` time the most recent operation (`lastSnapshotMs`, `lastSearchMs`); `subscribedThreads` counts live thread subscriptions. The unscoped names (`events`, `threads`, …) are kept for one release.
+
+Network page → **Test connection** names the cause (connection refused, host not found, timeout, token, certificate) instead of "fetch failed"; saving an address the hub cannot reach says so, and the other machines keep the last address that worked.
 
 Logs: `~/.cafe/daemon.log` (timestamped, capped at 16 MB with one `daemon.log.1`), `~/.cafe/daemon.stdout.log` (raw startup output), `~/.cafe/logs/barista-*.log`; raw Threads in `~/.cafe/sessions/<date>/<threadId>.jsonl`.
 

@@ -167,3 +167,44 @@ describe("capped worker log", () => {
     expect(readFileSync(path, "utf8")).toBe(`line one\nline two\n${logTruncatedMarker(18)}`);
   });
 });
+
+// #82: a worker that fails at once (a Codex TUI Barista with no Codex session in its directory)
+// was restarted forever, every minute, and the only trace was a per-worker log nobody was pointed at.
+describe("supervisor failed state (#82)", () => {
+  function failing(root: string): string {
+    const bin = join(root, "fails.sh");
+    writeFileSync(bin, "#!/bin/sh\necho 'cafe: cannot start: no Codex session in this directory' >&2\necho 'next: start codex here and try again' >&2\nexit 1\n");
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  it("stops restarting after three quick failures and keeps the reason", async () => {
+    const { root, home, dir } = setup();
+    const logged: string[] = [];
+    const sup = new Supervisor({ home, daemonAddr: "127.0.0.1:1", token: "t", piBin: FAKE_PI, extension: "/dev/null", graceMs: 500, backoffBaseMs: 20, log: (m: string) => logged.push(m) });
+    cleanup.push(() => sup.shutdown());
+    sup.start({ dir, bin: failing(root) });
+    await waitFor(() => sup.list()[0]?.state === "failed", 8000);
+    const w = sup.list()[0]!;
+    expect(w.restarts).toBeLessThanOrEqual(3);
+    expect(w.running).toBe(false);
+    expect(w.lastError).toContain("no Codex session");
+    expect(w.lastError).toContain("next: start codex");
+    expect(w.log).toBe(join(home, "logs", "barista-work-1.log"));
+    // The daemon log hears about it, not only the per-worker log.
+    expect(logged.join("\n")).toMatch(/gave up after 3 failed starts/);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(sup.list()[0]!.restarts).toBe(w.restarts); // really stopped
+  });
+
+  it("lets start() replace a failed Barista in the same directory", async () => {
+    const { root, home, dir } = setup();
+    const sup = supervisor(home, { backoffBaseMs: 20 });
+    sup.start({ dir, bin: failing(root) });
+    await waitFor(() => sup.list()[0]?.state === "failed", 8000);
+    const again = sup.start({ dir });
+    expect(again).toHaveLength(1);
+    expect(sup.list()).toHaveLength(1);
+    await waitFor(() => sup.list()[0]?.state === "running", 5000);
+  });
+});

@@ -338,3 +338,48 @@ describe("connector command aliases (#59)", () => {
     }
   });
 });
+
+// #87: a misspelt top-level command had no suggestion (subcommands did), and --json printed
+// plain text for both, so a script parsing --json output crashed on a typo.
+describe("unknown commands suggest and honour --json (#87)", () => {
+  it("suggests the nearest top-level command", () => {
+    const r = cafe(home(), "agentz");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("unknown command 'agentz'");
+    expect(r.stderr).toMatch(/did you mean: cafe agents/i);
+  });
+
+  it("keeps the subcommand suggestion", () => {
+    const r = cafe(home(), "barista", "lsit");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/Did you mean list\?/);
+  });
+
+  it("prints a JSON error for a top-level typo under --json", () => {
+    const r = cafe(home(), "--json", "agentz");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe("");
+    const j = JSON.parse(r.stdout);
+    expect(j).toMatchObject({ error: "unknown_command", message: "unknown command 'agentz'" });
+    expect(j.suggestions[0]).toBe("agents");
+  });
+
+  it("prints a JSON error for a subcommand typo under --json", () => {
+    const r = cafe(home(), "--json", "barista", "lsit");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe("");
+    expect(JSON.parse(r.stdout)).toMatchObject({ error: "unknown_command", suggestions: ["list"] });
+  });
+
+  it("prints a JSON error when a command fails under --json", () => {
+    const r = cafe(home(), "config", "get", "no.such.key", "--json");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe("");
+    expect(JSON.parse(r.stdout)).toMatchObject({ error: "failed", message: expect.stringContaining("no.such.key") });
+  });
+
+  it("still fails a typo with --help (#7)", () => {
+    const r = cafe(home(), "agentz", "--help");
+    expect(r.status).toBe(1);
+  });
+});

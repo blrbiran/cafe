@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync, existsSync } from "node:fs";
 import { hostname, homedir } from "node:os";
-import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { join, resolve } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
 import { parse, stringify } from "yaml";
 import { z } from "zod";
 import { DEFAULT_PORT } from "@cafe/protocol";
@@ -159,12 +159,36 @@ export function configPath(home = cafeHome()): string {
   return join(home, "config.yml");
 }
 
-export function loadConfig(home = cafeHome()): CafeConfig {
+/**
+ * A short, stable id for a CAFE_HOME (its resolved path, hashed). The daemon reports it in
+ * /api/health so `cafe daemon stop|restart` can tell its own daemon from another home's daemon
+ * on the same port (#88). The path itself is not exposed.
+ */
+export function homeId(home = cafeHome()): string {
+  let path = resolve(home);
+  try {
+    path = realpathSync(path);
+  } catch {
+    // A home that does not exist yet still has a stable id.
+  }
+  return createHash("sha256").update(path).digest("hex").slice(0, 16);
+}
+
+export function configInitialized(home = cafeHome()): boolean {
+  return existsSync(configPath(home));
+}
+
+/**
+ * Read the config. Defaults fill anything missing. Only the daemon (and explicit writes such as
+ * `cafe config set`) persist a generated config: a read-only command on an empty CAFE_HOME must
+ * not create one, or "is this home initialized?" stops being answerable (#88).
+ */
+export function loadConfig(home = cafeHome(), opts: { persist?: boolean } = {}): CafeConfig {
   const path = configPath(home);
   const raw = existsSync(path) ? (parse(readFileSync(path, "utf8")) ?? {}) : {};
   const cfg = CafeConfig.parse(raw);
   // Persist generated defaults (token, host) so they stay stable across runs.
-  if (!existsSync(path)) saveConfig(cfg, home);
+  if (opts.persist && !existsSync(path)) saveConfig(cfg, home);
   return cfg;
 }
 

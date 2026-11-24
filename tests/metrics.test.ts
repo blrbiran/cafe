@@ -66,3 +66,40 @@ describe("health metrics", () => {
     expect(stats.truncated).toBe(false);
   });
 });
+// #86: one flat object mixed "since this start" counters, database totals and last-operation
+// timings, so a restarted daemon showed "49 threads, 0 events". Each scope now has its own name.
+describe("health metrics name their scope (#86)", () => {
+  it("separates since-start counters, totals and last timings, and says when the daemon started", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = mkdtempSync(join(tmpdir(), "cafe-m86-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+
+    const before = Date.now();
+    const d = await startDaemon("pc1", { mode: "root", home });
+    const b = await barista(d.addr, identity("builder", { description: "builds things" }));
+    const c = await customer(d.addr);
+    const res = await c.ask({ body: "metrics scope probe", to: "builder" });
+    await untilClosed(c, res.threadId, res.orderId);
+    const first = (await fetch(`http://${d.addr}/api/health`).then((r) => r.json())) as any;
+    expect(first.startedAt).toBeGreaterThanOrEqual(before - 1000);
+    expect(first.metrics.eventsSinceStart).toBeGreaterThanOrEqual(3);
+    expect(first.metrics.eventsSinceStart).toBe(first.metrics.events); // old name kept for one release
+    expect(first.metrics.appendBytesSinceStart).toBeGreaterThan(0);
+    expect(first.metrics.metaWritesSinceStart).toBeGreaterThan(0);
+    expect(first.metrics.threadsTotal).toBe(1);
+    expect(first.metrics).toHaveProperty("indexedEventsTotal");
+    expect(first.metrics).toHaveProperty("lastSnapshotMs");
+    expect(first.metrics).toHaveProperty("lastSearchMs");
+    c.close();
+    b.client.close();
+    await d.stop();
+
+    const again = await startDaemon("pc1", { mode: "root", home });
+    cleanup.push(again.stop);
+    const second = (await fetch(`http://${again.addr}/api/health`).then((r) => r.json())) as any;
+    expect(second.metrics.eventsSinceStart).toBe(0);
+    expect(second.metrics.threadsTotal).toBe(1);
+  });
+});

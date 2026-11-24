@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -198,5 +199,60 @@ describe("supervised Codex TUI Barista", () => {
     await waitFor(() => root.daemon.registry.all().some((r) => r.name === "tuicoder" && r.status === "idle"), 15_000);
     expect(root.daemon.registry.all().filter((r) => r.name === "tuicoder")).toMatchObject([{ mode: "tui", agent: "codex" }]);
     expect(JSON.parse(readFileSync(join(root.home, "baristas.json"), "utf8"))).toMatchObject([{ dir, agent: "codex", tui: true }]);
+  }, 30_000);
+});
+
+// #82: `barista start --agent codex --tui` said "started" in a directory with no Codex session;
+// the worker then failed in the background forever and nothing told the person why.
+describe("barista start reports a Barista that cannot start (#82)", () => {
+  const BIN = join(dirname(fileURLToPath(import.meta.url)), "../packages/cli/bin/cafe.js");
+  function cli(addr: string, env: Record<string, string>, ...args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+    return new Promise((done) => {
+      const p = spawn(process.execPath, [BIN, ...args], { env: { ...process.env, CAFE_DAEMON: addr, CAFE_TOKEN: "t0k", ...env } });
+      let stdout = "";
+      let stderr = "";
+      p.stdout.on("data", (d) => (stdout += d));
+      p.stderr.on("data", (d) => (stderr += d));
+      p.on("close", (status) => done({ status, stdout, stderr }));
+    });
+  }
+  function workDir(name: string) {
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-82-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const dir = join(tmp, "work");
+    const state = join(tmp, "state");
+    mkdirSync(dir);
+    mkdirSync(state);
+    writeFileSync(join(dir, ".cafe"), `name: ${name}\ndescription: probe\nrole: barista\n`);
+    writeFileSync(join(state, "threads.json"), "[]");
+    return { tmp, dir, state };
+  }
+
+  it("fails before starting anything when the directory has no Codex session", async () => {
+    const { dir, state } = workDir("tuiprobe");
+    const root = await startDaemon("root", { mode: "root", noSupervisor: false });
+    cleanup.push(root.stop);
+    const r = await cli(root.addr, { CAFE_CODEX_BIN: FAKE, FAKE_CODEX_STATE: state }, "barista", "start", "--agent", "codex", "--tui", "--dir", dir);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`no Codex session in ${dir}`);
+    expect(r.stderr).toContain("next: start codex");
+    expect(root.daemon.supervisor!.list()).toEqual([]);
+  }, 20_000);
+
+  it("reports a worker that exits at once, with its reason and log, and leaves nothing behind", async () => {
+    const { tmp, dir } = workDir("crashes");
+    const bin = join(tmp, "fails.sh");
+    writeFileSync(bin, "#!/bin/sh\necho 'cafe: this worker cannot start here' >&2\nexit 1\n");
+    const { chmodSync } = await import("node:fs");
+    chmodSync(bin, 0o755);
+    process.env.CAFE_PI_BIN = bin;
+    cleanup.push(() => void delete process.env.CAFE_PI_BIN);
+    const root = await startDaemon("root", { mode: "root", noSupervisor: false });
+    cleanup.push(root.stop);
+    const r = await cli(root.addr, {}, "barista", "start", "--dir", dir);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("this worker cannot start here");
+    expect(r.stderr).toMatch(/barista-work-1\.log/);
+    expect(root.daemon.supervisor!.list()).toEqual([]);
   }, 30_000);
 });

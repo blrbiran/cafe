@@ -107,6 +107,8 @@ cafe barista start --dir ~/code/billing            # pi
 cafe barista start --dir ~/code/billing --agent omp
 ```
 
+`barista start` 会等到 Barista 注册成功并打印它的地址。如果它一启动就失败（找不到可执行文件、`--tui` 时目录里没有 Codex 会话、`.cafe` 写错等），命令会直接报错，带上 worker 自己的报错和日志路径，不留下任何在跑的东西。连续三次刚启动就失败的 worker 会停止重试，`cafe barista list` 显示为 `failed` 并给出原因；再跑一次 `barista start` 会替换它。
+
 ### Codex / Claude Code（原生会话，由 Daemon 托管）
 
 ```bash
@@ -211,6 +213,12 @@ open http://127.0.0.1:4777/
 2. 宿主要重启才会重新加载扩展；`cafe daemon status` 看 Daemon 是否在跑；
 3. `cafe init` 确认当前目录有可解析的 `.cafe`；
 4. `cafe doctor` 会把以上结果和下一步一起打印出来。
+
+`cafe daemon stop` / `restart` 只会操作**当前 `CAFE_HOME`** 的 daemon：daemon 在 `/api/health` 里报告自己 home 的标识，属于别的 home 的 daemon（或没有 `config.yml` 的 `CAFE_HOME`）会被拒绝，而不是被关掉。只读命令不再在空的 `CAFE_HOME` 里生成 `config.yml`，只有 `cafe daemon start`（或 `cafe config set`）才会。加 `--json` 时，所有错误（包括命令拼错）都在 stdout 输出一个 JSON 对象（`{"error","message","suggestions"?}`），退出码 1。
+
+`GET /api/health` 还返回 `startedAt` 和分清口径的指标：`*SinceStart` 是本次启动以来的累计，重启归零（`eventsSinceStart`、`appendBytesSinceStart`、`metaWritesSinceStart`、`metaBytesSinceStart`）；`*Total` 是库里的总量（`threadsTotal`、`indexedEventsTotal`）；`last*` 是最近一次操作的耗时（`lastSnapshotMs`、`lastSearchMs`）；`subscribedThreads` 是当前的 thread 订阅数。旧的不带口径的名字（`events`、`threads` 等）保留一个版本。
+
+网络页的**测试连接**会说出具体原因（连接被拒、找不到主机、超时、token 不一致、证书问题），不再只说 "fetch failed"；保存一个中心节点连不上的地址时会明确提示，其他机器继续用上一个能连上的地址。
 
 日志：`~/.cafe/daemon.log`（带时间戳，上限 16 MB，保留一份 `daemon.log.1`）、`~/.cafe/daemon.stdout.log`（启动阶段的原始输出）、`~/.cafe/logs/barista-*.log`；Thread 原文在 `~/.cafe/sessions/<date>/<threadId>.jsonl`。
 
