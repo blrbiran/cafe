@@ -125,7 +125,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 ### 2026-11-24 (late) — TLS：续期 × pin × SAN 互相打架的 7 个缺陷已修；#62 侧栏可调宽；CI
 
 - **一句话**：昨夜 #61 的「自动续期 + 每 peer 叶子 pin + 精确 SAN」三项彼此冲突，只有在真实滚动网络里
-  才会暴露；连同两条救援路径一共修了 **7 个真实缺陷**，每个都先用一次性实验确认、再写会失败的测试。
+  才会暴露；连同三条救援路径一共修了 **7 个真实缺陷**，每个都先用一次性实验确认、再写会失败的测试。
 - **为什么修。** 全部先做一次性实验确认、再写会失败的测试（RED），最后修复：
   1. **自定义 `checkServerIdentity` 关掉了 SAN 校验。** Node 只要收到这个选项就**替换**默认身份校验，
      不会叠加。于是 pin 检查让每条 Daemon↔Daemon `wss://` 都跳过了 SAN：实测「签给
@@ -162,8 +162,8 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
   （`what is the meaning of life`、`帮我随便看看`、`hello`），top-k 在 docs/db/search/mobile 间摇摆。
   提交的 `docs/eval/routing-2026-11-24.json` 是第二次；#39 per-target 变体落地后的新基线，
   旧的 2026-11-21 基线（124/126）仅作历史对照。
-- **spec / 文档。** `docs/specs/v4-6-tls.md` 新增 §10.1（as-built 记录这四项）；README / README_zh /
-  SKILL 的 TLS 段改为「续期保留密钥、公钥 pin、`cafe host pin --clear`」。
+- **spec / 文档。** `docs/specs/v4-6-tls.md` 新增 §10.1 与 §10.2（as-built 记录全部 7 项）；README /
+  README_zh / SKILL 的 TLS 段改为「续期保留密钥、公钥 pin、`cafe host pin --clear`」。
 - **#62 侧栏可调宽（用户早先要求「加 1/4」）。** 宽度收成单一来源 `--nav-width`（默认 300px，
   240–420 可拖）；`Shell.tsx` 用 `w-[var(--nav-width)]`，宽屏 drawer 的
   `calc(100vw - var(--nav-width) - 680px)` 自动跟随。拖拽手柄在侧栏右边界（`role="separator"`，
