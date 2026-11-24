@@ -103,3 +103,37 @@ describe("health metrics name their scope (#86)", () => {
     expect(second.metrics.threadsTotal).toBe(1);
   });
 });
+
+// #31 criterion 2: a burst of 100 events/s on one Thread coalesces metadata writes (150 ms per Thread)
+// and keeps each write bounded (replies/declines capped), so write volume tracks the payload.
+describe("metadata writes under an event burst (#31)", () => {
+  it("writes a Thread's metadata at most ~7 times a second at 100 events/s", async () => {
+    const d = await startDaemon("pc1", { mode: "root" });
+    cleanup.push(d.stop);
+    const b = await barista(d.addr, identity("chatty"), async (h) => {
+      await h.ack();
+      for (let i = 0; i < 150; i++) {
+        await h.reply(`interim ${i} `.repeat(20), false);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      await h.reply("done");
+    });
+    cleanup.push(() => b.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const m0 = (await (await fetch(`http://${d.addr}/api/health`)).json()).metrics;
+    const t0 = Date.now();
+    const res = await c.ask({ body: "burst", to: "chatty" });
+    await untilClosed(c, res.threadId, res.orderId);
+    const seconds = (Date.now() - t0) / 1000;
+    const m1 = (await (await fetch(`http://${d.addr}/api/health`)).json()).metrics;
+    const writes = m1.metaWritesSinceStart - m0.metaWritesSinceStart;
+    const events = m1.eventsSinceStart - m0.eventsSinceStart;
+    expect(events).toBeGreaterThanOrEqual(150);
+    // created/closed write immediately; everything else is coalesced per 150 ms.
+    expect(writes).toBeLessThanOrEqual(Math.ceil(seconds / 0.15) + 4);
+    expect(writes / seconds).toBeLessThanOrEqual(10);
+    // Bounded metadata: the average write stays far below the sum of the replies it summarizes.
+    expect((m1.metaBytesSinceStart - m0.metaBytesSinceStart) / writes).toBeLessThan(64 * 1024);
+  }, 20_000);
+});
