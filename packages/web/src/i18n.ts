@@ -164,6 +164,10 @@ const zh = {
   hostTesting: "测试中…",
   hostReconnect: "重新连接",
   hostReachable: "本机能连到它",
+  hostForget: "移除",
+  hostForgetConfirm: (name: string) => `移除 ${name}？`,
+  hostForgetExplain: "从网络里忘掉这台离线机器和它的 Agent；对话记录保留。它若再连上来会重新出现——要彻底挡住它，需更换网络 token（cafe config set token <新值>，之后每台机器都要用新 token 重连）。",
+  hostForgotten: (name: string, n: number) => `已移除 ${name}（${n} 个 Agent）`,
   hostOnlineViaUplink: (address: string, why: string) =>
     `在线（它连到中心节点的链路正常）· 但中心节点直连它的地址 ${address || "（无）"} 不通${why ? `：${why}` : ""}。这只影响中心节点离线时其他机器直连它；需要时用「改地址」填一个中心节点能连到的地址。`,
   hostUnreachable: "连不上",
@@ -529,6 +533,10 @@ const en: Dict = {
   hostTesting: "Testing…",
   hostReconnect: "Reconnect",
   hostReachable: "Reachable from this machine",
+  hostForget: "Remove",
+  hostForgetConfirm: (name: string) => `Remove ${name}?`,
+  hostForgetExplain: "Forgets this offline machine and its agents; conversations are kept. If it connects again it reappears — to keep it out for good, change the network token (cafe config set token <new>; every machine then reconnects with it).",
+  hostForgotten: (name: string, n: number) => `Removed ${name} (${n} agent${n === 1 ? "" : "s"})`,
   hostOnlineViaUplink: (address: string, why: string) =>
     `Online (its link to the hub is up) · but the hub cannot reach its address ${address || "(none)"} directly${why ? `: ${why}` : ""}. This only matters for direct links while the hub is offline; if needed, use "Edit address" to enter one the hub can reach.`,
   hostUnreachable: "Unreachable",

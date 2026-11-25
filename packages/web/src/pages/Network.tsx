@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { hostFailure, hostStatus, savedAddressNote, testNote } from "../hostReason.ts";
+import { canForget, forgetNote, hostFailure, hostStatus, savedAddressNote, testNote } from "../hostReason.ts";
 import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
@@ -24,6 +24,10 @@ export function NetworkPage() {
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [editingAddr, setEditingAddr] = useState<Record<string, string>>({});
   const [note, setNote] = useState<Record<string, { text: string; ok: boolean; warn?: boolean }>>({});
+  // v4-8: "Remove" asks once inline (no modal) before forgetting an offline machine.
+  const [confirmForget, setConfirmForget] = useState<string>();
+  // The note of a removed machine has no card left to sit on; it shows above the grid.
+  const [removed, setRemoved] = useState<string>();
 
   const run = async (key: string, fn: () => Promise<void>) => {
     setBusy(key);
@@ -66,6 +70,13 @@ export function NetworkPage() {
       await refreshStore();
       setNote((n) => ({ ...n, [h]: savedAddressNote(t, saved) }));
     });
+  const forgetHost = (h: string) =>
+    run(`forget:${h}`, async () => {
+      setConfirmForget(undefined);
+      const r = await api.forgetHost(h);
+      await refreshStore();
+      setRemoved(forgetNote(t, r).text);
+    });
   const copyCli = (h: string, self: boolean) => {
     const cmd = self ? "cafe daemon status" : `cafe root test ${h}`;
     void navigator.clipboard?.writeText(cmd).then(() => setNote((n) => ({ ...n, [h]: { text: `${t.copied}: ${cmd}`, ok: true } })));
@@ -100,6 +111,11 @@ export function NetworkPage() {
         </div>
       )}
       {!isRoot && <div className="hint">{t.childView}</div>}
+      {removed && (
+        <div role="status" className="text-sm text-ok">
+          {removed}
+        </div>
+      )}
       {sorted.length === 0 ? (
         <Empty>—</Empty>
       ) : (
@@ -168,7 +184,25 @@ export function NetworkPage() {
                   <button type="button" className="btn-sm" onClick={() => copyCli(d.host, isThis)}>
                     {t.copyCommand}
                   </button>
+                  {canForget(d, { isThis, isRoot }) && confirmForget !== d.host && (
+                    <button type="button" className="btn-sm" onClick={() => setConfirmForget(d.host)}>
+                      {t.hostForget}
+                    </button>
+                  )}
                 </div>
+                {confirmForget === d.host && (
+                  <div role="alertdialog" aria-label={t.hostForgetConfirm(name)} className="well flex flex-col gap-2 text-xs" data-tone="warn">
+                    <span className="leading-relaxed text-fg">{t.hostForgetExplain}</span>
+                    <div className="flex items-center gap-1.5">
+                      <button type="button" className="btn-sm" data-tone="danger" aria-busy={busy === `forget:${d.host}`} onClick={() => forgetHost(d.host)}>
+                        {t.hostForgetConfirm(name)}
+                      </button>
+                      <button type="button" className="btn-sm" onClick={() => setConfirmForget(undefined)}>
+                        {t.cancel}
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {editing[d.host] !== undefined && (
                   <div className="flex items-center gap-1.5">
                     <input

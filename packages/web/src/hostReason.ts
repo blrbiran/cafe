@@ -61,3 +61,13 @@ export function hostStatus(
   if (d.online) return { tone: "ok", label: t.online, title: t.onlineHint };
   return { tone: undefined, label: t.mOffline };
 }
+
+/** Network page: "Remove" is offered for an offline machine, on the hub, not this machine, not a refused one (v4-8). */
+export function canForget(d: { online: boolean; refused?: { reason: "plaintext"; at: number } }, where: { isThis: boolean; isRoot: boolean }): boolean {
+  return where.isRoot && !where.isThis && !d.online && !d.refused;
+}
+
+/** The note after a machine was removed (v4-8). */
+export function forgetNote(t: Dict, r: { host: string; agents: number }): { text: string; ok: boolean } {
+  return { text: t.hostForgotten(r.host, r.agents), ok: true };
+}

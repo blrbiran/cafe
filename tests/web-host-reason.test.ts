@@ -77,3 +77,27 @@ describe("Test connection result (#92)", () => {
     expect(testNote(en, { online: false, code: "ECONNREFUSED", error: "x" })).toEqual({ text: hostFailure(en, { code: "ECONNREFUSED", error: "x" }), tone: "danger" });
   });
 });
+
+// v4-8: the Network page offers "Remove" only for an offline machine, on the hub, never for this machine
+// or a refused plaintext Host (its next attempt would recreate the card at once).
+import { canForget, forgetNote } from "../packages/web/src/hostReason.ts";
+
+describe("Network page: remove an offline machine (v4-8)", () => {
+  const zh = dictFor("zh");
+  const en = dictFor("en");
+  it("is offered only for an offline, non-refused machine on the hub", () => {
+    expect(canForget({ online: false }, { isThis: false, isRoot: true })).toBe(true);
+    expect(canForget({ online: true }, { isThis: false, isRoot: true })).toBe(false);
+    expect(canForget({ online: false }, { isThis: true, isRoot: true })).toBe(false);
+    expect(canForget({ online: false }, { isThis: false, isRoot: false })).toBe(false);
+    expect(canForget({ online: false, refused: { reason: "plaintext", at: 1 } }, { isThis: false, isRoot: true })).toBe(false);
+  });
+  it("says plainly what removing does and how to keep a machine out", () => {
+    expect(zh.hostForgetConfirm("ssh9")).toBe("移除 ssh9？");
+    expect(zh.hostForgetExplain).toContain("对话记录保留");
+    expect(zh.hostForgetExplain).toContain("cafe config set token");
+    expect(en.hostForgetExplain).toContain("conversations are kept");
+    expect(forgetNote(zh, { host: "ssh9", agents: 2 })).toEqual({ text: "已移除 ssh9（2 个 Agent）", ok: true });
+    expect(forgetNote(en, { host: "ssh9", agents: 1 })).toEqual({ text: "Removed ssh9 (1 agent)", ok: true });
+  });
+});

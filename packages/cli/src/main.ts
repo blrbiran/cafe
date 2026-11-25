@@ -1096,6 +1096,20 @@ host
   });
 
 host
+  .command("forget")
+  .argument("<host>")
+  .description("Root only: remove an offline machine and its agents from the network (conversations are kept; it reappears if it connects again)")
+  .action(async (hostName: string) => {
+    if (!(await healthy())) throw new Error("cafe daemon is not running");
+    const r = await api<{ host: string; agents: number; config: string[] }>("/api/hosts/forget", { method: "POST", body: JSON.stringify({ host: hostName }) });
+    out(
+      `removed ${r.host} (${r.agents} agent${r.agents === 1 ? "" : "s"}); conversations are kept, and it reappears if it connects again.\n` +
+        "to keep it out for good, change the network token (cafe config set token <new>); every machine then reconnects with it",
+      r,
+    );
+  });
+
+host
   .command("pin")
   .argument("[peer]")
   .description("list the per-peer leaf-key pins another Host is held to (host:port); with --clear, forget one")

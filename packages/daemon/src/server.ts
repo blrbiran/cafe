@@ -369,7 +369,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       res.end(useGzip ? file.gz! : file.body);
     } catch (err) {
       const e = err as RpcError;
-      send(res, e.code === "not_found" ? 404 : 400, { error: e.code ?? "error", message: e.message });
+      send(res, e.code === "not_found" ? 404 : e.code === "host_online" ? 409 : 400, { error: e.code ?? "error", message: e.message });
     }
   };
 
@@ -604,6 +604,11 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host required");
     if (url !== null && (typeof url !== "string" || !url.trim())) throw new RpcError("bad_request", "url must be a host:port string or null");
     return send(res, 200, await daemon.setHostAddress(host, url === null ? null : url.trim()));
+  }
+  if (m === "POST" && path === "/api/hosts/forget") {
+    const { host } = await readJson(req);
+    if (typeof host !== "string" || !host) throw new RpcError("bad_request", "host required");
+    return send(res, 200, await daemon.forgetHost(host));
   }
   if (m === "POST" && path === "/api/hosts/test") {
     const { host } = await readJson(req);

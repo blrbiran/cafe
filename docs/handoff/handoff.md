@@ -120,11 +120,66 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - **TLS is fail-closed (v4-6).** Never add a plaintext fallback on a handshake error, never disable certificate verification to "make it connect", and keep the CA fingerprint (trust anchor) distinct from the per-peer leaf pin. `security.mode: plaintext` is only ever chosen explicitly by a person.
 - Data safety: nothing is deleted automatically unless the user sets `retention.days`; `cafe prune` is a dry run unless `--yes`.
 - **TLS fail-closed holds on the accepting side too (#89).** With TLS on, a `daemon`/`peer` `initialize` on the plaintext port is refused (`tls_required`); never relax this for "compatibility". The CLI never probes the Root over `http://` with the token while TLS is on.
+- **Forgetting a Host is not a ban (v4-8).** `forgetHost` only removes what the network remembers; a machine with the token rejoins. Do not make it block reconnects without a per-Host credential (TLS phase 2). Online Hosts are refused (`host_online`).
 - **Discord: one channel = one Thread, until** the channel is quiet for `newThreadAfterHours` (default 6, from the Thread's `lastActivityAt`) or the person sends `/new` (user decision 2026-11-24). Conversation cards show the latest activity time; the title stays the first question.
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-25 (newest) — 测试者第九轮的 #91–#94（TLS 部署），两批均已提交
+### 2026-11-25 (newest) — 台账第十轮：#95 多地址入网、#31 SSE 游标、#33、#84、#16 关闭；v4-8「移除离线机器」
+
+- **一句话**：按 `../cafe_dogfooding/issue-20261119.md` 第十轮复核，用户裁定 Q121–Q125 全按推荐：批 A（#95 #31 #33 #84）+
+  批 B「移除离线机器」（Q125 A，spec → 独立 subagent 审阅 → 修订 → 实现）+ #16 用真 Codex 跑行为回归。两批均已提交，
+  **未推送、未发版**（`git log origin/main..main` 查看；#91–#94 那两个提交也还在本地）。
+- **#95**：`joinAddresses()`（`daemon.ts`）——没设 `advertise` 时给出本机所有 IPv4 的 `host:port`，设了只给那一个；
+  `/api/settings.join` 多了 `addresses`/`advertised`（`address` 保留给旧客户端）；`cafe root show` 用 `join-text.ts`，多地址时
+  每个地址一条命令 + 「用对方能连到的那条」+ `advertise` 提示；Web「加入另一台机器」每条命令一个复制按钮（截图 1440/390 已看）。
+  本机实测给出 `192.168.3.129` 与 `198.18.0.1` 两条。
+- **#31**：`/api/threads/:id/stream?after=` 改为 `store.readEventsAfter(file, after, 5000)` 从游标往后读，不再切默认 200 条的页；
+  找不到游标（或其后超过 5000 条）先发命名事件 `event: gap`，再重放最近一页。目前没有客户端传 `after`（CLI/connector 的
+  解析器只取 `data:`，将来传 `after` 的客户端要跳过带 `event:` 的块，已写进 v4-3 spec）。`putThread` 整份序列化不改（理由：
+  replies/declines 各 ≤50 且 150ms 合并）。`tests/sse-after.test.ts`。
+- **#33**：进行中卡片只有「已用时」那段每秒刷新（`<ElapsedText>`），卡片本身 30 s；虚拟列表仍不做（300 条上限，不是瓶颈）。
+- **#84**：favicon 白底去掉 `rx`，16px 四角不透明（`rsvg-convert` 实测四角 RGB 白、无 alpha 通道）。
+- **#16**：`codex exec --json --ephemeral -s read-only` 5 次（用户 provider，约 5 次小调用），提示「$cafe 问 cafe 负责人 SSE after…」：
+  **5/5 首个工具调用是 `cafe agents`**；只读沙箱里连不上 daemon（EPERM）时 5/5 停下并请用户选择，没有回落去读本地代码。
+  按判据（≥4/5 软约束）可关闭。注意：`zsh -lc` 会重置 PATH，所以桩没被调用、跑的是真 `cafe agents`（只读、被沙箱挡住，
+  没有产生任何 Order）。脚本与输出在 session scratchpad（不入库）。
+- **v4-8 移除离线机器**（`docs/specs/v4-8-forget-host.md`，含审阅后的修订记录）：Root 上 `forgetHost(name)` / `POST /api/hosts/forget`
+  / `cafe host forget <host>` / Network 页离线卡片「移除」（行内二次确认，非弹窗）。按 id、显示名、别名解析，也能删只剩配置的
+  主机（Root 重启后）。删 `daemonRecords`、该主机的 Registry Agent（delta 广播）、`knownDaemons`/`pinnedDaemons`/`hostNames`、
+  `reportedUrls`、`refusedPlaintext`；`forgotten` 标记挡住正在进行的地址探测写回；`uplinkAlive` 之后不再 await，期间重连的子节点
+  不删（409）；ping 不回的连接先关掉再删。子节点收到 `cafe/hostForgotten` 后丢掉 `peerUrls`、直连和该端点的 pin（别的 peer 或
+  Root 还在用的 pin 保留）。**不是封禁**：还有 token 的机器再连会重新出现；文案写明换 token 的命令。在线 → `409 host_online`。
+  审阅发现并已修：pin 实际在子节点（Root 没有）、探测竞态、若干对现有代码的错误描述。12 条新测试。
+- **验证**：批 A：typecheck；545 tests ×2；`routing:eval` 67/67；web check + `build:web`；`test:release` 17/17；`test:claude-plugin` 5/5。
+  批 B：typecheck；**559 tests ×2**；`routing:eval` 67/67；web check + `build:web`；`test:release` 17/17；`test:claude-plugin` 5/5。
+  本机 Root 已重启，doctor 全绿（多地址 join 已生效）。
+- **纠正上一轮复核清单**：ssh1 的 Test 显示「Reachable from this machine」是**对的**——那是 Root 直连 ssh1 成功；黄色提示只在
+  「直连不通但 ssh1 的上行链路活着」时出现。而且那台 Root 是测试者的机器（#91–#94 尚未推送）。#91 真正要复核的是反方向：
+  ssh1 经 VPN 地址 `30.251.51.85:4778` 连 Root（需要 Root 换上新代码，叶子含 VPN 地址）。
+- **仍需你本人**：推送与发版（建议 0.1.5 带上 #91–#95、#31/#33/#84、v4-8）；Discord 实测（附件私信、`/new`、6h 新 thread、稳态
+  重启去重、回答途中重启）；Root 换新代码后在 ssh1 上复核 #91（经 VPN 地址入网）；看一眼 v4-8 截图/文案是否满意。
+- **下一步候选（先 brainstorm/spec）**：#18 只读 token；#27 Root 主动推送升级通知；#71–#73；Web「哪段加密」标注 + 局域网 https
+  原型（Q120）；#34 snapshot 分页（等规模）；#61 `perf:tls` 基准。
+
+- **给测试者的复核清单**（纯文本，可直接转发）：
+
+```
+cafe 台账复核建议（2026-11-25 第十轮之后）
+
+1. #95：多网卡 Root 上 cafe root show 每个地址一条 cafe connect；/api/settings.join.addresses 含全部地址；
+   设 advertise 后只剩一条。Web 设置抽屉「加入另一台机器」同样。tests/join-hint.test.ts、join-text.test.ts、web-join.test.ts。
+2. #31：GET /api/threads/<id>/stream?after=<比默认页更旧的 eventId> 返回该游标之后的全部事件；未知游标先出
+   event: gap（data {"after","reason":"unknown_cursor"}）再重放最近一页。tests/sse-after.test.ts。putThread 整份序列化维持现状。
+3. #33：有进行中卡片时只有用时文本每秒更新（Feed.tsx <ElapsedText>）；虚拟列表不做，建议收窄判据 5。
+4. #84：icon.svg 白底无 rx；rsvg-convert 16px 四角不透明白。
+5. #16：codex exec 5 次，5/5 首个工具调用是 cafe agents，连不上 daemon 时不回落本地搜索 → 建议按软约束关闭。
+6. 新功能 v4-8：Root 的 Network 页离线机器「移除」/ cafe host forget <host>；在线时 409；被拒的明文卡片不显示按钮；
+   再连会重新出现。tests/forget-host.test.ts、forget-host-cli.test.ts。
+7. 上一轮清单第 2 条更正：Root 上 Test 显示「Reachable」= 直连成功，是正常结果；黄色提示只在直连不通、上行活着时出现。
+```
+
+### 2026-11-25 — 测试者第九轮的 #91–#94（TLS 部署），两批均已提交
 
 - **一句话**：台账第九轮新开的 4 条在代码里都成立，用户裁定 Q116–Q120：两批都做（批 1 #91 #92，批 2 #93 #94），
   #91 每 5 分钟比对地址，#92 Test 用「经上行链路在线 + 直连地址不通」，#93 只做按时间降级、不加清除命令，Web
@@ -878,12 +933,13 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - **Update/rollback (#27)** has a decided spec at `docs/specs/v4-2-update-rollback.md`; the MVP is implemented (service-aware `apply`/`rollback`, drain, health, auto-rollback). **Connector SDK (#28)** is implemented through the **Discord** platform (`docs/specs/v4-3-connector-sdk.md`): `cafe connector install|list|status|start|stop|restart|logs|config|remove`, the `@cafe/connector` SDK (thread map / seen events / outbox, atomic writes, stdout heartbeat protocol), a mock connector, a **Discord connector** (`discord-core.ts` core + `discordjs.ts` adapter; allowlists, `requireMention`, `allowDMs`, @everyone rejection, 2000-char chunking, idempotent event → Order → SSE follow), the optional `POST /api/orders` `idempotencyKey`, a **crash-restart supervisor** (`cafe connector supervise`, backoff + crash-loop give-up), and the SDK **packaged in the release** (`connector/`). Still open: a **real Discord end-to-end run** (needs the user's bot token + the Message Content intent), attachment support, and nonce/`enforce_nonce` outbound dedup for Discord.
 - Phase 2 follow-ups: the web UI could show "paused" for a Claude session (`/cafe off` currently just leaves the network); a Codex `--tui` Barista could prefer the shared app-server daemon's live events when the TUI uses it (today it always polls `thread/turns/list`, ~1 s).
 - CI (GitHub Actions: typecheck, test, build:web, test:release, `routing:eval`) — suggested, not started.
-- LAN security: **TLS is implemented and hardened** (v4-6 #61, see §1/§5): CA + leaf, dual port, fail-closed, TOFU CA fingerprint, **per-peer leaf pin enforced on Daemon links**, **leaf renewal (start + every 6 h while running)**, **exact SAN coverage**. Remaining is phase 2: mutual TLS (a client certificate per peer) and ECDSA leaves (`node-forge` 1.x has no EC keygen); the token still travels inside TLS rather than replacing it.
+- LAN security: **TLS is implemented and hardened** (v4-6 #61, see §1/§5): CA + leaf, dual port, fail-closed, TOFU CA fingerprint, **per-peer leaf pin enforced on Daemon links**, **leaf renewal (start + every 5 min while running, #91)**, **exact SAN coverage**. Remaining is phase 2: mutual TLS (a client certificate per peer) and ECDSA leaves (`node-forge` 1.x has no EC keygen); the token still travels inside TLS rather than replacing it.
 - `search` uses the FTS5 trigram index (`search_index`) for 3+ char queries and falls back to the JSONL scan below that; `threadsNeedingIndex()` + `backfillSearchIndex()` index Threads that predate the index. A short/symbol-only query returns [] from the index path rather than erroring.
 - Web: maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
 
 ## 8. Traps already found
 - **Backward reads must split bytes, not strings (#90)**: a fixed-size chunk boundary can cut a UTF-8 character; decoding a chunk before joining the carried half line turns it into U+FFFD while the JSON stays valid, so counts and ids look fine. Any test of a reader must use CJK/emoji text and assert the text, not only ids.
+- **TLS pins live where the link is dialled (v4-8)**: `security.tls.pins` is written by `linkOptions` (a child's uplink and direct links), so the Root holds no pins for its children; cleaning a forgotten Host's pins happens on the children, and only for keys no other peer (or the Root) maps to. Async address probes (`rememberChildUrl`) must check the `forgotten` mark before writing `knownDaemons`.
 - **A just-stopped child is still in `children` for a moment**: anything that says "online because its uplink is up" must prove it with a round-trip (`uplinkAlive()` sends one request; any reply, even `unknown_method`, counts), or a stopped Host reads as online (`tests/identity.test.ts` caught this).
 - **Addresses on a TLS network (#92)**: never build `ws://${addr}` for another Daemon. A pin is shown as its learned `wss://` endpoint (`tlsEndpoints`, filled by `resolveDaemonUrl`) or bare `host:port`; `ws://` entries in `knownDaemons` are stale once TLS is on. The leaf SAN comes from `daemon.desiredSans()` (all local IPv4 + `security.tls.sans`), checked every `leafCheckIntervalMs` (5 min).
 - **Several processes start the daemon at once**: Claude Code session-hosts auto-start it when it goes away, so `cafe daemon stop && cafe daemon start` races them; losers exit with "already running" (see `daemon.stdout.log`). The CLI now waits for the lock holder. Loading pi's model runtime has taken 26–47 s; the ports open first and Orders wait for the router.
@@ -959,7 +1015,7 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - On 2026-11-21 a smoke test briefly installed the mock connector in the real `~/.cafe` by mistake and removed it with `cafe connector remove mock`. `~/.cafe/connectors` and `~/.cafe/connector-data` are now empty leftovers (safe to `rmdir`); config.yml, `cafe.db` and sessions were not changed.
 
 - **TLS (v4-6) traps.** `tests/helpers.startDaemon` defaults to `security: { mode: "plaintext" }` because production defaults to TLS and the fixed 4778 port would collide across dozens of parallel test daemons; a TLS suite opts in with an explicit `security` block. **Any script that writes its own scratch `config.yml` must also declare `security.mode: plaintext`** — the release smoke and `scripts/sim-hosts.sh` did not and died on `EADDRINUSE 0.0.0.0:4778` whenever a real Root was running (`tests/scratch-configs.test.ts` now guards both). `setDefaultCACertificates`/`applyCa` are **process-wide and additive** — a same-file test that trusts a CA makes a later "untrusted peer" test pass for the wrong reason, so the fail-closed check lives in its own file (`tests/tls-untrusted.test.ts`) and the child-link test in `tests/tls-child.test.ts`. Daemon-to-daemon links use `wss://` only when `tlsContext.network` is true (a real network CA is enrolled, not the temporary local CA a child falls back to when its Root is unreachable). `createTlsServer` reads the leaf through `tls.current()` and swaps it via `setSecureContext` on `onRenew`; a keep-alive client reuses the old socket, so renewal tests use `keepAlive: false`. `node-forge` 1.x has **no EC keygen** — leaves are RSA-2048. A `POST /api/tls/leaf` is the only way a child gets a leaf; it is Root-only and token-authed over TLS.
-- **Leaf lifecycle (v4-6 §5 B).** A leaf is valid 90 days; `ensureLeaf` reissues when it is inside `LEAF_RENEW_BEFORE_MS` (21 days) **or** the SAN set changed, and a running Daemon checks every `timing.leafCheckIntervalMs` (6 h prod, tunable in tests) and renews in place (write-through to disk + `setSecureContext`). A child with no CA key renews by asking the Root; if the Root is unreachable the tick retries and the not-yet-expired leaf keeps serving. Do not shorten validity or remove the renewal path — fail-closed means an expired fleet has no rescue.
+- **Leaf lifecycle (v4-6 §5 B).** A leaf is valid 90 days; `ensureLeaf` reissues when it is inside `LEAF_RENEW_BEFORE_MS` (21 days) **or** the SAN set changed, and a running Daemon checks every `timing.leafCheckIntervalMs` (5 min prod since #91, tunable in tests) and renews in place (write-through to disk + `setSecureContext`). A child with no CA key renews by asking the Root; if the Root is unreachable the tick retries and the not-yet-expired leaf keeps serving. Do not shorten validity or remove the renewal path — fail-closed means an expired fleet has no rescue.
 - **SAN coverage is exact.** `sanCovers()` compares whole `subjectAltName` entries. A substring test let `127.0.0.1` "cover" `127.0.0.10` and `desk` cover `desk.example`, which kept a stale leaf and made the new name fail closed with `ERR_TLS_CERT_ALTNAME_INVALID`.
 - **Per-peer leaf-key pin.** `security.tls.pins[host:port]` is enforced via `checkServerIdentity` on Daemon-to-Daemon `wss://` (TOFU on first contact, persisted to config); it is separate from the CA fingerprint and must never be compared to it. The CA pin authenticates the trust anchor; the pin catches an unexpected leaf issued under that CA. **The pin names the leaf's public key (SPKI), not its certificate** — a certificate fingerprint changes on every renewal and would reject a Host that merely rotated. Old certificate pins are accepted while that leaf is unchanged and upgraded in place. Clear one with `cafe host pin <host:port> --clear` (hot, `POST /api/tls/pins`).
 - **A custom `checkServerIdentity` disables Node's SAN check.** Node *replaces* the default identity check when the option is supplied; it does not add to it. `trust.ts`'s `pinnedIdentityCheck` runs `tls.checkServerIdentity` first and the pin second — never pass a pin-only function here, or every `wss://` link stops checking SANs (`tests/tls-pinned-san.test.ts` pins the old bug down).
@@ -971,7 +1027,7 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 
 ## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q120**). On 2026-11-24 night they approved the Web small fixes (#63/#74/#64) directly and asked that the session finish every non-blocking task, report review items at the end, and hand off; do not wait on them for anything that does not need a person. On 2026-11-20 they approved #20 Q1–Q4, #27 Q1–Q5 and #28 Q1–Q4 (Discord), accepted a brief stop for upgrades, deferred read-only tokens, and required that **large attachment contents never be put into an agent's context automatically**. On 2026-11-21 they asked for **one intuitive `/cafe` entry across Claude/pi/omp** and for the inconsistent group to be renamed: the Customer command is `/cafe` everywhere; the Claude plugin's session pause/resume moved to `/cafe-barista`.
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q125**). On 2026-11-24 night they approved the Web small fixes (#63/#74/#64) directly and asked that the session finish every non-blocking task, report review items at the end, and hand off; do not wait on them for anything that does not need a person. On 2026-11-20 they approved #20 Q1–Q4, #27 Q1–Q5 and #28 Q1–Q4 (Discord), accepted a brief stop for upgrades, deferred read-only tokens, and required that **large attachment contents never be put into an agent's context automatically**. On 2026-11-21 they asked for **one intuitive `/cafe` entry across Claude/pi/omp** and for the inconsistent group to be renamed: the Customer command is `/cafe` everywhere; the Claude plugin's session pause/resume moved to `/cafe-barista`.
 - New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
 - Commit when asked (or at the end of an away batch they asked to hand off), with a stat or diff shown first; messages end with the Co-Authored-By line.
 - Restart their daemon yourself after daemon / web changes (section 8). Publishing to npm and changing their Claude / Codex config stay with them.

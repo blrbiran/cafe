@@ -67,6 +67,7 @@ cafe agent unalias billing@mac-mini invoices
 cafe daemon rename ssh1 ssh1-docker # Root 上改另一台 Daemon 的展示名
 cafe host address ssh1 30.251.57.17:4777   # 仅 Root：固定其他机器访问这台机器用的地址
 cafe host address ssh1 --clear             # 清除固定的地址
+cafe host forget ssh9                      # 仅 Root：移除一台离线机器和它的 Agent（Network 页「移除」）
 ```
 
 内部 `host`、`agentId` 和 Address 不变，旧 Thread/统计继续有效。改名不再把旧名字放进展示候选：旧名进入 `legacyAliases` 只用于路由；`aliases` 是用户显式添加的别名，展示优先级是 `alias → displayName → 稳定名`。Web 会把两类都显示为 chip，只有用户别名有删除按钮。
@@ -237,6 +238,7 @@ open http://127.0.0.1:4777/
 - Daemon 只接受属于本机的 `Host` 头（`localhost`、`127.0.0.1`、本机 host 名、`advertise` 或其 IP）。被 DNS rebinding 骗进本机的页面会被拒绝，连静态文件也不给。
 - 带外部 `Origin` 的请求不能写。写请求只有在 `Origin` 与本次请求到达时的 scheme、主机、端口完全一致时才放行——同一主机名换个端口或 scheme 也会被拒。Web UI 与 CLI 不受影响；`curl` / MCP 不带 `Origin`，照常可用。loopback 仍免 token，远程访问仍需 token。
 - `advertise` 可以只写主机（`192.168.1.20`），也可以写 `host:port`；已经带端口时不会再拼一遍。`cafe root set` 与 `cafe connect` 会先校验再写盘（`POST /api/root` 同样拒绝畸形地址），所以停着的 daemon 不会被写进一个它解析不了的地址。
+- **移除已经不用的机器（v4-8）。** 在中心节点上，离线机器的 Network 卡片有「移除」（CLI：`cafe host forget <host>`，可用 id、显示名或别名）。它把这台机器和它的 Agent 从 Network 页、`cafe doctor`、中心节点的 `knownDaemons` / `pinnedDaemons` / `hostNames` 里去掉，并通知其它机器丢掉它的地址、直连和 TLS pin（别的机器仍在用的 pin 会保留）。对话记录保留。这不是封禁：还持有 token 的机器再连上来会重新出现；要彻底挡住它，需更换网络 token（`cafe config set token <新值>`，之后每台机器都要用新 token 重连）。在线的机器会被拒绝（`host_online`：先在它上面停掉 cafe）。详见 [`docs/specs/v4-8-forget-host.md`](docs/specs/v4-8-forget-host.md)。
 - 子机 `advertise` 从 Root 不可达（Docker/NAT）时不再污染直连：Root 只广播验证过的地址，用 `cafe host address`（或 Network 页「改地址」）可以固定一个可用地址。手工固定的地址要等可达性探测成功才会下发给其它子机；`cafe host address <host> --clear` 会回退到 Root 最后验证过的地址。
 - `cafe ask` 支持 `--timeout <秒>`（默认不限），超时会取消该 Order；Ctrl-C 也会取消，不会留下 `thread_busy`。取消请求本身失败时会如实报告，不再谎称已取消。unicast Order 的目标只发心跳不回答时，10 分钟后自动关单。Thread 忙时追问可加 `--replace` 取消旧问题。对早于 daemon 200 条回放窗口的旧轮次执行 `cafe wait` 也会正常结束（daemon 会从 Thread 文件里读出该轮次的关闭事件）。
 - `POST /api/baristas` 只接受 `pi` / `omp` / `codex` / `claude`，不再接受任意可执行文件与 argv。

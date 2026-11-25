@@ -450,6 +450,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private tlsEndpoints = new Map<string, string>();
   /** Root: the address each child reported in its latest handshake, so clearing a pin returns to it (#92). */
   private reportedUrls = new Map<string, string>();
+  /** Root: Hosts forgotten (v4-8) → when. An address probe that started before that must not write them back. */
+  private forgotten = new Map<string, number>();
   private refusedPlaintext = new Map<string, { host: string; kind: "daemon" | "peer"; at: number; version?: string; ownRecord?: boolean }>();
 
   /**
@@ -1002,6 +1004,96 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const probe = url !== null ? await this.rememberChildUrl(host, this.pinnedAddress(host)!) : undefined;
     const result = this.daemons().find((d) => d.host === host) ?? record!;
     return probe ? { ...result, ...probe } : result;
+  }
+
+  /** Root: the internal id for a Host name — id, display name, alias or legacy alias, of a live or remembered Host. */
+  private resolveHostId(name: string): string | undefined {
+    const n = name.trim();
+    if (!n) return undefined;
+    if (this.daemonRecords.has(n) || n in this.config.knownDaemons || n in this.config.pinnedDaemons || n in this.config.hostNames) return n;
+    for (const d of this.daemonRecords.values()) {
+      if (d.host === "__root__") continue;
+      if (d.displayName === n || d.aliases.includes(n) || (d.legacyAliases ?? []).includes(n)) return d.host;
+    }
+    for (const [host, x] of Object.entries(this.config.hostNames)) {
+      if (x.displayName === n || x.aliases.includes(n) || x.legacyAliases.includes(n)) return host;
+    }
+    return undefined;
+  }
+
+  /**
+   * Root: forget an offline Host everywhere the network remembers it (v4-8). Not a ban: a machine that
+   * still has the token reconnects and reappears. Threads are kept.
+   */
+  async forgetHost(name: string): Promise<{ host: string; agents: number; config: string[] }> {
+    if (!this.isRoot) throw new RpcError("not_root", "only the hub can remove a machine; open the hub's Network page");
+    const host = this.resolveHostId(name);
+    if (!host) throw new RpcError("not_found", `no machine '${name}'`);
+    if (host === this.host) throw new RpcError("bad_request", "this is the hub itself; it cannot be removed");
+    const online = () => new RpcError("host_online", `${this.daemonRecords.get(host)?.displayName ?? host} is connected right now. Stop cafe on it first (cafe daemon stop), then remove it.`);
+    const pinged = this.children.get(host);
+    if (pinged && (await this.uplinkAlive(host))) throw online();
+    // No await from here on: a child that reconnected during the check is a new peer and stays (§3.2).
+    if (this.children.get(host) !== pinged) throw online();
+    if (pinged) {
+      // A connection that no longer answers: close it, so a machine that is in fact alive reconnects.
+      this.children.delete(host);
+      pinged.close();
+    }
+    this.forgotten.set(host, Date.now());
+    this.daemonRecords.delete(host);
+    this.reportedUrls.delete(host);
+    this.refusedPlaintext.delete(host);
+    const ids = this.registry.all().filter((r) => r.host === host).map((r) => r.agentId);
+    if (ids.length) this.broadcastDelta(this.registry.remove(ids));
+    const config: string[] = [];
+    for (const key of ["knownDaemons", "pinnedDaemons", "hostNames"] as const) {
+      if (host in this.config[key]) {
+        delete this.config[key][host];
+        config.push(`${key}.${host}`);
+      }
+    }
+    if (config.length) saveConfig(this.config, this.store.home);
+    this.emitDaemons();
+    for (const child of this.children.values()) child.notify(Methods.hostForgotten, { host });
+    this.log(`forgot host ${host} (${ids.length} agent(s)${config.length ? `; ${config.join(", ")}` : ""})`);
+    return { host, agents: ids.length, config };
+  }
+
+  /**
+   * Child: the Root forgot `host` (v4-8). Drop its address and direct link, and the TLS pins for its
+   * endpoints — unless another peer or the Root uses the same endpoint (a reused address must not lose a
+   * live peer's pin: clearing it would silently trust that peer's next key).
+   */
+  private onHostForgotten(x: { host: string }): void {
+    const host = x?.host;
+    if (!host || host === this.host || host === this.rootHost || host === "__root__") return;
+    const link = this.links.get(host);
+    if (link) {
+      this.links.delete(host);
+      link.ws.close();
+    }
+    const url = this.peerUrls.get(host);
+    if (url === undefined) return;
+    this.peerUrls.delete(host);
+    this.store.setKv("peerUrls", Object.fromEntries(this.peerUrls));
+    const keyOf = (u: string) => u.replace(/^wss?:\/\//, "").replace(/\/.*$/, "");
+    const keysFor = (u: string) => {
+      const plain = keyOf(u);
+      const tls = this.tlsEndpoints.get(plain);
+      return tls ? [plain, keyOf(tls)] : [plain];
+    };
+    const inUse = new Set<string>([...[...this.peerUrls.values()].flatMap(keysFor), ...(this.config.root ? keysFor(this.config.root) : [])]);
+    const pins = this.config.security.tls.pins;
+    let changed = false;
+    for (const k of keysFor(url)) {
+      if (k in pins && !inUse.has(k)) {
+        delete pins[k];
+        changed = true;
+      }
+    }
+    if (changed) saveConfig(this.config, this.store.home);
+    this.log(`hub forgot host ${host}; dropped its address${changed ? " and TLS pin" : ""}`);
   }
 
   /** The pinned address if a person set one; also the only child address worth broadcasting. */
@@ -2292,6 +2384,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const prev = this.children.get(host);
     if (prev && prev !== peer) prev.close();
     this.children.set(host, peer);
+    this.forgotten.delete(host);
     peer.meta.host = host;
     const now = Date.now();
     const override = this.config.hostNames[host];
@@ -2364,6 +2457,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * the Root; writing it would poison `knownDaemons` and announceRoot forever.
    */
   private async rememberChildUrl(host: string, url: string): Promise<{ verified: boolean; error?: string; code?: string }> {
+    const probeStarted = Date.now();
     if (this.config.knownDaemons[host] === url) return { verified: true };
     try {
       // Remember the address in the form it is dialled: a pin on a TLS network becomes `wss://` (#92).
@@ -2384,6 +2478,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return { verified: false, ...why };
     }
     if (this.config.knownDaemons[host] === url) return { verified: true };
+    // Forgotten while this probe was in flight (v4-8): writing it back would resurrect the Host.
+    if ((this.forgotten.get(host) ?? -1) >= probeStarted) return { verified: false, error: "forgotten while the address was being checked" };
     this.config.knownDaemons[host] = url;
     saveConfig(this.config, this.store.home);
     this.log(`known daemon ${host} -> ${url}`);
@@ -2497,6 +2593,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
+    peer.on(Methods.hostForgotten, (x: { host: string }) => this.onHostForgotten(x));
     peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; removeAliases?: string[]; legacyAliases?: string[] }) => {
       if (x.displayName) {
         this.displayName = x.displayName;

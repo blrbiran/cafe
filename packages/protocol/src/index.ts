@@ -396,6 +396,8 @@ export const Methods = {
   threadBackfill: "thread/backfill",
   rootMoved: "root/moved",
   daemonsChanged: "daemons/changed",
+  /** Root→children: a Host was forgotten (v4-8); drop its address, link and pins. */
+  hostForgotten: "cafe/hostForgotten",
 } as const;
 
 export function isRequest(f: Frame): f is Request {

@@ -146,6 +146,7 @@ export const api = {
   renameHost: (host: string, displayName: string, aliases: string[] = [], removeAliases: string[] = []) =>
     call<unknown>("POST", "/api/hosts/rename", { host, displayName, aliases, removeAliases }),
   testHost: (host: string) => call<{ host: string; online: boolean; via?: "direct" | "uplink"; address?: string; latencyMs?: number; version?: string; error?: string; code?: string }>("POST", "/api/hosts/test", { host }),
+  forgetHost: (host: string) => call<{ host: string; agents: number; config: string[] }>("POST", "/api/hosts/forget", { host }),
   reconnectHost: (host: string) => call<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string; code?: string }>("POST", "/api/hosts/reconnect", { host }),
   /** Root only: pin the address other machines use for `host`; `null` forgets it (#75). */
   setHostAddress: (host: string, url: string | null) => call<DaemonRecord & { verified?: boolean; error?: string; code?: string }>("POST", "/api/hosts/address", { host, url }),

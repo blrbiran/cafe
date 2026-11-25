@@ -67,6 +67,7 @@ cafe status                                           # daemon / router / root /
 cafe doctor                                           # daemon, identity, extension, skill, Claude command, router, root
 cafe root set 192.168.1.10:4777                       # Root moved; updates config and the live connection
 cafe root show                                        # the Root this Host uses + its CA fingerprint; on the Root, the cafe connect command for a new machine (one per address on a multi-address Root)
+cafe host forget <host>                       # Root only: remove an offline machine and its agents (it reappears if it reconnects)
 cafe connect 192.168.1.10:4777 --token <t> --ca-fingerprint sha256:AA:BB…  # join a Root by its main address; pins its CA, then links over wss (TLS, v4-6)
 cafe daemon renew-cert [--san <name>]                 # reissue this Host's TLS leaf for every local address (+ extra names), keeps the key, no restart
                                                       # a TLS hub refuses plaintext Daemon links: `cafe doctor` shows them under tls-links
