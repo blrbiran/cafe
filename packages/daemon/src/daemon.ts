@@ -1097,11 +1097,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (rec.teamDir) {
       try {
         const doc = readCafeFile(join(rec.teamDir, ".cafe"));
-        if (doc.team) {
+        if (doc.team?.name === rec.team && doc.team.channel === rec.teamChannel) {
           // The file owns membership: a member removed from `.cafe` disappears here too. Live
           // status is derived from the registry, so a file without statuses is not a downgrade.
           members = doc.team.members;
           authoritative = true;
+        } else if (doc.team) {
+          // A registration may not point at another team's roster and borrow its membership.
+          this.log(`teamDir ${rec.teamDir} is team ${doc.team.name} (#${doc.team.channel}), not ${rec.team} (#${rec.teamChannel}); ignoring it`);
         }
       } catch (err) {
         this.log(`cannot read team roster at ${rec.teamDir}: ${(err as Error).message}`);
