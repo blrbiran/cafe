@@ -8,13 +8,14 @@ import { fileURLToPath } from "node:url";
 import { Command, CommanderError } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
-import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
+import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configKeyPath, isConfigKey, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { fingerprintOf, issueLeaf, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 import { hostWithPort, lanAddress } from "@cafe/daemon";
+import { tlsLine } from "./tls-line.ts";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
@@ -103,14 +104,6 @@ async function assertNotForeign(home: string): Promise<boolean> {
   return true;
 }
 
-/** One line about transport security for `cafe status` / `cafe daemon status` (v4-6 §10.3). */
-function tlsLine(t: { mode?: string; port?: number; network?: boolean; waiting?: string } | undefined): string {
-  if (!t) return "unknown (older daemon)";
-  if (t.mode !== "tls") return "off (security.mode: plaintext)";
-  if (!t.network) return `on :${t.port ?? "?"}, NOT on the network yet — not connecting to the hub: ${t.waiting ?? "enrolling"}`;
-  return `on :${t.port ?? "?"} (daemon links use wss)`;
-}
-
 /** The daemon is on this machine (its directories are ours), not a remote CAFE_DAEMON. */
 function localDaemon(): boolean {
   const target = process.env.CAFE_DAEMON;
@@ -146,9 +139,17 @@ async function uploadAttachment(file: string) {
  * Write a config value and apply it. A value the running daemon rejects (an
  * unknown router model) is rolled back, so config and running state stay equal.
  */
+/** `config get` and `config set` accept the same keys; a misspelt one fails with suggestions (#94). */
+function assertConfigKey(key: string): void {
+  if (isConfigKey(key)) return;
+  const suggestions = similar(key, [...CONFIG_KEYS]).slice(0, 3);
+  throw new Error(`unknown config key '${key}'${suggestions.length ? `; did you mean ${suggestions.join(", ")}?` : ""}`);
+}
+
 async function setAndApply(key: string, value: string): Promise<{ human: string; data: any }> {
+  assertConfigKey(key);
   const before = loadConfig() as Record<string, any>;
-  const old = key.split(".").reduce((o, k) => o?.[k], before);
+  const old = configKeyPath(key).reduce((o, k) => o?.[k], before);
   setConfigValue(key, value);
   // Only hot keys can be applied to a running daemon; say which mode a key has instead of pretending.
   if (configApplyMode(key) !== "hot") {
@@ -1186,6 +1187,18 @@ root
     const caPath = tls.ca ?? join(cafeHome(), "tls", "ca.crt");
     const haveCa = existsSync(caPath);
     const where = c.mode === "root" ? "this host is the root" : (c.root ?? "(no root configured)");
+    if (!haveCa && tls.mode === "tls" && tls.caFingerprint) {
+      // A child that has not joined yet: the fingerprint it will accept is the one to compare with the
+      // Root's `cafe root show` (doctor's "compare the CA fingerprint", #94).
+      out(`${where}\nsha256:${tls.caFingerprint} (expected; this Host has not joined the network yet, so it has no CA — compare with \`cafe root show\` on the Root)`, {
+        mode: c.mode,
+        root: c.root,
+        security: tls.mode,
+        ca: null,
+        expectedFingerprint: tls.caFingerprint,
+      });
+      return;
+    }
     if (!haveCa) {
       out(`${where}\nsha256: (no CA on this Host — TLS is ${tls.mode}${tls.mode === "tls" ? " but the CA is not written yet; start the daemon once" : ""})`, {
         mode: c.mode,
@@ -1241,8 +1254,8 @@ config
       out(JSON.stringify(shown, null, 2), shown);
       return;
     }
-    if (!CONFIG_KEYS.includes(key)) throw new Error(`unknown config key '${key}'`);
-    const v = key.split(".").reduce((o, k) => o?.[k], c);
+    assertConfigKey(key);
+    const v = configKeyPath(key).reduce((o, k) => o?.[k], c);
     if (v === undefined) {
       out("(not set)", null);
       return;

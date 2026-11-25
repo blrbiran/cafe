@@ -250,7 +250,7 @@ were closed on 2026-11-24 night, each with a test that failed first:
   (`cafe daemon renew-cert`) and `ensureLeaf` only reissued when the SAN set
   changed, so a restart kept an expiring leaf and a fleet that never restarts
   would expire together under fail-closed. Now a leaf inside 21 days is reissued
-  at start, and a running Daemon checks every 6 hours and renews in place
+  at start, and a running Daemon checks every 5 minutes (6 hours before #91) and renews in place
   (`setSecureContext`, written through to disk). A child with no CA key asks the
   Root and retries next tick if the Root is unreachable. `tls/store.ts`:
   `leafNeedsRenewal`; `daemon.ts`: `startLeafRenewalCheck`,

@@ -83,6 +83,10 @@ export interface Timing {
   linkIdleMs: number;
   /** How often to check the TLS leaf while running: expiry (v4-6 §5 B) and addresses it must name (#91). */
   leafCheckIntervalMs: number;
+  /** A refused plaintext link counts as "still trying" (a doctor failure) for this long after its last attempt (#93). */
+  refusedRecentMs: number;
+  /** …and is forgotten this long after its last attempt (#93). */
+  refusedForgetMs: number;
   /** A child waiting to join a TLS network retries enrolment after this, doubling (v4-6 §10.3). */
   enrolRetryBaseMs: number;
   /** …up to this. */
@@ -295,6 +299,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       linkConnectTimeoutMs: 3000,
       linkIdleMs: 5 * 60_000,
       leafCheckIntervalMs: 5 * 60_000,
+      refusedRecentMs: 10 * 60_000,
+      refusedForgetMs: 24 * 3600_000,
       enrolRetryBaseMs: 5_000,
       enrolRetryMaxMs: 5 * 60_000,
       ...opts.timing,
@@ -444,7 +450,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private tlsEndpoints = new Map<string, string>();
   /** Root: the address each child reported in its latest handshake, so clearing a pin returns to it (#92). */
   private reportedUrls = new Map<string, string>();
-  private refusedPlaintext = new Map<string, { host: string; kind: "daemon" | "peer"; at: number; version?: string }>();
+  private refusedPlaintext = new Map<string, { host: string; kind: "daemon" | "peer"; at: number; version?: string; ownRecord?: boolean }>();
+
+  /**
+   * The refusals still worth reporting, each marked `recent` while that Host is still trying (#93). A
+   * refusal nobody repeats for `refusedForgetMs` is dropped, with the Network-page record it alone
+   * created: one probe must not keep `cafe doctor` failing forever.
+   */
+  private refusals(now = Date.now(), emit = true): Array<{ host: string; kind: "daemon" | "peer"; at: number; version?: string; recent: boolean }> {
+    for (const [host, r] of this.refusedPlaintext) {
+      if (now - r.at < this.timing.refusedForgetMs) continue;
+      this.refusedPlaintext.delete(host);
+      const rec = this.daemonRecords.get(host);
+      if (rec && !rec.online) {
+        if (r.ownRecord) this.daemonRecords.delete(host);
+        else delete rec.refused;
+        if (emit) this.emitDaemons();
+      }
+    }
+    return [...this.refusedPlaintext.values()].map(({ ownRecord: _own, ...r }) => ({ ...r, recent: now - r.at < this.timing.refusedRecentMs }));
+  }
 
   /** Transport state for `/api/health`, `cafe doctor` and `cafe daemon status`. */
   /** This Daemon's main (plaintext-port) address as other machines reach it: what `root:` / `cafe connect` take. */
@@ -473,17 +498,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     network?: boolean;
     caFingerprint?: string;
     waiting?: string;
-    refused?: Array<{ host: string; kind: "daemon" | "peer"; at: number; version?: string }>;
+    refused?: Array<{ host: string; kind: "daemon" | "peer"; at: number; version?: string; recent: boolean }>;
   } {
     if (!this.tlsContext) return { mode: "plaintext" };
     const network = !!this.tlsContext.network;
+    const refused = this.refusals();
     return {
       mode: "tls",
       ...(this.tlsPort ? { port: this.tlsPort } : {}),
       network,
       caFingerprint: this.tlsContext.caFingerprint,
       ...(!network ? { waiting: this.tlsWaiting ?? "enrolling the network CA" } : {}),
-      ...(this.refusedPlaintext.size ? { refused: [...this.refusedPlaintext.values()] } : {}),
+      ...(refused.length ? { refused } : {}),
     };
   }
 
@@ -496,7 +522,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const host = p.host ?? "unknown host";
     const kind = p.kind === "daemon" ? "daemon" : "peer";
     const first = !this.refusedPlaintext.has(host);
-    this.refusedPlaintext.set(host, { host, kind, at: Date.now(), ...(p.cafeVersion ? { version: p.cafeVersion } : {}) });
+    const ownRecord = this.refusedPlaintext.get(host)?.ownRecord ?? (kind === "daemon" && this.isRoot && !!p.host && !this.daemonRecords.has(p.host));
+    this.refusedPlaintext.set(host, { host, kind, at: Date.now(), ownRecord, ...(p.cafeVersion ? { version: p.cafeVersion } : {}) });
     if (kind === "daemon" && this.isRoot && p.host) {
       // Show the Host as refused rather than letting it vanish; its plaintext address is not kept.
       const now = Date.now();
@@ -2768,6 +2795,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // -------------------------------------------------------------------------
 
   daemons(): DaemonRecord[] {
+    // Drop refusals nobody repeated for a day, and the records they alone created (#93).
+    if (this.refusedPlaintext.size) this.refusals(Date.now(), false);
     // The listening port is only known after the server starts.
     const self = this.daemonRecords.get(this.host);
     if (self) {
@@ -2960,15 +2989,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
     checks.push(this.tlsCheck());
     if (this.tlsContext) {
-      const refused = [...this.refusedPlaintext.values()];
+      const refused = this.refusals();
+      const trying = refused.filter((r) => r.recent);
+      const stopped = refused.filter((r) => !r.recent);
+      const who = (list: typeof refused) => list.map((r) => `${r.host}${r.version ? ` (cafe ${r.version})` : ""}`).join(", ");
+      const ago = (at: number) => `${Math.max(1, Math.round((Date.now() - at) / 60_000))}m ago`;
       checks.push(
-        refused.length
+        trying.length
           ? {
               name: "tls-links",
               level: "fail",
-              detail: `refused plaintext links from ${refused.map((r) => `${r.host}${r.version ? ` (cafe ${r.version})` : ""}`).join(", ")}; they stay off the network until they connect over TLS`,
+              detail: `refusing plaintext links from ${who(trying)}; they stay off the network until they connect over TLS${stopped.length ? ` (also refused earlier: ${stopped.map((r) => `${r.host} ${ago(r.at)}`).join(", ")})` : ""}`,
               next: "on each: upgrade cafe, cafe config set security.mode tls, cafe daemon restart",
             }
+          : stopped.length
+            ? {
+                name: "tls-links",
+                level: "warn",
+                detail: `refused a plaintext link from ${stopped.map((r) => `${r.host}${r.version ? ` (cafe ${r.version})` : ""} ${ago(r.at)}`).join(", ")}; not tried since (forgotten after ${Math.round(this.timing.refusedForgetMs / 3_600_000) || 1} h)`,
+                next: "nothing to do unless that machine should join: then on it, upgrade cafe, cafe config set security.mode tls, cafe daemon restart",
+              }
           : { name: "tls-links", level: "ok", detail: "every Daemon link uses TLS" },
       );
     }

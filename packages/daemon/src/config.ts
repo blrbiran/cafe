@@ -85,16 +85,59 @@ export const CafeConfig = z.object({
 });
 export type CafeConfig = z.infer<typeof CafeConfig>;
 
-/** Every dotted key the schema knows, for `cafe config get` (top level + one nested level). */
-export const CONFIG_KEYS: readonly string[] = Object.entries(CafeConfig.shape).flatMap(([key, type]) => {
+/** The object shape under defaults/optionals, or undefined for a leaf. */
+function shapeOf(type: unknown): Record<string, unknown> | undefined {
   let t: any = type;
   for (let i = 0; i < 5 && t; i++) {
     const shape = t._def?.shape;
-    if (shape) return [key, ...Object.keys(typeof shape === "function" ? shape() : shape).map((s) => `${key}.${s}`)];
+    if (shape) return typeof shape === "function" ? shape() : shape;
     t = t._def?.innerType;
   }
-  return [key];
-});
+  return undefined;
+}
+
+function isRecord(type: unknown): boolean {
+  let t: any = type;
+  for (let i = 0; i < 5 && t; i++) {
+    if (t._def?.typeName === "ZodRecord" || t._def?.type === "record") return true;
+    t = t._def?.innerType;
+  }
+  return false;
+}
+
+function walkKeys(shape: Record<string, unknown>, prefix: string, keys: string[], records: string[]): void {
+  for (const [name, type] of Object.entries(shape)) {
+    const key = `${prefix}${name}`;
+    keys.push(key);
+    if (isRecord(type)) records.push(key);
+    const inner = shapeOf(type);
+    if (inner) walkKeys(inner, `${key}.`, keys, records);
+  }
+}
+
+const SCHEMA_KEYS: string[] = [];
+const RECORD_KEYS: string[] = [];
+walkKeys(CafeConfig.shape as Record<string, unknown>, "", SCHEMA_KEYS, RECORD_KEYS);
+
+/** Every dotted key the schema knows, down to the leaves (#94), for `cafe config get` and `set`. */
+export const CONFIG_KEYS: readonly string[] = SCHEMA_KEYS;
+
+/**
+ * Is `key` one `cafe config get` / `set` accept? A known key, or an entry of a map-valued key
+ * (`security.tls.pins.<host:port>`, `knownDaemons.<host>`).
+ */
+export function isConfigKey(key: string): boolean {
+  return CONFIG_KEYS.includes(key) || RECORD_KEYS.some((r) => key.startsWith(`${r}.`) && key.length > r.length + 1);
+}
+
+/**
+ * The path segments of a config key. A map entry's own name stays one segment even when it has dots
+ * (`security.tls.pins.10.0.0.5:4778` → `security`, `tls`, `pins`, `10.0.0.5:4778`).
+ */
+export function configKeyPath(key: string): string[] {
+  const record = RECORD_KEYS.filter((r) => key.startsWith(`${r}.`)).sort((a, b) => b.length - a.length)[0];
+  return record ? [...record.split("."), key.slice(record.length + 1)] : key.split(".");
+}
 
 export function cafeHome(): string {
   return process.env.CAFE_HOME ?? join(homedir(), ".cafe");
@@ -208,7 +251,8 @@ export function saveConfig(cfg: CafeConfig, home = cafeHome()): void {
 /** Set a dotted key (e.g. `router.model`) and persist. Returns the new config. */
 export function setConfigValue(key: string, value: string, home = cafeHome()): CafeConfig {
   const cfg = loadConfig(home) as Record<string, any>;
-  const parts = key.split(".");
+  if (!isConfigKey(key)) throw new Error(`unknown config key '${key}'`);
+  const parts = configKeyPath(key);
   let obj = cfg;
   for (const p of parts.slice(0, -1)) obj = obj[p] ??= {};
   const last = parts.at(-1)!;

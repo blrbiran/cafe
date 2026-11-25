@@ -18,7 +18,7 @@ cafe is an agent network. A message (an **Order**) is routed to the agent or age
 - While the Root is online, every Order goes through it (ADR-0001), so the Root's web UI shows all traffic. **While the Root is offline, cross-host Orders go over a direct Daemon-to-Daemon link** and are backfilled to the Root when it returns (ADR-0004).
 - On a LAN a Daemon without `root` finds the Root over mDNS. `cafe daemon install` gives autostart (launchd / systemd --user).
 - Daemons exchange their cafe version in `initialize`: a different `PROTOCOL_VERSION` is refused with `protocol_mismatch` and an upgrade hint; a different cafe version on the same protocol only warns (`cafe daemon status`, Network page). Published as the npm package `@blrbiran/cafe` (command `cafe`).
-- **Transport security (v4-6 #61).** `security.mode: tls` is the default. A Root generates a CA once (`~/.cafe/tls/ca.crt` + `ca.key` 0600) and each Daemon presents a leaf signed by it on `security.tls.port` (default **4778**); plaintext **4777** keeps serving the Web UI and loopback. Verification is fail-closed (no plaintext fallback); **exact SAN** and a separate **per-peer leaf pin** (`security.tls.pins`, TOFU on first Daemon link) are both checked; **`root:` is the Root's main address** — a child learns the TLS port from public `GET /api/tls`, does not dial the Root at all until it has joined (enrolment retries 5 s→5 min), and on a TLS network every Daemon address is `wss://<host>:<tls port>` (v4-6 §10.3); `caFingerprint` authenticates the trust anchor at enrolment (TOFU, `cafe connect --ca-fingerprint`). `cafe root show` prints the fingerprint; `cafe daemon renew-cert` reissues a leaf on demand, and a leaf is also renewed automatically before expiry (inside 21 days, checked every 6 h while running).
+- **Transport security (v4-6 #61).** `security.mode: tls` is the default. A Root generates a CA once (`~/.cafe/tls/ca.crt` + `ca.key` 0600) and each Daemon presents a leaf signed by it on `security.tls.port` (default **4778**); plaintext **4777** keeps serving the Web UI and loopback. Verification is fail-closed (no plaintext fallback); **exact SAN** and a separate **per-peer leaf pin** (`security.tls.pins`, TOFU on first Daemon link) are both checked; **`root:` is the Root's main address** — a child learns the TLS port from public `GET /api/tls`, does not dial the Root at all until it has joined (enrolment retries 5 s→5 min), and on a TLS network every Daemon address is `wss://<host>:<tls port>` (v4-6 §10.3); `caFingerprint` authenticates the trust anchor at enrolment (TOFU, `cafe connect --ca-fingerprint`). `cafe root show` prints the fingerprint; `cafe daemon renew-cert` reissues a leaf on demand, and a leaf is also renewed automatically before expiry (inside 21 days, checked every 5 min while running, which also reissues when a local address is missing from the SAN — #91).
 - Ways to be a Barista: pi with the cafe extension (TUI or headless `pi --mode rpc`, supervised by the Daemon); the same extension inside **oh-my-pi** (`--agent omp`); **native Codex / Claude Code** (`cafe barista start --agent codex|claude`, a **Bridge** process supervised by the Daemon, read-only by default, follow-ups continue the same Codex thread / Claude session; ADR-0005); `cafe serve --exec/--preset claude|codex` for any prompt-in / answer-out command (no session); **a running Claude Code session** (the cafe Claude Code plugin, a mod, installed with `cafe claude install`; ADR-0006; the plugin's `/cafe-barista off|on` pauses/resumes, while `/cafe` is the Customer command) and **a running Codex session** (`cafe barista start --agent codex --tui`, Orders go into the session's queue; ADR-0006).
 - Ways to be a Customer: any agent, **`cafe mcp`** (MCP stdio server: `cafe_agents`, `cafe_ask`, `cafe_wait`, `cafe_cancel`; `cafe mcp install` registers it with Claude Code / Codex), the `cafe` CLI plus skill, the web UI, or **`cafe connector`** (out-of-process platform connectors; the SDK, supervisor and a mock connector are implemented, Discord is the first real platform).
 - First use: `cafe init` writes a commented `.cafe` (interactive or `--yes --name …`), `cafe extension install` puts the extension into pi's settings and links it with omp, `cafe doctor` checks daemon / identity / extension / skill / router / root and prints the next command. `cafe config get` prints `(not set)` for unset known keys and fails for unknown ones.
@@ -83,7 +83,7 @@ npm workspaces, TypeScript run directly by Node ≥ 22.18 (type stripping, no bu
 ```bash
 npm install
 npm run typecheck          # use the npm script, NOT `npx tsc` (see traps)
-npm test                   # vitest; all 471 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
+npm test                   # vitest; all 531 must pass (the #6 heartbeat regression and the identity/legacy tests are part of it)
 npm run routing:eval       # offline rules eval: 67 scored cases, 3 blocked team cases, no model cost
 npm run check --workspace @cafe/web && npm run build:web
 npm run test:claude-plugin # claude plugin validate + claude plugin test (needs Claude Code ≥ 2.1.3xx on PATH, see traps)
@@ -124,7 +124,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-25 (latest) — 测试者第九轮的 #91–#94（TLS 部署）
+### 2026-11-25 (newest) — 测试者第九轮的 #91–#94（TLS 部署），两批均已提交
 
 - **一句话**：台账第九轮新开的 4 条在代码里都成立，用户裁定 Q116–Q120：两批都做（批 1 #91 #92，批 2 #93 #94），
   #91 每 5 分钟比对地址，#92 Test 用「经上行链路在线 + 直连地址不通」，#93 只做按时间降级、不加清除命令，Web
@@ -141,6 +141,26 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
   `host-address.test.ts` #83 的期望随之改为 `online: true, via: "uplink"`。
 - **验证（批 1）**：typecheck；**520 tests ×2**；`routing:eval` 67/67；web check + `build:web`；`test:release` 17/17；
   `test:claude-plugin` 5/5。本机 Root 已重启，doctor 全绿。
+- **#93**：被拒的明文连接按时间老化（`timing.refusedRecentMs` 10 min / `refusedForgetMs` 24 h）：还在反复尝试 →
+  doctor `fail`（文案改为 "refusing plaintext links from …"）；停止尝试 → `warn` + 「N m ago」，`doctor.ok` 不受影响；
+  24 h 后删除，连同仅由拒绝产生的 Network 记录。`/api/health.tls.refused[]` 多了 `recent`。`cafe daemon status` 的
+  tls 行（抽到 `packages/cli/src/tls-line.ts`）与 doctor 同口径。按用户裁定不加清除命令。
+- **#94**：`CONFIG_KEYS` 递归到叶子（`security.tls.port|ca|caFingerprint|pins|sans`）；`isConfigKey()` 也接受 map
+  条目（`security.tls.pins.<host:port>`，`configKeyPath()` 让带点的条目名保持一段）；`config get` 与 `config set`
+  用同一校验，拼错给 did-you-mean，`set` 不再「保存成功但什么都没写」。`cafe root show` 在子节点尚未入网（无 ca.crt）
+  时打印 `security.tls.caFingerprint`（expected）。
+- **文档**：两份 README + SKILL：多地址 SAN / `--san` / 5 分钟检查、Test 的「经上行链路在线」、拒绝老化、重启后
+  `router: loading`（0.1.5 原来缺的那一条）；spec v4-6 SAN 段。
+- **验证（批 2）**：typecheck；**531 tests ×2**；`routing:eval` 67/67；web check + `build:web`；`test:release` 17/17；
+  `test:claude-plugin` 5/5。本机 Root 已重启，doctor 全绿，`cafe config get security.tls.port` → 4778，三个会话已重连。
+- **改了旧测试的两处期望**（行为按用户裁定改变，不是放松）：`host-address.test.ts`（#83 用例，上行链路在时 Test 为
+  `online: true, via: "uplink"` 且仍带 `ECONNREFUSED`）、`doctor.test.ts`（"refusing plaintext links from"）。
+- **仍需你本人**：推送与发版（建议 0.1.5 带上 #91–#94）；Discord 实测（附件私信、`/new`、6h 新 thread、稳态重启去重、
+  回答途中重启）；ssh1 现场复核 #91/#92（Root 叶子已含所有本机地址；在 Root Network 页点 ssh1 的 Test 应显示黄色
+  「在线（链路正常）· 直连 x 不通」）。
+- **下一步候选（先 brainstorm/spec，没动）**：#18 只读 token（spec）；#27 Root 主动推送升级通知（Network 页的版本落后
+  标注**已经有了**：横幅 + 警告色）；#71–#73；Web 标注「哪段加密」与局域网 https 一起出原型（Q120）；「移除一台离线
+  机器」（Q119 B，未做）。
 
 ### 2026-11-25 — 台账复核后三批：#90 乱码、#31 关、端口/后台会话、#33 Web 空转、#18 收窄、daemon 启动
 
@@ -846,6 +866,8 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 
 ## 8. Traps already found
 - **Backward reads must split bytes, not strings (#90)**: a fixed-size chunk boundary can cut a UTF-8 character; decoding a chunk before joining the carried half line turns it into U+FFFD while the JSON stays valid, so counts and ids look fine. Any test of a reader must use CJK/emoji text and assert the text, not only ids.
+- **A just-stopped child is still in `children` for a moment**: anything that says "online because its uplink is up" must prove it with a round-trip (`uplinkAlive()` sends one request; any reply, even `unknown_method`, counts), or a stopped Host reads as online (`tests/identity.test.ts` caught this).
+- **Addresses on a TLS network (#92)**: never build `ws://${addr}` for another Daemon. A pin is shown as its learned `wss://` endpoint (`tlsEndpoints`, filled by `resolveDaemonUrl`) or bare `host:port`; `ws://` entries in `knownDaemons` are stale once TLS is on. The leaf SAN comes from `daemon.desiredSans()` (all local IPv4 + `security.tls.sans`), checked every `leafCheckIntervalMs` (5 min).
 - **Several processes start the daemon at once**: Claude Code session-hosts auto-start it when it goes away, so `cafe daemon stop && cafe daemon start` races them; losers exit with "already running" (see `daemon.stdout.log`). The CLI now waits for the lock holder. Loading pi's model runtime has taken 26–47 s; the ports open first and Orders wait for the router.
 - **Infinite CSS animations must stay on transform/opacity**: a `box-shadow` pulse cost ~170 ms/s of main-thread work on an idle page (`tests/web-pulse.test.ts`). Measure idle pages with CDP `Performance.getMetrics` (TaskDuration over 10 s) against a scratch daemon, not the user's.
 - **FTS trigram index**: `search_index` is FTS5 with `tokenize='trigram'` (case-insensitive substring). Altering its columns needs a rebuild (drop + recreate + backfill); `search_indexed` tracks indexed event ids. `search()` trusts results for 3+ chars only.
@@ -931,7 +953,7 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 
 ## 9. Working with this user
 
-- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q115**). On 2026-11-24 night they approved the Web small fixes (#63/#74/#64) directly and asked that the session finish every non-blocking task, report review items at the end, and hand off; do not wait on them for anything that does not need a person. On 2026-11-20 they approved #20 Q1–Q4, #27 Q1–Q5 and #28 Q1–Q4 (Discord), accepted a brief stop for upgrades, deferred read-only tokens, and required that **large attachment contents never be put into an agent's context automatically**. On 2026-11-21 they asked for **one intuitive `/cafe` entry across Claude/pi/omp** and for the inconsistent group to be renamed: the Customer command is `/cafe` everywhere; the Claude plugin's session pause/resume moved to `/cafe-barista`.
+- They write in Chinese; answer in Chinese. They decide quickly when given numbered questions with a recommended answer (last used number: **Q120**). On 2026-11-24 night they approved the Web small fixes (#63/#74/#64) directly and asked that the session finish every non-blocking task, report review items at the end, and hand off; do not wait on them for anything that does not need a person. On 2026-11-20 they approved #20 Q1–Q4, #27 Q1–Q5 and #28 Q1–Q4 (Discord), accepted a brief stop for upgrades, deferred read-only tokens, and required that **large attachment contents never be put into an agent's context automatically**. On 2026-11-21 they asked for **one intuitive `/cafe` entry across Claude/pi/omp** and for the inconsistent group to be renamed: the Customer command is `/cafe` everywhere; the Claude plugin's session pause/resume moved to `/cafe-barista`.
 - New feature areas: go through the decisions first; small fixes go straight ahead. When they are away, follow the recommendations, keep going on what does not need them, and list the review items at the end.
 - Commit when asked (or at the end of an away batch they asked to hand off), with a stat or diff shown first; messages end with the Co-Authored-By line.
 - Restart their daemon yourself after daemon / web changes (section 8). Publishing to npm and changing their Claude / Codex config stay with them.

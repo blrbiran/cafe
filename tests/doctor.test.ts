@@ -227,7 +227,7 @@ describe("cafe doctor on a TLS machine", () => {
     const userHome = join(tmp, "user-home");
     mkdirSync(userHome, { recursive: true });
     const r = await doctor(tmp, join(tmp, "cafe-home"), root.addr, userHome);
-    expect(r.stdout).toMatch(/fail\s+tls-links\s+refused plaintext links from oldbox/);
+    expect(r.stdout).toMatch(/fail\s+tls-links\s+refusing plaintext links from oldbox/);
     expect(r.status).toBe(1);
   });
 });

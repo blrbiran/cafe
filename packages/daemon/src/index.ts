@@ -14,7 +14,7 @@ import { issueLeaf, localAddresses, missingSans, publicKeyOf } from "./tls/certs
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
-export { CafeConfig, CONFIG_KEYS, cafeHome, configApplyMode, configInitialized, configPath, diffConfig, homeId, loadConfig, saveConfig, setConfigValue } from "./config.ts";
+export { CafeConfig, CONFIG_KEYS, cafeHome, configKeyPath, isConfigKey, configApplyMode, configInitialized, configPath, diffConfig, homeId, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
 export { startServer, type ServerHandle } from "./server.ts";

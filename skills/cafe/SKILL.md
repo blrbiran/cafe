@@ -56,6 +56,8 @@ cafe barista list         # headless Baristas supervised by this daemon
 - Logs: `~/.cafe/daemon.log` and `~/.cafe/logs/barista-*.log`.
 - Thread files: `~/.cafe/sessions/<date>/<threadId>.jsonl`.
 - `claude·bg` in `cafe agents` is a Claude Code session running in the background (no terminal); attach and exit, or `/cafe off` in it, to take it offline.
+- `router: loading` right after a daemon restart: the LLM router is still loading; questions asked now wait for it, nothing to fix.
+- `tls-links` warn "refused … ago" in `cafe doctor`: a machine tried plaintext once and stopped; it clears itself after 24 h.
 - "port … is already in use" from `cafe daemon start`: a second Daemon on one machine needs its own `port` and `security.tls.port`.
 
 ## Configure
