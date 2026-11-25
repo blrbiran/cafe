@@ -140,6 +140,8 @@ export function orderPrompt(order: Order, self?: AgentRecord, attachments?: Arra
     "Answer this Order directly; your final reply in this turn is sent back to the asker.",
     "If it is outside your responsibility or scope, call cafe_decline with a short reason instead of answering.",
     "For long work, you may send interim progress with cafe_reply.",
+    "An unrelated new question → cafe_ask without escalate. To ask the sender of THIS Order a clarifying question, call cafe_ask with escalate=true (it creates a sub-thread; do not pass threadId). To delegate, use `to:` or broadcast.",
+    "A new Order defaults to this agent's home channel; pass channel to post elsewhere (channels are scopes, not secrets).",
   ].join("\n");
 }
 
@@ -619,18 +621,34 @@ export default function cafe(pi: ExtensionAPI) {
     parameters: Type.Object({
       body: Type.String({ description: "The question or task, self-contained." }),
       to: Type.Optional(Type.String({ description: "Explicit address; omit to let the router decide." })),
-      threadId: Type.Optional(Type.String({ description: "Continue a previous conversation (thread) with whoever answered in it." })),
+      threadId: Type.Optional(Type.String({ description: "Continue a previous conversation (thread) with whoever answered in it. Do not combine with escalate." })),
+      escalate: Type.Optional(Type.Boolean({ description: "Ask the sender of the Order this session is currently handling a clarifying question (creates a sub-thread)." })),
+      channel: Type.Optional(Type.String({ description: "Post to this channel instead of the agent's home channel (channels are scopes, not secrets)." })),
+      collect: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("all")], { description: "any: first answer wins; all: wait for every target or the deadline." })),
       wait: Type.Optional(Type.Boolean({ description: "Block until all replies are in." })),
     }),
     async execute(_id, params, signal) {
       const c = requireClient();
-      const parentOrderId = current?.handle.order.orderId;
+      const parentOrderId = params.escalate ? current?.handle.order.orderId : undefined;
+      const parentThreadId = params.escalate ? current?.handle.order.threadId : undefined;
       const ask = async () => {
         try {
-          return await c.ask({ body: params.body, to: params.to, threadId: params.threadId, parentOrderId });
+          return await c.ask({
+            body: params.body,
+            to: params.to,
+            threadId: params.escalate ? undefined : params.threadId,
+            parentOrderId,
+            parentThreadId,
+            escalate: params.escalate || undefined,
+            channel: params.channel,
+            collect: params.collect,
+          });
         } catch (err) {
           if ((err as { code?: string }).code === "thread_busy") {
             throw new Error(`Thread ${params.threadId} still has an open Order; wait for its replies (cafe-reply messages) before following up.`);
+          }
+          if ((err as { code?: string }).code === "unknown_parent") {
+            throw new Error("Nothing to escalate: this session is not handling a cafe Order right now. Ask a fresh question without escalate.");
           }
           throw err;
         }

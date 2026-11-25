@@ -748,6 +748,11 @@ program
   .option("--to <address>", "explicit Address (name, name@host, name#n@host); skips routing")
   .option("--broadcast", "ask every eligible Barista (skips routing; only when you mean it)")
   .option("--thread <threadId>", "follow-up in an existing thread (goes to whoever answered there)")
+  .option("--parent <orderId>", "the Order this question is a sub-Order of")
+  .option("--parent-thread <threadId>", "the Thread holding --parent (needed when it is no longer in memory)")
+  .option("--escalate", "with --parent: ask the parent Order's sender (creates a sub-thread; skips routing)")
+  .option("--channel <name>", "message scope (default: this agent's home channel, else default)")
+  .option("--collect <mode>", "any (first answer wins) or all (wait for every target)", "any")
   .option("--replace", "with --thread: cancel the thread's still-open question and ask this one instead")
   .option("--async", "return the thread id immediately")
   .option("--notice", "send a Notice (no reply expected)")
@@ -769,6 +774,11 @@ program
         to: o.to,
         broadcast: o.broadcast || undefined,
         threadId: o.thread,
+        ...(o.parent ? { parentOrderId: o.parent } : {}),
+        ...(o.parentThread ? { parentThreadId: o.parentThread } : {}),
+        ...(o.escalate ? { escalate: true } : {}),
+        ...(o.channel ? { channel: o.channel } : {}),
+        ...(o.collect !== "any" ? { collect: o.collect } : {}),
         kind: o.notice ? "notice" : "order",
         deadlineMs: o.deadline,
         ...(o.replace ? { replace: true } : {}),
@@ -921,7 +931,7 @@ function runsAs(a: Pick<AgentRecord, "mode" | "agent" | "access" | "background">
 
 const printThreads = (list: ThreadMeta[], agents: Map<string, AgentRecord>) =>
   list
-    .map((t) => `${t.status.padEnd(9)} ${t.threadId}  ${time(t.createdAt)}  ${t.from.address} → ${t.targets.map((id) => agents.get(id)?.address ?? id).join(",") || "-"}  ${t.summary.replace(/\s+/g, " ").slice(0, 60)}`)
+    .map((t) => `${t.status.padEnd(9)} ${t.threadId}  ${time(t.createdAt)}  ${(t.channel ?? "default") === "default" ? "" : `#${t.channel} `}${t.from.address} → ${t.targets.map((id) => agents.get(id)?.address ?? id).join(",") || "-"}  ${t.summary.replace(/\s+/g, " ").slice(0, 60)}`)
     .join("\n") || "(no threads)";
 
 program
@@ -975,10 +985,11 @@ program
   .command("threads")
   .description("list recent threads")
   .option("--status <status>")
+  .option("--channel <name>", "only this channel")
   .option("--limit <n>", "", Number, 30)
   .action(async (o) => {
     await ensureDaemon();
-    const q = new URLSearchParams({ limit: String(o.limit), ...(o.status ? { status: o.status } : {}) });
+    const q = new URLSearchParams({ limit: String(o.limit), ...(o.status ? { status: o.status } : {}), ...(o.channel ? { channel: o.channel } : {}) });
     const list = await api<ThreadMeta[]>(`/api/threads?${q}`);
     const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
     out(printThreads(list, agents), list);
@@ -1025,7 +1036,7 @@ program
     const t = await api<{ meta: ThreadMeta; events: ThreadEnvelope[] }>(`/api/threads/${id}`);
     const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
     const att = t.meta.attachments?.map((a) => `📎 ${a.name} (${a.size} bytes, id ${a.id})`) ?? [];
-    const lines = [`${t.meta.from.address}: ${t.meta.summary}`, ...att, ...t.events.map((e) => describe(e, agents)).filter(Boolean)];
+    const lines = [`${t.meta.from.address}: ${t.meta.summary}`, ...((t.meta.channel ?? "default") !== "default" ? [`channel: #${t.meta.channel}`] : []), ...att, ...t.events.map((e) => describe(e, agents)).filter(Boolean)];
     out(lines.join("\n"), t);
   });
 

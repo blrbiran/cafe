@@ -97,6 +97,8 @@ export const AgentRecord = AgentIdentity.extend({
   aliases: z.array(z.string()).default([]),
   /** Names kept for routing only (automatic on rename); never used as the display label. */
   legacyAliases: z.array(z.string()).default([]),
+  /** Thread this Agent is currently handling (v4-11); set by its own daemon, cleared on reply/decline. */
+  activeThreadId: z.string().optional(),
 });
 export type AgentRecord = z.infer<typeof AgentRecord>;
 
@@ -172,6 +174,10 @@ export const Order = z.object({
   threadId: z.string(),
   kind: OrderKind,
   from: Party,
+  /** Message scope (v4-11); absent on Orders older than channels. */
+  channel: ChannelName.optional(),
+  /** any (default) or all (v4-11). */
+  collect: z.enum(["any", "all"]).optional(),
   /** Absent on Threads created before provenance existed. */
   origin: OrderOrigin.optional(),
   via: OrderVia.optional(),
@@ -321,6 +327,8 @@ export const ThreadMeta = z.object({
   replies: z.array(z.object({ agentId: z.string(), address: z.string().optional(), text: z.string(), at: z.number() })).default([]),
   /** Declines of the latest Order. */
   declines: z.array(z.object({ agentId: z.string(), address: z.string().optional(), reason: z.string(), at: z.number() })).default([]),
+  /** Per-target state of the latest Order (v4-11); absent on old rows. */
+  targetStates: z.array(z.object({ agentId: z.string(), state: z.enum(["pending", "acked", "replied", "declined", "failed", "skipped"]) })).optional(),
 });
 export type ThreadMeta = z.infer<typeof ThreadMeta>;
 
@@ -360,6 +368,10 @@ export type InitializeParams = z.infer<typeof InitializeParams>;
 export const CreateOrderParams = z.object({
   body: z.string().min(1),
   kind: OrderKind.default("order"),
+  /** Message scope (v4-11). Explicit wins for a fresh Order; follow-ups/sub-Threads inherit. */
+  channel: ChannelName.optional(),
+  /** any (default): first final answer wins; all: wait for every target or the deadline. */
+  collect: z.enum(["any", "all"]).optional(),
   to: z.string().optional(),
   parentOrderId: z.string().optional(),
   /** The Thread holding the parent Order (v4-11); used when it is no longer in the daemon's memory. */

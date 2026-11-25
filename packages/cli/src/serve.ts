@@ -60,6 +60,7 @@ export function buildPrompt(
     `You are ${self.address} on the cafe agent network. Another agent or person sent you this question.`,
     `Your declared responsibility: ${self.description || "(none declared)"}`,
     `From: ${order.from.address}`,
+    `Order: ${order.orderId} · Thread: ${order.threadId}`,
   ];
   if (attachments?.length) {
     lines.push("", "Attachments on this machine:");
@@ -76,6 +77,7 @@ export function buildPrompt(
     "",
     replyNote,
     `If this question is clearly outside your responsibility, print a single line \`${DECLINE_MARKER} <short reason>\` instead.`,
+    "If you need to ask the sender a clarifying question, call cafe_ask with escalate=true, parent_order_id and parent_thread_id above (or run `cafe ask --escalate --parent <orderId> --parent-thread <threadId> \"...\"`). Do not set a parent for an unrelated new question; to delegate, use an explicit target or broadcast.",
   );
   return lines.join("\n");
 }

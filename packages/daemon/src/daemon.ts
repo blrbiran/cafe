@@ -18,6 +18,7 @@ import {
   AgentIdentity,
   BROADCAST_DEADLINE_MS,
   CreateOrderParams,
+  DEFAULT_CHANNEL,
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MISSES,
   InitializeParams,
@@ -26,6 +27,7 @@ import {
   Methods,
   PROTOCOL_VERSION,
   RegistryDelta,
+  channelsOf,
   formatAddress,
   parseAddress,
   type AgentRecord,
@@ -1385,6 +1387,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!p.escalate && p.threadId) {
       prior = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
       if (!prior) throw new RpcError("not_found", `unknown thread ${p.threadId}`);
+      const tc = prior.channel ?? DEFAULT_CHANNEL;
+      if (p.channel && p.channel !== tc) throw new RpcError("channel_mismatch", `thread ${prior.threadId} is in channel ${tc}`);
       const open = [...this.tracking.values()].find((x) => x.order.threadId === p.threadId && x.status === "open");
       if (open) {
         if (!p.replace) {
@@ -1399,12 +1403,31 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     const threadId = p.escalate ? ulid() : prior?.threadId ?? ulid();
+    // Channel (v4-11). A follow-up and a sub-Thread inherit; an explicit channel on a fresh Order
+    // wins; a registered Agent defaults to its home channel (the first one it listed).
+    const parentChannel = p.escalate && parent ? (this.metas.get(parent.threadId)?.channel ?? this.store.getThread(parent.threadId)?.channel ?? DEFAULT_CHANNEL) : undefined;
+    let channel: string;
+    if (p.escalate) {
+      channel = parentChannel ?? DEFAULT_CHANNEL;
+      if (p.channel && p.channel !== channel) throw new RpcError("channel_mismatch", `an escalation stays in its parent thread's channel (${channel})`);
+    } else if (prior) {
+      const tc = prior.channel ?? DEFAULT_CHANNEL;
+      if (p.channel && p.channel !== tc) throw new RpcError("channel_mismatch", `thread ${prior.threadId} is in channel ${tc}`);
+      channel = tc;
+    } else if (p.channel) {
+      channel = p.channel;
+    } else {
+      const rec = peer?.meta.agentId ? (this.local.get(peer.meta.agentId) ?? this.registry.get(peer.meta.agentId)) : undefined;
+      channel = rec ? channelsOf(rec)[0]! : DEFAULT_CHANNEL;
+    }
     // Blobs were uploaded to this daemon before the Order; move them into the Thread now.
     const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
     const order: Order = {
       orderId: ulid(),
       threadId,
       kind: p.kind,
+      channel,
+      ...(p.collect ? { collect: p.collect } : {}),
       from,
       // A registered Agent asking through the protocol is relaying on someone's behalf.
       origin: p.origin ?? (peer?.meta.party ? "agent" : "human"),
@@ -1453,9 +1476,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private eligible(order: Order): AgentRecord[] {
     const excluded = new Set([order.from.id, ...order.chain]);
+    const channel = order.channel ?? DEFAULT_CHANNEL;
     return this.registry
       .all()
       .filter((r) => r.role === "barista" && r.status !== "offline" && !excluded.has(r.agentId))
+      .filter((r) => !r.observer && channelsOf(r).includes(channel))
       .filter((r) => this.rootOnline || r.host === this.host || this.peerUrls.has(r.host));
   }
 
@@ -1503,23 +1528,34 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     if (order.to) return this.explicitDecision(order);
     if (broadcast) {
-      return {
+      return this.channelFailure(order, {
         targets: candidates.map((c) => c.agentId),
         mode: "broadcast",
         reason: "customer asked everyone",
         router: "explicit",
         candidates: [],
-      };
+      });
     }
     await this.routerReady();
     if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
       try {
-        return await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId), broadcast }, 60_000);
+        return this.channelFailure(order, await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId), broadcast }, 60_000));
       } catch (err) {
         this.log(`root route/decide failed: ${(err as Error).message}`);
       }
     }
-    return this.router.decide({ order, candidates, hints: this.hintsFor(candidates) });
+    return this.channelFailure(order, await this.router.decide({ order, candidates, hints: this.hintsFor(candidates) }));
+  }
+
+  /**
+   * A non-default channel with no eligible member is not "no barista available": name the scope so
+   * an agent does not read it as "everyone is offline" (v4-11).
+   */
+  private channelFailure(order: Order, decision: RoutingDecision): RoutingDecision {
+    if (decision.targets.length || decision.failure) return decision;
+    const channel = order.channel ?? DEFAULT_CHANNEL;
+    const elsewhere = this.registry.all().some((r) => r.role === "barista" && r.status !== "offline" && !r.observer && !channelsOf(r).includes(channel));
+    return elsewhere ? { ...decision, failure: "no_channel_members" } : decision;
   }
 
   /**
@@ -1862,7 +1898,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           t.targets.set(ev.agentId, "done");
           // In a fan-out, one good answer is enough: give the others a short
           // grace window instead of holding the Thread to the deadline (#39).
-          if (t.decision?.mode !== "unicast" && !t.grace && this.hasPending(t)) {
+          // `collect: all` deliberately has no grace: silence is not success (v4-11).
+          if (t.decision?.mode !== "unicast" && !t.grace && this.hasPending(t) && t.order.collect !== "all") {
             t.grace = setTimeout(() => this.finishGrace(t), this.timing.graceMs);
           }
           this.maybeClose(t);
@@ -1921,12 +1958,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private finishOnDeadline(t: Tracking): void {
     if (t.status !== "open") return;
     if (t.order.kind === "notice") return this.close(t, "done");
-    // A deadline is final: unlike an a refusal, there is no time left to try the next candidate.
+    // A deadline is final: unlike a refusal, there is no time left to try the next candidate.
+    // `collect: all` reports silent targets as skipped (auditable), not as declines (#101);
+    // `any` keeps the old failure semantics, where nobody answered.
+    const all = t.order.collect === "all";
     for (const [id, s] of t.targets) {
       if (s !== "pending" && s !== "acked") continue;
       this.clearTimer(t, id);
-      t.targets.set(id, "failed");
-      this.emitEvent(t.order, { type: "order.failed", agentId: id, reason: "deadline", unavailable: true }, { skipTrack: true });
+      t.targets.set(id, all ? "done" : "failed");
+      if (all) this.emitEvent(t.order, { type: "order.declined", agentId: id, reason: "deadline", unavailable: true, skipped: true }, { skipTrack: true });
+      else this.emitEvent(t.order, { type: "order.failed", agentId: id, reason: "deadline", unavailable: true }, { skipTrack: true });
     }
     this.maybeClose(t);
   }
@@ -2380,6 +2421,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         threadId: env.threadId,
         orderId: env.orderId,
         kind: ev.order.kind,
+        ...(ev.order.channel ? { channel: ev.order.channel } : {}),
         ...(ev.order.parentThreadId ? { parentThreadId: ev.order.parentThreadId } : {}),
         ...(ev.order.parentOrderId ? { parentOrderId: ev.order.parentOrderId } : {}),
         from: ev.order.from,
@@ -2400,6 +2442,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     meta.lastActivityAt = env.at;
     this.evictCaches();
     const addr = (id: string) => this.registry.get(id)?.address;
+    type TargetState = "pending" | "acked" | "replied" | "declined" | "failed" | "skipped";
+    const setTargetState = (agentId: string, state: TargetState, onlyUpgrade = false) => {
+      const list = (meta.targetStates ??= []);
+      const entry = list.find((x) => x.agentId === agentId);
+      if (!entry) list.push({ agentId, state });
+      else if (!onlyUpgrade || entry.state === "pending") entry.state = state;
+    };
     if (ev.type === "order.created") {
       this.knownOrders.set(ev.order.orderId, ev.order);
       // A new turn: the Thread now reflects this Order. The title stays on the
@@ -2422,6 +2471,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         meta.status = "routing";
         meta.replies = [];
         meta.declines = [];
+        meta.targetStates = [];
         meta.closedAt = undefined;
       }
       return meta;
@@ -2434,21 +2484,31 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         meta.reason = ev.decision.reason;
         meta.router = ev.decision.router;
         for (const id of ev.decision.targets) if (!meta.targets.includes(id)) meta.targets.push(id);
+        for (const id of ev.decision.targets) setTargetState(id, "pending");
         meta.status = "delivering";
         break;
       case "order.delivered":
         if (!meta.targets.includes(ev.agentId)) meta.targets.push(ev.agentId);
+        setTargetState(ev.agentId, "pending");
         break;
       case "order.acked":
         if (meta.status === "delivering" || meta.status === "routing") meta.status = "working";
+        setTargetState(ev.agentId, "acked", true);
         break;
       case "order.replied":
         meta.firstReplyAt ??= env.at;
-        if (ev.final) pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at }, MAX_META_REPLIES);
+        if (ev.final) {
+          pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at }, MAX_META_REPLIES);
+          setTargetState(ev.agentId, "replied");
+        }
         break;
       case "order.declined":
         // A grace skip is not a decline: with a late reply the same agent would sit in both lists (#101).
         if (!ev.skipped) pushBounded(meta.declines, { agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at }, MAX_META_DECLINES);
+        setTargetState(ev.agentId, ev.skipped ? "skipped" : "declined");
+        break;
+      case "order.failed":
+        if (ev.agentId) setTargetState(ev.agentId, "failed");
         break;
       case "order.closed":
         meta.status = ev.status;
@@ -3000,9 +3060,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   search(
     q: string,
     limit = 20,
-    opts: { budgetMs?: number; stats?: { scanned: number; elapsedMs: number; truncated: boolean } } = {},
+    opts: { budgetMs?: number; stats?: { scanned: number; elapsedMs: number; truncated: boolean }; channel?: string } = {},
   ): { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] {
     const started = performance.now();
+    const channel = opts.channel;
     const fill = (scanned: number, truncated: boolean) => {
       const elapsedMs = performance.now() - started;
       this.stats.searchMs = elapsedMs;
@@ -3018,13 +3079,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Very short queries (below the trigram minimum) and any index failure fall back to the scan.
     if (needle.length >= 3) {
       try {
-        const indexed = this.store.searchIndex(q, limit * 5);
+        const indexed = this.store.searchIndex(q, limit * 5, channel);
         if (!indexed.short) {
           const byThread = new Map<string, { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }>();
           const seenEvents = new Set<string>();
           for (const h of indexed.hits) {
             const meta = this.metas.get(h.threadId) ?? this.store.getThread(h.threadId);
             if (!meta) continue;
+            if (channel && (meta.channel ?? DEFAULT_CHANNEL) !== channel) continue;
             if (seenEvents.has(h.eventId)) continue;
             seenEvents.add(h.eventId);
             const entry = byThread.get(h.threadId) ?? { meta, hits: [] };
@@ -3044,6 +3106,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const out: { meta: ThreadMeta; hits: { orderId: string; who: string; text: string; at: number }[] }[] = [];
     let scanned = 0;
     for (const meta of this.store.allThreads()) {
+      if (channel && (meta.channel ?? DEFAULT_CHANNEL) !== channel) continue;
       scanned++;
       const hits: { orderId: string; who: string; text: string; at: number }[] = [];
       for (const env of this.store.readEvents(meta.file)) {
@@ -3464,7 +3527,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     };
   }
 
-  snapshot() {
+  snapshot(channel?: string) {
     const started = performance.now();
     const result = {
       host: this.host,
@@ -3478,7 +3541,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       registryVersion: this.registry.version,
       agents: this.registry.all(),
       daemons: this.daemons(),
-      threads: this.store.listThreads(200).map((m) => this.summaryMeta(m)),
+      threads: (channel ? this.store.listThreadsIn(channel, 200) : this.store.listThreads(200)).map((m) => this.summaryMeta(m)),
     };
     this.stats.snapshotMs = performance.now() - started;
     return result;

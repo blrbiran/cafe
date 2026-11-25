@@ -74,9 +74,12 @@ export class RulesRouter implements Router {
 
   /** Keyword score of one candidate against one text; shared by whole-body and per-clause scoring. */
   private score(c: AgentRecord, body: Set<string>, raw: string): { score: number; weak: number } {
-    const text = tokenize(`${c.name} ${c.tags.join(" ")} ${c.description} ${c.scope.join(" ")}`);
+    const text = tokenize(`${c.name} ${c.duty ?? ""} ${c.tags.join(" ")} ${c.description} ${c.scope.join(" ")}`);
     let score = 0;
     if (mentions(body, c.name)) score += 5;
+    // A duty is a responsibility label ("tester", "writer"): stronger than a generic token,
+    // weaker than the agent's exact name (v4-11).
+    if (c.duty && mentions(body, c.duty)) score += 4;
     for (const t of c.tags) {
       if (mentions(body, t)) score += 3 + specific(t);
     }
@@ -246,7 +249,7 @@ class Gate {
 }
 
 const SYSTEM_PROMPT = `You are the router of "cafe", a network of AI agents.
-Given an Order (a question or task) and a list of Baristas (each with a description, tags and scope), choose who should receive it. Do NOT answer the Order; you only route.
+Given an Order (a question or task) and a list of Baristas (each with a duty, description, tags and scope), choose who should receive it. Do NOT answer the Order; you only route.
 Respond with ONLY a JSON object:
 {"targets": ["<agentId>", ...], "mode": "unicast" | "multicast" | "broadcast", "reason": "<one sentence>", "candidates": ["<fallback agentId>", ...]}
 Policy:
@@ -289,8 +292,8 @@ export class LlmRouter implements Router {
     if (candidates.length === 1) {
       return { targets: [candidates[0]!.agentId], mode: "unicast", reason: "only eligible barista (no model call)", router: "llm", candidates: [], confidence: 1, fanout: 1 };
     }
-    const cacheKey = `${order.body}\u0000${candidates
-      .map((c) => `${c.agentId}:${c.status}:${c.description}:${c.tags.join(",")}`)
+    const cacheKey = `${order.body}\u0000${order.channel ?? "default"}\u0000${candidates
+      .map((c) => `${c.agentId}:${c.status}:${c.duty ?? ""}:${c.description}:${c.tags.join(",")}`)
       .sort()
       .join("|")}`;
     const cached = this.cacheEnabled ? this.cache.get(cacheKey) : undefined;
@@ -300,7 +303,7 @@ export class LlmRouter implements Router {
       .map((c) => {
         const declined = overlappingDeclines(hints?.get(c.agentId), body).slice(0, 5);
         const history = declined.length ? `\n  history (weak hint): recently declined orders about ${declined.join(", ")}` : "";
-        return `- agentId: ${c.agentId}\n  address: ${c.address}\n  status: ${c.status}\n  tags: ${c.tags.join(", ")}\n  scope: ${c.scope.join(", ")}\n  description: ${c.description}${history}`;
+        return `- agentId: ${c.agentId}\n  address: ${c.address}\n  status: ${c.status}\n  duty: ${c.duty ?? ""}\n  tags: ${c.tags.join(", ")}\n  scope: ${c.scope.join(", ")}\n  description: ${c.description}${history}`;
       })
       .join("\n");
     const prompt = `Order from ${order.from.address}:\n"""\n${order.body}\n"""\n\nBaristas:\n${list}`;

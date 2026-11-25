@@ -560,7 +560,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   }
   if (m === "GET" && path === "/api/events") return eventStream(daemon, url, req, res, recentEvents.get(daemon) ?? []);
   if (m === "GET" && path === "/api/snapshot") {
-    const snap = daemon.snapshot();
+    const snap = daemon.snapshot(url.searchParams.get("channel") ?? undefined);
     return send(res, 200, webStale() ? { ...snap, webStale: true } : snap);
   }
   if (m === "POST" && path === "/api/tls/renew") {
@@ -765,20 +765,25 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return;
   }
   if (m === "GET" && path === "/api/threads") {
-    const rows = daemon.store.listThreads(parseLimit(url.searchParams.get("limit"), 200), parseStatus(url.searchParams.get("status")), parseBefore(url.searchParams.get("before")));
+    const limit = parseLimit(url.searchParams.get("limit"), 200);
+    const status = parseStatus(url.searchParams.get("status"));
+    const before = parseBefore(url.searchParams.get("before"));
+    const channel = url.searchParams.get("channel");
+    const rows = channel ? daemon.store.listThreadsIn(channel, limit, status, before) : daemon.store.listThreads(limit, status, before);
     return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
   }
   if (m === "GET" && path === "/api/search") {
     const q = url.searchParams.get("q") ?? "";
     if (!q.trim()) throw new RpcError("bad_request", "q required");
     const limit = parseLimit(url.searchParams.get("limit"), 20, { zeroOk: true });
+    const channel = url.searchParams.get("channel") ?? undefined;
     // `stats=1` adds scan/elapsed/truncated without changing the default array shape the CLI and Web use.
     if (url.searchParams.get("stats") === "1") {
       const stats = { scanned: 0, elapsedMs: 0, truncated: false };
-      const results = daemon.search(q, limit, { stats });
+      const results = daemon.search(q, limit, { stats, channel });
       return send(res, 200, { results, ...stats });
     }
-    return send(res, 200, daemon.search(q, limit));
+    return send(res, 200, daemon.search(q, limit, { channel }));
   }
   if (m === "POST" && path === "/api/prune") {
     const { olderThanDays, dryRun } = await readJson(req);

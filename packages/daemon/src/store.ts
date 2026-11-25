@@ -33,6 +33,7 @@ export class Store {
         thread_id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,
         status TEXT NOT NULL,
+        channel TEXT,
         meta TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS threads_created ON threads(created_at DESC);
@@ -79,6 +80,14 @@ export class Store {
     if (!cols.has("tokens")) this.db.exec("ALTER TABLE agent_events ADD COLUMN tokens TEXT");
     // After the migration: an older database gets `identity` just above (#68).
     this.db.exec("CREATE INDEX IF NOT EXISTS agent_events_identity ON agent_events(identity, kind, at DESC)");
+    // v4-11: channel is a first-class column so filtering never scans the 200-Thread snapshot
+    // or the metadata JSON. Old rows are default-channel Threads.
+    const threadCols = new Set((this.db.prepare("PRAGMA table_info(threads)").all() as { name: string }[]).map((c) => c.name));
+    if (!threadCols.has("channel")) {
+      this.db.exec("ALTER TABLE threads ADD COLUMN channel TEXT");
+      this.db.exec("UPDATE threads SET channel = COALESCE(json_extract(meta, '$.channel'), 'default')");
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_created ON threads(channel, created_at DESC)");
     this.upsertIndexRows = this.prepareIndexRows();
   }
 
@@ -188,16 +197,26 @@ export class Store {
    * Substring search over the FTS trigram index. Returns raw hits in recency order (newest first),
    * capped at `limit` Threads. A query shorter than 3 characters (the trigram minimum) yields `short: true`.
    */
-  searchIndex(q: string, limit: number): { hits: { eventId: string; threadId: string; orderId: string; who: string; at: number; text: string }[]; short: boolean } {
+  searchIndex(q: string, limit: number, channel?: string): { hits: { eventId: string; threadId: string; orderId: string; who: string; at: number; text: string }[]; short: boolean } {
     if (q.length < 3) return { hits: [], short: true };
     // FTS5 string literals: wrap in double quotes, doubling any embedded quote; the trigram tokenizer
     // then treats the whole thing as a case-insensitive substring.
     const phrase = `"${q.replace(/"/g, '""')}"`;
     let rows: { event_id: string; thread_id: string; order_id: string; who: string; at: string; text: string }[];
     try {
-      rows = this.db
-        .prepare("SELECT event_id, thread_id, order_id, who, at, text FROM search_index WHERE search_index MATCH ? ORDER BY at DESC LIMIT ?")
-        .all(phrase, Math.max(1, limit) * 20) as typeof rows;
+      // The channel predicate is applied BEFORE the limit so a channel with matches is never
+      // starved by hits from other channels (v4-11 review).
+      rows = (
+        channel
+          ? this.db
+              .prepare(
+                "SELECT si.event_id, si.thread_id, si.order_id, si.who, si.at, si.text FROM search_index si JOIN threads t ON t.thread_id = si.thread_id WHERE si.search_index MATCH ? AND t.channel = ? ORDER BY si.at DESC LIMIT ?",
+              )
+              .all(phrase, channel, Math.max(1, limit) * 20)
+          : this.db
+              .prepare("SELECT event_id, thread_id, order_id, who, at, text FROM search_index WHERE search_index MATCH ? ORDER BY at DESC LIMIT ?")
+              .all(phrase, Math.max(1, limit) * 20)
+      ) as typeof rows;
     } catch {
       // A query the tokenizer rejects (unbalanced quote, symbol-only): no hits rather than an error.
       return { hits: [], short: false };
@@ -356,8 +375,8 @@ export class Store {
   putThread(meta: ThreadMeta): number {
     const json = JSON.stringify(meta);
     this.db
-      .prepare("INSERT INTO threads(thread_id, created_at, status, meta) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, meta=excluded.meta")
-      .run(meta.threadId, meta.createdAt, meta.status, json);
+      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, meta) VALUES (?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, meta=excluded.meta")
+      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", json);
     return Buffer.byteLength(json);
   }
 
@@ -379,6 +398,16 @@ export class Store {
     const rows = (status
       ? this.db.prepare("SELECT meta FROM threads WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(status, at, n)
       : this.db.prepare("SELECT meta FROM threads WHERE created_at < ? ORDER BY created_at DESC LIMIT ?").all(at, n)) as { meta: string }[];
+    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+  }
+
+  /** Newest first, restricted to one channel (v4-11). */
+  listThreadsIn(channel: string, limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER): ThreadMeta[] {
+    const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 200;
+    const at = Number.isFinite(before) ? before : Number.MAX_SAFE_INTEGER;
+    const rows = (status
+      ? this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, status, at, n)
+      : this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, at, n)) as { meta: string }[];
     return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 
