@@ -16,6 +16,8 @@ interface Turn {
   decision?: RoutingDecision;
   replies: { agentId: string; text: string; final: boolean; at: number; attachments?: Attachment[] }[];
   declines: { agentId: string; reason: string; at: number }[];
+  /** `collect: all` deadline silences: recorded, but not a refusal (v4-11). */
+  skips: { agentId: string; reason: string; at: number }[];
   failures: { agentId?: string; reason: string; at: number }[];
   acked: Set<string>;
   closed?: { status: ThreadStatus; at: number };
@@ -28,7 +30,7 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
   for (const env of events) {
     let turn = byId.get(env.orderId);
     if (!turn) {
-      turn = { orderId: env.orderId, startedAt: env.at, replies: [], declines: [], failures: [], acked: new Set() };
+      turn = { orderId: env.orderId, startedAt: env.at, replies: [], declines: [], skips: [], failures: [], acked: new Set() };
       byId.set(env.orderId, turn);
       turns.push(turn);
     }
@@ -48,7 +50,8 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
         turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at, ...(ev.attachments?.length ? { attachments: ev.attachments } : {}) });
         break;
       case "order.declined":
-        turn.declines.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
+        if (ev.skipped) turn.skips.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
+        else turn.declines.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
         break;
       case "order.failed":
         turn.failures.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
@@ -67,13 +70,14 @@ function turnOutcome(t: Dict, turn: Turn, active: boolean, agents: Record<string
   if (active) {
     const targets = turn.decision?.targets ?? [];
     if (!turn.decision || targets.length === 0) return { tone: "info", text: t.routing };
-    const pending = targets.filter((id) => !finals.some((r) => r.agentId === id) && !turn.declines.some((d) => d.agentId === id));
+    const pending = targets.filter((id) => !finals.some((r) => r.agentId === id) && !turn.declines.some((d) => d.agentId === id) && !turn.skips.some((s) => s.agentId === id));
     if (turn.acked.size === 0) return { tone: "info", text: t.delivering(names(pending.length ? pending : targets)) };
     return { tone: "info", text: t.working(names(pending.length ? pending : targets), t.dur(now - turn.startedAt)) };
   }
   if (turn.closed?.status === "cancelled") return { tone: undefined, text: t.cancelled };
   if (finals.length > 0) return { tone: "ok", text: t.answeredBy(names(finals.map((r) => r.agentId)), t.dur(finals[0]!.at - turn.startedAt)) };
   if (turn.declines.length > 0) return { tone: "warn", text: t.nobody(turn.declines.length) };
+  if (finals.length === 0 && turn.skips.length > 0) return { tone: "info", text: t.skipped(turn.skips.length) };
   return { tone: "danger", text: t.noAnswer };
 }
 
@@ -370,6 +374,7 @@ function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: Th
   const items = [
     ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.final ? "ok" : "info") as Tone, kind: r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
     ...turn.declines.map((d) => ({ key: `d-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "warn" as Tone, kind: t.kDecline, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
+    ...turn.skips.map((d) => ({ key: `s-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "info" as Tone, kind: t.kSkipped, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
   ].sort((a, b) => a.at - b.at);
   return (
     <section className="flex flex-col gap-2.5">
@@ -507,7 +512,7 @@ function DeliveryLog({ events, meta }: { events: ThreadEnvelope[]; meta: ThreadM
         text = ev.final ? t.stepReplied(name(ev.agentId)) : t.stepPartial(name(ev.agentId));
         break;
       case "order.declined":
-        text = t.stepDeclined(name(ev.agentId));
+        text = ev.skipped ? t.stepSkipped(name(ev.agentId)) : t.stepDeclined(name(ev.agentId));
         break;
       case "order.failed":
         text = t.stepFailed(name(ev.agentId), t.failReason[ev.reason] ?? ev.reason);

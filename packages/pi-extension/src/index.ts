@@ -674,7 +674,7 @@ export default function cafe(pi: ExtensionAPI) {
       const parentThreadId = params.escalate ? current?.handle.order.threadId : undefined;
       const ask = async () => {
         try {
-          return await c.ask({
+          const res = await c.ask({
             body: params.body,
             to: params.to,
             threadId: params.escalate ? undefined : params.threadId,
@@ -684,6 +684,11 @@ export default function cafe(pi: ExtensionAPI) {
             channel: params.channel,
             collect: params.collect,
           });
+          if (res.decision?.targets?.length === 0) {
+            // Never report "sent" when routing failed immediately (offline parent, empty channel).
+            throw new Error(`The question was not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}.`);
+          }
+          return res;
         } catch (err) {
           if ((err as { code?: string }).code === "thread_busy") {
             throw new Error(`Thread ${params.threadId} still has an open Order; wait for its replies (cafe-reply messages) before following up.`);

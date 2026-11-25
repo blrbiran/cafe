@@ -65,4 +65,13 @@ describe("channel routing (v4-11)", () => {
     const res = await c.ask({ body: "anyone here?", channel: "empty" });
     expect(res.decision).toMatchObject({ targets: [], failure: "no_channel_members" });
   });
+
+  it("calls an entirely empty network no_online_barista", async () => {
+    const d = await startDaemon("ch5", { mode: "root", timing: { ...FAST, graceMs: 60 } });
+    cleanup.push(d.stop);
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const res = await c.ask({ body: "anyone?" });
+    expect(res.decision).toMatchObject({ targets: [], failure: "no_online_barista" });
+  });
 });

@@ -163,7 +163,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
           if (env.orderId !== orderId) continue;
           const e = env.event;
           if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final });
-          else if (e.type === "order.declined") notes.push(`${who(e.agentId)} declined: ${e.reason}`);
+          else if (e.type === "order.declined") notes.push(e.skipped ? `${who(e.agentId)} did not answer before the deadline` : `${who(e.agentId)} declined: ${e.reason}`);
           else if (e.type === "order.failed") notes.push(`${e.agentId ? who(e.agentId) : "the question"} failed: ${e.reason}`);
           else if (e.type === "order.cancelled") notes.push(`cancelled by ${e.by}`);
           else if (e.type === "order.closed") status = e.status;
@@ -206,7 +206,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
         const attachments: Attachment[] = [];
         for (const file of files) attachments.push(await upload(file));
-        const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[] } }>("/api/orders", {
+        const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[]; failure?: string } }>("/api/orders", {
           method: "POST",
           body: JSON.stringify({
             body,
@@ -224,6 +224,10 @@ export function runMcp(opts: McpOptions): Promise<void> {
             ...(attachments.length ? { attachments } : {}),
           }),
         });
+        if (res.decision?.targets?.length === 0) {
+          // An immediate routing failure (offline parent, empty channel) is not "sent, replies will come".
+          return { text: `Not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`, isError: true };
+        }
         return waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
       }
       case "cafe_wait": {

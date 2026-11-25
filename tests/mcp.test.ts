@@ -104,7 +104,8 @@ describe("cafe mcp", () => {
     await m.request("initialize", { clientInfo: { name: "x" } });
     const none = await m.call("cafe_ask", { question: "hello", to: "nobody-here" });
     expect(none.isError).toBe(true);
-    expect(none.text).toMatch(/status: failed/);
+    // An immediate routing failure is reported as one, not as a thread that later failed.
+    expect(none.text).toMatch(/Not delivered.*unknown_team/);
     const missing = await m.call("cafe_ask", {});
     expect(missing).toEqual({ text: "question is required", isError: true });
     const started = Date.now();

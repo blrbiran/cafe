@@ -928,7 +928,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       byKey.set(key, rec);
     }
-    const partial = !this.isRoot && !this.rootOnline;
     return [...byKey.values()].map((t) => {
       const agents = this.registry.all().filter((r) => r.host === t.host && r.team === t.team);
       const roster = t.members.map((m) => {
@@ -945,13 +944,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const threads = [...this.metas.values()].filter((m) => (m.channel ?? DEFAULT_CHANNEL) === t.channel);
       return {
         ...t,
-        hostOnline: t.host === this.host || this.children.has(t.host),
+        // A child sees the network registry (and therefore whether any member is online) but only
+        // its own Threads: mark the view local instead of letting zero counts read as "idle"
+        // (v4-11 review). Membership itself is replicated, so the roster is still complete.
+        hostOnline: t.host === this.host || this.registry.all().some((r) => r.host === t.host && r.status !== "offline"),
+        ...(this.isRoot ? {} : { partial: true }),
         roster,
         online: roster.filter((m) => "status" in m && m.status !== "offline").length,
         total: t.members.length,
         openThreads: threads.filter((m) => m.status === "routing" || m.status === "delivering" || m.status === "working").length,
         ...(threads.length ? { lastActivityAt: Math.max(...threads.map((m) => m.lastActivityAt ?? m.createdAt)) } : {}),
-        ...(partial ? { partial: true } : {}),
       };
     });
   }
@@ -1830,7 +1832,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (decision.targets.length || decision.failure) return decision;
     const channel = order.channel ?? DEFAULT_CHANNEL;
     const elsewhere = this.registry.all().some((r) => r.role === "barista" && r.status !== "offline" && !r.observer && !channelsOf(r).includes(channel));
-    return elsewhere ? { ...decision, failure: "no_channel_members" } : decision;
+    // The eligible pool is empty. Name the scope whenever there is one (a non-default channel, or
+    // baristas somewhere else); only a truly empty default network is a plain "nobody online".
+    return { ...decision, failure: channel !== DEFAULT_CHANNEL || elsewhere ? "no_channel_members" : "no_online_barista" };
   }
 
   /**

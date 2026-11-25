@@ -789,7 +789,11 @@ program
         ...(attachments.length ? { attachments } : {}),
       }),
     });
-    if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision.mode}: ${res.decision.reason}`, res);
+    if (res.decision?.targets?.length === 0) {
+      // An immediate routing failure is not "thread created"; say so and exit non-zero (#39 review).
+      throw new Error(`not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`);
+    }
+    if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision?.mode ?? "?"}: ${res.decision?.reason ?? ""}`, res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
     const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}) });
     process.exitCode = status === "done" ? 0 : 1;
@@ -1582,7 +1586,7 @@ team
       ...(m.currentThread ? { currentThread: m.currentThread } : {}),
     }));
     const lines = rows.map((r: any) => `${r.status.padEnd(8)} ${r.member.padEnd(16)} ${r.duty.padEnd(14)} ${r.mode.padEnd(8)} ${r.address}${r.observer ? " (observer)" : ""}${r.currentThread ? `  thread ${r.currentThread}` : ""}`);
-    out([`team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: root offline)" : ""}`, ...lines].join("\n"), t);
+    out([`team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: this Host's view)" : ""}`, ...lines].join("\n"), t);
   });
 team
   .command("stop")

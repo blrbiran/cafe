@@ -133,18 +133,20 @@ function applySnapshot(s: Snapshot): void {
 export async function loadOlder(): Promise<void> {
   if (state.older.loading || state.older.done) return;
   const channel = state.channel;
-  const seq = snapshotSeq;
+  // A generation that only changes with the channel: a same-channel reconnect/refresh must not
+  // strand `loading` forever (and hide pagination) (v4-11 review).
+  const gen = channelGen;
   const before = state.threads.reduce((m, t) => Math.min(m, t.createdAt), Number.MAX_SAFE_INTEGER);
   set((s) => ({ older: { ...s.older, loading: true } }));
   try {
     const page = (await api.threads(before, OLDER_PAGE, channel)).map(norm);
-    if (seq !== snapshotSeq) return; // the channel changed while this page was in flight
+    if (gen !== channelGen) return; // the channel changed while this page was in flight
     set((s) => {
       const ids = new Set(s.threads.map((t) => t.threadId));
       return { threads: [...s.threads, ...page.filter((t) => !ids.has(t.threadId))], older: { loading: false, loaded: true, done: page.length < OLDER_PAGE } };
     });
   } catch (err) {
-    if (seq !== snapshotSeq) return;
+    if (gen !== channelGen) return;
     set((s) => ({ error: (err as Error).message, older: { ...s.older, loading: false } }));
   }
 }
@@ -156,6 +158,7 @@ export async function loadOlder(): Promise<void> {
 export function setChannel(channel: string): void {
   if (channel === state.channel) return;
   snapshotSeq++;
+  channelGen++;
   searchSeq++;
   set((s) => ({
     channel,
@@ -163,7 +166,8 @@ export function setChannel(channel: string): void {
     older: { loading: false, loaded: false, done: false },
     search: { q: "", loading: false },
     live: {},
-    loaded: false,
+    // Keep `loaded` true: the Feed owns the unsent composer draft, and unmounting it for the
+    // re-snapshot threw the draft away (v4-11 review). The list is empty until the new page lands.
   }));
   void refresh();
 }
@@ -174,6 +178,9 @@ export function syncChannel(channel: string): void {
 }
 
 let snapshotSeq = 0;
+
+/** Channel generation: only a channel switch changes it (not a reconnect/re-snapshot). */
+let channelGen = 0;
 
 let searchSeq = 0;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
