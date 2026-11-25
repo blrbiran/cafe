@@ -16,6 +16,8 @@ export function FeedPage({ filter, channel }: { filter: Filter; channel: string 
   const composer = useStore((s) => s.composer);
   const older = useStore((s) => s.older);
   const search = useStore((s) => s.search);
+  const legacy = useStore((s) => s.legacy);
+  const effectiveChannel = legacy ? "default" : channel;
   const searching = search.q.trim() !== "";
 
   const { active, done } = useMemo(() => {
@@ -46,7 +48,12 @@ export function FeedPage({ filter, channel }: { filter: Filter; channel: string 
           </button>
         }
       />
-      {composer && <Composer initialTo={composer.to} channel={channel} />}
+      {composer && <Composer initialTo={composer.to} channel={effectiveChannel} />}
+      {legacy ? (
+        <div className="well text-sm" role="status">
+          {t.legacyChannels}
+        </div>
+      ) : (
       <div className="flex flex-wrap items-center gap-2">
         <div role="group" aria-label="channel" className="flex flex-wrap gap-2">
           {["default", ...channels.map((c) => c.name).filter((n) => n !== "default")].map((name) => (
@@ -66,7 +73,7 @@ export function FeedPage({ filter, channel }: { filter: Filter; channel: string 
         </div>
         <div role="group" aria-label="filter" className="flex flex-wrap gap-2">
           {filters.map(([k, label]) => (
-            <button key={k} type="button" className="chip" aria-pressed={filter === k} onClick={() => navigate({ page: "feed", filter: k, channel })}>
+            <button key={k} type="button" className="chip" aria-pressed={filter === k} onClick={() => navigate({ page: "feed", filter: k, channel: effectiveChannel })}>
               {label}
             </button>
           ))}
@@ -85,6 +92,7 @@ export function FeedPage({ filter, channel }: { filter: Filter; channel: string 
           }}
         />
       </div>
+      )}
       {searching ? <SearchResults filter={filter} /> : <>
       {threads.length === 0 && <Empty>{t.emptyFeed}</Empty>}
       {showActive && (

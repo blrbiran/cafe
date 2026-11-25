@@ -61,6 +61,32 @@ describe("cafe doctor", () => {
     expect(r.stdout).toContain("cafe init");
   });
 
+  it("warns when the running daemon does not advertise features (v4-12)", async () => {
+    const server = createServer((req, res) => {
+      const url = req.url ?? "/";
+      res.setHeader("content-type", "application/json");
+      if (url.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "oldbox", version: "0.1.5", isRoot: true }));
+      res.statusCode = 404;
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-"));
+    cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const cwd = join(tmp, "work");
+    const home = join(tmp, "cafe-home");
+    const userHome = join(tmp, "user-home");
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    mkdirSync(userHome, { recursive: true });
+    writeFileSync(join(cwd, ".cafe"), "name: widgets\ndescription: answers widget questions\n");
+
+    const r = await doctor(cwd, home, addr, userHome);
+    expect(r.stdout).toContain("does not advertise features");
+  });
+
   it("fails when the daemon cannot be reached", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "cafe-doc-"));
     cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));

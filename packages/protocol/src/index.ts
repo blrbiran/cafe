@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export { DEFAULT_PORT, onlineVersions, PROTOCOL_VERSION } from "./version.ts";
+export { CURRENT_FEATURES, DEFAULT_PORT, FEATURES, missingFeatures, onlineVersions, PROTOCOL_VERSION, type Feature } from "./version.ts";
 
 /** Delivery deadlines (ms). See GLOSSARY: Order lifecycle. */
 export const ACK_TIMEOUT_MS = 30_000;
@@ -162,6 +162,8 @@ export const DaemonRecord = z.object({
   lastSeenAt: z.number(),
   /** cafe release running on that Host (absent: older than this field). */
   version: z.string().optional(),
+  /** Features that Host's Daemon supports (v4-12); absent = an older release. */
+  features: z.array(z.string()).optional(),
   /** Its last connection was refused (#89: plaintext link to a TLS Root); cleared when it joins. */
   refused: z.object({ reason: z.literal("plaintext"), at: z.number() }).optional(),
 });
@@ -428,6 +430,8 @@ export const InitializeParams = z.object({
   registryVersion: z.number().int().optional(),
   /** cafe release of the connecting side, for mismatch messages and the Network view. */
   cafeVersion: z.string().optional(),
+  /** Features the connecting side supports (v4-12); absent = an older release. */
+  features: z.array(z.string()).optional(),
 });
 export type InitializeParams = z.infer<typeof InitializeParams>;
 

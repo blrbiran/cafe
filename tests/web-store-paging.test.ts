@@ -74,4 +74,36 @@ describe("web store channel switch and pagination (v4-11)", () => {
     expect(store.getState().threads.map((t) => t.threadId)).toContain("t1");
     expect(store.getState().threads.map((t) => t.threadId)).toContain("t2");
   });
+
+  it("falls back to the legacy view only when both the feature list and /api/channels say no", async () => {
+    vi.resetModules();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string) => {
+        if (String(path).startsWith("/api/channels")) return new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify(snapshot([meta("t1", 1000)])), { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+    const store = await import("../packages/web/src/store.ts");
+    store.syncChannel("team");
+    await store.refreshStore();
+    expect(store.getState().legacy).toBe(true);
+    expect(store.getState().channel).toBe("default");
+  });
+
+  it("keeps channels for a v4-11 daemon that advertises nothing but serves /api/channels", async () => {
+    vi.resetModules();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string) => {
+        if (String(path).startsWith("/api/channels")) return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify(snapshot([meta("t1", 1000)])), { status: 200, headers: { "content-type": "application/json" } });
+      }),
+    );
+    const store = await import("../packages/web/src/store.ts");
+    store.syncChannel("team");
+    await store.refreshStore();
+    expect(store.getState().legacy).toBe(false);
+    expect(store.getState().channel).toBe("team");
+  });
 });

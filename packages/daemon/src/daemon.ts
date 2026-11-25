@@ -19,6 +19,7 @@ import {
   BROADCAST_DEADLINE_MS,
   CreateOrderParams,
   DEFAULT_CHANNEL,
+  CURRENT_FEATURES,
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MISSES,
   InitializeParams,
@@ -264,6 +265,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** cafe release of the Root, from the last handshake. */
   private rootVersion?: string;
   private rootDisplayName?: string;
+  /** Features the connected Root advertises (v4-12); absent/empty = an older Root. */
+  private rootFeatures: string[] = [];
+  /** One log line while a roster cannot be published to an old Root (v4-12 D8). */
+  private teamLocalLogged = false;
 
   /** Routing hints computed from this Daemon's own outcomes (agent_events). */
   private localHints: Record<string, RoutingHint> = {};
@@ -352,7 +357,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Replica restored from disk; the Root will resync on connect.
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
-    this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version });
+    this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version, features: [...CURRENT_FEATURES] });
     this.schedulePrune();
     this.schedulePulls();
     this.stagingTimer = setInterval(() => {
@@ -444,6 +449,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** What the router is actually doing now (config may differ from it). */
+  /** What this Daemon can do on the wire (v4-12). An older peer advertises nothing. */
+  features(): readonly string[] {
+    return CURRENT_FEATURES;
+  }
+
+  /** Features the connected Root advertises; the Root itself always supports everything (v4-12). */
+  rootFeatureList(): string[] {
+    return this.isRoot ? [...CURRENT_FEATURES] : [...this.rootFeatures];
+  }
+
+  /** True when the connected Root advertises every feature in `need` (an absent list = none). */
+  private rootSupports(...need: string[]): boolean {
+    return this.isRoot || need.every((f) => this.rootFeatures.includes(f));
+  }
+
   routerStatus(): { router: string; model?: string; error?: string; routerLoading?: true } {
     return {
       router: this.router.name,
@@ -738,6 +758,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (p.host) this.refusedPlaintext.delete(p.host);
       }
       peer.meta.kind = p.kind;
+      peer.meta.features = p.features ?? [];
       // Bind the agent RPC surface only after a successful handshake (token + protocol). Binding it
       // on accept let any network socket that could open /ws create Orders or register a Barista
       // before initialize (v4-11 review).
@@ -749,10 +770,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         peer.meta.host = p.host;
         if (p.host && p.url && !this.isRoot) this.learnPeers([{ host: p.host, url: p.url }]);
         this.bindLink(peer);
-        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
+        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
       }
       if (p.kind === "ui") this.uis.add(peer);
-      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
+      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
     });
   }
 
@@ -909,7 +930,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private publishAgents(records: AgentRecord[]): void {
     if (this.isRoot) this.broadcastDelta(this.registry.upsert(records));
-    else if (this.rootOnline) this.uplink!.notify(Methods.registryUpsert, { records });
+    else if (this.rootOnline) this.uplink!.notify(Methods.registryUpsert, { records: records.filter((r) => this.publishableTo(r, this.rootFeatures)) });
     else this.registry.upsert(records); // Root down: keep a local view; resynced on reconnect.
   }
 
@@ -957,6 +978,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         total: t.members.length,
         openThreads: threads.filter((m) => m.status === "routing" || m.status === "delivering" || m.status === "working").length,
         ...(threads.length ? { lastActivityAt: Math.max(...threads.map((m) => m.lastActivityAt ?? m.createdAt)) } : {}),
+        // Whether this roster reaches the Root; `partial` is about Thread metrics only (v4-12 D8).
+        rosterShared: this.isRoot || this.rootSupports("teams"),
       };
     });
   }
@@ -1074,7 +1097,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (current?.revision !== undefined && rec.revision !== undefined && current.revision >= rec.revision) return;
     this.teamRecords.set(key, rec);
     this.saveTeams();
-    if (this.isRoot) for (const child of this.children.values()) if (child !== from) child.notify(Methods.teamUpsert, { team: rec });
+    if (this.isRoot) for (const child of this.children.values()) if (child !== from && (child.meta.features as string[] | undefined)?.includes("teams")) child.notify(Methods.teamUpsert, { team: rec });
   }
 
   private saveTeams(): void {
@@ -1121,7 +1144,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const revision = Math.max(Date.now(), (existing?.revision ?? 0) + 1);
     const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision };
     this.storeTeam(team);
-    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.teamUpsert, { team });
+    if (!this.isRoot && this.rootOnline) {
+      if (this.rootSupports("teams")) {
+        this.teamLocalLogged = false;
+        this.uplink!.notify(Methods.teamUpsert, { team });
+      } else if (!this.teamLocalLogged) {
+        this.teamLocalLogged = true;
+        this.log("root does not advertise teams; rosters stay local (cafe team status shows this)");
+      }
+    }
   }
 
   /**
@@ -1134,6 +1165,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const previous = this.teamRecords.get(key);
     const members = team.members.map((m) => ({ ...m, channels: m.channels?.length ? m.channels : [team.channel!] }));
     this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1) });
+    if (!this.isRoot && this.rootOnline && this.rootSupports("teams")) {
+      const saved = this.teamRecords.get(`${this.host}/${team.name}`);
+      if (saved) this.uplink!.notify(Methods.teamUpsert, { team: saved });
+    }
     this.log(`roster ${team.name} published from ${rosterDir}`);
   }
 
@@ -1592,7 +1627,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private broadcastDelta(delta: RegistryDelta): void {
-    for (const child of this.children.values()) child.notify(Methods.registryDelta, delta);
+    for (const child of this.children.values()) child.notify(Methods.registryDelta, this.deltaFor(delta, child.meta.features as string[] | undefined));
+  }
+
+  /**
+   * v4-12 D5: an incapable routing peer must not learn an Agent it would mishandle — an old
+   * Daemon's `eligible()` knows neither `observer` nor `channels`, so publishing an observer or a
+   * channel-only member to it would let it select that Agent. The local registry keeps the record;
+   * the peer simply does not see it until it upgrades (a new connection resyncs).
+   */
+  private publishableTo(rec: AgentRecord, features: readonly string[] | undefined): boolean {
+    const caps = features ?? [];
+    if (rec.observer && !caps.includes("digests")) return false;
+    if (!caps.includes("channels") && !channelsOf(rec).includes(DEFAULT_CHANNEL)) return false;
+    return true;
+  }
+
+  private deltaFor(delta: RegistryDelta, features: readonly string[] | undefined): RegistryDelta {
+    if (!delta.upsert.length) return delta;
+    const upsert = delta.upsert.filter((r) => this.publishableTo(r, features));
+    return upsert.length === delta.upsert.length ? delta : { ...delta, upsert };
   }
 
   // -------------------------------------------------------------------------
@@ -1820,10 +1874,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     await this.routerReady();
     if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
-      try {
-        return this.channelFailure(order, await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId), broadcast }, 60_000));
-      } catch (err) {
-        this.log(`root route/decide failed: ${(err as Error).message}`);
+      // An old Root's router lacks channel/duty inputs; for a scoped ask, decide locally from the
+      // already channel-filtered candidates instead (v4-12 D6).
+      const scoped = (order.channel ?? DEFAULT_CHANNEL) !== DEFAULT_CHANNEL;
+      if (scoped && !this.rootSupports("channels")) {
+        this.log("root does not advertise channels; routing this channel order locally");
+      } else {
+        try {
+          return this.channelFailure(order, await this.uplink!.request<RoutingDecision>(Methods.routeDecide, { order, candidates: candidates.map((c) => c.agentId), broadcast }, 60_000));
+        } catch (err) {
+          this.log(`root route/decide failed: ${(err as Error).message}`);
+        }
       }
     }
     return this.channelFailure(order, await this.router.decide({ order, candidates, hints: this.hintsFor(candidates) }));
@@ -2915,7 +2976,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const displayName = override?.displayName ?? p.displayName ?? host;
     const aliases = [...new Set([...(p.aliases ?? []), ...(override?.aliases ?? [])])];
     const legacyAliases = [...new Set([...(p.legacyAliases ?? []), ...(override?.legacyAliases ?? [])])];
-    this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
+    this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion, features: p.features ?? [] });
     if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
     if (p.url) this.reportedUrls.set(host, p.url);
     if (p.url) void this.rememberChildUrl(host, p.url);
@@ -2977,12 +3038,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.log(`daemon ${host} connected (${p.url})`);
     // Send snapshot after the initialize response.
     queueMicrotask(() => {
-      peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all() });
+      peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all().filter((r) => this.publishableTo(r, peer.meta.features as string[] | undefined)) });
       // v4-11: replay this Host's teams (and every replicated roster) so a reconnecting child has them.
-      for (const team of this.teamRecords.values()) peer.notify(Methods.teamUpsert, { team });
+      for (const team of this.teamRecords.values()) if ((peer.meta.features as string[] | undefined)?.includes("teams")) peer.notify(Methods.teamUpsert, { team });
       this.pushHints(peer);
     });
-    return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: true, registryVersion: this.registry.version };
+    return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, isRoot: true, registryVersion: this.registry.version };
   }
 
   /**
@@ -3194,9 +3255,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const peer = new Peer(ws);
     ws.on("open", async () => {
       try {
-        const hello = await peer.request<{ host: string; displayName?: string; aliases?: string[]; cafeVersion?: string }>(Methods.initialize, {
+        const hello = await peer.request<{ host: string; displayName?: string; aliases?: string[]; cafeVersion?: string; features?: string[] }>(Methods.initialize, {
           protocolVersion: PROTOCOL_VERSION,
           cafeVersion: this.version,
+          features: [...CURRENT_FEATURES],
           kind: "daemon",
           token: this.config.token,
           host: this.host,
@@ -3214,6 +3276,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.uplink = peer;
         this.bindAgentMethods(peer); // the Root may relay agent/rename down this connection
         this.rootHost = hello.host;        this.rootVersion = hello.cafeVersion;
+        this.rootFeatures = hello.features ?? [];
         this.rootDisplayName = hello.displayName;
         this.store.setKv("rootHost", hello.host);
         this.reconnectDelay = 0;
@@ -3228,10 +3291,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.lastRootAddr = target;
         this.store.setKv("lastRoot", target);
         this.setRootOnline(true);
-        await peer.request("registry/sync", { records: [...this.local.values()] });
+        await peer.request("registry/sync", { records: [...this.local.values()].filter((r) => this.publishableTo(r, this.rootFeatures)) });
         // A roster learned while the Root was offline was stored but never published. The Root
         // replays its own records on connect; send this Host's rosters the other way too (v4-11 review).
-        for (const team of this.teamRecords.values()) if (team.host === this.host) peer.notify(Methods.teamUpsert, { team });
+        if (this.rootSupports("teams")) for (const team of this.teamRecords.values()) if (team.host === this.host) peer.notify(Methods.teamUpsert, { team });
         void this.flushBackfill();
         this.log(`connected to root ${target}`);
       } catch (err) {
@@ -3322,6 +3385,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.rootHost) rec.host = this.rootHost;
     if (this.rootDisplayName) rec.displayName = this.rootDisplayName;
     if (online) rec.version = this.rootVersion;
+    if (online) rec.features = [...this.rootFeatures];
     // Show where the uplink actually is, not only what the file says: after a move they differ (#104).
     rec.url = rootAddr ? `ws://${rootAddr}` : "";
     rec.lastSeenAt = Date.now();
@@ -3880,6 +3944,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       ...(this.routerModel ? { routerModel: this.routerModel } : {}),
       ...(this.lastRouterError ? { routerError: this.lastRouterError } : {}),
       registryVersion: this.registry.version,
+      features: [...this.features()],
       agents: this.registry.all(),
       daemons: this.daemons(),
       threads: (channel ? this.store.listThreadsIn(channel, 200) : this.store.listThreads(200)).map((m) => this.summaryMeta(m)),

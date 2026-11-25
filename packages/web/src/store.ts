@@ -23,6 +23,10 @@ export interface State {
   channels: ChannelInfo[];
   /** The running daemon still serves an older web build than the one on disk. */
   webStale?: boolean;
+  /** Features the serving Daemon advertises (v4-12). */
+  features?: string[];
+  /** The Daemon has no channel API: run the legacy view (force `default`, no chips) (v4-12 D9). */
+  legacy: boolean;
   /** The open Thread detail, kept live while open. */
   detail?: ThreadDetail & { loading?: boolean; loadingOlder?: boolean };
   /** Per-thread facts about the latest turn that ThreadMeta does not carry. */
@@ -78,6 +82,7 @@ let state: State = {
   events: [],
   older: { loading: false, loaded: false, done: false },
   search: { q: "", loading: false },
+  legacy: false,
 };
 
 const listeners = new Set<() => void>();
@@ -105,8 +110,12 @@ function norm(m: ThreadMeta): ThreadMeta {
   return { ...m, turns: m.turns ?? 1, replies: m.replies ?? [], declines: m.declines ?? [] };
 }
 
-function applySnapshot(s: Snapshot): void {
+function applySnapshot(s: Snapshot, channelsOk: boolean): void {
   const fresh = s.threads.map(norm);
+  // v4-12 D9: an absent feature list is not proof (a v4-11 build may have no list); the channel
+  // endpoint is. Only when both say no does the Web fall back to the legacy view.
+  const channelsSupported = s.features ? s.features.includes("channels") : channelsOk;
+  const legacy = !channelsSupported;
   // A re-snapshot (reconnect) must not drop older threads the user already loaded.
   const ids = new Set(fresh.map((t) => t.threadId));
   const oldest = fresh.reduce((m, t) => Math.min(m, t.createdAt), Number.POSITIVE_INFINITY);
@@ -121,6 +130,9 @@ function applySnapshot(s: Snapshot): void {
     rootOnline: s.rootOnline,
     router: s.router,
     registryVersion: s.registryVersion,
+    features: s.features,
+    legacy,
+    ...(legacy ? { channel: "default" } : {}),
     agents: Object.fromEntries(s.agents.map((a) => [a.agentId, a])),
     daemons: s.daemons,
     threads: [...fresh, ...kept],
@@ -174,6 +186,8 @@ export function setChannel(channel: string): void {
 
 /** Call once from the shell when the URL's channel differs from the store (direct link/refresh). */
 export function syncChannel(channel: string): void {
+  // A legacy Daemon ignores `?channel`; honoring a deep link would only mislabel the list (v4-12 D9).
+  if (state.legacy && channel !== "default") return;
   if (channel !== state.channel) setChannel(channel);
 }
 
@@ -330,10 +344,13 @@ async function refresh(): Promise<void> {
   const channel = state.channel;
   const seq = ++snapshotSeq;
   try {
-    const [snap, channels] = await Promise.all([api.snapshot(channel), api.channels().catch(() => [] as ChannelInfo[])]);
+    const [snap, channelProbe] = await Promise.all([
+      api.snapshot(channel),
+      api.channels().then((list) => ({ ok: true, list })).catch(() => ({ ok: false, list: [] as ChannelInfo[] })),
+    ]);
     if (seq !== snapshotSeq) return; // a channel switch happened while this request was in flight
-    applySnapshot(snap);
-    set({ channels });
+    applySnapshot(snap, channelProbe.ok);
+    set({ channels: channelProbe.list });
     const open = state.detail?.meta.threadId;
     if (open) await openThread(open);
     await backfillEvents();

@@ -13,6 +13,8 @@ export interface Snapshot {
   agents: AgentRecord[];
   daemons: DaemonRecord[];
   threads: ThreadMeta[];
+  /** Features the serving Daemon advertises (v4-12); absent = an older build (support unconfirmed). */
+  features?: string[];
   /** The daemon's in-memory web UI is older than the build on disk; restart it. */
   webStale?: boolean;
 }

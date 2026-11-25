@@ -71,6 +71,13 @@ cafe channel threads <name> [--after <ms>]               # one channel's Threads
   Root is offline.
 - Channels are **not permissions**. The Web shows channel chips and a Teams page;
   the composer always names its destination (`→ #channel`).
+- **Mixed releases:** a Daemon advertises features on `initialize`, `/api/health`
+  and `/api/snapshot`. A newer client talking to an older Daemon returns a
+  `warning:` line in the tool result (channel/escalate/collect/team identity may
+  have been ignored); observer registration is refused when it cannot be honoured,
+  and `cafe team` preflights before touching a worker. After upgrading, restart
+  the daemon (`cafe daemon restart`) and the session; `cafe doctor` reports a
+  daemon without the current features.
 
 ## Inspect / debug
 

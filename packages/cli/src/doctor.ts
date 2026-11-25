@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
+import { CURRENT_FEATURES, missingFeatures } from "@cafe/protocol";
 import { defaultExtensionPath, loadConfig } from "@cafe/daemon";
 import { ompExtensionState, piExtensionState } from "./extension.ts";
 import { claudeCommandState } from "./commands.ts";
@@ -34,6 +35,17 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     daemonInfo = await res.json();
     checks.push({ name: "daemon", level: "ok", detail: `${daemonInfo.host}${daemonInfo.isRoot ? " (root)" : ""} at ${opts.base}${daemonInfo.version ? `, cafe ${daemonInfo.version}` : ""}` });
+    // v4-12: a Daemon that does not advertise the current feature set is likely older than this CLI.
+    if (Array.isArray(daemonInfo.features)) {
+      const missing = missingFeatures(daemonInfo.features, [...CURRENT_FEATURES]);
+      checks.push(
+        missing.length
+          ? { name: "features", level: "warn", detail: `${daemonInfo.host} (cafe ${daemonInfo.version ?? "unknown"}) does not advertise ${missing.join(", ")}`, next: `restart the daemon on ${daemonInfo.host} (cafe daemon restart) after upgrading it` }
+          : { name: "features", level: "ok", detail: `${daemonInfo.features.length} feature(s) advertised` },
+      );
+    } else {
+      checks.push({ name: "features", level: "warn", detail: `${daemonInfo.host} does not advertise features (older build, or a v4-11 build before this release)`, next: "restart the daemon after upgrading (cafe daemon restart); teammates keep working meanwhile" });
+    }
   } catch (err) {
     checks.push({ name: "daemon", level: "fail", detail: `not reachable at ${opts.base}: ${(err as Error).message}`, next: "cafe daemon start" });
   }

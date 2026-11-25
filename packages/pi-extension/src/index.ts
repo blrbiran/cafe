@@ -406,6 +406,14 @@ export default function cafe(pi: ExtensionAPI) {
       try {
         await c.connect({ ...identity, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
         client = c;
+        // A capability downgrade at registration (team/channel/observer) must be visible, not logged.
+        for (const w of c.drainWarnings()) {
+          try {
+            ctx.ui.notify(`cafe: ${w}`, "warning");
+          } catch {
+            // headless
+          }
+        }
       } catch (err) {
         startupError = `cannot connect to the cafe daemon at ${addr}: ${(err as Error).message}`;
         setUiStatus(`☕ cafe: ${(err as Error).message}`);
@@ -702,9 +710,13 @@ export default function cafe(pi: ExtensionAPI) {
       await refreshRegistry(c);
       if (!params.wait) {
         const res = await ask();
+        const warnings = c.drainWarnings().map((w) => `warning: ${w}`);
         track(res.threadId, { orderId: res.orderId });
         return text(
-          `Order ${res.orderId} sent (threadId ${res.threadId}). Routed ${res.decision.mode} to ${res.decision.targets.map(addrOf).join(", ") || "nobody"}: ${res.decision.reason}. Replies will arrive as cafe-reply messages; to follow up later, call cafe_ask with threadId "${res.threadId}".`,
+          [
+            ...warnings,
+            `Order ${res.orderId} sent (threadId ${res.threadId}). Routed ${res.decision.mode} to ${res.decision.targets.map(addrOf).join(", ") || "nobody"}: ${res.decision.reason}. Replies will arrive as cafe-reply messages; to follow up later, call cafe_ask with threadId "${res.threadId}".`,
+          ].join("\n\n"),
         );
       }
       const replies: string[] = [];
@@ -735,8 +747,12 @@ export default function cafe(pi: ExtensionAPI) {
           .catch(reject);
       });
       const status = await closed;
+      const warnings = c.drainWarnings().map((w) => `warning: ${w}`);
       return text(
-        `Order ${orderId} (threadId ${threadId}) ${status}.\n\n${replies.join("\n\n") || "(no replies)"}\n\nTo follow up with whoever answered, call cafe_ask with threadId "${threadId}".`,
+        [
+          ...warnings,
+          `Order ${orderId} (threadId ${threadId}) ${status}.\n\n${replies.join("\n\n") || "(no replies)"}\n\nTo follow up with whoever answered, call cafe_ask with threadId "${threadId}".`,
+        ].join("\n\n"),
       );
     },
   });

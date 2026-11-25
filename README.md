@@ -195,6 +195,16 @@ members when there is no orchestrator).
   Orders. Run an observer on the Root or on the team's own Host; a child's
   digest is marked `partial` while the Root is down.
 
+**Mixed releases.** Every Daemon advertises its feature set on `initialize`,
+`/api/health` and `/api/snapshot`. A newer client talking to an older Daemon
+warns (naming the Host and version) when a channel, escalation, `collect: all`
+or team identity may have been ignored; registering as an observer is refused
+when the Daemon demonstrably cannot honour it, and `cafe team` preflights before
+touching a worker. During a mixed rollout an old Host is not given observer or
+channel-only records, so it cannot route to them. After upgrading cafe, restart
+the daemon (`cafe daemon restart`) and the pi/Claude session; `cafe doctor`
+reports a daemon that does not advertise the current features.
+
 ## Chat connectors (experimental)
 
 `cafe connector` runs a Customer connector **out of process**: it turns platform messages into cafe Orders and posts the answers back. A mock connector ships for testing, and **Discord** is the first real platform.

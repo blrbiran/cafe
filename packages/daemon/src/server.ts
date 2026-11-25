@@ -543,7 +543,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const root = daemon.isRoot
       ? {}
       : { root: daemon.config.root, rootOnline: daemon.rootOnline, rootConnected: daemon.rootConnected, rootLastSeenAt: daemon.rootLastSeen };
-    return send(res, 200, { ok: true, host: daemon.host, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, tls: daemon.tlsStatus(), isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, draining: daemon.isDraining, ...root, ...daemon.routerStatus(), metrics: daemon.metrics() });
+    return send(res, 200, { ok: true, host: daemon.host, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, tls: daemon.tlsStatus(), isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, features: [...daemon.features()], ...(daemon.isRoot ? {} : { rootFeatures: daemon.rootFeatureList() }), draining: daemon.isDraining, ...root, ...daemon.routerStatus(), metrics: daemon.metrics() });
   }
   if (m === "GET" && path === "/api/router/models") {
     return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });

@@ -206,7 +206,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
         const attachments: Attachment[] = [];
         for (const file of files) attachments.push(await upload(file));
-        const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[]; failure?: string } }>("/api/orders", {
+        const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[]; failure?: string; router?: string } }>("/api/orders", {
           method: "POST",
           body: JSON.stringify({
             body,
@@ -224,11 +224,28 @@ export function runMcp(opts: McpOptions): Promise<void> {
             ...(attachments.length ? { attachments } : {}),
           }),
         });
+        // v4-12: MCP is HTTP-only, so it checks /api/health itself and prepends the notes.
+        const warnings: string[] = [];
+        {
+          const h = await api<{ host: string; version?: string; features?: string[] }>("/api/health").catch(() => undefined);
+          const add = (feature: string, used: boolean, effect: string) => {
+            if (!used || !h) return;
+            if (Array.isArray(h.features) && h.features.includes(feature)) return;
+            const claim = Array.isArray(h.features) ? "does not support" : "does not advertise";
+            warnings.push(`${h.host} (cafe ${h.version ?? "unknown"}) ${claim} ${feature}; ${effect}. If that Host already runs a newer cafe, restart it there (cafe daemon restart); otherwise upgrade cafe on it first.`);
+          };
+          add("channels", !!str(args.channel, "channel"), `the channel #${str(args.channel, "channel")} may have been ignored`);
+          add("collect", args.collect === "all", "the first answer may close the thread instead of waiting for every target");
+          const reachedParent = res.decision.router === "explicit" && /escalate/i.test(res.decision.reason);
+          add("escalate", args.escalate === true && !reachedParent, "the question may have been routed as a normal ask, not to the parent");
+        }
+        const withWarnings = (text: string) => (warnings.length ? `${warnings.map((w) => `warning: ${w}`).join("\n")}\n\n${text}` : text);
         if (res.decision?.targets?.length === 0) {
           // An immediate routing failure (offline parent, empty channel) is not "sent, replies will come".
-          return { text: `Not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`, isError: true };
+          return { text: withWarnings(`Not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`), isError: true };
         }
-        return waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
+        const followed = await waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
+        return { ...followed, text: withWarnings(followed.text) };
       }
       case "cafe_wait": {
         const threadId = str(args.threadId, "threadId", true)!;

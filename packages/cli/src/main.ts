@@ -59,6 +59,34 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
 /** Why the last `healthy()` check failed, as an error code (ECONNREFUSED = nothing is listening). */
 let lastHealthCode: string | undefined;
 
+type DaemonHealth = { host: string; version?: string; features?: string[] };
+
+/**
+ * A mixed-release note (v4-12). `undefined` means the feature is advertised. When the list is
+ * absent, say "does not advertise" — a v4-11 build may still support it (support unconfirmed).
+ */
+function featureWarning(h: DaemonHealth, feature: string, effect: string): string | undefined {
+  if (Array.isArray(h.features) && h.features.includes(feature)) return undefined;
+  const claim = Array.isArray(h.features) ? "does not support" : "does not advertise";
+  return `${h.host} (cafe ${h.version ?? "unknown"}) ${claim} ${feature}; ${effect}. If that Host already runs a newer cafe, restart it there (cafe daemon restart); otherwise upgrade cafe on it first.`;
+}
+
+/**
+ * Team commands write to `/api/baristas`. A pre-v4-11 Daemon ignores the team selector and may
+ * stop unrelated workers, so refuse before any POST/DELETE (v4-12 D7). With no feature list the
+ * endpoint itself is the probe (v4-11 has it).
+ */
+async function requireTeams(): Promise<DaemonHealth> {
+  const h = await api<DaemonHealth>("/api/health");
+  if (Array.isArray(h.features) && h.features.includes("teams")) return h;
+  try {
+    await api("/api/teams");
+  } catch (err) {
+    throw new Error(featureWarning(h, "teams", "team commands are unavailable on this daemon") + ` (${(err as Error).message})`);
+  }
+  return h;
+}
+
 async function healthy(): Promise<boolean> {
   try {
     const r = await fetch(`${base()}/api/health`, { signal: AbortSignal.timeout(800) });
@@ -315,7 +343,7 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
 }
 
 /** Follow a Thread over SSE until it closes. Returns the final status. */
-async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string; timeoutMs?: number } = {}): Promise<string> {
+async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string; timeoutMs?: number; warnings?: string[] } = {}): Promise<string> {
   const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
   // Abort the local stream on timeout or Ctrl-C. Cancelling the Order too is the caller's job: a
   // follow-up should not kill an answer that is just slow, but leaving `thread_busy` behind is worse (#60).
@@ -358,7 +386,7 @@ async function follow(threadId: string, opts: { quiet?: boolean; orderId?: strin
   }
 }
 
-async function followStream(threadId: string, opts: { quiet?: boolean; orderId?: string }, agents: Map<string, AgentRecord>, signal: AbortSignal): Promise<string> {
+async function followStream(threadId: string, opts: { quiet?: boolean; orderId?: string; warnings?: string[] }, agents: Map<string, AgentRecord>, signal: AbortSignal): Promise<string> {
   const res = await fetch(`${base()}/api/threads/${threadId}/stream${opts.orderId ? `?orderId=${opts.orderId}` : ""}`, {
     headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
     signal,
@@ -387,7 +415,7 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
       }
     }
   }
-  if (JSON_OUT) console.log(JSON.stringify({ threadId, status, replies }, null, 2));
+  if (JSON_OUT) console.log(JSON.stringify({ threadId, status, replies, ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
   return status;
 }
 
@@ -793,9 +821,29 @@ program
       // An immediate routing failure is not "thread created"; say so and exit non-zero (#39 review).
       throw new Error(`not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`);
     }
-    if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision?.mode ?? "?"}: ${res.decision?.reason ?? ""}`, res);
+    // v4-12: name a mixed-release downgrade before following, so the person sees it even in JSON.
+    const warnings: string[] = [];
+    if (o.channel || o.collect !== "any" || o.escalate) {
+      const h = await api<DaemonHealth>("/api/health").catch(() => undefined);
+      if (h) {
+        if (o.channel) {
+          const w = featureWarning(h, "channels", `the channel #${o.channel} may have been ignored`);
+          if (w) warnings.push(w);
+        }
+        if (o.collect !== "any") {
+          const w = featureWarning(h, "collect", "the first answer may close the thread instead of waiting for every target");
+          if (w) warnings.push(w);
+        }
+        if (o.escalate && !(res.decision?.router === "explicit" && /escalate/i.test(res.decision.reason ?? ""))) {
+          const w = featureWarning(h, "escalate", "the question may have been routed as a normal ask, not to the parent");
+          if (w) warnings.push(w);
+        }
+      }
+    }
+    for (const w of warnings) console.error(`warning: ${w}`);
+    if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision?.mode ?? "?"}: ${res.decision?.reason ?? ""}`, warnings.length ? { ...res, warnings } : res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
-    const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}) });
+    const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}), ...(warnings.length ? { warnings } : {}) });
     process.exitCode = status === "done" ? 0 : 1;
   });
 
@@ -1463,6 +1511,7 @@ barista
       ...(o.member ? { member: o.member } : {}),
       ...(o.teamDir ? { teamDir: resolve(o.teamDir) } : {}),
     };
+    if (o.member) await requireTeams();
     const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir, ...spec }) });
     const how = o.tui ? " (answers in the running Codex session)" : native ? (o.write ? " (may edit files)" : " (read-only)") : "";
     // A member's cwd is the roster entry's dir, not --dir; that check belongs to `cafe team status`.
@@ -1522,6 +1571,7 @@ team
   .option("--force", "start a headless member even if an unowned same-name agent is online")
   .action(async (names: string[], o) => {
     await ensureDaemon();
+    await requireTeams();
     const { rosterDir, team: spec } = rosterAt(o.dir, o.teamDir);
     const unknown = names.filter((n) => !spec.members.some((m) => m.name === n));
     if (unknown.length) throw new Error(`unknown member(s): ${unknown.join(", ")}; roster: ${spec.members.map((m) => m.name).join(", ")}`);
@@ -1572,6 +1622,7 @@ team
   .option("--team-dir <dir>", "same as --dir (explicit roster)")
   .action(async (o) => {
     await ensureDaemon();
+    await requireTeams();
     const { team: spec } = rosterAt(o.dir, o.teamDir);
     const all = await api<any[]>("/api/teams");
     const local = (await api<{ host: string }>("/api/health")).host;
@@ -1597,6 +1648,7 @@ team
   .option("--team-dir <dir>", "same as --dir (explicit roster)")
   .action(async (names: string[], o) => {
     await ensureDaemon();
+    await requireTeams();
     const { rosterDir } = rosterAt(o.dir, o.teamDir);
     let stopped = 0;
     if (names.length) {

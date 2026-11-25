@@ -12,6 +12,7 @@ export function TeamsPage() {
   const connected = useStore((s) => s.connected);
   const threads = useStore((s) => s.threads);
   const [teams, setTeams] = useState<TeamView[]>();
+  const [unavailable, setUnavailable] = useState(false);
   const [selected, setSelected] = useState<string>();
   const activity = threads.reduce((n, m) => Math.max(n, m.lastActivityAt ?? m.createdAt), 0);
 
@@ -19,8 +20,8 @@ export function TeamsPage() {
     let alive = true;
     api
       .teams()
-      .then((list) => alive && setTeams(list))
-      .catch(() => alive && setTeams([]));
+      .then((list) => alive && (setTeams(list), setUnavailable(false)))
+      .catch(() => alive && (setTeams([]), setUnavailable(true)));
     return () => {
       alive = false;
     };
@@ -49,7 +50,7 @@ export function TeamsPage() {
   return (
     <>
       <PageHeader title={t.teamsTitle} sub={t.teamsSub} />
-      {teams && teams.length === 0 && <Empty>{t.noTeams}</Empty>}
+      {unavailable ? <Empty>{t.teamsUnavailable}</Empty> : teams && teams.length === 0 ? <Empty>{t.noTeams}</Empty> : null}
       {!teams && <div className="hint">{t.loading}</div>}
       <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(270px,1fr))]">
         {teams?.map((x) => {

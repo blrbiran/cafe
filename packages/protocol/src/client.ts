@@ -1,6 +1,7 @@
 import * as nodeTls from "node:tls";
 import { daemonWsUrl } from "./urls.ts";
 import {
+  CURRENT_FEATURES,
   DEFAULT_PORT,
   HEARTBEAT_INTERVAL_MS,
   Methods,
@@ -15,7 +16,7 @@ import {
   type RoutingDecision,
   type ThreadEnvelope,
 } from "./index.ts";
-import { Peer } from "./peer.ts";
+import { Peer, RpcError } from "./peer.ts";
 
 export interface ClientOptions {
   /** `host:port` of the Daemon; defaults to the local one. */
@@ -72,6 +73,14 @@ export class CafeClient {
   private digestListeners = new Set<Listener<ChannelDigest>>();
   /** Digest ids already dispatched on this connection (reconnect/replay protection). */
   private seenDigests = new Set<number>();
+  /** What the connected Daemon advertises (v4-12); undefined = it did not say. */
+  private daemonFeatures?: string[];
+  private daemonVersion?: string;
+  private daemonHost?: string;
+  /** Feature support proven by the registration echo when the Daemon advertises nothing. */
+  private echoed = new Set<string>();
+  private warnings: string[] = [];
+  private warningListeners = new Set<Listener<string>>();
   /** Recent events, so a listener attached after a fast thread closed can still read it. */
   private recent: ThreadEnvelope[] = [];
   private connectListeners = new Set<Listener<AgentRecord | undefined>>();
@@ -83,6 +92,49 @@ export class CafeClient {
 
   get connected(): boolean {
     return !!this.peer && !this.peer.isClosed;
+  }
+
+  /** Features the connected Daemon advertises; undefined means it did not advertise any (v4-12). */
+  get features(): string[] | undefined {
+    return this.daemonFeatures;
+  }
+
+  /** `true`/`false` when known (advertised or proven by the registration echo); undefined otherwise. */
+  supports(feature: string): boolean | undefined {
+    if (this.daemonFeatures) return this.daemonFeatures.includes(feature);
+    return this.echoed.has(feature) ? true : undefined;
+  }
+
+  /** A mixed-release warning raised on this connection (v4-12); not an error. */
+  onWarning(fn: Listener<string>): () => void {
+    this.warningListeners.add(fn);
+    return () => this.warningListeners.delete(fn);
+  }
+
+  /** Take the warnings raised so far (a tool result prepends them once). */
+  drainWarnings(): string[] {
+    return this.warnings.splice(0);
+  }
+
+  private warn(text: string): void {
+    this.warnings.push(text);
+    for (const fn of this.warningListeners) fn(text);
+  }
+
+  private who(): string {
+    return `daemon ${this.daemonHost ?? this.opts.daemon} (cafe ${this.daemonVersion ?? "unknown"})`;
+  }
+
+  /** Actionable copy: restart if the capable build is already installed, otherwise upgrade there. */
+  private upgradeHint(what: string): string {
+    return `${what}. If that Host already runs a newer cafe, restart it there (cafe daemon restart); otherwise upgrade cafe on it first, then restart.`;
+  }
+
+  private warnIgnored(feature: string, effect: string): void {
+    const state = this.supports(feature);
+    if (state === true) return;
+    const claim = state === false ? "does not support" : "does not advertise";
+    this.warn(this.upgradeHint(`${this.who()} ${claim} ${feature}; ${effect}`));
   }
 
   /** An Order delivered to this Agent was cancelled by its Customer; stop working on it. */
@@ -139,6 +191,8 @@ export class CafeClient {
   private open(): Promise<AgentRecord | undefined> {
     return new Promise((resolve, reject) => {
       this.seenDigests.clear();
+      this.echoed.clear();
+      this.daemonFeatures = undefined;
       const ws = this.connectSocket();
       this.ws = ws;
       const peer = new Peer(ws);
@@ -169,12 +223,50 @@ export class CafeClient {
       ws.addEventListener("message", (e) => void peer.receive(String(e.data)));
       ws.addEventListener("open", async () => {
         try {
-          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, kind: "agent", token: this.opts.token, cafeVersion: this.opts.cafeVersion });
+          const hello = await peer.request<{ host?: string; cafeVersion?: string; features?: string[] }>(Methods.initialize, {
+            protocolVersion: PROTOCOL_VERSION,
+            kind: "agent",
+            token: this.opts.token,
+            cafeVersion: this.opts.cafeVersion,
+            features: [...CURRENT_FEATURES],
+          });
+          this.daemonFeatures = Array.isArray(hello.features) ? hello.features : undefined;
+          this.daemonVersion = hello.cafeVersion;
+          this.daemonHost = hello.host;
           this.peer = peer;
           this.retry = 0;
           // Keep the same agentId across reconnects so in-flight Orders stay attributable.
           const identity = this.identity ? { ...this.identity, resumeAgentId: this.record?.agentId ?? this.identity.resumeAgentId } : undefined;
-          this.record = identity ? await peer.request<AgentRecord>(Methods.agentRegister, identity) : undefined;
+          if (identity) {
+            // A confirmed-incapable Daemon is refused before publishing the identity (v4-12 D3).
+            if (identity.observer && this.supports("digests") === false) {
+              throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support digests; observer registration was refused`));
+            }
+            this.record = await peer.request<AgentRecord>(Methods.agentRegister, identity);
+            // With no advertisement, the echo still proves support: an old Daemon strips these.
+            const lost: string[] = [];
+            if (identity.observer && this.record.observer) this.echoed.add("digests");
+            if (identity.observer && !this.record.observer) lost.push("observer");
+            if (identity.team && this.record.team) this.echoed.add("teams");
+            if (identity.team && !this.record.team) lost.push("team");
+            if (identity.channels?.length && this.record.channels?.length) this.echoed.add("channels");
+            if (identity.channels?.length && !this.record.channels?.length) lost.push("channels");
+            if (identity.duty && !this.record.duty) lost.push("duty");
+            if (lost.includes("observer")) {
+              // Never stay connected as a routable Barista when the caller asked to observe. The
+              // close below removes the record; the local filter (v4-12 D5) kept it off the network.
+              this.record = undefined;
+              this.peer = undefined;
+              peer.closed();
+              try {
+                ws.close();
+              } catch {
+                // already closing
+              }
+              throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} ignored observer: true; observer registration was refused`));
+            }
+            if (lost.length) this.warn(this.upgradeHint(`${this.who()} did not keep ${lost.join(", ")} on the registration; this session is an ordinary Barista`));
+          }
           for (const fn of this.connectListeners) fn(this.record);
           settled = true;
           resolve(this.record);
@@ -257,7 +349,16 @@ export class CafeClient {
   /** Create an Order as a Customer; Thread events arrive via onThreadEvent. */
   async ask(params: Partial<CreateOrderParams> & { body: string }): Promise<{ orderId: string; threadId: string; decision: RoutingDecision }> {
     if (!this.peer) throw new Error("not connected to cafe daemon");
-    return this.peer.request(Methods.orderCreate, { kind: "order", ...params }, 120_000);
+    const res = await this.peer.request<{ orderId: string; threadId: string; decision: RoutingDecision }>(Methods.orderCreate, { kind: "order", ...params }, 120_000);
+    // v4-12: say what the old side may have done with a field it cannot understand.
+    if (params.channel) this.warnIgnored("channels", `the order was routed ${res.decision.mode} in the daemon's old scope, not necessarily channel #${params.channel}`);
+    if (params.collect === "all") this.warnIgnored("collect", "the daemon may close on the first answer instead of waiting for every target");
+    if (params.escalate) {
+      // The decision reveals whether the sub-Thread actually reached the parent.
+      const reachedParent = res.decision.router === "explicit" && /escalate/i.test(res.decision.reason);
+      if (!reachedParent) this.warnIgnored("escalate", "the question became a normal routed ask instead of a sub-Thread to the parent");
+    }
+    return res;
   }
 
   async cancel(threadId: string): Promise<void> {

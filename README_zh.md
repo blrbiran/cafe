@@ -186,6 +186,15 @@ orchestrator（没有就投给在线的非 observer 成员）。
   channel 摘要（不是每条消息），也可以主动发新单。observer 请放在 Root 或
   team 所在的机器；Root 离线时子机的摘要有 `partial` 标记。
 
+**混合版本。** 每个 daemon 在 `initialize`、`/api/health` 和 `/api/snapshot`
+里声明自己的能力。新客户端连到旧 daemon 时，如果 channel、escalate、
+`collect: all` 或 team 身份可能被忽略，会给出带主机名和版本号的警告；确认
+不支持 observer 时拒绝注册，避免它变成可被投单的普通 Barista；`cafe team`
+在动 worker 之前先做检查。混合升级期间，旧主机收不到 observer 和只在非
+default channel 的 agent 记录，因此不会把它们选为投递目标。升级 cafe 后记得
+重启 daemon（`cafe daemon restart`）和 pi/Claude 会话；`cafe doctor` 会指出
+没有声明当前能力的 daemon。
+
 ## 聊天 connector（实验）
 
 `cafe connector` 以**进程外 sidecar** 的方式运行 Customer connector：把平台消息变成 cafe Order，再把回答发回原频道。提供 mock connector 用于测试，**Discord** 是第一个真实平台。

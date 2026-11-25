@@ -104,6 +104,47 @@ describe("cafe wait cancellation is honest (#60)", () => {
   });
 });
 
+describe("mixed-release preflights (v4-12)", () => {
+  /** A pre-v4-11 Daemon: no feature list, no /api/teams. Records every request. */
+  async function oldDaemon() {
+    const http = await import("node:http");
+    const calls: string[] = [];
+    const server = http.createServer((req, res) => {
+      calls.push(`${req.method} ${req.url}`);
+      const url = req.url ?? "/";
+      res.setHeader("content-type", "application/json");
+      if (url.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "oldbox", version: "0.1.5", isRoot: true }));
+      if (url.startsWith("/api/teams")) {
+        res.statusCode = 404;
+        return res.end(JSON.stringify({ error: "not_found", message: "no such endpoint" }));
+      }
+      if (url === "/api/orders") return res.end(JSON.stringify({ threadId: "t1", orderId: "o1", decision: { mode: "unicast", targets: ["a1"], reason: "the most available Barista" } }));
+      if (url.startsWith("/api/agents")) return res.end("[]");
+      res.statusCode = 404;
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
+    return { addr: `127.0.0.1:${(server.address() as { port: number }).port}`, calls };
+  }
+
+  it("warns about a channel on an old daemon and still creates the order", async () => {
+    const { addr, calls } = await oldDaemon();
+    const r = await cafeAsync(home(), addr, "ask", "--channel", "dev", "--async", "hello");
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toContain("does not advertise channels");
+    expect(calls).toContain("POST /api/orders");
+  });
+
+  it("refuses team stop before any barista write", async () => {
+    const { addr, calls } = await oldDaemon();
+    const r = await cafeAsync(home(), addr, "team", "stop");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("team commands are unavailable");
+    expect(calls.some((c) => c.startsWith("DELETE /api/baristas"))).toBe(false);
+  });
+});
+
 describe("cafe commands", () => {
   it("status lists the entry point for each host", () => {
     const r = cafeEnv(home(), home(), "commands", "status");
