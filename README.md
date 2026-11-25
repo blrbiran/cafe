@@ -129,10 +129,11 @@ cafe claude install            # install cafe's Claude Code plugin (--dry-run fi
                                # Claude Code sessions opened in a dir with .cafe then answer questions
                                # in the session: /cafe shows the address, /cafe-barista off pauses, on resumes
                                # (older plugin installs used /cafe for pause/resume; rerun `cafe claude install`)
-cafe barista start --dir ~/code/billing --agent codex --tui   # questions go to the most recently active Codex session in that dir
+cafe barista start --dir ~/code/billing --agent codex --tui   # attach to the Codex session in that dir
+                                                             # (one session: used and named; several: pass --thread <id>)
 ```
 
-Questions enter as a new turn when the session is idle; approvals stay with you in the terminal. If a question has not started within 120 s (busy, interrupted with Esc and no new message yet, or closed) it is declined as "temporarily unavailable". See [ADR-0006](docs/adr/0006-tui-sessions-as-baristas.md).
+Questions enter as a new turn when the session is idle; approvals stay with you in the terminal. cafe never guesses between several sessions in one directory — the command lists them and asks for `--thread <id>`, because the newest one is often the session you are typing in. If a question has not started within 120 s (busy, interrupted with Esc and no new message yet, or closed) it is declined as "temporarily unavailable". See [ADR-0006](docs/adr/0006-tui-sessions-as-baristas.md).
 
 ### Any command
 

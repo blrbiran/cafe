@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
+import { watchLiveness } from "./liveness.ts";
+import { discoverRoots } from "./discovery.ts";
 import { pinnedIdentityCheck } from "./tls/trust.ts";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
 import { localAddresses, missingSans, sanCovers, sanList } from "./tls/certs.ts";
@@ -81,6 +83,8 @@ export interface Timing {
   linkConnectTimeoutMs: number;
   /** Direct links: close an outgoing link after this long without traffic. */
   linkIdleMs: number;
+  /** Daemon↔Daemon sockets: ping this often; two missed pongs close the link (#99, v4-10). */
+  linkPingMs: number;
   /** How often to check the TLS leaf while running: expiry (v4-6 §5 B) and addresses it must name (#91). */
   leafCheckIntervalMs: number;
   /** A refused plaintext link counts as "still trying" (a doctor failure) for this long after its last attempt (#93). */
@@ -92,6 +96,11 @@ export interface Timing {
   /** …up to this. */
   enrolRetryMaxMs: number;
 }
+
+/** Re-discovery of an orphaned child: start often, back off, and give up after a few minutes (#104). */
+const DISCOVERY_MIN_MS = 30_000;
+const DISCOVERY_MAX_MS = 5 * 60_000;
+const DISCOVERY_MAX_TRIES = 6;
 
 /** Recompute hints at least this often even without new outcomes, so time decay shows. */
 const HINTS_MAX_AGE_MS = 3600_000;
@@ -298,6 +307,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       hintsIntervalMs: 30_000,
       linkConnectTimeoutMs: 3000,
       linkIdleMs: 5 * 60_000,
+      linkPingMs: Number(process.env.CAFE_LINK_PING_MS) || 30_000,
       leafCheckIntervalMs: 5 * 60_000,
       refusedRecentMs: 10 * 60_000,
       refusedForgetMs: 24 * 3600_000,
@@ -337,6 +347,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       for (const id of this.store.getKv<string[]>("backfill") ?? []) this.backfill.set(id, since[id] ?? 0);
       // Show the Root's real host name before the first (re)connection.
       this.rootHost = this.store.getKv<string>("rootHost");
+      // Where the Root was reachable last time, and where it said it could be reached (v4-10).
+      this.rootAddressesLearned = this.store.getKv<string[]>("rootAddresses") ?? [];
+      this.lastRootAddr = this.store.getKv<string>("lastRoot") ?? undefined;
       this.linkSweep = setInterval(() => this.sweepLinks(), Math.min(this.timing.linkIdleMs, 60_000));
       this.linkSweep.unref?.();
     }
@@ -691,6 +704,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (p.host) this.refusedPlaintext.delete(p.host);
       }
       peer.meta.kind = p.kind;
+      // Both directions check: an idle accepted link whose peer died looks exactly like a healthy one.
+      if (p.kind === "daemon" || p.kind === "peer") this.watchLink(ws);
       if (p.kind === "daemon") return this.onChildDaemon(peer, p);
       if (p.kind === "peer") {
         peer.meta.host = p.host;
@@ -1554,6 +1569,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // On a TLS network `url` is always `wss://` (a plaintext address was upgraded above); the pin is
       // keyed by the TLS endpoint dialled, like the uplink's.
       const ws = new WebSocket(`${url}/ws`, this.linkOptions(url.replace(/^wss?:\/\//, "")));
+      this.watchLink(ws);
       const peer = new Peer(ws);
       peer.meta.kind = "peer";
       peer.meta.host = host;
@@ -2426,6 +2442,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (prev && prev !== peer) prev.close();
     this.children.set(host, peer);
     this.forgotten.delete(host);
+    // A child that moved networks can reconnect through any of these (#104).
+    peer.notify(Methods.rootMoved, { addresses: this.rootAddressesForPeers() });
     peer.meta.host = host;
     const now = Date.now();
     const override = this.config.hostNames[host];
@@ -2559,7 +2577,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // -------------------------------------------------------------------------
 
   connectRoot(): void {
-    if (this.isRoot || !this.config.root || this.stopped) return;
+    if (this.isRoot || this.stopped || !this.rootCandidates().length) return;
     // Fail-closed (v4-6 §10.3, #79): a TLS Host that has not enrolled the network CA does not dial its
     // Root at all — a plaintext uplink is exactly the downgrade TLS exists to prevent. The enrolment
     // retry reconnects once it succeeds.
@@ -2569,13 +2587,106 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return;
     }
     const gen = ++this.dialGen;
-    void this.dialRoot(this.config.root, gen);
+    void this.dialRoot(this.nextRootTarget(), gen);
+  }
+
+  /** Where this Host may look for its Root: the configured address, the last one that worked, learned ones. */
+  rootCandidates(): string[] {
+    const list = [this.config.root, this.lastRootAddr, ...this.rootAddressesLearned].filter((x): x is string => !!x);
+    return [...new Set(list)];
+  }
+
+  private nextRootTarget(): string {
+    const list = this.rootCandidates();
+    return list[this.rootDialIndex % list.length] ?? this.config.root!;
+  }
+
+  /**
+   * Merge Root addresses learned from `root/moved` (v4-10). Bounded, newest first: a Root on several
+   * networks reports every address it has, and an old one is kept as a fallback.
+   */
+  rememberRootAddresses(addresses: string[]): void {
+    const clean = addresses.filter((a) => typeof a === "string" && /^[^\s:]+:\d+$|^\[[^\]]+\]:\d+$/.test(a));
+    if (!clean.length) return;
+    const merged = [...new Set([...clean, ...this.rootAddressesLearned])].slice(0, 8);
+    if (merged.join() === this.rootAddressesLearned.join()) return;
+    this.rootAddressesLearned = merged;
+    this.store.setKv("rootAddresses", merged);
+  }
+
+  /** A dial failed or a working address dropped: try the next candidate, and rediscover now and then. */
+  private rootFailed(): void {
+    this.rootDialIndex += 1;
+    if (this.rootDialIndex % Math.max(2, this.rootCandidates().length * 2) === 0) this.discoverRootOnce();
+  }
+
+  /** The address the current uplink uses (undefined while offline). */
+  get rootConnected(): string | undefined {
+    return this.rootConnectedAddr;
+  }
+
+  /** When this child last heard anything from its Root (pong or any frame). */
+  get rootLastSeen(): number | undefined {
+    return this.rootLastSeenAt;
+  }
+
+  /** Ping a Daemon link; two missed pongs kill the socket locally so the close path runs (#99). */
+  private linkWatchers = new Set<() => void>();
+  private watchLink(ws: WebSocket, onAlive?: () => void): void {
+    const stop = watchLiveness(ws, { intervalMs: this.timing.linkPingMs, onDead: () => ws.terminate(), ...(onAlive ? { onAlive } : {}) });
+    this.linkWatchers.add(stop);
+    ws.once("close", () => this.linkWatchers.delete(stop));
+  }
+
+  /** Root: the addresses it tells its children about (the same set `cafe root show` prints). */
+  private rootAddressesForPeers(): string[] {
+    const all = joinAddresses({ advertise: this.config.advertise, port: this.config.port, lan: localAddresses() }).addresses;
+    // `joinAddresses` falls back to 127.0.0.1 on a machine with no LAN address; a remote child cannot
+    // use that, and adopting it as a candidate would only burn retries.
+    const reachable = all.filter((a) => !/^127\.|^localhost:|^\[::1\]:/.test(a));
+    return reachable.length ? reachable : all;
+  }
+
+  /** Try mDNS again while every known Root address is failing (v4-10); rate-limited, respects config. */
+  private discoveryDelayMs = DISCOVERY_MIN_MS;
+  private discoveryTries = 0;
+  private discoverRootOnce(): void {
+    if (this.stopped || this.rootOnline || !this.config.discovery || process.env.CAFE_DISCOVERY === "0") return;
+    if (this.discoveryTries >= DISCOVERY_MAX_TRIES) return;
+    const now = Date.now();
+    if (now - this.lastRootDiscoveryAt < this.discoveryDelayMs) return;
+    this.lastRootDiscoveryAt = now;
+    this.discoveryTries += 1;
+    // 30 s → 1 m → 2 m → 4 m → 5 m, then stop trying: a permanently orphaned child must not multicast forever.
+    this.discoveryDelayMs = Math.min(DISCOVERY_MAX_MS, this.discoveryDelayMs * 2);
+    void discoverRoots(2000)
+      .then((roots) => {
+        if (this.stopped || this.rootOnline) return;
+        const addrs = roots.filter((r) => r.host !== this.host).map((r) => r.addr);
+        if (!addrs.length) return;
+        this.log(`discovery: root candidates ${addrs.join(", ")}`);
+        this.rememberRootAddresses(addrs);
+        this.reconnectDelay = 0;
+        this.connectRoot();
+      })
+      .catch(() => {});
   }
 
   private dialGen = 0;
+  private dialTarget?: string;
   private waitingLogged = false;
+  /** The address the current uplink was dialled at: `config.root` may have moved since (v4-10). */
+  private rootConnectedAddr?: string;
+  private rootLastSeenAt?: number;
+  /** Reconnect rotation over `rootCandidates()` (#104); advanced on every dropped/failed dial. */
+  private rootDialIndex = 0;
+  private lastRootDiscoveryAt = 0;
+  /** Root addresses learned through `root/moved`, newest first, bounded (v4-10). */
+  private rootAddressesLearned: string[] = [];
+  private lastRootAddr?: string;
 
   private async dialRoot(target: string, gen: number): Promise<void> {
+    this.dialTarget = target;
     let url: string;
     try {
       // `root:` is the Root's main address; on a TLS network this finds its TLS endpoint (v4-6 §10.3).
@@ -2583,11 +2694,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     } catch (err) {
       if (gen !== this.dialGen || this.stopped) return;
       this.log(`cannot reach root ${target}: ${(err as Error).message}`);
+      this.rootFailed();
       this.scheduleReconnect();
       return;
     }
-    // A newer dial (setRoot, a reconnect) superseded this one while we were resolving.
-    if (gen !== this.dialGen || this.stopped || this.config.root !== target) return;
+    // A newer dial (setRoot, a reconnect) superseded this one while we were resolving. Compare against
+    // the target this dial was started for, not `config.root`: rotation dials learned addresses (#104).
+    if (gen !== this.dialGen || this.stopped || this.dialTarget !== target) return;
     let ws: WebSocket;
     try {
       // Pin the Root's leaf by the TLS `host:port` this Host dials (v4-6 §5 A).
@@ -2596,10 +2709,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // A persisted bad address must not crash the daemon on every boot (#76): say so and keep
       // retrying at the normal backoff, so `cafe root set` can still repair it later.
       this.log(`cannot dial root '${target}': ${(err as Error).message}; fix it with \`cafe root set <host:port>\``);
+      this.rootFailed();
       this.scheduleReconnect();
       return;
     }
     this.uplinkSocket = ws;
+    // A half-open uplink never fires `close`; the pong watcher is what notices (#99).
+    this.watchLink(ws, () => (this.rootLastSeenAt = Date.now()));
     const peer = new Peer(ws);
     ws.on("open", async () => {
       try {
@@ -2614,18 +2730,35 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           url: this.url(),
           registryVersion: this.registry.version,
         });
+        // A rotated candidate may answer from a different Root (same token, a sibling network, a
+        // spoofed discovery answer). Only an address the person set is trusted to change the Root.
+        const knownRoot = this.rootHost ?? this.store.getKv<string>("rootHost");
+        if (target !== this.config.root && knownRoot && hello.host !== knownRoot) {
+          throw new Error(`this address answers as root '${hello.host}', but the Root was '${knownRoot}'; refusing it (run \`cafe root set <host:port>\` if the Root really moved)`);
+        }
         this.uplink = peer;
         this.bindAgentMethods(peer); // the Root may relay agent/rename down this connection
         this.rootHost = hello.host;        this.rootVersion = hello.cafeVersion;
         this.rootDisplayName = hello.displayName;
         this.store.setKv("rootHost", hello.host);
         this.reconnectDelay = 0;
+        this.rootDialIndex = 0;
+        this.rootConnectedAddr = target;
+        this.rootLastSeenAt = Date.now();
+        this.discoveryDelayMs = DISCOVERY_MIN_MS;
+        this.discoveryTries = 0;
+        if (this.lastRootAddr !== target) this.log(`root reachable at ${target}`);
+        // The address that worked is remembered as a candidate, not written over the person's
+        // `root:` setting: a hand-set root may be an ssh tunnel that is right even when a probe fails.
+        this.lastRootAddr = target;
+        this.store.setKv("lastRoot", target);
         this.setRootOnline(true);
         await peer.request("registry/sync", { records: [...this.local.values()] });
         void this.flushBackfill();
         this.log(`connected to root ${target}`);
       } catch (err) {
         this.log(`root handshake failed: ${(err as Error).message}`);
+        this.rootFailed();
         ws.close();
       }
     });
@@ -2634,6 +2767,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
+    peer.on(Methods.rootMoved, (x: { addresses?: string[] }) => this.rememberRootAddresses(x?.addresses ?? []));
     peer.on(Methods.hostForgotten, (x: { host: string }) => this.onHostForgotten(x));
     peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; removeAliases?: string[]; legacyAliases?: string[] }) => {
       if (x.displayName) {
@@ -2690,19 +2824,23 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.setRootOnline(false);
         this.log("root connection lost");
       }
+      this.rootFailed();
       this.scheduleReconnect();
     });
   }
 
   private setRootOnline(online: boolean): void {
-    const rec: DaemonRecord = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", hostId: this.rootHost, aliases: [], legacyAliases: [], url: `ws://${this.config.root}`, isRoot: true, online, lastSeenAt: Date.now() };
+    const rootAddr = this.rootConnectedAddr ?? this.config.root;
+    const rec: DaemonRecord = this.daemonRecords.get("__root__") ?? { host: this.rootHost ?? "root", hostId: this.rootHost, aliases: [], legacyAliases: [], url: rootAddr ? `ws://${rootAddr}` : "", isRoot: true, online, lastSeenAt: Date.now() };
     rec.online = online;
     if (this.rootHost) rec.host = this.rootHost;
     if (this.rootDisplayName) rec.displayName = this.rootDisplayName;
     if (online) rec.version = this.rootVersion;
-    rec.url = `ws://${this.config.root}`;
+    // Show where the uplink actually is, not only what the file says: after a move they differ (#104).
+    rec.url = rootAddr ? `ws://${rootAddr}` : "";
     rec.lastSeenAt = Date.now();
     if (online) rec.connectedAt = Date.now();
+    else this.rootConnectedAddr = undefined;
     this.daemonRecords.set("__root__", rec);
     if (!online) {
       // Remote agents become unreachable unless their Daemon can be reached directly (ADR-0004).
@@ -2726,6 +2864,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.config.root = clean;
     saveConfig(this.config, this.store.home);
     this.reconnectDelay = 0;
+    this.rootDialIndex = 0;
     const old = this.uplinkSocket;
     this.uplinkSocket = undefined;
     old?.close();
@@ -2970,7 +3109,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // address nobody else can use, and broadcasting it broke every direct link once the Root was down (#75).
     if (this.isRoot) {
       const verified = list.map((d) => (d.host === this.host ? d : { ...d, url: this.verifiedAddress(d.host) ?? "" }));
-      for (const child of this.children.values()) child.notify(Methods.daemonsChanged, verified);
+      const rootAddresses = this.rootAddressesForPeers();
+      for (const child of this.children.values()) {
+        child.notify(Methods.daemonsChanged, verified);
+        child.notify(Methods.rootMoved, { addresses: rootAddresses });
+      }
     }
   }
 
@@ -3296,6 +3439,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   stop(): void {
     this.stopped = true;
+    for (const stop of this.linkWatchers) stop();
+    this.linkWatchers.clear();
     this.flushMetas();
     this.registry.removeAllListeners();
     this.removeAllListeners();

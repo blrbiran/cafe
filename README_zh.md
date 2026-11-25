@@ -127,10 +127,11 @@ cafe claude install            # 装 cafe 的 Claude Code 插件（--dry-run 先
                                # 之后在有 .cafe 的目录里开的 Claude Code 会话自动接问题
                                # 会话里：/cafe 看地址，/cafe-barista off 暂停，on 恢复
                                # （旧插件的暂停/恢复占用 /cafe；重跑 `cafe claude install` 即可切换）
-cafe barista start --dir ~/code/billing --agent codex --tui   # 问题放进该目录最近活动的 Codex 会话
+cafe barista start --dir ~/code/billing --agent codex --tui   # 接入该目录里的 Codex 会话
+                                                             # （只有一个是直接用它并报出 id；多个要 --thread <id>）
 ```
 
-问题在会话空闲时作为新的一轮进入，审批照常在终端里由你处理。120 秒内没开始（忙、按 Esc 打断后还没发新消息、或已关闭）就以“暂时不可用”婉拒。设计见 [ADR-0006](docs/adr/0006-tui-sessions-as-baristas.md)。
+问题在会话空闲时作为新的一轮进入，审批照常在终端里由你处理。同一目录里有多个 Codex 会话时，cafe 不会替你猜——命令会列出它们并让你用 `--thread <id>` 选，因为“最新的那个”往往正是你正在打字的会话。120 秒内没开始（忙、按 Esc 打断后还没发新消息、或已关闭）就以“暂时不可用”婉拒。设计见 [ADR-0006](docs/adr/0006-tui-sessions-as-baristas.md)。
 
 ### 任意命令
 

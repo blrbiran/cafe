@@ -468,7 +468,7 @@ program
     const lines = [
       `daemon:  ${h.host}${h.isRoot ? " (root)" : ""} at ${base()}, cafe ${h.version}`,
       `router:  ${h.routerLoading ? "loading (Orders wait for it)" : `${h.router}${h.model ? ` (${h.model})` : ""}`}${h.error ? ` — ${h.error}` : ""}`,
-      `root:    ${h.isRoot ? "this machine is the hub" : `${h.root ?? "none"}${h.rootOnline ? " (online)" : " (offline)"}`}`,
+      `root:    ${h.isRoot ? "this machine is the hub" : rootLine(h)}`,
       `tls:     ${tlsLine(h.tls)}`,
       `traffic: ${snap.threads.length} recent thread(s), ${snap.agents.length} agent(s), ${snap.daemons.length} machine(s)`,
     ];
@@ -481,6 +481,16 @@ program
     if (snap.webStale) lines.push("web:     the built UI on disk is newer; cafe daemon restart");
     out(lines.join("\n"), { running: true, health: h, threads: snap.threads.length, agents: snap.agents.length, machines: snap.daemons.length, pending, webStale: !!snap.webStale });
   });
+
+/** `configured (online via <addr>)` / `(offline, last heard Ns ago)`; the connected address may differ after a move (#104). */
+function rootLine(h: { root?: string; rootOnline?: boolean; rootConnected?: string; rootLastSeenAt?: number }): string {
+  if (!h.root) return "mDNS discovery";
+  if (!h.rootOnline) {
+    const ago = h.rootLastSeenAt ? Math.round((Date.now() - h.rootLastSeenAt) / 1000) : undefined;
+    return `${h.root} (offline${ago !== undefined ? `, last heard ${ago}s ago` : ""})`;
+  }
+  return h.rootConnected && h.rootConnected !== h.root ? `${h.root} (online via ${h.rootConnected})` : `${h.root} (online)`;
+}
 
 const update = program.command("update").description("controlled upgrade and rollback of this machine's cafe (v4-2)");
 update
@@ -717,7 +727,7 @@ daemon
         `url:       ${base()}`,
         `web:       ${webLine(base(), settings.web?.https)}`,
         `advertise: ${loadConfig().advertise ?? "(not set; other machines use any local address)"}`,
-        `root:      ${s.isRoot ? "self" : loadConfig().root ? `${loadConfig().root} (${s.rootOnline ? "online" : "offline"})` : "mDNS discovery"}`,
+        `root:      ${s.isRoot ? "self" : rootLine(h)}`,
         `tls:       ${tlsLine(h.tls)}`,
         `router:    ${h.routerLoading ? "loading (Orders wait for it)" : `${h.router}${h.model ? ` (${h.model})` : ""}`}`,
         `agents:    ${s.agents.length} (registry v${s.registryVersion})`,

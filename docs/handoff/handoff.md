@@ -123,10 +123,62 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - **TLS fail-closed holds on the accepting side too (#89).** With TLS on, a `daemon`/`peer` `initialize` on the plaintext port is refused (`tls_required`); never relax this for "compatibility". The CLI never probes the Root over `http://` with the token while TLS is on.
 - **Forgetting a Host is not a ban (v4-8).** `forgetHost` only removes what the network remembers; a machine with the token rejoins. Do not make it block reconnects without a per-Host credential (TLS phase 2). Online Hosts are refused (`host_online`).
 - **Discord: one channel = one Thread, until** the channel is quiet for `newThreadAfterHours` (default 6, from the Thread's `lastActivityAt`) or the person sends `/new` (user decision 2026-11-24). Conversation cards show the latest activity time; the title stays the first question.
+- **Daemon-link liveness is transport-level and scoped (v4-10 #99).** Only `kind: daemon|peer` sockets send ping/pong; never agent or UI sockets. The watcher starts on `open` (pinging while CONNECTING throws and would kill a slow dial), stops on `close`, and `Daemon.stop()` clears every watcher.
+- **`config.root` belongs to the person (v4-10 #104).** Failover rotates `config.root` → `lastRoot` (kv) → `root/moved` candidates and never rewrites the file; a learned candidate that answers as a different Root is refused, only a person-set address may change which Root a Host belongs to. mDNS re-discovery backs off (30 s → 5 min, 6 tries).
+- **An address pin is proven before it is saved (v4-10 #103).** `setHostAddress` probes first; a failed probe is not written to `config.yml` and never hides the address of a Host that is online. An offline Host may still pre-set one (it is never broadcast while unverified).
+- **`barista --tui` never guesses a session (v4-10 #100).** One session in the directory is used and named; several → list them and require `--thread <id>`; a session with a running turn is skipped when choosing between several.
+- **A grace skip is not a decline (v4-10 #101).** `order.declined` may carry `skipped: true`; it stays in the log for audit but is not booked in outcomes or `meta.declines`.
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-25 (newest) — 台账第十一轮：#97 Web token 走请求头、v4-9 加密访问 Web、`perf:tls`、测试地址
+### 2026-11-25 — 台账第十三轮补充复核之后：三批（#98 #103 #105 / #99 #104 / #100 #101 #102）
+
+- **一句话**：测试者第十三轮（含补充复核）新开的 #103/#104/#105 与仍开着的 #98/#99/#100/#101/#102 全部处理完，分三批提交并推送 origin main；**未发版**（建议 0.1.5）；§4 新增 5 条不可悄悄推翻的约定，§8 新增 4 条陷阱。
+- **批 1｜地址与诊断（#98 #103 #105）**：
+  - `resolveDaemonUrl()` 保留原始错误为 `cause`，`describeFetchError()` 在没有 code 时读 `cause.message`（`bad port` 不再变成 `fetch failed`）。TLS 网络 + 裸 `host:port` 这条**唯一**能由人手输入的路径现在返回 `ECONNREFUSED` 之类的 code。
+  - `discoverTls()` 在明文端口拒绝时，会再试同一主机的默认 TLS 端口（4778）——只发布 4778 的容器能被发现；两个端口都失败时错误里同时含两个端口号。**loopback 不做这个回退**（127.0.0.1 上的端口名指某个具体实例，4778 可能是另一个 daemon；测试里也避免了误连本机真 Root）。
+  - `setHostAddress()` 改成**先探测再落盘**：探测失败不写 `config.yml`、不改在线机器的显示地址，返回 `verified:false` + code。不在线的主机仍可预先保存（这是修 Docker 地址的用法），但未验证的 pin 不会再盖住一个能用的地址（`daemons()` 只在已验证或主机离线时采用 pin）。
+  - `webStale` 改为比较 `index.html` 的**内容哈希**：同样的字节重新构建（新 mtime）不再提示重启。
+  - Web 的 `ECONNREFUSED` 文案补了“也可能只发布了加密端口（4778）”。
+- **批 2｜链路存活与 Root 换址（#99 #104）**：spec `docs/specs/v4-10-link-liveness.md`，实现前由独立 subagent 审阅，审阅的 16 条意见全部处理（连接中的 socket 不 ping、Root 身份校验、不改写 `config.root`、轮换顺序、定时器清理、loopback 候选过滤、mDNS 退避上限、CLI 输出等）。
+  - **#99**：Daemon↔Daemon 链路（child 上行、Root 侧的 child 链路、直连 peer）加 ws ping/pong，默认 30 s、连续 2 次无 pong 则 `terminate()`，走既有 close 路径（child 记 `root connection lost` 并重连；Root 走 `onPeerClosed()`）。**只在 socket OPEN 后开始 ping**（CONNECTING 上 ping 会抛，黑洞 SYN/慢 TLS 发现不能被误杀）；agent/UI socket 不 ping；watcher 在 close 与 `Daemon.stop()` 时清理。
+  - **#104**：Root 在 child 注册时和每次 `emitDaemons()` 发 `root/moved {addresses}`（去掉无可路由地址时的 127.0.0.1 回退）。child 把地址存入 kv `rootAddresses`（≤8），重连候选依次为 `config.root` → 上次成功地址（kv `lastRoot`）→ 学到的地址；每次失败/掉线才前进一格。**不改写 `config.root`**（可能是人手设的 ssh 隧道）；候选成功只记 `lastRoot`。**身份校验**：非 `config.root` 的候选若 `initialize` 回来的 host 与已知 Root 不同，拒绝（`answers as root 'x', but the Root was 'y'`）；只有人手设的地址能改变归属。mDNS 在全部候选失败后重试，30 s 起翻倍到 5 min、最多 6 次。
+  - `/api/health`（child）新增 `root` / `rootOnline` / `rootConnected` / `rootLastSeenAt`；`cafe status` 与 `cafe daemon status` 显示 `(online via <addr>)` 或 `(offline, last heard Ns ago)`。
+  - **诚实边界**：mDNS 再发现、TLS 跨叶子续期的换址没有自动化测试；换到从未见过且不在同一 LAN 的地址仍需人工（日志给 `cafe root set` 提示）。TLS 网络换址有分钟级窗口（每个候选先 `discoverTls`、Root 叶子最多 5 分钟才写到新地址、新 `host:port` 要重新 TOFU pin）。
+- **批 3｜三个小修（#100 #101 #102）**：
+  - **#100** `barista run/start --agent codex --tui` 不再“挑目录里最新的会话”（那往往是你正在打字的那个）：目录里只有一个会话就直接用并打印 id + dir + 换法；多个会话则**拒绝并列出候选**，要求 `--thread <id>`；多选时跳过“正在跑 turn”的会话（另一进程看到的是 `interrupted` 且无 `completedAt`）。`--tui` 的帮助文案明确“接入已存在的会话，本命令不开界面”。README/README_zh 同步。
+  - **#101** `order.declined` 新增可选 `skipped: true`：grace 窗口跳过仍发事件（可审计），但不再计入 outcome 与 `meta.declines`，晚到的回复不会让同一个 agent 同时出现在 replies/declines，`cafe stats` 不再把“没赶上”算成“婉拒”。
+  - **#102** worker 日志名改为 `barista-<叶子名>-<sha256(dir) 前 8 位>-<slot>.log`，两个同名叶子目录不再交错写一份日志。
+- **验证**：`npm run typecheck`；`npm test` **两遍各 606/606 全绿**；`routing:eval` 67/67；`build:web` 55 modules；`test:release` 17/17；`test:claude-plugin` 5/5。本机 Root 已用 `cafe daemon stop/start` 重启，`cafe daemon status` 与 `cafe status` 都正常。
+- **flake（非本次改动）**：机器高负载时（本机同时 20+ 个 Claude 会话）并行全量跑曾见 `tests/connector.test.ts` 的 install（20 s 超时）与 `tests/cli.test.ts > prints the port-in-use reason…`（5 s 计时）超时；单独跑 45/45 通过，未改动的树上也会复现。
+- **行为变化（请审核）**：① 失败的地址不再落盘（离线主机除外）；② `barista --tui` 多会话时必须 `--thread`；③ grace 跳过不再计入 declined；④ 日志文件名变化（旧的 `barista-work-1.log` 不再更新）；⑤ `root:` 不被自动改写，换址走 `lastRoot`。
+- **仍需你本人**：发版（0.1.5，含 #91–#105 相关批次）；Discord 实测；Root 换新代码后在 ssh1 上复核 #91；真机证书安装（你说先不做）。
+- **下一步候选（先 brainstorm/spec 再拍板）**：#34 snapshot 分页、#33 虚拟列表/脉冲动画剩余开销、#39 路由精度、#18 只读 token、#27 Root 推送升级通知、#71–#73 team/channel、v4-10 的 mDNS/TLS 换址自动化。
+
+- **给测试者的复核清单**（纯文本，可直接转发）：
+
+```
+cafe 台账复核建议（2026-11-25 第十三轮补充复核之后）
+
+1. #98/#103：TLS 网络下对裸 host:port 的不可达地址 POST /api/hosts/test → 响应含 code（ECONNREFUSED 等），
+   不再是 "fetch failed"；只发布 4778 的容器可被发现（loopback 地址不做 4778 回退）。
+2. #103：对**在线** Host 保存一个不可达地址 → verified:false + code，/api/daemons 仍是原可用地址，
+   config.yml 的 pinnedDaemons 不含它；离线 Host 仍允许预存（但不会被广播）。
+3. #105：不改源码重跑 npm run build:web（字节相同）→ /api/snapshot 不再带 webStale。
+4. #99：把 child 与 Root 之间的 TCP 代理断开一半（半开）→ 90 s 内 child 日志出现 root connection lost 并重连；
+   agent/UI 连接不受心跳影响；/api/health 的 eventsSinceStart 不因心跳增长。
+5. #104：改 Root 的地址/端口后，child 通过 root/moved 学到的候选重连；cafe daemon status 显示
+   root: <configured> (online via <connected>)；学到但答成另一个 Root 的地址会被拒绝；mDNS 只在前述都失败后重试。
+6. #100：同一目录两个 Codex 会话 → barista run --agent codex --tui 拒绝并列出 id，要求 --thread；
+   只有一个会话时 ready 文案给出 threadId 和目录；有 turn 在跑的会话会被跳过。
+7. #101：broadcast 里慢 worker 在 grace 后交活 → meta.declines 不含它，cafe stats 的 declined 不增长；
+   事件里仍有 skipped:true 的 order.declined 可审计。
+8. #102：两个不同路径的同名叶子目录 → supervisor 日志路径不同（barista-<name>-<hash8>-<slot>.log）；
+   旧的 barista-<name>-<slot>.log 不再更新。
+9. #61 判据 5：仍建议把 "<10%" 改成绝对值（perf:tls 同时打印两者）。
+```
+
+### 2026-11-25 — 台账第十一轮：#97 Web token 走请求头、v4-9 加密访问 Web、`perf:tls`、测试地址
 
 - **一句话**：测试者第十一轮新开 #97（P1）和一条测试缺陷；用户裁定 Q126–Q128 全按推荐（token 存 localStorage +
   设置里可忘记；401 时页面要 token、支持 `#token=` 链接；范围 = #97 + 测试地址 + `perf:tls`，之后做局域网 https），
@@ -992,6 +1044,11 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - Web: maybe a routing-quality view (eval numbers are only in `tests/routing-eval.test.ts` and `cafe stats`).
 
 ## 8. Traps already found
+- **Liveness watchers (v4-10)**: `ws.ping()` throws while the socket is CONNECTING — attach the watcher on `open`, not on creation, or a black-holed SYN / slow TLS discovery is killed after one tick. Stop on `close` and from `Daemon.stop()`. Never ping agent/UI sockets (`tests/link-liveness.test.ts` pins the CONNECTING case).
+- **Root candidate rotation (v4-10)**: advance the index on a failed/dropped dial (not inside `scheduleReconnect`, or the first retry skips `config.root`), and guard the in-flight dial with `dialTarget`, not `config.root` — comparing to `config.root` cancels every rotated dial. A learned candidate's `initialize.host` must match the stored `rootHost` (`tests/root-failover.test.ts`).
+- **`root/moved` payload**: `joinAddresses()` falls back to `127.0.0.1` when a machine has no routable IPv4; strip loopback from the payload when real addresses exist, or a remote child adopts an unusable candidate.
+- **`discoverTls` fallback (v4-10 #98)**: the implicit 4778 retry is for non-loopback hosts only — a typed `127.0.0.1:<port>` names one instance and 4778 may be an unrelated daemon (a test child enrolled the developer's real Root before this guard). It never speaks plaintext to 4778: only TLS.
+- **`webStale` compares content (v4-10 #105)**: never re-introduce mtime; a deterministic rebuild rewrites identical bytes and would nag for a restart that changes nothing.
 - **The TLS port serves the Web UI too (v4-9)**: both listeners share `handleRequest`, so `https://<addr>:4778/` is the encrypted Web. Only list addresses the current leaf names (`sanCovers`) and never offer a CA from a Host with `tlsContext.network === false` (temporary CA). A token may cross origins only in a `#token=` fragment, never a query.
 - **Web token (#97)**: the daemon takes only `Authorization: Bearer` from non-loopback callers; the Web keeps the token in localStorage `cafe.token`. A plain `<a href>` cannot carry the header — downloads fetch with it when a token is set. Test against a LAN address, not 127.0.0.1 (loopback needs no token and hides the bug).
 - **Test helpers**: `startDaemon` sets `advertise: 127.0.0.1` unless the config overrides it (`advertise: undefined`); Node's `fetch` silently drops a hand-set `Host` header — use `node:http` for Host tests. Made-up IPs in tests come from 192.0.2.0/24 (a real VPN address broke a tester's run).
