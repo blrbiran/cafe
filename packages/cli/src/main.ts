@@ -1559,7 +1559,9 @@ team
         const runner = m.agent ?? spec.agent ?? "pi";
         return runner === "codex"
           ? `start ${m.name}: cafe barista run --agent codex --tui --dir ${dir} --member ${m.name} --team-dir ${rosterDir}`
-          : `start ${m.name}: open ${runner} in ${dir} with CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${rosterDir}, then run /cafe-team ${m.name}`;
+          : runner === "claude"
+            ? `start ${m.name}: open Claude Code in ${dir} with CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${rosterDir} (the session picks the member up at start)`
+            : `start ${m.name}: open ${runner} in ${dir} with CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${rosterDir}, then run /cafe-team ${m.name}`;
       }),
     ];
     out(lines.join("\n"), plan);
