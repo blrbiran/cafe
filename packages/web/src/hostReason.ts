@@ -21,6 +21,26 @@ export function hostFailure(t: Dict, p: HostProbe): string {
   return `${t.hostUnreachable}: ${reason(t, p) ?? p.error ?? ""}`;
 }
 
+/** What `POST /api/hosts/test` returns (#92 adds `via` and `address`). */
+export interface HostTest extends HostProbe {
+  online: boolean;
+  via?: "direct" | "uplink";
+  address?: string;
+  latencyMs?: number;
+}
+
+/**
+ * The note under a machine after Test. A machine whose own link to the hub is up is online even when
+ * the hub cannot dial its address: say both, instead of "unreachable" next to a green "online" (#92).
+ */
+export function testNote(t: Dict, r: HostTest): { text: string; tone: "ok" | "warn" | "danger" } {
+  if (r.online && r.via === "uplink") {
+    return { text: t.hostOnlineViaUplink(r.address ?? "", reason(t, r) ?? r.error ?? ""), tone: "warn" };
+  }
+  if (r.online) return { text: `${t.hostReachable}${r.latencyMs !== undefined ? ` · ${r.latencyMs}ms` : ""}`, tone: "ok" };
+  return { text: hostFailure(t, r), tone: "danger" };
+}
+
 /** The note after saving an address: a warning when the hub could not reach it. */
 export function savedAddressNote(t: Dict, p: HostProbe): { text: string; ok: boolean } {
   if (p.verified === false) return { text: t.hostAddressUnverified(reason(t, p) ?? p.error ?? t.hostUnreachable), ok: false };

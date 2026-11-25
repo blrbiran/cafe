@@ -6,6 +6,7 @@
  * `node:tls` / `node:https` — forge never runs on the hot path.
  */
 import { X509Certificate, createHash } from "node:crypto";
+import { networkInterfaces } from "node:os";
 
 export interface CertPair {
   /** PEM certificate. */
@@ -111,23 +112,43 @@ function isIp(name: string): boolean {
 }
 
 /**
- * The leaf SAN list. Includes the hostname, its `advertise` address, the LAN IP, and loopback. IPs
- * must be included: a DNS-only SAN fails a connection to `127.0.0.1` with
- * `ERR_TLS_CERT_ALTNAME_INVALID` (measured in the spec).
+ * Every non-internal IPv4 address of this machine, in interface order (#91). A machine on an office
+ * LAN and a VPN (or a Docker bridge) is dialled on any of them; a leaf naming only the first one
+ * failed the others with "IP address mismatch". IPv6 is left out: Daemons dial IPv4 addresses.
  */
-export function sanList(input: { host: string; advertise?: string; lan?: string }): string[] {
+export function localAddresses(ifaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string[] {
+  const out: string[] = [];
+  for (const list of Object.values(ifaces)) {
+    for (const ni of list ?? []) if (ni.family === "IPv4" && !ni.internal && !out.includes(ni.address)) out.push(ni.address);
+  }
+  return out;
+}
+
+/**
+ * The leaf SAN list. Includes the hostname, its `advertise` address, every local IP, any names a
+ * person added (`security.tls.sans`), and loopback. IPs must be included: a DNS-only SAN fails a
+ * connection to `127.0.0.1` with `ERR_TLS_CERT_ALTNAME_INVALID` (measured in the spec).
+ */
+export function sanList(input: { host: string; advertise?: string; lan?: string | string[]; extra?: string[] }): string[] {
   const out: string[] = [];
   const add = (v: string | undefined) => {
-    // `advertise` may be `host:port`; IPv6 hosts already strip their brackets from `split(":")[0]`.
-    const name = v?.trim().replace(/^\[|\]$/g, "").split(":")[0]?.trim();
+    // `advertise` may be `host:port`; a bracketed IPv6 address keeps its colons.
+    const raw = v?.trim() ?? "";
+    const name = (raw.startsWith("[") ? raw.slice(1, raw.indexOf("]")) : /^[^:]+:\d+$/.test(raw) ? raw.split(":")[0] : raw).trim();
     if (name && !out.includes(name)) out.push(name);
   };
   add(input.host);
   add(input.advertise);
-  add(input.lan);
+  for (const lan of Array.isArray(input.lan) ? input.lan : [input.lan]) add(lan);
+  for (const extra of input.extra ?? []) add(extra);
   add("127.0.0.1");
   add("localhost");
   return out;
+}
+
+/** The names in `names` that `certPem` does not carry as a SAN entry (#91: doctor names them). */
+export function missingSans(certPem: string, names: string[]): string[] {
+  return names.filter((n) => !sanCovers(certPem, n));
 }
 
 /**

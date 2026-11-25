@@ -529,12 +529,15 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, webStale() ? { ...snap, webStale: true } : snap);
   }
   if (m === "POST" && path === "/api/tls/renew") {
-    // Reissue this Host's leaf and swap it for new connections. Only the Root holds the CA key.
-    if (!daemon.isRoot) return send(res, 400, { error: "not_root", message: "only the Root signs leaves; restart this Host to request one from the Root" });
+    // Reissue this Host's leaf and swap it for new connections. The Root signs locally; a child asks
+    // its Root for a leaf over TLS (#91: adding a VPN address must not need a restart on either side).
     const ca = daemon.tlsContext;
     if (!ca?.renew) return send(res, 400, { error: "tls_off", message: "TLS is off (security.mode: plaintext)" });
     const body = await readJson(req);
     const sans = Array.isArray(body.sans) ? body.sans.filter((s: unknown): s is string => typeof s === "string" && !!s) : [];
+    // `cafe daemon renew-cert --san` saved these to config.yml; the running daemon adopts them so its
+    // own renewal check and `cafe doctor` keep naming them.
+    if (Array.isArray(body.extra)) daemon.config.security.tls.sans = body.extra.filter((s: unknown): s is string => typeof s === "string" && !!s);
     // `renew` keeps the existing key and writes through to disk: a swap that only changed memory
     // would be undone by the next restart, which then serves the stale (possibly expiring) leaf.
     await ca.renew(sans.length ? sans : undefined);

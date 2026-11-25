@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { hostFailure, hostStatus, savedAddressNote } from "../hostReason.ts";
+import { hostFailure, hostStatus, savedAddressNote, testNote } from "../hostReason.ts";
 import { onlineVersions } from "@cafe/protocol/version";
 import { ago, useT } from "../i18n.ts";
 import { useNow } from "../format.ts";
@@ -23,7 +23,7 @@ export function NetworkPage() {
   const [busy, setBusy] = useState<string>();
   const [editing, setEditing] = useState<Record<string, string>>({});
   const [editingAddr, setEditingAddr] = useState<Record<string, string>>({});
-  const [note, setNote] = useState<Record<string, { text: string; ok: boolean }>>({});
+  const [note, setNote] = useState<Record<string, { text: string; ok: boolean; warn?: boolean }>>({});
 
   const run = async (key: string, fn: () => Promise<void>) => {
     setBusy(key);
@@ -38,7 +38,8 @@ export function NetworkPage() {
   const test = (h: string) =>
     run(`test:${h}`, async () => {
       const r = await api.testHost(h);
-      setNote((n) => ({ ...n, [h]: r.online ? { text: `${t.hostReachable}${r.latencyMs !== undefined ? ` · ${r.latencyMs}ms` : ""}`, ok: true } : { text: hostFailure(t, r), ok: false } }));
+      const n2 = testNote(t, r);
+      setNote((n) => ({ ...n, [h]: { text: n2.text, ok: n2.tone !== "danger", ...(n2.tone === "warn" ? { warn: true } : {}) } }));
     });
   const reconnect = (h: string) =>
     run(`reconnect:${h}`, async () => {
@@ -207,7 +208,7 @@ export function NetworkPage() {
                   </div>
                 )}
                 {!isThis && !isRoot && <span className="hint">{t.settingsRootOnly}</span>}
-                {note[d.host] && <div className={`text-xs ${note[d.host]!.ok ? "text-ok" : "text-danger"}`}>{note[d.host]!.text}</div>}
+                {note[d.host] && <div className={`text-xs ${note[d.host]!.warn ? "text-warn" : note[d.host]!.ok ? "text-ok" : "text-danger"}`}>{note[d.host]!.text}</div>}
               </article>
             );
           })}

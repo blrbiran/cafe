@@ -122,7 +122,7 @@ export async function ensureLeaf(
   home: string,
   host: string,
   ca: CertPair,
-  sansInput: { host: string; advertise?: string; lan?: string },
+  sansInput: { host: string; advertise?: string; lan?: string | string[]; extra?: string[] },
   opts: { fetchLeaf?: (sans: string[], publicKey?: string) => Promise<{ cert: string; key: string }> } = {},
 ): Promise<TlsContext> {
   const sans = sanList(sansInput);

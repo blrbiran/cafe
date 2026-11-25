@@ -8,7 +8,7 @@ import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
 import { pinnedIdentityCheck } from "./tls/trust.ts";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
-import { sanCovers } from "./tls/certs.ts";
+import { localAddresses, missingSans, sanList } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -81,7 +81,7 @@ export interface Timing {
   linkConnectTimeoutMs: number;
   /** Direct links: close an outgoing link after this long without traffic. */
   linkIdleMs: number;
-  /** How often to check the TLS leaf's expiry while running (v4-6 §5 B). */
+  /** How often to check the TLS leaf while running: expiry (v4-6 §5 B) and addresses it must name (#91). */
   leafCheckIntervalMs: number;
   /** A child waiting to join a TLS network retries enrolment after this, doubling (v4-6 §10.3). */
   enrolRetryBaseMs: number;
@@ -294,7 +294,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       hintsIntervalMs: 30_000,
       linkConnectTimeoutMs: 3000,
       linkIdleMs: 5 * 60_000,
-      leafCheckIntervalMs: 6 * 3600_000,
+      leafCheckIntervalMs: 5 * 60_000,
       enrolRetryBaseMs: 5_000,
       enrolRetryMaxMs: 5 * 60_000,
       ...opts.timing,
@@ -440,12 +440,25 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * Hosts whose Daemon link arrived on the plaintext port while TLS is on, and was refused (#89).
    * Cleared when that Host next connects over TLS.
    */
+  /** `host:port` (a main, plaintext-port address) → the `wss://` endpoint that Host answered with (#92). */
+  private tlsEndpoints = new Map<string, string>();
+  /** Root: the address each child reported in its latest handshake, so clearing a pin returns to it (#92). */
+  private reportedUrls = new Map<string, string>();
   private refusedPlaintext = new Map<string, { host: string; kind: "daemon" | "peer"; at: number; version?: string }>();
 
   /** Transport state for `/api/health`, `cafe doctor` and `cafe daemon status`. */
   /** This Daemon's main (plaintext-port) address as other machines reach it: what `root:` / `cafe connect` take. */
   mainAddress(): string {
     return hostWithPort(this.config.advertise ?? lanAddress(), this.config.port);
+  }
+
+  /**
+   * The names this Host's leaf must carry: host, `advertise`, every local IPv4 address and the
+   * configured `security.tls.sans` (#91). Read live, so a VPN that comes up later, or a name a person
+   * adds, is noticed by the renewal check and by `cafe doctor`.
+   */
+  desiredSans(): string[] {
+    return sanList({ host: this.config.host, advertise: this.config.advertise, lan: localAddresses(), extra: this.config.security.tls.sans });
   }
 
   /** What another machine needs to join this Root with `cafe connect` (the token is read on the Root). */
@@ -521,7 +534,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (trimmed.startsWith("wss://")) return trimmed;
     const plain = trimmed.replace(/^ws:\/\//, "");
     try {
-      return `wss://${await tlsAddressOf(plain, { ca: this.tlsContext.ca })}`;
+      const resolved = `wss://${await tlsAddressOf(plain, { ca: this.tlsContext.ca })}`;
+      this.tlsEndpoints.set(plain, resolved);
+      return resolved;
     } catch (err) {
       throw new Error(`cannot find the TLS port of ${plain}: ${(err as Error).message}`);
     }
@@ -942,14 +957,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     saveConfig(this.config, this.store.home);
     const rec = this.daemonRecords.get(host);
     // A cleared pin must fall back to the address the Root verified, not keep the stale pin (#75).
-    if (rec) rec.url = url === null ? (this.verifiedAddress(host) ?? rec.url) : `ws://${this.config.pinnedDaemons[host]}`;
+    // A cleared pin goes back to what the child itself reports, then to the address the Root verified —
+    // never to an older remembered one (#75, #92).
+    if (rec) rec.url = url === null ? (this.reportedUrls.get(host) ?? this.verifiedAddress(host) ?? rec.url) : this.pinnedAddress(host)!;
     this.emitDaemons();
     this.log(url === null ? `cleared pinned address for ${host}` : `pinned ${host} -> ${this.config.pinnedDaemons[host]}`);
     // Prove the new address before it reaches the children: a hand-typed Docker address is as useless
     // to them as a self-reported one (#75).
     // The probe result goes back to the caller, so "saved" is never shown for an address the Root
     // just failed to reach (#83).
-    const probe = url !== null ? await this.rememberChildUrl(host, `ws://${this.config.pinnedDaemons[host]}`) : undefined;
+    const probe = url !== null ? await this.rememberChildUrl(host, this.pinnedAddress(host)!) : undefined;
     const result = this.daemons().find((d) => d.host === host) ?? record!;
     return probe ? { ...result, ...probe } : result;
   }
@@ -957,7 +974,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** The pinned address if a person set one; also the only child address worth broadcasting. */
   private pinnedAddress(host: string): string | undefined {
     const pin = this.config.pinnedDaemons[host];
-    return pin ? `ws://${pin}` : undefined;
+    if (!pin) return undefined;
+    if (/^wss?:\/\//.test(pin)) return pin;
+    // On a TLS network a pin is a main address: once the Host has told us its TLS port the address is
+    // its `wss://` endpoint; until then it stays a bare `host:port`, which is upgraded when dialled —
+    // never shown or used as `ws://` (#92).
+    if (this.tlsContext?.network) return this.tlsEndpoints.get(pin) ?? pin;
+    return `ws://${pin}`;
   }
 
   /**
@@ -969,6 +992,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const pinned = this.pinnedAddress(host);
     const known = this.config.knownDaemons[host];
     if (pinned && known === pinned) return pinned;
+    // A plaintext address remembered before this network used TLS is stale: nothing dials it as is, and
+    // handing it out made children (and the Network page) show `ws://<old address>` (#92).
+    if (known && this.tlsContext?.network && known.startsWith("ws://")) return undefined;
     return known ? known : undefined;
   }
 
@@ -977,12 +1003,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return this.peerUrls.get(host);
   }
 
-  /** Reachability check from this machine to another Host's HTTP API (Web "Test"). */
-  async testHost(host: string): Promise<{ host: string; online: boolean; latencyMs?: number; version?: string; error?: string; code?: string }> {
+  /**
+   * Reachability check from this machine to another Host (Web "Test"). The direct address is tried
+   * first; when it fails but that Host's uplink to this Root is up, the Host is online all the same —
+   * the answer says so and names the address that failed (#92), instead of "unreachable" next to a
+   * green "online".
+   */
+  async testHost(host: string): Promise<{ host: string; online: boolean; via?: "direct" | "uplink"; address?: string; latencyMs?: number; version?: string; error?: string; code?: string }> {
     if (host === this.host) return { host, online: true, latencyMs: 0, version: this.version };
     const rec = this.daemons().find((d) => d.host === host);
     const url = this.pinnedAddress(host) || rec?.url || (host === "root" && this.config.root ? `ws://${this.config.root}` : undefined) || this.config.knownDaemons[host];
-    if (!url) throw new RpcError("not_found", `no daemon '${host}'`);
+    const viaUplink = (failure: { error?: string; code?: string }, address?: string) => ({
+      host,
+      online: true,
+      via: "uplink" as const,
+      ...(address ? { address } : {}),
+      ...(rec?.version ? { version: rec.version } : {}),
+      ...failure,
+    });
+    if (!url) {
+      if (await this.uplinkAlive(host)) return viaUplink({ error: "no address to dial it directly" });
+      throw new RpcError("not_found", `no daemon '${host}'`);
+    }
+    const address = url.replace(/^wss?:\/\//, "");
     const started = Date.now();
     try {
       const res = await this.daemonFetch(`${await this.httpBase(url)}/api/health`, {
@@ -990,12 +1033,31 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         signal: AbortSignal.timeout(2500),
       });
       if (!res.ok) {
-        return { host, online: false, error: res.status === 401 ? "unauthorized: the hosts use different tokens" : `HTTP ${res.status}` };
+        const failure = { error: res.status === 401 ? "unauthorized: the hosts use different tokens" : `HTTP ${res.status}`, code: res.status === 401 ? "UNAUTHORIZED" : `HTTP_${res.status}` };
+        return (await this.uplinkAlive(host)) ? viaUplink(failure, address) : { host, online: false, address, ...failure };
       }
       const info = (await res.json()) as { version?: string };
-      return { host, online: true, latencyMs: Date.now() - started, ...(info.version ? { version: info.version } : {}) };
+      return { host, online: true, via: "direct", address, latencyMs: Date.now() - started, ...(info.version ? { version: info.version } : {}) };
     } catch (err) {
-      return { host, online: false, ...describeFetchError(err, url.replace(/^wss?:\/\//, "")) };
+      const failure = describeFetchError(err, address);
+      return (await this.uplinkAlive(host)) ? viaUplink(failure, address) : { host, online: false, address, ...failure };
+    }
+  }
+
+  /**
+   * Root: does `host`'s uplink still answer? A round-trip, not the `children` map: a Host that just
+   * stopped is still in the map until its close is processed. Any reply counts, including an
+   * `unknown_method` error from an older Daemon.
+   */
+  private async uplinkAlive(host: string, timeoutMs = 1500): Promise<boolean> {
+    const peer = this.children.get(host);
+    if (!peer) return false;
+    try {
+      await peer.request("cafe/ping", {}, timeoutMs);
+      return true;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      return code !== "closed" && code !== "timeout";
     }
   }
 
@@ -1702,12 +1764,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   startLeafRenewalCheck(needsRenewal: () => boolean): void {
     clearInterval(this.leafTimer);
+    let lastError: string | undefined;
     this.leafTimer = setInterval(() => {
       if (!this.tlsContext?.renew || !needsRenewal()) return;
       void this.tlsContext
         .renew()
-        .then(() => this.log("tls: leaf renewed before expiry"))
-        .catch((err) => this.log(`tls: leaf renewal failed: ${(err as Error).message}`));
+        .then(() => {
+          lastError = undefined;
+          this.log(`tls: leaf renewed (names: ${this.desiredSans().join(", ")})`);
+        })
+        .catch((err) => {
+          // A child whose Root is unreachable retries every tick; say so once, not every few minutes.
+          const why = (err as Error).message;
+          if (why !== lastError) this.log(`tls: leaf renewal failed (retrying): ${why}`);
+          lastError = why;
+        });
     }, this.timing.leafCheckIntervalMs);
     this.leafTimer.unref?.();
   }
@@ -2196,6 +2267,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const legacyAliases = [...new Set([...(p.legacyAliases ?? []), ...(override?.legacyAliases ?? [])])];
     this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion });
     if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
+    if (p.url) this.reportedUrls.set(host, p.url);
     if (p.url) void this.rememberChildUrl(host, p.url);
     peer.on(Methods.hostIdentity, (x: { displayName?: string; aliases?: string[]; removeAliases?: string[]; legacyAliases?: string[] }) => {
       const rec = this.daemonRecords.get(host);
@@ -2261,7 +2333,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private async rememberChildUrl(host: string, url: string): Promise<{ verified: boolean; error?: string; code?: string }> {
     if (this.config.knownDaemons[host] === url) return { verified: true };
     try {
-      const res = await this.daemonFetch(`${await this.httpBase(url)}/api/health`, {
+      // Remember the address in the form it is dialled: a pin on a TLS network becomes `wss://` (#92).
+      url = await this.resolveDaemonUrl(url);
+      if (this.config.knownDaemons[host] === url) return { verified: true };
+      const res = await this.daemonFetch(`${url.replace(/^ws/, "http")}/api/health`, {
         headers: { authorization: `Bearer ${this.config.token}` },
         signal: AbortSignal.timeout(2000),
       });
@@ -2704,7 +2779,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // only knows an address nobody else can reach.
     for (const [host, addr] of Object.entries(this.config.pinnedDaemons)) {
       const rec = this.daemonRecords.get(host);
-      if (rec) rec.url = `ws://${addr}`;
+      if (rec && addr) rec.url = this.pinnedAddress(host)!;
     }
     return [...this.daemonRecords.values()];
   }
@@ -2939,11 +3014,19 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     try {
       const leaf = new X509Certificate(this.tlsContext!.current().cert);
       const days = Math.floor((Date.parse(leaf.validTo) - Date.now()) / 86_400_000);
-      const advertised = (this.config.advertise ?? lanAddress()).replace(/^\[|\]$/g, "").replace(/:\d+$/, "");
-      const covers = sanCovers(this.tlsContext!.current().cert, advertised);
+      // Every address another machine may dial, not just `advertise` (#91): a leaf missing the VPN
+      // address passed this check while the child behind the VPN failed with "IP address mismatch".
+      const missing = missingSans(this.tlsContext!.current().cert, this.desiredSans());
       const base = `on ${port}, ca ${st.caFingerprint?.slice(0, 11)}…, leaf valid ${days} more days`;
       if (days < 21) return { name: "tls", level: "warn", detail: `${base} (renews automatically within 21 days; renewal has not happened yet)`, next: "cafe daemon renew-cert" };
-      if (!covers) return { name: "tls", level: "warn", detail: `${base}, but the leaf does not name ${advertised} (other machines dialling it will be refused)`, next: "cafe daemon renew-cert" };
+      if (missing.length) {
+        return {
+          name: "tls",
+          level: "warn",
+          detail: `${base}, but the leaf does not name ${missing.join(", ")} (machines dialling ${missing.length > 1 ? "those addresses" : "that address"} are refused; it renews within ${Math.round(this.timing.leafCheckIntervalMs / 60_000) || 1} min)`,
+          next: "cafe daemon renew-cert",
+        };
+      }
       return { name: "tls", level: "ok", detail: base };
     } catch (err) {
       return { name: "tls", level: "warn", detail: `TLS on ${port}; cannot read the leaf: ${(err as Error).message}`, next: "cafe daemon renew-cert" };

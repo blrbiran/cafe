@@ -9,7 +9,7 @@ import { Command, CommanderError } from "commander";
 import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
-import { fingerprintOf, issueLeaf, sanList } from "../../daemon/src/tls/certs.ts";
+import { fingerprintOf, issueLeaf, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
@@ -601,33 +601,41 @@ daemon
   });
 daemon
   .command("renew-cert")
-  .description("reissue this Host's TLS leaf from the CA (a running daemon picks it up on the next connection)")
-  .action(async () => {
+  .description("reissue this Host's TLS leaf for every address it has (a running daemon swaps it in place)")
+  .option("--san <name>", "also name this address or DNS name (kept in security.tls.sans); repeatable", (v: string, prev: string[]) => [...prev, v], [] as string[])
+  .action(async (o: { san: string[] }) => {
     const cfg = loadConfig();
     const tls = readTlsConfig(cfg);
     if (tls.mode !== "tls") throw new Error("TLS is off (security.mode: plaintext); set security.mode: tls and restart first");
+    // Extra names are remembered, so the next automatic renewal keeps them (#91).
+    const added = o.san.map((s) => s.trim()).filter((s) => s && !cfg.security.tls.sans.includes(s));
+    if (added.length) {
+      cfg.security.tls.sans = [...cfg.security.tls.sans, ...added];
+      saveConfig(cfg, cafeHome());
+    }
+    const sans = sanList({ host: cfg.host, advertise: cfg.advertise, lan: localAddresses(), extra: cfg.security.tls.sans });
+    if (await healthy()) {
+      // The running daemon reissues in place and swaps the leaf for new connections; on a child it
+      // asks the Root for the leaf.
+      const r = await api<{ fingerprint256: string }>("/api/tls/renew", { method: "POST", body: JSON.stringify({ sans, extra: cfg.security.tls.sans }) });
+      out(`reissued leaf for ${cfg.host} naming ${sans.join(", ")} (fingerprint ${r.fingerprint256}); new connections use it, no restart needed`, { ...r, sans });
+      return;
+    }
     const caPath = tls.ca ?? tlsPaths(cafeHome(), cfg.host).caPath;
     const caKeyPath = caPath.endsWith(".crt") ? `${caPath.slice(0, -4)}.key` : `${caPath}.key`;
     if (!existsSync(caPath)) throw new Error(`no CA at ${caPath}; copy the Root's ca.crt here (\`cafe root show\` on the Root prints it) and start the daemon once`);
     const ca = { cert: readFileSync(caPath, "utf8"), key: existsSync(caKeyPath) ? readFileSync(caKeyPath, "utf8") : "", fingerprint256: fingerprintOf(readFileSync(caPath, "utf8")) };
     if (!ca.key) {
       throw new Error(
-        "this Host has no CA key (only the Root signs certificates); reissue from the Root with `cafe daemon renew-cert` there, or restart this daemon to request a leaf from the Root",
+        `this Host has no CA key (only the Root signs certificates) and its daemon is not running; start it (cafe daemon start) — it asks the Root for a leaf naming ${sans.join(", ")}`,
       );
-    }
-    const sans = sanList({ host: cfg.host, advertise: cfg.advertise, lan: lanAddress() });
-    if (await healthy()) {
-      // The running daemon reissues in place and swaps the leaf for new connections (SNICallback).
-      const r = await api<{ fingerprint256: string }>("/api/tls/renew", { method: "POST", body: JSON.stringify({ sans }) });
-      out(`reissued leaf for ${cfg.host} (fingerprint ${r.fingerprint256}); new connections use it, no restart needed`, r);
-      return;
     }
     // Re-sign the key that is already on disk. A fresh key would change this Host's identity, and a
     // peer that pinned the old key would then refuse it — fail-closed, with no way back but a manual
     // `cafe host pin --clear` on every peer.
     const leaf = await issueLeaf(ca, sans, 90, readLeaf(cafeHome(), cfg.host)?.key);
     writeLeaf(cafeHome(), cfg.host, { cert: leaf.cert, key: leaf.key || readLeaf(cafeHome(), cfg.host)?.key || "" });
-    out(`reissued leaf for ${cfg.host} (fingerprint ${leaf.fingerprint256}); written to ${tlsPaths(cafeHome(), cfg.host).leafCertPath}`, leaf);
+    out(`reissued leaf for ${cfg.host} naming ${sans.join(", ")} (fingerprint ${leaf.fingerprint256}); written to ${tlsPaths(cafeHome(), cfg.host).leafCertPath}`, { ...leaf, key: undefined, sans });
   });
 daemon
   .command("drain")

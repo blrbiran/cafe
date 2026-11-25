@@ -106,8 +106,11 @@ no benefit.
 - The Root generates a CA once (`CAFE_HOME/tls/ca.crt` + `ca.key`, mode 0600,
   ~10-year validity). The CA private key never leaves the Root.
 - Each Daemon gets a leaf certificate, ECDSA P-256, 90-day validity, with a SAN
-  that lists the hostname, `advertise`, `lanAddress()`, `127.0.0.1` and
-  `localhost`. SAN must include the IPs: connecting to `127.0.0.1` against a
+  that lists the hostname, `advertise`, **every** non-internal IPv4 address
+  (`localAddresses()`; #91 — a machine on a LAN and a VPN is dialled on both),
+  the extra names in `security.tls.sans` (`cafe daemon renew-cert --san`),
+  `127.0.0.1` and `localhost`. The running Daemon re-checks every 5 minutes and
+  reissues (same key) when a name is missing; `cafe doctor` names it. SAN must include the IPs: connecting to `127.0.0.1` against a
   DNS-only SAN fails with `ERR_TLS_CERT_ALTNAME_INVALID` (measured).
 - Only `ca.crt` and the node's own `cert`/`key` are distributed; the CA key is not.
 

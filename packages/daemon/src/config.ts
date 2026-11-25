@@ -73,6 +73,11 @@ export const CafeConfig = z.object({
           caFingerprint: z.string().optional(),
           /** Per-peer leaf pin, keyed by `host:port`. */
           pins: z.record(z.string(), z.string()).default({}),
+          /**
+           * Extra names other machines dial this Host by (a VPN address, a DNS name), added to the
+           * leaf next to every local IPv4 address (#91). `cafe daemon renew-cert --san` appends here.
+           */
+          sans: z.array(z.string()).default([]),
         })
         .default({}),
     })

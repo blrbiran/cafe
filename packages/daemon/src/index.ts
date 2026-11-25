@@ -5,12 +5,12 @@ import { cafeHome, loadConfig, saveConfig } from "./config.ts";
 import { startServer, type ServerHandle } from "./server.ts";
 import { Supervisor } from "./supervisor.ts";
 import { advertiseRoot, discoverRoots } from "./discovery.ts";
-import { lanAddress, advertisedAddress } from "./daemon.ts";
+import { advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
 import { ensureLeaf, leafNeedsRenewal, tlsPaths, writeLeaf } from "./tls/store.ts";
 import { bootstrapCa, fetchLeafFromRoot, fetchRootCa, tlsAddressOf, trustCaForClient } from "./tls/bootstrap.ts";
 import { readTlsConfig } from "./tls/trust.ts";
-import { issueLeaf, publicKeyOf, sanList } from "./tls/certs.ts";
+import { issueLeaf, localAddresses, missingSans, publicKeyOf } from "./tls/certs.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
@@ -116,7 +116,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             config.security.tls.caFingerprint = boot.enroll;
             saveConfig(config, home);
           }
-          const leafSans = () => sanList({ host: config.host, advertise: config.advertise, lan: lanAddress() });
+          const leafSans = () => daemon.desiredSans();
           // The leaf in force, set below. `fetchFromRoot` runs during the boot issuance too, when no
           // active leaf exists yet: then it is a first issuance and no key is sent.
           let active: { cert: string; key: string } | undefined;
@@ -130,7 +130,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             home,
             config.host,
             ca,
-            { host: config.host, advertise: config.advertise, lan: lanAddress() },
+            { host: config.host, advertise: config.advertise, lan: localAddresses(), extra: config.security.tls.sans },
             {
               // A child Host holds the CA certificate but not its key; the Root issues the leaf. The
               // request carries the public key the child already has, so a reissue keeps its identity.
@@ -238,7 +238,9 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   else daemon.log("tls disabled (security.mode: plaintext)");
   // A leaf nearing expiry is renewed while the Daemon keeps running, not only at the next start
   // (v4-6 §5 B): otherwise a fleet that never restarts expires together and fails closed.
-  if (tls) daemon.startLeafRenewalCheck(() => leafNeedsRenewal(tls!.current().cert));
+  // The same tick reissues when an address appeared that the leaf does not name (#91): a VPN that
+  // comes up after boot must not wait for a restart.
+  if (tls) daemon.startLeafRenewalCheck(() => leafNeedsRenewal(tls!.current().cert) || missingSans(tls!.current().cert, daemon.desiredSans()).length > 0);
   // A child that booted while its Root was offline runs on a temporary local CA; retry enrolment so
   // it moves onto the real CA and its `wss://` links come on, without a restart (v4-6 §3.3).
   if (daemon.tlsContext?.enrol && !daemon.tlsContext.network) daemon.startEnrolmentRetry();

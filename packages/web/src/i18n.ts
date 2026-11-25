@@ -164,6 +164,8 @@ const zh = {
   hostTesting: "测试中…",
   hostReconnect: "重新连接",
   hostReachable: "本机能连到它",
+  hostOnlineViaUplink: (address: string, why: string) =>
+    `在线（它连到中心节点的链路正常）· 但中心节点直连它的地址 ${address || "（无）"} 不通${why ? `：${why}` : ""}。这只影响中心节点离线时其他机器直连它；需要时用「改地址」填一个中心节点能连到的地址。`,
   hostUnreachable: "连不上",
   hostAddress: "地址",
   hostAddressEdit: "改地址",
@@ -525,6 +527,8 @@ const en: Dict = {
   hostTesting: "Testing…",
   hostReconnect: "Reconnect",
   hostReachable: "Reachable from this machine",
+  hostOnlineViaUplink: (address: string, why: string) =>
+    `Online (its link to the hub is up) · but the hub cannot reach its address ${address || "(none)"} directly${why ? `: ${why}` : ""}. This only matters for direct links while the hub is offline; if needed, use "Edit address" to enter one the hub can reach.`,
   hostUnreachable: "Unreachable",
   hostAddress: "Address",
   hostAddressEdit: "Edit address",

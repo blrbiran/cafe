@@ -124,7 +124,25 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-25 (newest) — 台账复核后三批：#90 乱码、#31 关、端口/后台会话、#33 Web 空转、#18 收窄、daemon 启动
+### 2026-11-25 (latest) — 测试者第九轮的 #91–#94（TLS 部署）
+
+- **一句话**：台账第九轮新开的 4 条在代码里都成立，用户裁定 Q116–Q120：两批都做（批 1 #91 #92，批 2 #93 #94），
+  #91 每 5 分钟比对地址，#92 Test 用「经上行链路在线 + 直连地址不通」，#93 只做按时间降级、不加清除命令，Web
+  上「哪段加密」的标注推迟到和 #61 尾巴一起出原型。
+- **#91**：叶子证书只含 `lanAddress()` 的第一个地址，VPN 后的子节点握手失败而 doctor 报 ok。现在 SAN = host +
+  advertise + **所有**非 internal IPv4（`localAddresses()`）+ `security.tls.sans`；daemon 每 5 分钟
+  （`leafCheckIntervalMs`，原 6h）检查到期和缺失地址并原地重签（保留密钥）；doctor 点名缺失地址；
+  `cafe daemon renew-cert --san <名字>` 记进配置、运行中免重启，子节点也能用（`/api/tls/renew` 不再限 Root，
+  子节点向 Root 申请）。本机重启后叶子含 `192.168.3.129` 和 `198.18.0.1` 两个地址。
+- **#92**：TLS 网络里 pin 不再显示成 `ws://`（解析出 TLS 端点后显示 `wss://`，`knownDaemons` 也存 `wss://`）；
+  `ws://` 的历史 `knownDaemons` 视为过期，不再广播给子节点；清除 pin 回到子节点握手时自报的地址；Test 在直连失败
+  但上行链路能往返（`uplinkAlive()` 真发一次请求，不看 `children` 表）时返回 `online, via: "uplink", address,
+  error`，Web 显示黄色「在线（它连到中心节点的链路正常）· 但中心节点直连它的地址 x 不通」。旧测试
+  `host-address.test.ts` #83 的期望随之改为 `online: true, via: "uplink"`。
+- **验证（批 1）**：typecheck；**520 tests ×2**；`routing:eval` 67/67；web check + `build:web`；`test:release` 17/17；
+  `test:claude-plugin` 5/5。本机 Root 已重启，doctor 全绿。
+
+### 2026-11-25 — 台账复核后三批：#90 乱码、#31 关、端口/后台会话、#33 Web 空转、#18 收窄、daemon 启动
 
 - **一句话**：按 `../cafe_dogfooding/issue-20261119.md` 重新核对开放项（以代码为准），用户裁定「先修 #90、发版时机
   他定；#31 按同步写关闭；#18 去掉 Web 改 token；做批 1–3」。全部做完并提交，**未推送、未发版**（`git log

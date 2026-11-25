@@ -124,7 +124,8 @@ describe("host address diagnostics (#83)", () => {
     expect(saved.body.error).toContain("ECONNREFUSED");
 
     const tested = await post(root.addr, "/api/hosts/test", { host: "pc1" });
-    expect(tested.body).toMatchObject({ online: false, code: "ECONNREFUSED" });
+    // pc1's uplink is up, so it is online; the answer still names the pinned address that failed (#92).
+    expect(tested.body).toMatchObject({ online: true, via: "uplink", address: dead, code: "ECONNREFUSED" });
     expect(tested.body.error).not.toBe("fetch failed");
 
     const good = await post(root.addr, "/api/hosts/address", { host: "pc1", url: child.addr });

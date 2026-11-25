@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { dictFor } from "../packages/web/src/i18n.ts";
-import { hostFailure, hostStatus, savedAddressNote } from "../packages/web/src/hostReason.ts";
+import { hostFailure, hostStatus, savedAddressNote, testNote } from "../packages/web/src/hostReason.ts";
 
 // #83: the Network page showed "Unreachable: fetch failed" for every cause, and "Address saved"
 // even when the Root had just failed to reach the new address.
@@ -54,5 +54,26 @@ describe("Network page host status", () => {
     expect(hostStatus(en, { online: true }, "pc1")).toMatchObject({ tone: "ok", label: en.online, title: en.onlineHint });
     expect(hostStatus(en, { online: false }, "pc1")).toMatchObject({ tone: undefined, label: en.mOffline });
     expect(hostStatus(en, { online: false }, "pc1").detail).toBeUndefined();
+  });
+});
+
+// #92: a machine whose uplink is up was "online" in its card and "unreachable" under Test.
+describe("Test connection result (#92)", () => {
+  const zh = dictFor("zh");
+  const en = dictFor("en");
+
+  it("says a machine reached through its uplink is online, and names the address that failed", () => {
+    const n = testNote(zh, { online: true, via: "uplink", address: "172.17.0.24:4777", code: "ETIMEDOUT", error: "timed out" });
+    expect(n.tone).toBe("warn");
+    expect(n.text).toContain("在线");
+    expect(n.text).toContain("172.17.0.24:4777");
+    expect(n.text).toContain("ETIMEDOUT");
+    expect(testNote(en, { online: true, via: "uplink", address: "a:1", error: "x" }).text).toMatch(/^Online/);
+  });
+
+  it("keeps the plain wording for a direct success and a real failure", () => {
+    expect(testNote(en, { online: true, via: "direct", latencyMs: 3 })).toEqual({ text: `${en.hostReachable} · 3ms`, tone: "ok" });
+    expect(testNote(en, { online: true, latencyMs: 0 })).toEqual({ text: `${en.hostReachable} · 0ms`, tone: "ok" });
+    expect(testNote(en, { online: false, code: "ECONNREFUSED", error: "x" })).toEqual({ text: hostFailure(en, { code: "ECONNREFUSED", error: "x" }), tone: "danger" });
   });
 });
