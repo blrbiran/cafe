@@ -42,14 +42,14 @@ import { sanList } from "../packages/daemon/src/tls/certs.ts";
 
 describe("join addresses on a multi-interface Root (#95)", () => {
   it("lists every local IPv4 address when advertise is not set, and the leaf names each", () => {
-    const lan = ["192.168.3.132", "30.251.51.85"];
-    expect(joinAddresses({ port: 4777, lan })).toEqual({ addresses: ["192.168.3.132:4777", "30.251.51.85:4777"], advertised: false });
+    const lan = ["192.168.3.132", "192.0.2.85"];
+    expect(joinAddresses({ port: 4777, lan })).toEqual({ addresses: ["192.168.3.132:4777", "192.0.2.85:4777"], advertised: false });
     const sans = sanList({ host: "root", lan });
     for (const ip of lan) expect(sans).toContain(ip);
   });
 
   it("gives only the advertised address when advertise is set", () => {
-    expect(joinAddresses({ port: 4777, lan: ["192.168.3.132", "30.251.51.85"], advertise: "cafe.lan" })).toEqual({ addresses: ["cafe.lan:4777"], advertised: true });
+    expect(joinAddresses({ port: 4777, lan: ["192.168.3.132", "192.0.2.85"], advertise: "cafe.lan" })).toEqual({ addresses: ["cafe.lan:4777"], advertised: true });
   });
 
   it("keeps the single-interface case unchanged", () => {

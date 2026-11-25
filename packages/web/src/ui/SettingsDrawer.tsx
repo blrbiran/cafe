@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type BaristaInfo, type DoctorCheck, type RuntimeConfig } from "../api.ts";
+import { api, forgetToken, token, type BaristaInfo, type DoctorCheck, type RuntimeConfig } from "../api.ts";
 import { agentAddress, agentLabel, removableAgentAliases, removableHostAliases } from "../display.ts";
 import { useT } from "../i18n.ts";
 import { joinCommands } from "../join.ts";
@@ -583,6 +583,14 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
             </div>
           </div>
           <div className="mono mt-2 text-xs text-warn">cafe daemon restart</div>
+          {token && (
+            <div className="mt-3 flex flex-col gap-1.5">
+              <p className="m-0 text-xs text-muted">{t.settingsForgetTokenDesc}</p>
+              <button type="button" className="btn-sm self-start" onClick={forgetToken}>
+                {t.settingsForgetToken}
+              </button>
+            </div>
+          )}
         </section>
 
       </div>

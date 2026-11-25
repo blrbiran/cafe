@@ -1,4 +1,6 @@
-import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent } from "react";
+import { authState } from "./auth.ts";
+import { TokenGate } from "./ui/TokenGate.tsx";
 import { Shell } from "./Shell.tsx";
 import { navigate, useRoute } from "./route.ts";
 import { closeThread, openThread, useStore } from "./store.ts";
@@ -37,6 +39,7 @@ export function App() {
   const route = useRoute();
   const error = useStore((s) => s.error);
   const loaded = useStore((s) => s.loaded);
+  const needsToken = useSyncExternalStore(authState.subscribe, () => authState.required);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const threadId = route.page === "thread" ? route.threadId : undefined;
   const from = route.page === "thread" ? (route.from ?? "all") : "all";
@@ -86,6 +89,8 @@ export function App() {
     }
     return;
   }, [settingsOpen, threadId, from]);
+
+  if (needsToken) return <TokenGate />;
 
   return (
     <Shell

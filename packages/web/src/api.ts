@@ -1,5 +1,6 @@
 import type { AgentRecord, Attachment, ConnectorStatusRow, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import type { JoinHint } from "./join.ts";
+import { authHeaders, authState, bootToken, tokenStore } from "./auth.ts";
 
 export interface Snapshot {
   host: string;
@@ -23,12 +24,24 @@ export interface ThreadDetail {
   hasMore?: boolean;
 }
 
-/** Daemons on the LAN require the shared token; open the UI with `?token=…` and it is reused for every call. */
-export const token: string | undefined = new URLSearchParams(location.search).get("token") ?? undefined;
+/**
+ * The daemon token on another machine (#97): read once from a `#token=` / `?token=` link or the
+ * token prompt, kept in this browser, and sent only as `Authorization: Bearer`.
+ */
+const boot = typeof location === "undefined" ? {} : bootToken(location.href, typeof localStorage === "undefined" ? undefined : localStorage);
+if (boot.cleanUrl) history.replaceState(history.state, "", boot.cleanUrl);
+export const token: string | undefined = boot.token;
 
-function withToken(path: string): string {
-  if (!token) return path;
-  return `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+/** Save a token typed into the prompt and start over with it. */
+export function useToken(value: string): void {
+  tokenStore(localStorage).set(value.trim());
+  location.reload();
+}
+
+/** "Forget the token on this browser" in Settings. */
+export function forgetToken(): void {
+  tokenStore(localStorage).clear();
+  location.reload();
 }
 
 export class ApiError extends Error {
@@ -40,13 +53,14 @@ export class ApiError extends Error {
 }
 
 async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(withToken(path), {
+  const res = await fetch(path, {
     method,
     signal,
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: { ...authHeaders(token), ...(body === undefined ? {} : { "content-type": "application/json" }) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) authState.markRequired();
   if (!res.ok) throw new ApiError(data.error ?? String(res.status), data.message ?? data.error ?? `${res.status} ${res.statusText}`);
   return data as T;
 }
@@ -169,19 +183,38 @@ export const api = {
   uploadAttachment: (file: File, onProgress?: (pct: number) => void): Promise<Attachment> =>
     new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", withToken(`/api/artifacts?name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.type || "application/octet-stream")}`));
+      xhr.open("POST", `/api/artifacts?name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.type || "application/octet-stream")}`);
+      for (const [k, v] of Object.entries(authHeaders(token))) xhr.setRequestHeader(k, v);
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
       };
       xhr.onload = () => {
         const data = JSON.parse(xhr.responseText || "{}") as { attachment?: Attachment; error?: string; message?: string };
+        if (xhr.status === 401) authState.markRequired();
         if (xhr.status >= 200 && xhr.status < 300 && data.attachment) resolve(data.attachment);
         else reject(new ApiError(data.error ?? String(xhr.status), data.message ?? data.error ?? `${xhr.status} ${xhr.statusText}`));
       };
       xhr.onerror = () => reject(new ApiError("network", "upload failed"));
       xhr.send(file);
     }),
-  attachmentUrl: (id: string) => withToken(`/api/artifacts/${encodeURIComponent(id)}`),
+  attachmentUrl: (id: string) => `/api/artifacts/${encodeURIComponent(id)}`,
+  /**
+   * A link cannot carry a header, so with a token the file is fetched and handed to the browser
+   * as a download; on this machine (no token) the plain link is enough.
+   */
+  downloadAttachment: async (id: string, name: string): Promise<void> => {
+    const res = await fetch(`/api/artifacts/${encodeURIComponent(id)}`, { headers: authHeaders(token) });
+    if (res.status === 401) authState.markRequired();
+    if (!res.ok) throw new ApiError(String(res.status), `${res.status} ${res.statusText}`);
+    const href = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 60_000);
+  },
   /** Controlled-update state left by `cafe update` (v4-2). */
   update: () =>
     call<{ current?: string; lastGood?: string; pending?: string; running?: { version?: string }; log?: Array<{ at: number; action: string; ok: boolean; error?: string }> }>("GET", "/api/update"),
@@ -189,5 +222,5 @@ export const api = {
 
 export function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return withToken(`${proto}//${location.host}/ws`);
+  return `${proto}//${location.host}/ws`;
 }

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import type { AgentRecord, Attachment, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, ThreadStatus } from "@cafe/protocol";
-import { api, ApiError } from "../api.ts";
+import { api, ApiError, token } from "../api.ts";
 import { ago, useT, type Dict } from "../i18n.ts";
 import { useNow } from "../format.ts";
 import { askerOf, whoAddress, whoName, whyText } from "../outcome.ts";
@@ -344,7 +344,19 @@ function AttachmentList({ items }: { items?: Attachment[] }) {
   return (
     <div className="flex flex-wrap gap-2">
       {items.map((a) => (
-        <a key={a.id} href={api.attachmentUrl(a.id)} download={a.name} className="kind-tag" title={t.download}>
+        <a
+          key={a.id}
+          href={api.attachmentUrl(a.id)}
+          download={a.name}
+          className="kind-tag"
+          title={t.download}
+          onClick={(e) => {
+            // On another machine the file needs the token header, which a plain link cannot send (#97).
+            if (!token) return;
+            e.preventDefault();
+            void api.downloadAttachment(a.id, a.name).catch(() => undefined);
+          }}
+        >
           📎 {a.name} · {sizeText(a.size)} · {t.download}
         </a>
       ))}

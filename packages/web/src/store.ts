@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import type { AgentRecord, DaemonRecord, RegistryDelta, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
+import { authState } from "./auth.ts";
 import { api, token, wsUrl, type SearchHit, type Snapshot, type ThreadDetail } from "./api.ts";
 
 export interface State {
@@ -327,6 +328,7 @@ function connect(): void {
     }
     // Response to initialize: we are subscribed; take a fresh snapshot so nothing between load and subscribe is lost.
     if ("error" in frame) {
+      if (frame.error?.code === "unauthorized") authState.markRequired();
       set({ error: frame.error?.message ?? "initialize failed" });
       return;
     }

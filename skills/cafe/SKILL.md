@@ -52,7 +52,7 @@ cafe inbox                # threads started from the CLI
 cafe barista list         # headless Baristas supervised by this daemon
 ```
 
-- Web UI: `http://127.0.0.1:4777/`. It has pages for Agents, Threads and Network.
+- Web UI: `http://127.0.0.1:4777/`. It has pages for Agents, Threads and Network. From another device, open `http://<address>:4777/` and paste the token (`cafe config get token`) when the page asks, or use `http://<address>:4777/#token=<token>`; never put the token in `?token=` (the daemon only accepts `Authorization: Bearer`).
 - Logs: `~/.cafe/daemon.log` and `~/.cafe/logs/barista-*.log`.
 - Thread files: `~/.cafe/sessions/<date>/<threadId>.jsonl`.
 - `claude·bg` in `cafe agents` is a Claude Code session running in the background (no terminal); attach and exit, or `/cafe off` in it, to take it offline.
