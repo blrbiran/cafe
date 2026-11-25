@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { stringify } from "yaml";
 import type { ChannelDigest } from "@cafe/protocol";
+import { CafeClient } from "@cafe/protocol/client";
+import { runDaemon } from "@cafe/daemon";
 import { FAST, barista, customer, identity, startDaemon, waitFor } from "./helpers.ts";
 
 const cleanup: Array<() => Promise<void> | void> = [];
@@ -55,6 +61,38 @@ describe("observer digests and channel history (v4-11)", () => {
 
     const missing = (await (await fetch(`http://${d.addr}/api/channels/nope/threads`)).json()) as { exists: boolean; threads: unknown[] };
     expect(missing).toMatchObject({ exists: false, threads: [] });
+  });
+
+  it("does not replay a channel's activity after a restart", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-digest-restart-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1", security: { mode: "plaintext" } }));
+    const timing = { ...FAST, graceMs: 60, digestIntervalMs: 100 };
+    const opts = { home, timing, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "none") };
+    let d = await runDaemon(opts);
+    const addr = `127.0.0.1:${d.server.port}`;
+
+    const first: ChannelDigest[] = [];
+    const watch = new CafeClient({ daemon: addr });
+    watch.onDigest((x) => first.push(x));
+    await watch.connect(identity("watch", { observer: true, channels: ["team"] }));
+    const c = await customer(addr);
+    await c.ask({ body: "before restart", channel: "team" });
+    await waitFor(() => first.length > 0, 5000);
+    watch.close();
+    c.close();
+
+    const port = d.server.port;
+    await d.stop();
+    d = await runDaemon({ ...opts, port });
+    cleanup.push(() => d.stop());
+    const after: ChannelDigest[] = [];
+    const watch2 = new CafeClient({ daemon: `127.0.0.1:${d.server.port}` });
+    watch2.onDigest((x) => after.push(x));
+    await watch2.connect(identity("watch", { observer: true, channels: ["team"] }));
+    cleanup.push(() => watch2.close());
+    await new Promise((r) => setTimeout(r, 350));
+    expect(after).toEqual([]);
   });
 
   it("marks a child digest partial", async () => {

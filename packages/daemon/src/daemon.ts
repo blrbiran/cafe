@@ -294,8 +294,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private stagingTimer?: ReturnType<typeof setInterval>;
   private digestTimer?: ReturnType<typeof setInterval>;
   private digestSeq = 0;
-  /** observerId → channel → last digest timestamp. */
-  private digestSince = new Map<string, Map<string, number>>();
+  /** channel → last digest timestamp. Persisted: a restarted daemon must not re-emit stored activity. */
+  private digestSince = new Map<string, number>();
 
   constructor(opts: DaemonOptions) {
     super();
@@ -313,6 +313,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     } catch {
       // no saved rosters yet
     }
+    // Digest cursors survive a restart; otherwise stored activity would be re-emitted (v4-11 review).
+    const savedDigests = this.store.getKv<Record<string, number>>("digestSince");
+    if (savedDigests) for (const [channel, ts] of Object.entries(savedDigests)) if (typeof ts === "number") this.digestSince.set(channel, ts);
     // Every SSE stream and Web UI attaches a "thread" listener; the default limit of 10 is far below
     // normal use (one tab per Thread, `cafe tail`, MCP) and the warning was hidden by --no-warnings (#70).
     this.setMaxListeners(0);
@@ -1025,43 +1028,42 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   private emitDigests(): void {
     const now = Date.now();
-    for (const rec of this.registry.all()) {
-      // Only the daemon the observer REGISTERED on publishes. Every daemon can see the network
-      // registry, so without this a Root and a child both wake the same observer for one Thread
-      // (v4-11 review). A child's digest is partial by design; an observer on the Root gets the
-      // network view.
-      if (!rec.observer || rec.host !== this.host) continue;
-      for (const channel of channelsOf(rec)) {
-        const since = this.digestSince.get(rec.agentId)?.get(channel) ?? 0;
-        const changed = this.store.listThreadsInByActivity(channel, { after: since, limit: 200 });
-        if (!changed.length) continue;
-        const digest: ChannelDigest = {
-          digestId: ++this.digestSeq,
-          channel,
-          since,
-          threads: changed.slice(0, 20).map((m) => ({
-            threadId: m.threadId,
-            status: m.status,
-            from: m.from,
-            summary: m.summary,
-            targets: m.targets,
-            replies: (m.replies ?? []).length,
-            declined: (m.declines ?? []).length,
-            ...(m.closedAt ? { closedAt: m.closedAt } : {}),
-            ...(m.parentThreadId ? { parentThreadId: m.parentThreadId } : {}),
-          })),
-          omitted: Math.max(0, changed.length - 20),
-          ...(this.isRoot ? {} : { partial: true }),
-        };
-        let map = this.digestSince.get(rec.agentId);
-        if (!map) {
-          map = new Map();
-          this.digestSince.set(rec.agentId, map);
-        }
-        map.set(channel, now);
-        this.notifyAgent(rec.agentId, Methods.channelDigest, { digest });
-      }
+    // Only the daemon the observer REGISTERED on publishes. Every daemon can see the network
+    // registry, so without this a Root and a child both wake the same observer for one Thread
+    // (v4-11 review). A child's digest is partial by design.
+    const observers = this.registry.all().filter((r) => r.observer && r.host === this.host);
+    if (!observers.length) return;
+    const channels = [...new Set(observers.flatMap((r) => channelsOf(r)))];
+    let moved = false;
+    for (const channel of channels) {
+      const since = this.digestSince.get(channel) ?? 0;
+      const changed = this.store.listThreadsInByActivity(channel, { after: since, limit: 200 });
+      if (!changed.length) continue;
+      const digest: ChannelDigest = {
+        digestId: ++this.digestSeq,
+        channel,
+        since,
+        threads: changed.slice(0, 20).map((m) => ({
+          threadId: m.threadId,
+          status: m.status,
+          from: m.from,
+          summary: m.summary,
+          targets: m.targets,
+          replies: (m.replies ?? []).length,
+          declined: (m.declines ?? []).length,
+          ...(m.closedAt ? { closedAt: m.closedAt } : {}),
+          ...(m.parentThreadId ? { parentThreadId: m.parentThreadId } : {}),
+        })),
+        omitted: Math.max(0, changed.length - 20),
+        ...(this.isRoot ? {} : { partial: true }),
+      };
+      for (const rec of observers) if (channelsOf(rec).includes(channel)) this.notifyAgent(rec.agentId, Methods.channelDigest, { digest });
+      // A channel cursor is global (one digest per channel per interval); persisting it is what
+      // stops a restart from replaying stored activity to a new observer (v4-11 review).
+      this.digestSince.set(channel, now);
+      moved = true;
     }
+    if (moved) this.store.setKv("digestSince", Object.fromEntries(this.digestSince));
   }
 
   private storeTeam(rec: TeamRecord, from?: Peer): void {
