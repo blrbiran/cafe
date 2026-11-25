@@ -862,6 +862,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
         const known = doc.team.members.map((m) => m.name);
         const unknown = names.filter((n) => !known.includes(n));
         if (unknown.length) throw new RpcError("bad_request", `unknown member(s): ${unknown.join(", ")}; roster: ${known.join(", ")}`);
+        daemon.publishRoster(rosterDir, doc.team);
         return send(res, 200, sup.startTeam(rosterDir, { ...doc.team, members: doc.team.members.filter((m) => names.includes(m.name)) }));
       }
       if (member !== undefined) {

@@ -1,10 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
-import type { TeamSpec } from "@cafe/protocol";
+import type { TeamMember, TeamSpec } from "@cafe/protocol";
 import { openWorkerLog, type CappedLineFile } from "./proc/cappedLog.ts";
 import { probeGroup, readProcessStart, signalGroup } from "./proc/processStart.ts";
 
@@ -229,9 +229,25 @@ export class Supervisor {
   startTeam(rosterDir: string, team: TeamSpec, persist = true): WorkerInfo[] {
     const dir = resolve(rosterDir);
     const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
-    // Upsert the full roster into every existing worker of this team, so save() persists all members.
+    // Refuse a roster with a missing worktree before starting anything: spawn would otherwise fail
+    // asynchronously while `team start` reports success (v4-11 review).
+    for (const member of team.members) {
+      if (member.mode === "tui") continue;
+      const memberDir = resolve(dir, member.dir);
+      let isDir = false;
+      try {
+        isDir = statSync(memberDir).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (!isDir) throw new Error(`team member ${member.name}: directory ${memberDir} does not exist`);
+    }
+    // Each worker keeps only its own member definition; save() unions them per roster. A partial
+    // `team start` must never overwrite the set that a later restart restores (v4-11 review).
     for (const w of this.workers) {
-      if (w.rosterDir === dir) w.spec = { ...w.spec, team: { rosterDir: dir, spec: team } };
+      if (w.rosterDir !== dir) continue;
+      const own = team.members.find((m) => m.name === w.member) ?? w.spec.team?.spec.members.find((m) => m.name === w.member);
+      w.spec = { ...w.spec, team: { rosterDir: dir, spec: { ...team, members: own ? [own] : [] } } };
     }
     for (const member of team.members) {
       if (member.mode === "tui") continue;
@@ -243,7 +259,7 @@ export class Supervisor {
       const native = runner === "codex" || runner === "claude";
       const base: BaristaSpec = {
         dir,
-        team: { rosterDir: dir, spec: team },
+        team: { rosterDir: dir, spec: { ...team, members: [member] } },
         ...(native ? { agent: runner as "codex" | "claude" } : { bin: member.bin ?? (runner === "pi" ? undefined : runner) }),
         ...(member.access ? { access: member.access === "read-only" ? "read-only" : "workspace-write" } : {}),
       };
@@ -353,8 +369,6 @@ export class Supervisor {
     const env = w.member ? { ...this.env, CAFE_TEAM_MEMBER: w.member, CAFE_TEAM_DIR: w.rosterDir! } : this.env;
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.
     const child = spawn(process.execPath, args, { cwd: workDir, env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
-    // Attach 'error' first: an unhandled spawn error would crash the daemon.
-    child.on("error", (err) => note(`spawn error: ${err.message}`));
     w.child = child;
     w.launchedAt = Date.now();
     w.startedAt = undefined;
@@ -384,20 +398,22 @@ export class Supervisor {
         }
       });
     }
-    child.on("exit", (code, signal) => {
-      note(code === EXIT_NOT_FOUND ? `agent executable not found: ${bin} (set CAFE_PI_BIN or --agent)` : `exited code=${code} signal=${signal}`);
+    let settled = false;
+    const retire = (code: number | null, signal: NodeJS.Signals | null, message?: string) => {
+      if (settled || w.child !== child) return;
+      settled = true;
+      note(message ?? (code === EXIT_NOT_FOUND ? `agent executable not found: ${bin} (set CAFE_PI_BIN or --agent)` : `exited code=${code} signal=${signal}`));
       const pgid = child.pid;
       // Grandchildren may still hold the group's pipes: give them a moment, then SIGKILL the group.
       if (pgid) setTimeout(() => signalGroup(pgid, "SIGKILL"), EXIT_DRAIN_MS).unref?.();
       setTimeout(() => log?.close(), EXIT_DRAIN_MS + 100).unref?.();
-      if (w.child === child) {
-        w.child = undefined;
-        w.startedAt = undefined;
-        this.saveRuntime();
-      }
+      w.child = undefined;
+      w.startedAt = undefined;
+      this.saveRuntime();
       if (w.stopping) return;
       const failedStart = (code ?? 1) !== 0 && !!w.launchedAt && Date.now() - w.launchedAt < this.quickExitMs;
-      if (code !== 0 || signal) {
+      if (message) w.lastError = message;
+      else if (code !== 0 || signal) {
         w.lastError = explain(w.tail, code === EXIT_NOT_FOUND ? `agent executable not found: ${bin}` : `exited code=${code} signal=${signal}`);
       }
       w.quickFailures = failedStart ? w.quickFailures + 1 : 0;
@@ -413,7 +429,11 @@ export class Supervisor {
       if (w.launchedAt && Date.now() - w.launchedAt > 60_000) w.restarts = 0;
       const delay = Math.min(60_000, this.backoffBaseMs * 2 ** w.restarts++);
       w.timer = setTimeout(() => !w.stopping && this.launch(w), delay);
-    });
+    };
+    // A spawn error (missing binary, bad cwd) has no `exit`; without this path the record stayed
+    // "waiting" forever and later `team start` calls considered the member present (v4-11 review).
+    child.on("error", (err) => retire(null, null, `spawn error: ${err.message}`));
+    child.on("exit", (code, signal) => retire(code, signal));
   }
 
   private kill(w: Worker): void {
@@ -474,7 +494,24 @@ export class Supervisor {
   }
 
   private save(): void {
-    const specs = [...new Map(this.workers.map((w) => [w.spec.dir, w.spec])).values()];
+    // Plain workers keep one spec per directory. Team workers collapse to one spec per roster whose
+    // members are exactly the workers this supervisor owns right now: stopping dev1 must not leave
+    // dev1 in dev2's saved spec, and a partial `team start` must not shrink the restored set.
+    const plain = new Map<string, BaristaSpec>();
+    const teams = new Map<string, { meta: TeamSpec; members: TeamMember[] }>();
+    for (const w of this.workers) {
+      if (!w.rosterDir) {
+        plain.set(w.spec.dir, w.spec);
+        continue;
+      }
+      const meta = w.spec.team?.spec ?? { members: [] };
+      const entry = teams.get(w.rosterDir) ?? { meta, members: [] };
+      const own = w.spec.team?.spec.members.find((m) => m.name === w.member);
+      if (own && !entry.members.some((m) => m.name === own.name)) entry.members.push(own);
+      teams.set(w.rosterDir, entry);
+    }
+    const specs: BaristaSpec[] = [...plain.values()];
+    for (const [dir, t] of teams) specs.push({ dir, team: { rosterDir: dir, spec: { ...t.meta, members: t.members } } });
     writeAtomic(this.file, JSON.stringify(specs, null, 2));
   }
 }

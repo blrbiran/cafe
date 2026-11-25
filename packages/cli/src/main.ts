@@ -1522,23 +1522,30 @@ team
     const unknown = names.filter((n) => !spec.members.some((m) => m.name === n));
     if (unknown.length) throw new Error(`unknown member(s): ${unknown.join(", ")}; roster: ${spec.members.map((m) => m.name).join(", ")}`);
     const selected = names.length ? spec.members.filter((m) => names.includes(m.name)) : spec.members;
+    const health = await api<{ host: string }>("/api/health");
     const agents = await api<AgentRecord[]>("/api/agents");
-    const workers = await api<{ rosterDir?: string; member?: string }[]>("/api/baristas");
-    const online = new Set(agents.filter((a) => a.team === spec.name && a.member).map((a) => a.member!));
-    const supervised = new Set(workers.filter((w) => w.rosterDir === rosterDir && w.member).map((w) => w.member!));
-    const missingHeadless = selected.filter((m) => m.mode !== "tui" && (o.force || (!online.has(m.name) && !supervised.has(m.name))));
-    const missingTui = selected.filter((m) => m.mode === "tui" && !online.has(m.name));
+    const workers = await api<{ rosterDir?: string; member?: string; state?: string }[]>("/api/baristas");
+    // Presence must be local: a same-named member on another Host is not this Host's process.
+    const onlineAny = new Set(agents.filter((a) => a.team === spec.name && a.member).map((a) => a.member!));
+    const onlineHere = new Set(agents.filter((a) => a.host === health.host && a.team === spec.name && a.member).map((a) => a.member!));
+    // A failed worker is not present: `team start` is how the person retries it (v4-11 review).
+    const supervised = new Set(workers.filter((w) => w.rosterDir === rosterDir && w.member && w.state !== "failed").map((w) => w.member!));
+    const missingHeadless = selected.filter((m) => m.mode !== "tui" && (o.force || (!onlineHere.has(m.name) && !supervised.has(m.name))));
+    const missingTui = selected.filter((m) => m.mode === "tui" && !onlineHere.has(m.name));
     const plan = {
       rosterDir,
       team: spec.name,
       channel: spec.channel,
-      present: selected.filter((m) => online.has(m.name) || supervised.has(m.name)).map((m) => m.name),
+      present: selected.filter((m) => onlineAny.has(m.name) || supervised.has(m.name)).map((m) => m.name),
       start: missingHeadless.map((m) => m.name),
       tui: missingTui.map((m) => m.name),
     };
     if (o.dryRun) return out(JSON.stringify(plan, null, 2), plan);
-    if (missingHeadless.length) {
-      await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: { ...spec, members: missingHeadless } }) });
+    // The daemon publishes the roster from disk even when only TUI members remain, so a team that
+    // has not registered yet still shows up (and `to: <team>` resolves) (v4-11 review).
+    const publish = missingHeadless.length ? missingHeadless : selected;
+    if (publish.length) {
+      await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: { ...spec, members: publish } }) });
     }
     const lines = [
       `${spec.name} (#${spec.channel}) in ${rosterDir}`,

@@ -42,6 +42,7 @@ import {
   type ThreadEventBody,
   type ThreadMeta,
   type TeamRecord,
+  type TeamSpec,
   type ChannelDigest,
 } from "@cafe/protocol";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
@@ -859,7 +860,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const rec = peer.meta.agentId ? this.local.get(peer.meta.agentId as string) : undefined;
       if (!rec) throw new RpcError("not_registered", "agent/register first");
       if (typeof p.threadId !== "string" || typeof p.kind !== "string") throw new RpcError("bad_request", "threadId and kind are required");
-      return { kind: p.kind, cwd: rec.cwd, threadId: p.threadId };
+      // Team members commonly share `dir: .`, so cwd is not an identity. Use team/member for them;
+      // a plain Barista keeps the cwd key so a restarted process resumes its session (v4-11 review).
+      const scope = rec.team && rec.member ? `team:${rec.team}/${rec.member}` : rec.cwd;
+      return { kind: p.kind, cwd: scope, threadId: p.threadId };
     };
     peer.on(Methods.agentSessionGet, (p: { threadId: string; kind: string }) => {
       const k = sessionKey(p);
@@ -920,7 +924,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const rec = byKey.get(key) ?? { team: r.team, host: r.host, channel: r.teamChannel, members: [], revision: 0 };
       const name = r.member ?? r.name;
       if (!rec.members.some((m) => m.name === name)) {
-        rec.members = [...rec.members, { name, duty: r.duty, description: r.description, tags: r.tags, scope: r.scope, mode: "headless" as const, dir: r.cwd }];
+        rec.members = [...rec.members, { name, duty: r.duty, description: r.description, tags: r.tags, scope: r.scope, mode: "headless" as const, dir: r.cwd, observer: r.observer }];
       }
       byKey.set(key, rec);
     }
@@ -1057,8 +1061,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private storeTeam(rec: TeamRecord, from?: Peer): void {
     const key = `${rec.host}/${rec.team}`;
     const current = this.teamRecords.get(key);
-    if (current && (current.revision ?? 0) > (rec.revision ?? 0)) return;
+    // A strictly newer revision wins. Equal means a replay/retry: applying it again would only
+    // reopen a window for a stale clock to overwrite a genuine update (v4-11 review).
+    if (current?.revision !== undefined && rec.revision !== undefined && current.revision >= rec.revision) return;
     this.teamRecords.set(key, rec);
+    this.saveTeams();
+    if (this.isRoot) for (const child of this.children.values()) if (child !== from) child.notify(Methods.teamUpsert, { team: rec });
+  }
+
+  private saveTeams(): void {
     try {
       const tmp = `${this.teamsFile}.tmp`;
       writeFileSync(tmp, JSON.stringify([...this.teamRecords.values()], null, 2));
@@ -1066,7 +1077,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     } catch (err) {
       this.log(`cannot save teams.json: ${(err as Error).message}`);
     }
-    if (this.isRoot) for (const child of this.children.values()) if (child !== from) child.notify(Methods.teamUpsert, { team: rec });
   }
 
   /** A registering member teaches this daemon its roster (from teamDir when readable) and publishes it. */
@@ -1075,24 +1085,45 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const key = `${rec.host}/${rec.team}`;
     const previous = this.teamRecords.get(key)?.members ?? [];
     let members: TeamRecord["members"] = previous;
+    let authoritative = false;
     if (rec.teamDir) {
       try {
         const doc = readCafeFile(join(rec.teamDir, ".cafe"));
-        members = doc.team?.members ?? previous;
+        if (doc.team) {
+          // The file owns membership: a member removed from `.cafe` disappears here too. Live
+          // status is derived from the registry, so a file without statuses is not a downgrade.
+          members = doc.team.members;
+          authoritative = true;
+        }
       } catch (err) {
         this.log(`cannot read team roster at ${rec.teamDir}: ${(err as Error).message}`);
       }
     }
-    // Keep members learned from earlier registrations (a TUI-only team has no roster file in reach).
+    // Without a readable roster (a sibling-worktree TUI, or the Root hearing a child registration)
+    // keep members learned earlier and add this registration.
     members = [...members];
-    for (const m of previous) if (!members.some((x) => x.name === m.name)) members.push(m);
     const name = rec.member ?? rec.name;
-    if (!members.some((m) => m.name === name)) {
+    if (!authoritative && !members.some((m) => m.name === name)) {
       members.push({ name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels, observer: rec.observer });
     }
-    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision: Date.now() };
+    const existing = this.teamRecords.get(key);
+    const revision = Math.max(Date.now(), (existing?.revision ?? 0) + 1);
+    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision };
     this.storeTeam(team);
     if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.teamUpsert, { team });
+  }
+
+  /**
+   * Publish a roster read from disk even when no worker starts (a TUI-only team), so the Teams
+   * page and `to: <team>` do not have to wait for the first registration (v4-11 review).
+   */
+  publishRoster(rosterDir: string, team: TeamSpec): void {
+    if (!team.name || !team.channel) return;
+    const key = `${this.host}/${team.name}`;
+    const previous = this.teamRecords.get(key);
+    const members = team.members.map((m) => ({ ...m, channels: m.channels?.length ? m.channels : [team.channel!] }));
+    this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1) });
+    this.log(`roster ${team.name} published from ${rosterDir}`);
   }
 
   // -------------------------------------------------------------------------
@@ -1339,6 +1370,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     if (config.length) saveConfig(this.config, this.store.home);
+    // A forgotten Host's rosters must not linger: a stale member name could make a bare team
+    // address ambiguous or resolve to a machine that is no longer part of the network.
+    let droppedTeams = 0;
+    for (const key of [...this.teamRecords.keys()]) {
+      if (key.startsWith(`${host}/`)) {
+        this.teamRecords.delete(key);
+        droppedTeams++;
+      }
+    }
+    if (droppedTeams) this.saveTeams();
     this.emitDaemons();
     for (const child of this.children.values()) child.notify(Methods.hostForgotten, { host });
     this.log(`forgot host ${host} (${ids.length} agent(s)${config.length ? `; ${config.join(", ")}` : ""})`);
@@ -3174,6 +3215,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.store.setKv("lastRoot", target);
         this.setRootOnline(true);
         await peer.request("registry/sync", { records: [...this.local.values()] });
+        // A roster learned while the Root was offline was stored but never published. The Root
+        // replays its own records on connect; send this Host's rosters the other way too (v4-11 review).
+        for (const team of this.teamRecords.values()) if (team.host === this.host) peer.notify(Methods.teamUpsert, { team });
         void this.flushBackfill();
         this.log(`connected to root ${target}`);
       } catch (err) {

@@ -65,10 +65,11 @@ describe("supervisor teams (v4-11)", () => {
     // Idempotent: a second start adds nothing while the workers are live.
     expect(sup.startTeam(roster, team)).toHaveLength(3);
 
-    // save() keeps one spec per roster, with the full roster.
+    // save() keeps one spec per roster, with exactly the supervised headless members (a TUI member
+    // is never a worker and must not be resurrected into one).
     const saved = JSON.parse(readFileSync(join(home, "baristas.json"), "utf8")) as { team?: { spec: TeamSpec } }[];
     expect(saved).toHaveLength(1);
-    expect(saved[0]!.team!.spec.members.map((m) => m.name).sort()).toEqual(["arch", "dev1", "dev2", "human"]);
+    expect(saved[0]!.team!.spec.members.map((m) => m.name).sort()).toEqual(["arch", "dev1", "dev2"]);
 
     expect(sup.stopTeam(roster, "dev1")).toBe(1);
     expect(sup.list().map((w) => w.member).sort()).toEqual(["arch", "dev2"]);
@@ -84,5 +85,34 @@ describe("supervisor teams (v4-11)", () => {
     const again = supervisor(home);
     await again.restore();
     expect(again.list().map((w) => w.member).sort()).toEqual(["arch", "dev1", "dev2"]);
+  });
+
+  it("persists the supervised set across partial starts and a member stop", async () => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    // Starting one member at a time must not shrink what a restart restores.
+    sup.startTeam(roster, { ...team, members: [team.members[0]!] });
+    sup.startTeam(roster, { ...team, members: [team.members[1]!] });
+    expect(sup.list().map((w) => w.member).sort()).toEqual(["dev1", "dev2"]);
+
+    let saved = JSON.parse(readFileSync(join(home, "baristas.json"), "utf8")) as { team?: { spec: TeamSpec } }[];
+    expect(saved[0]!.team!.spec.members.map((m) => m.name).sort()).toEqual(["dev1", "dev2"]);
+
+    // Stopping dev1 must leave only dev2 in the saved spec.
+    expect(sup.stopTeam(roster, "dev1")).toBe(1);
+    saved = JSON.parse(readFileSync(join(home, "baristas.json"), "utf8")) as { team?: { spec: TeamSpec } }[];
+    expect(saved[0]!.team!.spec.members.map((m) => m.name)).toEqual(["dev2"]);
+
+    await sup.shutdown();
+    const again = supervisor(home);
+    await again.restore();
+    expect(again.list().map((w) => w.member)).toEqual(["dev2"]);
+  });
+
+  it("refuses a member with a missing worktree before starting anything", () => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    expect(() => sup.startTeam(roster, { ...team, members: [{ ...team.members[0]!, dir: "no-such-dir" }] })).toThrow(/does not exist/);
+    expect(sup.list()).toHaveLength(0);
   });
 });

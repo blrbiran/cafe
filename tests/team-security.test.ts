@@ -103,6 +103,37 @@ describe("team start never learns an executable from the request body", () => {
     expect(bad.status, bad.body).toBe(400);
     expect(calls).toHaveLength(1);
   });
+
+  it("publishes a TUI-only roster even though no worker starts", async () => {
+    const roster = mkdtempSync(join(tmpdir(), "cafe-roster-tui-"));
+    writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: human\n      dir: .\n      mode: tui\n");
+    cleanup.push(() => rmSync(roster, { recursive: true, force: true }));
+
+    const d = await startDaemon("team2");
+    cleanup.push(d.stop);
+    const calls: Array<{ team: { members: Array<Record<string, unknown>> } }> = [];
+    d.daemon.supervisor = {
+      list: () => [],
+      startTeam: (_dir: string, team: (typeof calls)[number]["team"]) => {
+        calls.push({ team });
+        return [];
+      },
+      stopTeam: () => 0,
+      start: () => [],
+      shutdown: async () => {},
+    } as unknown as typeof d.daemon.supervisor;
+
+    const res = await fetch(`http://${d.addr}/api/baristas`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dir: roster, team: { members: [{ name: "human" }] } }),
+    });
+    expect(res.status, await res.text()).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.team.members[0]!.mode).toBe("tui");
+    expect(d.daemon.teams().map((t) => t.team)).toEqual(["repo"]);
+    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["human"]);
+  });
 });
 
 describe("escalation authorization is per Order, not per Thread", () => {
