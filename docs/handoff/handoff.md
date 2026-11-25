@@ -129,7 +129,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 - **一句话**：按 `../cafe_dogfooding/issue-20261119.md` 第十轮复核，用户裁定 Q121–Q125 全按推荐：批 A（#95 #31 #33 #84）+
   批 B「移除离线机器」（Q125 A，spec → 独立 subagent 审阅 → 修订 → 实现）+ #16 用真 Codex 跑行为回归。两批均已提交，
-  **未推送、未发版**（`git log origin/main..main` 查看；#91–#94 那两个提交也还在本地）。
+  **未推送、未发版**（`git log origin/main..main` 查看；#91–#94 已在 origin 上，但还没发版）。
 - **#95**：`joinAddresses()`（`daemon.ts`）——没设 `advertise` 时给出本机所有 IPv4 的 `host:port`，设了只给那一个；
   `/api/settings.join` 多了 `addresses`/`advertised`（`address` 保留给旧客户端）；`cafe root show` 用 `join-text.ts`，多地址时
   每个地址一条命令 + 「用对方能连到的那条」+ `advertise` 提示；Web「加入另一台机器」每条命令一个复制按钮（截图 1440/390 已看）。
