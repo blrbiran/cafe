@@ -141,6 +141,51 @@ cafe serve --exec "<任意命令>" --dir ~/code/billing    # 或 --preset claude
 
 每个问题跑一次命令，prompt 走 stdin，stdout 即回答；输出 `CAFE_DECLINE: 原因` 表示婉拒。追问没有会话，只靠 prompt 里的历史。
 
+## 团队与 channel（v4-11）
+
+一份 `.cafe` 可以声明一个 team。每个成员是一个独立进程，有自己的职责、目录和
+channel；`cafe team start` 只补齐缺的 headless 成员，不碰你自己开的会话。cafe
+不创建 worktree、不碰分支合入——把成员指向你准备好的目录即可。
+
+```yaml
+name: myproj
+description: 这个仓库是做什么的
+team:
+  channel: myproj-dev        # 可省：默认由 team 名生成
+  members:
+    - { name: orch,  duty: orchestrator, mode: headless, dir: . }
+    - { name: arch,  duty: architect,    mode: tui,      dir: ../myproj-arch }
+    - { name: dev1,  duty: developer,    mode: headless, dir: ../myproj-dev1 }
+    - { name: t1,    duty: tester,       mode: headless, dir: . }
+    - { name: watch, duty: monitor, observer: true, channels: [myproj-dev, default], mode: tui }
+```
+
+```bash
+cafe team start            # 补齐缺的 headless 成员（默认是 headless pi）
+cafe team start dev1       # 只补一个
+cafe team status           # 名册、在线成员、当前 Thread、警告
+cafe team stop             # 停掉被托管的成员；你的 TUI 会话不受影响
+```
+
+TUI 成员用 `CAFE_TEAM_MEMBER=<名字> CAFE_TEAM_DIR=<名册目录>` 启动会话来注册；
+pi/omp 里 `/cafe-team <名字>` 会列出名册并把选择记到下个会话（TUI 无法隔离
+context，所以重启会话才真正生效）。Codex TUI 用 `cafe barista run --agent codex
+--tui --dir <目录> --member <名字> --team-dir <目录>`。
+
+**channel 是消息范围，不是权限边界。** Feed 顶部有 channel 切换，composer 会
+显示 `→ #channel`；`cafe ask --channel <名字>` 可以发到别处。成员自己发起的新
+问题默认落在它的 home channel（它列出的第一个）。`to: <team>` 会找该 team 的
+orchestrator（没有就投给在线的非 observer 成员）。
+
+- `escalate`：Barista 可以就“正在处理的那张单”向它的上级追问。这会创建同一
+  channel 下、带 `parentThreadId` 的子 Thread，绝不退回路由或隐式广播。
+  `cafe ask --escalate --parent <orderId> --parent-thread <threadId>`。
+- `collect: all`：`cafe ask --collect all` 会让多播 Thread 等到所有 target
+  交活或到 deadline；沉默的 target 记为 skipped，不算婉拒。
+- **observer**（`observer: true`）永远不会被路由选中。它每个周期收一条
+  channel 摘要（不是每条消息），也可以主动发新单。observer 请放在 Root 或
+  team 所在的机器；Root 离线时子机的摘要有 `partial` 标记。
+
 ## 聊天 connector（实验）
 
 `cafe connector` 以**进程外 sidecar** 的方式运行 Customer connector：把平台消息变成 cafe Order，再把回答发回原频道。提供 mock connector 用于测试，**Discord** 是第一个真实平台。

@@ -143,6 +143,58 @@ cafe serve --exec "<any command>" --dir ~/code/billing    # or --preset claude|c
 
 One command run per question: prompt on stdin, answer on stdout; print `CAFE_DECLINE: reason` to decline. Follow-ups have no session and rely only on the history in the prompt.
 
+## Teams and channels (v4-11)
+
+A `.cafe` may declare one team. Each member is one process with its own duty,
+directory and channel; `cafe team start` fills in the missing headless members
+while leaving sessions you started yourself alone. cafe never creates worktrees
+or merges branches — point a member at a directory you prepared.
+
+```yaml
+name: myproj
+description: what this repository is
+team:
+  channel: myproj-dev        # optional: defaults to a sanitized team name
+  members:
+    - { name: orch,  duty: orchestrator, mode: headless, dir: . }
+    - { name: arch,  duty: architect,    mode: tui,      dir: ../myproj-arch }
+    - { name: dev1,  duty: developer,    mode: headless, dir: ../myproj-dev1 }
+    - { name: t1,    duty: tester,       mode: headless, dir: . }
+    - { name: watch, duty: monitor, observer: true, channels: [myproj-dev, default], mode: tui }
+```
+
+```bash
+cafe team start            # start missing headless members (headless pi by default)
+cafe team start dev1       # only one member
+cafe team status           # roster, online members, current Thread, warnings
+cafe team stop             # stop supervised members; TUI sessions are untouched
+```
+
+A TUI member registers by starting the session with
+`CAFE_TEAM_MEMBER=<name> CAFE_TEAM_DIR=<roster dir>`; in pi/omp, `/cafe-team
+<name>` lists the roster and records the choice for the next session start
+(a TUI cannot isolate context, so a restart is what makes the role real).
+Codex TUIs use `cafe barista run --agent codex --tui --dir <dir> --member <name>
+--team-dir <dir>`.
+
+**Channels are message scopes, not permissions.** The Feed has channel chips
+and the composer shows `→ #channel`; `cafe ask --channel <name>` posts
+elsewhere. A member's fresh question defaults to its home channel (the first
+one it lists). `to: <team>` reaches the team's orchestrator (or its online
+members when there is no orchestrator).
+
+- `escalate`: a Barista can ask the sender of the Order it is handling a
+  clarifying question. It creates a linked sub-Thread in the same channel and
+  never falls back to routing or an implicit broadcast. `cafe ask --escalate
+  --parent <orderId> --parent-thread <threadId>`.
+- `collect: all`: `cafe ask --collect all` keeps a multicast Thread open until
+  every target answers or the deadline; silent targets are skipped, not
+  counted as declines.
+- An **observer** (`observer: true`) is never routed to. It receives one
+  channel digest per interval (not one message per Order) and can send fresh
+  Orders. Run an observer on the Root or on the team's own Host; a child's
+  digest is marked `partial` while the Root is down.
+
 ## Chat connectors (experimental)
 
 `cafe connector` runs a Customer connector **out of process**: it turns platform messages into cafe Orders and posts the answers back. A mock connector ships for testing, and **Discord** is the first real platform.

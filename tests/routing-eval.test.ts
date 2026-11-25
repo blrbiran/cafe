@@ -90,11 +90,11 @@ describe("per-target sub-questions in the eval (v4-7 #39)", () => {
 });
 
 describe("team cases (#71/#72) are recorded without changing routing", () => {
-  it("keeps every team case labelled, and marks the ones waiting on a decision", () => {
-    const blocked = TEAM_CASES.filter((c) => c.blocked).map((c) => c.blocked);
-    expect(blocked).toEqual(expect.arrayContaining(["D1-escalate", "D2-parallel", "D3-collect-all"]));
-    // The two shapes the router can already answer must not be marked blocked.
-    expect(TEAM_CASES.filter((c) => !c.blocked).length).toBeGreaterThanOrEqual(2);
-    for (const c of TEAM_CASES) if (!c.blocked) expect(c.mode).toBe("multicast");
+  it("keeps the team cases the rules router can answer, with no decision blockers left", () => {
+    // Escalation/collect-all are daemon behavior covered by tests/escalate.test.ts and
+    // tests/collect-all.test.ts; the eval only keeps the routing shapes.
+    expect(TEAM_CASES.filter((c) => c.blocked)).toHaveLength(0);
+    expect(TEAM_CASES.length).toBeGreaterThanOrEqual(2);
+    for (const c of TEAM_CASES) expect(c.mode).toBe("multicast");
   });
 });

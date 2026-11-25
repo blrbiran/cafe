@@ -41,6 +41,37 @@ cafe ask --notice "deploy finished"          # one-way notice, no reply expected
 - Long tasks are fine, but not unbounded: heartbeats prove the Barista is alive, not that it will answer. A unicast Order closes after 10 minutes without a final reply, and `cafe ask --timeout <seconds>` (or Ctrl-C) cancels it earlier, so a stuck follow-up never leaves `thread_busy` behind. `cafe cancel <threadId>` stops waiting; `cafe ask --thread <id> --replace "..."` asks again immediately.
 - `cafe thread <id>` now returns the newest 200 events; older pages come with `?before=`.
 
+## Teams and channels (v4-11)
+
+A `.cafe` may declare one team; each member is one process with a duty, directory
+and channel. `cafe team start` fills in missing headless members and never
+touches a session you started yourself.
+
+```bash
+cafe team start [member…] --dir <roster dir> --dry-run   # plan; --force starts an unowned same-name member
+cafe team status                                         # roster, online, current Thread, warnings
+cafe team stop [member…]                                 # only supervised members; TUI sessions stay
+cafe ask --channel <name> "..."                          # post to a channel instead of your home channel
+cafe ask --collect all "..."                             # multicast: wait for every target or the deadline
+cafe ask --escalate --parent <orderId> --parent-thread <threadId> "..."  # ask the sender of the Order you are handling
+cafe channel list                                        # channels, Thread counts, teams
+cafe channel threads <name> [--after <ms>]               # one channel's Threads (observer catch-up)
+```
+
+- `to: <team>` reaches the team's orchestrator (or its online non-observer
+  members). A bare member name resolves inside your own team first.
+- A sub-Thread (`escalate`) is linked by `parentThreadId`; it never falls back
+  to routing or an implicit broadcast. Use `to:` to delegate, `broadcast: true`
+  to address the whole channel.
+- `collect: all` reports deadline silences as skipped (auditable), not declines;
+  `ThreadMeta.targetStates` names who is still silent.
+- An `observer: true` member is never routed to. It receives one channel digest
+  per interval (not one message per Order), can send fresh Orders, and should
+  run on the Root or the team's Host. A child digest is `partial` while the
+  Root is offline.
+- Channels are **not permissions**. The Web shows channel chips and a Teams page;
+  the composer always names its destination (`→ #channel`).
+
 ## Inspect / debug
 
 ```bash

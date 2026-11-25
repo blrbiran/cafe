@@ -1,6 +1,7 @@
 # v4-5 — Agent teams: orchestration semantics (#71, #72)
 
-Status: **decisions + eval fixtures only; no implementation this round.**
+Status: **superseded by `v4-11-agent-teams.md` (2026-11-25).** Kept for the
+original #72 decision record and the eval fixtures; implement from v4-11.
 Drafted 2026-11-23 from the dogfooding ledger entries #71/#72. The owner chose to
 record the decisions and add offline eval cases before touching routing or the
 wire, because every option here changes how Orders are delivered.

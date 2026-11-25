@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createHash, X509Certificate } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { ulid } from "ulid";
@@ -245,6 +245,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private local = new Map<string, AgentRecord>();
   /** v4-11 team rosters by `<host>/<team>`; the Root is authoritative and children replicate. */
   private teamRecords = new Map<string, TeamRecord>();
+  /** Rosters survive a daemon restart; the Root replays them on reconnect. */
+  private teamsFile: string;
 
   /** Root side: connected child Daemons by host. */
   private children = new Map<string, Peer>();
@@ -304,6 +306,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.hostAliases = [...opts.config.aliases];
     this.hostLegacyAliases = [...(opts.config.legacyAliases ?? [])];
     this.store = new Store(opts.home);
+    this.teamsFile = join(opts.home, "teams.json");
+    try {
+      for (const t of JSON.parse(readFileSync(this.teamsFile, "utf8")) as TeamRecord[]) this.teamRecords.set(`${t.host}/${t.team}`, t);
+    } catch {
+      // no saved rosters yet
+    }
     // Every SSE stream and Web UI attaches a "thread" listener; the default limit of 10 is far below
     // normal use (one tab per Thread, `cafe tail`, MCP) and the warning was hidden by --no-warnings (#70).
     this.setMaxListeners(0);
@@ -1048,6 +1056,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const current = this.teamRecords.get(key);
     if (current && (current.revision ?? 0) > (rec.revision ?? 0)) return;
     this.teamRecords.set(key, rec);
+    try {
+      const tmp = `${this.teamsFile}.tmp`;
+      writeFileSync(tmp, JSON.stringify([...this.teamRecords.values()], null, 2));
+      renameSync(tmp, this.teamsFile);
+    } catch (err) {
+      this.log(`cannot save teams.json: ${(err as Error).message}`);
+    }
     if (this.isRoot) for (const child of this.children.values()) if (child !== from) child.notify(Methods.teamUpsert, { team: rec });
   }
 

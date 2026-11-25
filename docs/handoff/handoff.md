@@ -128,8 +128,49 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - **An address pin is proven before it is saved (v4-10 #103).** `setHostAddress` probes first; a failed probe is not written to `config.yml` and never hides the address of a Host that is online. An offline Host may still pre-set one (it is never broadcast while unverified).
 - **`barista --tui` never guesses a session (v4-10 #100).** One session in the directory is used and named; several → list them and require `--thread <id>`; a session with a running turn is skipped when choosing between several.
 - **A grace skip is not a decline (v4-10 #101).** `order.declined` may carry `skipped: true`; it stays in the log for audit but is not booked in outcomes or `meta.declines`.
+- **A sub-order is a sub-Thread (v4-11).** `escalate: true` (with `parentOrderId`) creates a NEW Thread linked by `parentThreadId`; never a second open Order in the parent Thread (`ThreadMeta` is a one-Order aggregate). `parentOrderId` alone keeps its legacy provenance meaning and must not be re-read as escalation. Explicit `to:` bypasses the chain (bounded by `MAX_ORDER_DEPTH`); an escalation never falls back to the router or an implicit broadcast.
+- **Channels are scopes, not permissions (v4-11).** `eligible()` filters by `channels` and excludes observers; an explicit `to:` may cross channels. A registered agent's fresh Order defaults to its home channel (`channels[0]`). One `.cafe` = one team; rosters replicate to the Root with a revision and persist in `teams.json`.
+- **`collect: all` has no grace (v4-11).** Deadline silences are `order.declined {skipped: true, reason: "deadline"}`, never declines; `ThreadMeta.targetStates` is the display truth.
+- **Observers are never routed to (v4-11).** They receive one digest per interval per channel; a child digest is `partial` while the Root is offline. A digest wakes one turn, queued behind an in-flight Order.
 
 ## 5. Waiting on the user (start the next session here)
+
+### 2026-11-25 — v4-11 team/channel 全量落地（批次 A–E，已推送 main）
+
+- **一句话**：team/channel 从设计到实现全部完成（#71/#72）：显式 escalate 子 thread、channel 路由、`collect: all`、`.cafe` 名册、`cafe team`、observer digest、Web Teams 页；验证全绿并推送 origin main；**未发版**（建议 0.1.6）。
+- **设计**：`docs/specs/v4-11-agent-teams.md`（rev 2；经独立 subagent 两轮对抗审阅后改定）；实现计划 `docs/superpowers/plans/2026-11-25-agent-teams.md`。v4-5 已标 superseded。
+- **关键决定（与 v4-5 不同，勿悄悄推翻）**：
+  - 子单 = **新子 thread**（`parentThreadId` 关联），不是同一 thread 的并行 order；`ThreadMeta` 保持单 order 聚合。
+  - `escalate` 是显式字段；单独的 `parentOrderId` 仍是旧的 provenance，不被重新解释。
+  - channel 参与路由过滤；显式 `to:` 可跨 channel；已注册 agent 的新单默认 home channel（`channels[0]`）。
+  - `collect: all` 无 grace；deadline 的沉默 target 记 `skipped`（不算 decline），`ThreadMeta.targetStates` 可查。
+  - 一个 `.cafe` 一个 team；roster 经 `team/upsert` 汇总到 Root，持久化 `teams.json`；supervisor 每个 headless member 一个 worker、各自 cwd。
+  - observer 永不被路由；每 interval 一条 digest（Root 全网络、子机 `partial`）；digest 唤醒一个 turn（不是每条消息）。
+  - Web：Teams 页 + roster drawer；channel 是 Feed 的全局维度，URL 带 channel，store 按 channel 重置。
+- **实现批次（均已在 main）**：
+  - **A** 协议/daemon：`escalate`、sub-thread、`unknown_parent`/`not_a_target`/`parent_offline`、显式地址绕过 chain。
+  - **B** channel/duty/collect：AgentIdentity/Order/ThreadMeta `channel`、duty 路由信号、`collect: all`、`targetStates`、`threads.channel` 列、`?channel=` 过滤、CLI/MCP 参数。
+  - **C** 名册/托管：`TeamSpec`/`CafeDocument`、`loadAgentIdentity`/`teamDir`、supervisor `startTeam`/`stopTeam`（每 member cwd、日志含 roster hash）、`/api/teams`、`team/upsert`、`to: <team>`、`cafe team start/status/stop`、`/cafe-team`。
+  - **D** observer：`channel/digest`、`onDigest`、`/api/channels`、channel history `after` 游标、`cafe channel`、pi/Claude digest 处理。
+  - **E** Web：Teams 页/drawer、channel chips、composer 目的、per-channel store、channel 路由。
+- **验证**：`npm run typecheck`；`npm test` **两遍 641/641（120 文件）**；`routing:eval` **67/67**；`build:web` 56 modules；`test:release` 17/17；`test:claude-plugin` 5/5；本机 Root 已重启（0.1.5），`/api/teams`、`/api/channels`、Web `/` 均 200。
+- **行为变化（请审核）**：
+  1. 只有 `escalate: true` 才回上级；旧的 `parentOrderId` 行为不变。
+  2. 子单创建新 thread，不再加入父 thread；父 thread 的 replies/history/turn 不受影响。
+  3. channel 过滤路由；显式地址可跨 channel；team member 新单落 home channel。
+  4. `collect: all` 的 deadline 沉默记 `skipped`；`ThreadMeta.targetStates` 新增。
+  5. `.cafe` 新增 `team:` 块；成员进程用 `--team-dir`/`CAFE_TEAM_DIR`；同一 `.cafe` 一个 team。
+  6. supervisor 日志名含 member + roster hash；`team stop` 只停托管成员。
+  7. Web 默认 Feed 只显示当前 channel（默认 `default`）；旧客户端/旧 URL 不带 channel 仍看全部。
+- **诚实边界**：
+  - 混合版本没有 capability 拒绝：旧 daemon 会 strip `channel`/`escalate`，按旧语义处理；升级两端再用 team。
+  - 子机的 `/api/teams` 指标是本地视角；Root 在线时 Web 通常跑在 Root。observer 请放 Root 或 team 所在机。
+  - Codex bridge 没有 cafe 工具面，不能 escalate；pi/Claude/CLI/MCP 可以。
+  - TUI `/cafe-team` 只记录选择，**重启会话**才真正换身份（TUI context 无法隔离）。
+  - 子机在 Root 离线期间新建的 team，重连后不会自动重发；等成员重新注册或重启 daemon。
+  - `routing:eval` 的 3 条 blocked team case 已移除（escalate/collect all 由 daemon 测试覆盖），不是“悄悄跳过”。
+- **仍需你本人**：审核上面的行为变化；真机跑一次 team（`cafe team start` + TUI 成员）；发版（建议 0.1.6）；Discord 实测；ssh1 复核 #91；真机证书安装（你说先不做）。
+- **下一步候选**：#39 路由精度、#34 snapshot 分页、#33 虚拟列表、#18 只读 token、#27 升级通知、team dogfooding 反馈。
 
 ### 2026-11-25 — 台账第十三轮补充复核之后：三批（#98 #103 #105 / #99 #104 / #100 #101 #102）
 
@@ -1049,6 +1090,12 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - **`root/moved` payload**: `joinAddresses()` falls back to `127.0.0.1` when a machine has no routable IPv4; strip loopback from the payload when real addresses exist, or a remote child adopts an unusable candidate.
 - **`discoverTls` fallback (v4-10 #98)**: the implicit 4778 retry is for non-loopback hosts only — a typed `127.0.0.1:<port>` names one instance and 4778 may be an unrelated daemon (a test child enrolled the developer's real Root before this guard). It never speaks plaintext to 4778: only TLS.
 - **`webStale` compares content (v4-10 #105)**: never re-introduce mtime; a deterministic rebuild rewrites identical bytes and would nag for a restart that changes nothing.
+- **Sub-Threads, not parallel Orders (v4-11)**: `ThreadMeta` resets `replies`/`turn` on every new `order.created` and ignores non-current orders, so two open Orders in one Thread corrupt replies/history/SSE follow/cancel. An escalation creates a new Thread (`parentThreadId`) and inherits the parent channel; `thread_busy` stays per Thread. `escalate: true` is explicit — the pi extension used to set `parentOrderId` on every ask, which would otherwise redirect unrelated questions.
+- **Channel routing (v4-11)**: `eligible()` filters `!observer && channelsOf(r).includes(order.channel)`; explicit `to:` bypasses the filter and the chain (`tests/channel-routing.test.ts`). The `threads` table has a `channel` column with a `default` backfill; the FTS channel predicate must be applied before the limit, or a channel with matches is starved (review finding).
+- **Team supervisor (v4-11)**: team workers are keyed by `rosterDir` + `member`; `w.cwd` is the member dir while `w.spec.dir` stays the roster dir (so `save()` is one spec per roster). Log names include the member and a hash of the member dir and roster, otherwise two rosters with the same member/cwd interleave. `team stop` uses `stopTeam`, never bare `stop(dir)`.
+- **Digests (v4-11)**: assembled by the daemon the observer is registered on (Root = network view, child = `partial`). One per interval per channel; `digestId` lets the client drop replays. Never deliver an Order to an observer implicitly.
+- **`.cafe` team validation (v4-11)**: `team.channel` is sanitized from the team/`.cafe` name (dots → dashes); `default` is reserved; duplicate members and a member whose `channels` omit the team channel are parse errors. A member process in a sibling worktree has no `.cafe` upward: pass `--team-dir`/`CAFE_TEAM_DIR` (bridge/session-host now accept a roster-backed identity).
+- **Web channels (v4-11)**: channel is a route field (`#/?channel=`), a per-channel store (reset on switch), and a server filter on snapshot/threads/search. WS thread upserts for another channel must not enter the visible list; a late snapshot/older page from the previous channel is dropped by `snapshotSeq`. A channel with no Threads says so explicitly.
 - **The TLS port serves the Web UI too (v4-9)**: both listeners share `handleRequest`, so `https://<addr>:4778/` is the encrypted Web. Only list addresses the current leaf names (`sanCovers`) and never offer a CA from a Host with `tlsContext.network === false` (temporary CA). A token may cross origins only in a `#token=` fragment, never a query.
 - **Web token (#97)**: the daemon takes only `Authorization: Bearer` from non-loopback callers; the Web keeps the token in localStorage `cafe.token`. A plain `<a href>` cannot carry the header — downloads fetch with it when a token is set. Test against a LAN address, not 127.0.0.1 (loopback needs no token and hides the bug).
 - **Test helpers**: `startDaemon` sets `advertise: 127.0.0.1` unless the config overrides it (`advertise: undefined`); Node's `fetch` silently drops a hand-set `Host` header — use `node:http` for Host tests. Made-up IPs in tests come from 192.0.2.0/24 (a real VPN address broke a tester's run).
