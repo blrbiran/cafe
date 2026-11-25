@@ -594,7 +594,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.tlsEndpoints.set(plain, resolved);
       return resolved;
     } catch (err) {
-      throw new Error(`cannot find the TLS port of ${plain}: ${(err as Error).message}`);
+      // Keep the original error as `cause`: `describeFetchError` reads the code from it, and dropping
+      // it turned every TLS-port discovery failure back into "fetch failed" (#103).
+      throw new Error(`cannot find the TLS port of ${plain}: ${(err as Error).message}`, { cause: err });
     }
   }
 
@@ -1007,24 +1009,41 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!record && !host) throw new RpcError("bad_request", "host is required");
     if (url === null) {
       delete this.config.pinnedDaemons[host];
-    } else {
-      this.config.pinnedDaemons[host] = assertDaemonAddress(url).replace(/^ws:\/\//, "");
+      saveConfig(this.config, this.store.home);
+      const rec = this.daemonRecords.get(host);
+      // A cleared pin must fall back to the address the Root verified, not keep the stale pin (#75).
+      // A cleared pin goes back to what the child itself reports, then to the address the Root verified —
+      // never to an older remembered one (#75, #92).
+      if (rec) rec.url = this.reportedUrls.get(host) ?? this.verifiedAddress(host) ?? rec.url;
+      this.emitDaemons();
+      this.log(`cleared pinned address for ${host}`);
+      return this.daemons().find((d) => d.host === host) ?? record!;
     }
-    saveConfig(this.config, this.store.home);
-    const rec = this.daemonRecords.get(host);
-    // A cleared pin must fall back to the address the Root verified, not keep the stale pin (#75).
-    // A cleared pin goes back to what the child itself reports, then to the address the Root verified —
-    // never to an older remembered one (#75, #92).
-    if (rec) rec.url = url === null ? (this.reportedUrls.get(host) ?? this.verifiedAddress(host) ?? rec.url) : this.pinnedAddress(host)!;
-    this.emitDaemons();
-    this.log(url === null ? `cleared pinned address for ${host}` : `pinned ${host} -> ${this.config.pinnedDaemons[host]}`);
+    const pin = assertDaemonAddress(url).replace(/^ws:\/\//, "");
     // Prove the new address before it reaches the children: a hand-typed Docker address is as useless
-    // to them as a self-reported one (#75).
-    // The probe result goes back to the caller, so "saved" is never shown for an address the Root
-    // just failed to reach (#83).
-    const probe = url !== null ? await this.rememberChildUrl(host, this.pinnedAddress(host)!) : undefined;
+    // to them as a self-reported one (#75). The probe goes first, so "saved" is never shown for an
+    // address the Root just failed to reach (#83), and a failed probe never overwrites the address a
+    // Host that is online right now is reachable at (#103).
+    const probe = await this.rememberChildUrl(host, pin);
+    const online = this.children.has(host);
+    if (probe.verified) {
+      this.config.pinnedDaemons[host] = pin;
+      saveConfig(this.config, this.store.home);
+      const rec = this.daemonRecords.get(host);
+      if (rec) rec.url = this.pinnedAddress(host)!;
+      this.emitDaemons();
+      this.log(`pinned ${host} -> ${pin}`);
+    } else if (!online) {
+      // The Host is away: remember where to look for it when it comes back. It stays unverified, so
+      // it is never broadcast and never hides a reachable address (see `daemons()`).
+      this.config.pinnedDaemons[host] = pin;
+      saveConfig(this.config, this.store.home);
+      this.log(`saved unverified address for ${host} -> ${pin} (not reachable from the Root)`);
+    } else {
+      this.log(`not saving ${host} address ${pin}: not reachable from the Root; keeping ${record?.url ?? "its current address"}`);
+    }
     const result = this.daemons().find((d) => d.host === host) ?? record!;
-    return probe ? { ...result, ...probe } : result;
+    return { ...result, ...probe };
   }
 
   /** Root: the internal id for a Host name — id, display name, alias or legacy alias, of a live or remembered Host. */
@@ -2929,10 +2948,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       self.aliases = this.hostAliases;
     }
     // A hand-set address wins over what the Host reports about itself (#75): a child behind Docker
-    // only knows an address nobody else can reach.
+    // only knows an address nobody else can reach. It only wins once the Root has proven it reachable
+    // though — an unverified pin must not hide the address an online Host is reachable at (#103).
     for (const [host, addr] of Object.entries(this.config.pinnedDaemons)) {
       const rec = this.daemonRecords.get(host);
-      if (rec && addr) rec.url = this.pinnedAddress(host)!;
+      if (!rec || !addr) continue;
+      const pin = this.pinnedAddress(host)!;
+      if (rec.online && this.verifiedAddress(host) !== pin) continue;
+      rec.url = pin;
     }
     return [...this.daemonRecords.values()];
   }

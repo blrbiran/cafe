@@ -140,15 +140,26 @@ function getJson(mod: typeof httpRequest | typeof request, addr: string, path: s
   });
 }
 
+/** A loopback address names one specific instance, not "the Root on that machine": never probe a default port there. */
+function loopbackHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "::1" || /^127\.\d+\.\d+\.\d+$/.test(h);
+}
+
 /**
  * What a Daemon at `addr` says about its TLS endpoint (v4-6 §10.3): its public CA and the port its TLS
  * listener is on. `addr` is normally the address people type — the main (plaintext) port — so this asks
  * over plaintext first; the answer carries nothing secret, the CA is checked against the pinned
  * fingerprint by the caller, and the TLS port is only ever dialled with that CA. An `addr` that already
  * names the TLS port (configs written before §10.3) answers over HTTPS instead.
+ *
+ * A container may publish only the TLS port (#98): when the plaintext port refuses, the same host is
+ * also asked over HTTPS on each of `fallbackPorts` (the default TLS port) before giving up. Explicit
+ * `fallbackPorts` are always tried; the implicit default is skipped for loopback, where a port names
+ * one instance and 4778 would be an unrelated Daemon.
  */
-export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?: number } = {}): Promise<{ ca?: string; fingerprint256?: string; tlsPort: number }> {
-  const { port } = splitAddr(addr);
+export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?: number; fallbackPorts?: number[] } = {}): Promise<{ ca?: string; fingerprint256?: string; tlsPort: number }> {
+  const { host, port } = splitAddr(addr);
   let first: Error | undefined;
   try {
     const r = await getJson(httpRequest, addr, "/api/tls", { timeoutMs: opts.timeoutMs });
@@ -156,17 +167,33 @@ export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?:
     first = new Error(`HTTP ${r.status}`);
   } catch (err) {
     first = err as Error;
-    // Nothing listens there, or the name does not resolve: HTTPS on the same port will not help.
-    if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|timed out/.test(`${(err as any).code ?? ""} ${first.message}`)) throw first;
+    // Nothing can answer on this address at all: another port cannot fix a name that does not resolve
+    // or a route that does not exist.
+    if (/ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|timed out/.test(`${(err as any).code ?? ""} ${first.message}`)) throw first;
   }
+  // Over TLS on the address itself: a config written before §10.3 names the TLS port directly.
+  // Verify with the network CA when we have it; enrolment (no CA yet) relies on the fingerprint check.
+  const viaTls = async (target: string, hint?: number) => {
+    const r = await getJson(request, target, "/api/tls", { ...(opts.ca ? { ca: opts.ca } : { insecure: true }), timeoutMs: opts.timeoutMs });
+    if (r.status !== 200) throw new Error(`HTTP ${r.status} over TLS at ${target}`);
+    return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, tlsPort: r.body.tlsPort ?? hint ?? DEFAULT_TLS_PORT };
+  };
   try {
-    // Verify with the network CA when we have it; enrolment (no CA yet) relies on the fingerprint check.
-    const r = await getJson(request, addr, "/api/tls", { ...(opts.ca ? { ca: opts.ca } : { insecure: true }), timeoutMs: opts.timeoutMs });
-    if (r.status === 200) return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, tlsPort: r.body.tlsPort ?? port ?? DEFAULT_TLS_PORT };
-    throw new Error(`HTTP ${r.status}`);
+    return await viaTls(addr, port);
   } catch {
-    throw first;
+    // Fall through to the default TLS port.
   }
+  const candidates = opts.fallbackPorts ?? (loopbackHost(host) ? [] : [DEFAULT_TLS_PORT]);
+  const fallbacks = candidates.filter((p) => p !== port);
+  for (const p of fallbacks) {
+    try {
+      return await viaTls(joinAddr(host, p), p);
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  if (fallbacks.length) throw new Error(`${first.message}; also tried ${fallbacks.map((p) => joinAddr(host, p)).join(", ")} over TLS: nothing answered`, { cause: first });
+  throw first;
 }
 
 /** `host:tlsPort` for the Daemon at `addr` (its main or its TLS address). */

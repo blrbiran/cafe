@@ -305,18 +305,24 @@ export interface TlsServerOptions {
 export function startServer(daemon: Daemon, opts: { port: number; bind?: string; webDist?: string; tlsPort?: number; tls?: TlsServerOptions }): Promise<ServerHandle> {
   const webDir = opts.webDist ?? defaultWebDist();
   const statics = loadStatic(webDir);
-  // The UI is read into memory at start; remember which build that was so the
-  // page can say "restart the daemon" instead of silently serving old HTML/JS.
-  const stampOf = () => {
+  // The UI is read into memory at start; remember which build that was so the page can say
+  // "restart the daemon" instead of silently serving old HTML/JS. Compare *content*, not mtime:
+  // `build:web` is deterministic, so an unchanged rebuild rewrites the same bytes with a new mtime
+  // and used to insist on a restart that changed nothing (#105).
+  const indexHtml = join(webDir, "index.html");
+  const digestOf = () => {
     try {
-      const s = statSync(join(webDir, "index.html"));
-      return `${s.mtimeMs}:${s.size}`;
+      return `"${createHash("sha1").update(readFileSync(indexHtml)).digest("hex").slice(0, 16)}"`;
     } catch {
       return undefined;
     }
   };
-  const loadedStamp = stampOf();
-  const webStale = () => !!loadedStamp && stampOf() !== undefined && stampOf() !== loadedStamp;
+  const loadedStamp = statics.get("index.html")?.etag ?? digestOf();
+  const webStale = () => {
+    if (!loadedStamp) return false;
+    const current = digestOf();
+    return current !== undefined && current !== loadedStamp;
+  };
   const wss = new WebSocketServer({ noServer: true });
   // A short ring of recent events, so an SSE client that reconnects with
   // Last-Event-ID resumes where it stopped instead of losing the gap.

@@ -74,8 +74,10 @@ describe("host address overrides (#75)", () => {
     await waitFor(() => root.daemon.daemons().some((d) => d.host === "pc1"));
     await waitFor(() => root.daemon.config.knownDaemons.pc1 === `ws://${child.addr}`);
 
-    await post(root.addr, "/api/hosts/address", { host: "pc1", url: "10.255.255.1:4777" });
-    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe("ws://10.255.255.1:4777");
+    // A pin that proves reachable is kept and shown.
+    const pinned = await post(root.addr, "/api/hosts/address", { host: "pc1", url: child.addr });
+    expect(pinned.body).toMatchObject({ verified: true });
+    expect(root.daemon.config.pinnedDaemons?.pc1).toBe(child.addr);
 
     // Clearing must fall back to the address the Root actually verified, not keep the old pin.
     const cleared = await post(root.addr, "/api/hosts/address", { host: "pc1", url: null });
@@ -95,17 +97,20 @@ describe("host address overrides (#75)", () => {
     await waitFor(() => other.daemon.rootOnline);
     await waitFor(() => other.daemon.peerUrlFor("pc1") === `ws://${child.addr}`);
 
-    // A person can still pin this address (the UI keeps it), but it was never proven reachable
-    // from the Root, so broadcasting it would break the children's direct links again (#75).
-    await post(root.addr, "/api/hosts/address", { host: "pc1", url: "10.255.255.1:4777" });
+    // An address the Root cannot reach must not be saved for an online Host (and never broadcast):
+    // saving it would hide the address that currently works (#103).
+    const refused = await post(root.addr, "/api/hosts/address", { host: "pc1", url: "10.255.255.1:4777" });
+    expect(refused.body).toMatchObject({ verified: false });
     await new Promise((r) => setTimeout(r, 600));
-    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe("ws://10.255.255.1:4777");
+    expect(root.daemon.config.pinnedDaemons?.pc1).toBeUndefined();
+    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe(`ws://${child.addr}`);
     expect(other.daemon.peerUrlFor("pc1")).toBe(`ws://${child.addr}`);
   });
 });
 // #83: saving an unreachable address said "Address saved" and Test said only "fetch failed".
-describe("host address diagnostics (#83)", () => {
-  it("reports a pin that the Root cannot reach, with the reason", async () => {
+// #103: and it persisted over the address of a Host that was online at the time.
+describe("host address diagnostics (#83, #103)", () => {
+  it("reports a pin that the Root cannot reach, with the reason, and does not save it", async () => {
     const { createServer } = await import("node:net");
     const s = createServer();
     await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
@@ -122,11 +127,14 @@ describe("host address diagnostics (#83)", () => {
     expect(saved.status).toBe(200);
     expect(saved.body).toMatchObject({ host: "pc1", verified: false, code: "ECONNREFUSED" });
     expect(saved.body.error).toContain("ECONNREFUSED");
+    // The online Host keeps the address that works (#103).
+    expect(saved.body.url).toBe(`ws://${child.addr}`);
+    expect(root.daemon.config.pinnedDaemons?.pc1).toBeUndefined();
+    expect(root.daemon.daemons().find((d) => d.host === "pc1")?.url).toBe(`ws://${child.addr}`);
 
     const tested = await post(root.addr, "/api/hosts/test", { host: "pc1" });
-    // pc1's uplink is up, so it is online; the answer still names the pinned address that failed (#92).
-    expect(tested.body).toMatchObject({ online: true, via: "uplink", address: dead, code: "ECONNREFUSED" });
-    expect(tested.body.error).not.toBe("fetch failed");
+    expect(tested.body).toMatchObject({ online: true, via: "direct", address: child.addr });
+    expect(tested.body.error).toBeUndefined();
 
     const good = await post(root.addr, "/api/hosts/address", { host: "pc1", url: child.addr });
     expect(good.body).toMatchObject({ verified: true });

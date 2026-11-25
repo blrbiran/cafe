@@ -17,16 +17,21 @@ const TLS_CODE = /^(CERT_|ERR_TLS_|ERR_SSL_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|
 
 function causeOf(err: unknown): { code?: string; message?: string; name?: string } | undefined {
   let e = err as any;
+  // The deepest error is the interesting one when none of them carries a code: undici puts
+  // "bad port" in `cause.message` and leaves `code` undefined (#98).
+  let deepest: { code?: string; message?: string; name?: string } | undefined;
   for (let i = 0; i < 4 && e; i++) {
     if (e.name === "TimeoutError" || e.name === "AbortError") return { code: "ETIMEDOUT", name: e.name };
     if (typeof e.code === "string") return e;
     if (Array.isArray(e.errors) && e.errors.length) {
       const coded = e.errors.find((x: any) => typeof x?.code === "string");
       if (coded) return coded;
+      if (!deepest && e.errors[0]?.message) deepest = e.errors[0];
     }
+    if (typeof e.message === "string" && e.message) deepest = e;
     e = e.cause;
   }
-  return undefined;
+  return deepest;
 }
 
 export function describeFetchError(err: unknown, target: string): FetchFailure {
@@ -53,5 +58,9 @@ export function describeFetchError(err: unknown, target: string): FetchFailure {
     return { code, error: `TLS certificate rejected (${code}) for ${target}: ${cause?.message ?? "verification failed"}` };
   }
   if (code) return { code, error: `${cause?.message ?? (err as Error)?.message ?? "request failed"} (${code})` };
-  return { error: (err as Error)?.message ?? String(err) };
+  // No code anywhere: keep undici's own reason (`bad port`, `other side closed`) instead of only
+  // the useless top-level "fetch failed" (#98).
+  const top = (err as Error)?.message ?? String(err);
+  const detail = cause?.message && cause.message !== top ? `${cause.message} (${target})` : top;
+  return { error: detail };
 }

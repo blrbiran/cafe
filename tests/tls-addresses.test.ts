@@ -66,4 +66,60 @@ describe("Daemon addresses on a TLS network (#92)", () => {
     expect(r.error).toBeTruthy();
     expect(r.address).toMatch(/10\.255\.255\.1/);
   }, 40_000);
+
+  // #103: `resolveDaemonUrl` wrapped the discovery failure in a plain Error without a `cause`, so the
+  // reason (and its code) was lost and the Web showed the raw English sentence. The bare `host:port`
+  // form is the only one a person can type, so this was the main path.
+  it("keeps the failure code for a bare host:port that cannot be resolved (#103)", async () => {
+    const { root } = await network();
+    const { createServer } = await import("node:net");
+    const s = createServer();
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    const closed = `127.0.0.1:${(s.address() as any).port}`;
+    await new Promise((r) => s.close(r));
+
+    const r = await root.daemon.setHostAddress("c1", closed);
+    expect(r.verified).toBe(false);
+    expect(r.code).toBeTruthy();
+    expect(r.error ?? "").not.toBe("fetch failed");
+  }, 40_000);
+});
+
+// #98: a container that publishes only its TLS port answers nothing on the plain port. Discovery used
+// to give up on ECONNREFUSED and never try the default TLS port.
+describe("TLS port discovery (#98)", () => {
+  it("finds a Host that only publishes its TLS port", async () => {
+    const d = await startDaemon("tls-only", { config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(d.stop);
+    const { createServer } = await import("node:net");
+    const s = createServer();
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    const closed = (s.address() as any).port as number;
+    await new Promise((r) => s.close(r));
+
+    const { discoverTls } = await import("../packages/daemon/src/tls/bootstrap.ts");
+    const found = await discoverTls(`127.0.0.1:${closed}`, { fallbackPorts: [d.server.tlsPort!] });
+    expect(found.tlsPort).toBe(d.server.tlsPort);
+  }, 30_000);
+
+  it("names both ports when neither answers", async () => {
+    const { createServer } = await import("node:net");
+    const s = createServer();
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    const closed = (s.address() as any).port as number;
+    await new Promise((r) => s.close(r));
+    const other = createServer();
+    await new Promise<void>((r) => other.listen(0, "127.0.0.1", r));
+    const fallback = (other.address() as any).port as number;
+    await new Promise((r) => other.close(r));
+
+    const { discoverTls } = await import("../packages/daemon/src/tls/bootstrap.ts");
+    const err = await discoverTls(`127.0.0.1:${closed}`, { fallbackPorts: [fallback] }).then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(err).toBeDefined();
+    expect(String(err)).toContain(String(closed));
+    expect(String(err)).toContain(String(fallback));
+  }, 30_000);
 });

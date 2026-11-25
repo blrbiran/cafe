@@ -177,7 +177,7 @@ const zh = {
   hostAddressSaved: "地址已保存",
   hostAddressUnverified: (why: string) => `地址已保存，但中心节点现在连不上它：${why}。其他机器继续使用上一个能连上的地址。`,
   hostReasons: {
-    ECONNREFUSED: "这个地址上没有 cafe 在监听。如果那台机器跑在 Docker 里，请填容器能被访问到的地址，或先在宿主机上发布端口",
+    ECONNREFUSED: "这个地址上没有 cafe 在监听。如果那台机器在 Docker 里，请填容器能被访问到的地址并发布端口；它也可能只发布了加密端口（4778）",
     ENOTFOUND: "找不到这个主机名，请检查拼写或改用 IP 地址",
     ETIMEDOUT: "连接超时：地址可能不对，或被防火墙拦住了",
     EHOSTUNREACH: "这台机器到不了那个网络",
@@ -580,7 +580,7 @@ const en: Dict = {
   hostAddressSaved: "Address saved",
   hostAddressUnverified: (why: string) => `Address saved, but the hub cannot reach it right now: ${why}. Other machines keep using the last address that worked.`,
   hostReasons: {
-    ECONNREFUSED: "Nothing is listening for cafe at this address. If that machine runs in Docker, use an address the container can be reached at, or publish the port on the host",
+    ECONNREFUSED: "Nothing is listening for cafe at this address. If that machine runs in Docker, use an address the container can be reached at, and publish the port; it may also publish only its encrypted port (4778)",
     ENOTFOUND: "This host name does not resolve; check the spelling or use an IP address",
     ETIMEDOUT: "Timed out: the address may be wrong, or a firewall is blocking it",
     EHOSTUNREACH: "This machine cannot reach that network",

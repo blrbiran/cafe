@@ -61,4 +61,20 @@ describe("describeFetchError (#83)", () => {
   it("falls back to the message for anything else", () => {
     expect(describeFetchError(new Error("boom"), "x:1")).toEqual({ error: "boom" });
   });
+
+  // #98: undici refuses some ports itself (`bad port`) with no code, and the fallback branch dropped
+  // the one thing that explained it — `cause.message`.
+  it("keeps undici's reason when it has no code (bad port)", async () => {
+    const d = describeFetchError(await failure("http://127.0.0.1:9/api/health"), "127.0.0.1:9");
+    expect(d.error).toContain("bad port");
+    expect(d.error).not.toBe("fetch failed");
+  });
+
+  it("reads a cause wrapped by our own error (#103)", () => {
+    const inner = Object.assign(new Error("connect ECONNREFUSED 10.0.0.9:4777"), { code: "ECONNREFUSED" });
+    const wrapped = new Error("cannot find the TLS port of 10.0.0.9:4777: connect ECONNREFUSED 10.0.0.9:4777", { cause: inner });
+    const d = describeFetchError(wrapped, "10.0.0.9:4777");
+    expect(d.code).toBe("ECONNREFUSED");
+    expect(d.error).toContain("ECONNREFUSED");
+  });
 });

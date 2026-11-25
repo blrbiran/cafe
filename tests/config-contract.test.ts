@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -103,5 +103,23 @@ describe("web build freshness", () => {
     expect((await snap()).webStale).toBeUndefined();
     writeFileSync(join(dist, "index.html"), "v2-rebuilt");
     expect((await snap()).webStale).toBe(true);
+  });
+
+  // #105: the check compared mtime+size, so `npm run build:web` (same bytes, new mtime) told the person
+  // to restart a daemon that was already serving exactly that build. A restart is a real outage window.
+  it("does not call a rebuild stale when the bytes are identical", async () => {
+    const dist = mkdtempSync(join(tmpdir(), "cafe-web-same-"));
+    writeFileSync(join(dist, "index.html"), "v1-same-bytes");
+    const d = await startDaemon("pc1", { webDist: dist });
+    cleanup.push(d.stop, () => rmSync(dist, { recursive: true, force: true }));
+
+    const snap = async () => (await (await fetch(`http://${d.addr}/api/snapshot`)).json()) as { webStale?: boolean };
+    expect((await snap()).webStale).toBeUndefined();
+
+    // Rewrite the same bytes and push the mtime forward, the way an unchanged rebuild does.
+    writeFileSync(join(dist, "index.html"), "v1-same-bytes");
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(dist, "index.html"), later, later);
+    expect((await snap()).webStale).toBeUndefined();
   });
 });
