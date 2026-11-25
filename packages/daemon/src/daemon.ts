@@ -734,6 +734,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (p.host) this.refusedPlaintext.delete(p.host);
       }
       peer.meta.kind = p.kind;
+      // Bind the agent RPC surface only after a successful handshake (token + protocol). Binding it
+      // on accept let any network socket that could open /ws create Orders or register a Barista
+      // before initialize (v4-11 review).
+      this.bindAgentMethods(peer);
       // Both directions check: an idle accepted link whose peer died looks exactly like a healthy one.
       if (p.kind === "daemon" || p.kind === "peer") this.watchLink(ws);
       if (p.kind === "daemon") return this.onChildDaemon(peer, p);
@@ -746,7 +750,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (p.kind === "ui") this.uis.add(peer);
       return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
     });
-    this.bindAgentMethods(peer);
   }
 
   /** Why a connection from another cafe release was refused, with the fix. */
@@ -1085,7 +1088,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const m of previous) if (!members.some((x) => x.name === m.name)) members.push(m);
     const name = rec.member ?? rec.name;
     if (!members.some((m) => m.name === name)) {
-      members.push({ name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels });
+      members.push({ name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels, observer: rec.observer });
     }
     const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision: Date.now() };
     this.storeTeam(team);
@@ -1596,10 +1599,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       throw new RpcError("unknown_parent", `parent order ${p.parentOrderId} is not in thread ${p.parentThreadId}`);
     }
     // Only a Barista that actually received the parent Order may escalate it: an Order id alone
-    // must not be a routing bypass for any caller (v4-11 review).
+    // must not be a routing bypass for any caller (v4-11 review). Ask the parent Order's own target
+    // map, not the Thread's: ThreadMeta.targets accumulates across turns, so an agent targeted on a
+    // later turn would otherwise be accepted as the recipient of an earlier one.
     if (p.escalate && peer?.meta.agentId) {
-      const parentMeta = this.metas.get(parent!.threadId) ?? this.store.getThread(parent!.threadId);
-      if (!parentMeta?.targets.includes(peer.meta.agentId)) {
+      const delivery = this.tracking.get(parent!.orderId)?.targets.get(peer.meta.agentId);
+      if (!delivery || delivery === "failed") {
         throw new RpcError("not_a_target", "escalate: only a Barista that received the parent Order may escalate it");
       }
     }
@@ -1823,12 +1828,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private explicitDecision(order: Order): RoutingDecision {
     const ids = this.explicitTargets(order);
     if (ids.length) {
+      if (ids.length === 1) {
+        return { targets: ids, mode: "unicast", reason: `explicit address ${order.to}`, router: "explicit", candidates: [] };
+      }
+      // A bare name can match namesakes on several Hosts. The sender's own Host is the intended
+      // team; never multicast an internal message to another Host's agent on a guess.
+      const local = ids.filter((id) => this.registry.get(id)?.host === order.from.host);
+      if (local.length === 1) {
+        return { targets: local, mode: "unicast", reason: `explicit address ${order.to} on ${order.from.host}`, router: "explicit", candidates: [] };
+      }
       return {
-        targets: ids,
-        mode: ids.length === 1 ? "unicast" : "multicast",
-        reason: `explicit address ${order.to}`,
+        targets: [],
+        mode: "multicast",
+        reason: `explicit address ${order.to} matches ${ids.length} agents on different Hosts; use name@host`,
         router: "explicit",
         candidates: [],
+        failure: "ambiguous_address",
       };
     }
     // Not an Agent: `to: <team>` (optionally `team@host`) resolves to its orchestrator or members.

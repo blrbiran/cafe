@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { ulid } from "ulid";
 import { WebSocketServer } from "ws";
 import { CreateOrderParams, Methods, TeamSpec, type ThreadEnvelope } from "@cafe/protocol";
-import { loadTeamMember } from "@cafe/protocol/cafe-file";
+import { loadTeamMember, readCafeFile } from "@cafe/protocol/cafe-file";
 import { RpcError } from "@cafe/protocol/peer";
 import type { Daemon } from "./daemon.ts";
 import { homeId, loadConfig, saveConfig } from "./config.ts";
@@ -843,10 +843,26 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       if (extra.length) throw new RpcError("bad_request", `unknown field(s): ${extra.join(", ")}; cafe only starts its own agents (pi, omp, codex, claude)`);
       const { dir, agent, access, model, tui, thread, member, teamDir, team } = body;
       if (body.team !== undefined) {
-        // A full roster from `cafe team start`: the roster directory is the spec key.
+        // A full roster from `cafe team start`. The body only selects member NAMES: the roster on
+        // disk is authoritative for the channel, agent and bin, so a network caller cannot choose
+        // which executable this Host runs (#65; v4-11 review).
         if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
         if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
-        return send(res, 200, sup.startTeam(resolve(dir), TeamSpec.parse(team)));
+        const rosterDir = resolve(dir);
+        const file = join(rosterDir, ".cafe");
+        let doc;
+        try {
+          doc = readCafeFile(file);
+        } catch (err) {
+          throw new RpcError("bad_request", (err as Error).message);
+        }
+        if (!doc.team) throw new RpcError("bad_request", `${file} has no team block`);
+        const selection = TeamSpec.parse(team);
+        const names = selection.members.map((m) => m.name);
+        const known = doc.team.members.map((m) => m.name);
+        const unknown = names.filter((n) => !known.includes(n));
+        if (unknown.length) throw new RpcError("bad_request", `unknown member(s): ${unknown.join(", ")}; roster: ${known.join(", ")}`);
+        return send(res, 200, sup.startTeam(rosterDir, { ...doc.team, members: doc.team.members.filter((m) => names.includes(m.name)) }));
       }
       if (member !== undefined) {
         if (typeof member !== "string" || !member) throw new RpcError("bad_request", "member must be a roster name");
