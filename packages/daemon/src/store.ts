@@ -267,6 +267,24 @@ export class Store {
     return newestFirst.reverse();
   }
 
+  /**
+   * Events strictly after `after` (an eventId), oldest first, read backwards until the cursor (#31: an
+   * SSE client resuming from a cursor older than the default page must get every later event).
+   * `found: false` when the cursor is not in the file, or more than `max` events follow it — the caller
+   * reports a gap rather than silently sending a partial replay.
+   */
+  readEventsAfter(file: string, after: string, max: number): { events: ThreadEnvelope[]; found: boolean } {
+    const newestFirst: ThreadEnvelope[] = [];
+    let found = false;
+    this.scanBackward(file, (env) => {
+      if (env.eventId === after) return (found = true);
+      if (newestFirst.length === max) return true;
+      newestFirst.push(env);
+      return false;
+    });
+    return found ? { events: newestFirst.reverse(), found } : { events: [], found };
+  }
+
   /** The newest event matching `match`, read from the end; stops at the first hit (#31). */
   findLastEvent(file: string, match: (env: ThreadEnvelope) => boolean): ThreadEnvelope | undefined {
     let hit: ThreadEnvelope | undefined;

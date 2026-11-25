@@ -178,12 +178,20 @@ function Highlight({ text, q }: { text: string; q: string }) {
   return <>{parts}</>;
 }
 
+/** The only part of an in-progress card that changes every second (#33). */
+function ElapsedText({ since }: { since: number }) {
+  const t = useT();
+  const now = useNow(1_000);
+  return <>{t.dur(now - since)}</>;
+}
+
 function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) {
   const t = useT();
   const agents = useStore((s) => s.agents);
   const live = useStore((s) => s.live[meta.threadId]);
   const bucket = bucketOf(meta);
-  const now = useNow(bucket === "active" ? 1_000 : 30_000);
+  // "3 min ago" only; an in-progress card's elapsed time ticks in <ElapsedText>.
+  const now = useNow(30_000);
   const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter });
 
   // In-progress cards show "why this agent", which needs the routing decision: fetch it lazily.
@@ -198,7 +206,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
   const timing =
     bucket === "active"
       ? started
-        ? t.dur(now - started)
+        ? <ElapsedText since={started} />
         : undefined
       : bucket === "answered" && started && end
         ? t.dur(end - started)

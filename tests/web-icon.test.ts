@@ -39,5 +39,16 @@ describe("web tab icon (#74)", () => {
     expect(attrs).toMatch(/\bheight="24"/);
     expect(attrs).toMatch(/fill="(#fff|#ffffff|white)"/i);
     expect(attrs).not.toMatch(/opacity/);
+    // Rounded corners leave the four corners transparent at 16 px (the tester measured alpha 0), so
+    // the plate is square: no rx/ry, or 0 (#84, owner decision Q123).
+    expect(attrs).not.toMatch(/\br[xy]="(?!0")[^"]*"/);
+    expect(attrs).toMatch(/\bx="0"/);
+    expect(attrs).toMatch(/\by="0"/);
+  });
+
+  it("ships the same icon in the build output", () => {
+    const dist = join(repo, "packages/web/dist/icon.svg");
+    if (!existsSync(dist)) return; // not built in this checkout
+    expect(readFileSync(dist, "utf8")).toBe(readFileSync(join(repo, "packages/web/public/icon.svg"), "utf8"));
   });
 });

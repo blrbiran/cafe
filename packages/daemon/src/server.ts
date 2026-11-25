@@ -815,6 +815,9 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   send(res, 404, { error: "not_found" });
 }
 
+/** The most events an SSE `after=` resume replays; beyond that the client is told about a gap (#31). */
+const SSE_AFTER_MAX = 5_000;
+
 /** SSE: replay the Thread so far, then follow live events until it closes. */
 function stream(daemon: Daemon, threadId: string, orderId: string | undefined, req: IncomingMessage, res: ServerResponse): void {
   const thread = daemon.thread(threadId);
@@ -861,10 +864,18 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   ping = setInterval(() => {
     if (!finished && !res.writableEnded && !res.destroyed) res.write(": ping\n\n");
   }, pingMs);
+  // Resume from a cursor by reading after it, not by slicing the default page: a cursor older than the
+  // page would otherwise replay the page and drop everything between the cursor and the page (#31).
+  // A cursor the Thread does not have (or one with more than SSE_AFTER_MAX events behind it) is
+  // announced as a named `gap` event, then the page is replayed for context.
   const after = new URL(req.url ?? "/", "http://x").searchParams.get("after");
-  const replay = thread.events;
-  const from = after ? replay.findIndex((e) => e.eventId === after) + 1 : 0;
-  for (const env of replay.slice(Math.max(0, from))) onEvent(env);
+  let replay = thread.events;
+  if (after) {
+    const r = daemon.store.readEventsAfter(thread.meta.file, after, SSE_AFTER_MAX);
+    if (r.found) replay = r.events;
+    else if (!finished) res.write(`event: gap\ndata: ${JSON.stringify({ after, reason: "unknown_cursor" })}\n\n`);
+  }
+  for (const env of replay) onEvent(env);
   // The page above is bounded: when the turn being followed closed before that page starts, its
   // `order.closed` is missing and the stream would keep the caller waiting forever (#31/#60). A replay
   // that did include the close has already finished the stream here.

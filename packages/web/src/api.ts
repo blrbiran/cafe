@@ -1,4 +1,5 @@
 import type { AgentRecord, Attachment, ConnectorStatusRow, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import type { JoinHint } from "./join.ts";
 
 export interface Snapshot {
   host: string;
@@ -157,7 +158,7 @@ export const api = {
     call<BaristaInfo[]>("POST", "/api/baristas", p),
   stopBarista: (dir: string) => call<{ stopped: boolean }>("DELETE", `/api/baristas?dir=${encodeURIComponent(dir)}`),
   /** Root and a masked token for the Settings panel; never the full secret. */
-  settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: { address: string; caFingerprint?: string } }>("GET", "/api/settings"),
+  settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: JoinHint }>("GET", "/api/settings"),
   /** What the daemon is running plus config.yml changes it has not applied yet. */
   config: () => call<RuntimeConfig>("GET", "/api/config"),
   saveConfig: (p: { advertise?: string | null; retentionDays?: number | null }) =>

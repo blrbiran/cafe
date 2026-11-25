@@ -37,7 +37,7 @@ cafe 已经能通过 HTTP、SSE、WebSocket、MCP 和 `cafe` CLI 接入 Customer
 ## 当前可复用的接入面
 
 - `POST /api/orders`：创建 Order（JSON）。
-- `GET /api/threads/:id/stream`（SSE）：跟一条 Thread，支持 `Last-Event-ID`。
+- `GET /api/threads/:id/stream`（SSE）：跟一条 Thread。续放用 `?after=<eventId>`：从该事件之后读起（不受默认 200 条页的限制，最多 5000 条）；Thread 里没有这个游标（或其后超过 5000 条）时先发一条命名事件 `event: gap`（`data: {"after","reason":"unknown_cursor"}`），再重放最近一页。传 `after` 的客户端要跳过带 `event:` 的块（#31）。
 - `GET /api/events`（SSE）：全局事件流，支持过滤和 `Last-Event-ID`；`GET /api/events/history?after=` 可补放。
 - `/ws`：Web UI 用的 WebSocket；connector 可以只用 HTTP/SSE。
 - `cafe mcp`：MCP stdio server（`cafe_agents` / `cafe_ask` / `cafe_wait` / `cafe_cancel`）。

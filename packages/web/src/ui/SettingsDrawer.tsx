@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type BaristaInfo, type DoctorCheck, type RuntimeConfig } from "../api.ts";
 import { agentAddress, agentLabel, removableAgentAliases, removableHostAliases } from "../display.ts";
 import { useT } from "../i18n.ts";
+import { joinCommands } from "../join.ts";
 import { refreshStore, useStore } from "../store.ts";
 import { Pill } from "./bits.tsx";
 
@@ -29,7 +30,7 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [agentKind, setAgentKind] = useState("pi");
   const [write, setWrite] = useState(false);
   const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: { address: string; caFingerprint?: string } }>();
-  const [joinCopied, setJoinCopied] = useState(false);
+  const [joinCopied, setJoinCopied] = useState<string | null>(null);
   const [rt, setRt] = useState<RuntimeConfig>();
   const [advertise, setAdvertise] = useState("");
   const [retention, setRetention] = useState("");
@@ -540,22 +541,28 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
             <h3 className="m-0 text-sm font-semibold text-fg-strong">{t.settingsJoinTitle}</h3>
             <p className="mt-1 mb-2 text-xs text-muted">{t.settingsJoinDesc}</p>
             {(() => {
-              const cmd = `cafe connect ${conn.join.address} --token <token>${conn.join.caFingerprint ? ` --ca-fingerprint ${conn.join.caFingerprint}` : ""}`;
+              const cmds = joinCommands(conn.join);
               return (
-                <div className="well flex flex-col gap-2 text-xs">
-                  <code className="mono break-all text-fg-strong">{cmd}</code>
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-muted">{t.settingsJoinToken}</span>
-                    <button
-                      type="button"
-                      className="btn-sm shrink-0 whitespace-nowrap"
-                      onClick={() => {
-                        void navigator.clipboard?.writeText(cmd).then(() => setJoinCopied(true), () => {});
-                      }}
-                    >
-                      {joinCopied ? t.copied : t.settingsJoinCopy}
-                    </button>
-                  </div>
+                <div className="flex flex-col gap-2 text-xs">
+                  {cmds.length > 1 && <p className="m-0 text-muted">{t.settingsJoinMany(cmds.length)}</p>}
+                  {cmds.map((cmd) => (
+                    <div key={cmd} className="well flex flex-col gap-2">
+                      <code className="mono break-all text-fg-strong">{cmd}</code>
+                      <div className="flex items-center justify-end">
+                        <button
+                          type="button"
+                          className="btn-sm shrink-0 whitespace-nowrap"
+                          onClick={() => {
+                            void navigator.clipboard?.writeText(cmd).then(() => setJoinCopied(cmd), () => {});
+                          }}
+                        >
+                          {joinCopied === cmd ? t.copied : t.settingsJoinCopy}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  <span className="text-muted">{t.settingsJoinToken}</span>
+                  {cmds.length > 1 && <span className="text-muted">{t.settingsJoinAdvertise}</span>}
                 </div>
               );
             })()}

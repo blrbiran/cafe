@@ -14,7 +14,8 @@ import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
-import { hostWithPort, lanAddress } from "@cafe/daemon";
+import { joinAddresses } from "@cafe/daemon";
+import { joinText } from "./join-text.ts";
 import { tlsLine } from "./tls-line.ts";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
@@ -712,7 +713,7 @@ daemon
         `mode:      ${s.isRoot ? "root" : "daemon"}`,
         `version:   ${h.version ?? "unknown"}`,
         `url:       ${base()}`,
-        `advertise: ${loadConfig().advertise ?? "(not set; other machines use lanAddress)"}`,
+        `advertise: ${loadConfig().advertise ?? "(not set; other machines use any local address)"}`,
         `root:      ${s.isRoot ? "self" : loadConfig().root ? `${loadConfig().root} (${s.rootOnline ? "online" : "offline"})` : "mDNS discovery"}`,
         `tls:       ${tlsLine(h.tls)}`,
         `router:    ${h.routerLoading ? "loading (Orders wait for it)" : `${h.router}${h.model ? ` (${h.model})` : ""}`}`,
@@ -1210,9 +1211,17 @@ root
     }
     const fingerprint = fingerprintOf(readFileSync(caPath, "utf8"));
     // On the Root: the command another machine runs to join (the token is read here, never printed).
-    const joinCmd = c.mode === "root" ? `cafe connect ${hostWithPort(c.advertise ?? lanAddress(), c.port)} --token <token> --ca-fingerprint sha256:${fingerprint}` : undefined;
-    const howTo = joinCmd ? `\nto add another machine, run there:\n  ${joinCmd}\n  (<token>: run \`cafe config get token\` on this Root)` : "";
-    out(`${where}\nsha256:${fingerprint}${howTo}`, { mode: c.mode, root: c.root, security: tls.mode, ca: caPath, fingerprint256: fingerprint, ...(joinCmd ? { join: joinCmd } : {}) });
+    // Every candidate address unless `advertise` pins one (#95).
+    const joinInfo = c.mode === "root" ? joinText({ ...joinAddresses({ advertise: c.advertise, port: c.port, lan: localAddresses() }), fingerprint }) : undefined;
+    const howTo = joinInfo ? `\n${joinInfo.text}` : "";
+    out(`${where}\nsha256:${fingerprint}${howTo}`, {
+      mode: c.mode,
+      root: c.root,
+      security: tls.mode,
+      ca: caPath,
+      fingerprint256: fingerprint,
+      ...(joinInfo ? { join: joinInfo.commands[0], joinCommands: joinInfo.commands } : {}),
+    });
   });
 root
   .command("test")

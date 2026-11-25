@@ -486,10 +486,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return sanList({ host: this.config.host, advertise: this.config.advertise, lan: localAddresses(), extra: this.config.security.tls.sans });
   }
 
-  /** What another machine needs to join this Root with `cafe connect` (the token is read on the Root). */
-  joinHint(): { address: string; caFingerprint?: string } {
+  /**
+   * What another machine needs to join this Root with `cafe connect` (the token is read on the Root).
+   * `addresses` lists every local IPv4 address unless `advertise` is set (#95): a Root on a LAN and a
+   * VPN is reached at a different address from each, and only the person knows which one the other
+   * machine can reach. `address` is the first, kept for older clients.
+   */
+  joinHint(): { address: string; addresses: string[]; advertised: boolean; caFingerprint?: string } {
     const fp = this.tlsStatus().caFingerprint;
-    return { address: this.mainAddress(), ...(fp ? { caFingerprint: `sha256:${fp}` } : {}) };
+    const j = joinAddresses({ advertise: this.config.advertise, port: this.config.port, lan: localAddresses() });
+    return { address: j.addresses[0]!, ...j, ...(fp ? { caFingerprint: `sha256:${fp}` } : {}) };
   }
 
   tlsStatus(): {
@@ -3173,6 +3179,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const p of this.children.values()) p.close();
     this.store.close();
   }
+}
+
+/** The addresses another machine can try to join this Root at (#95); see `Daemon.joinHint()`. */
+export function joinAddresses(o: { advertise?: string; port: number; lan: string[] }): { addresses: string[]; advertised: boolean } {
+  if (o.advertise) return { addresses: [hostWithPort(o.advertise, o.port)], advertised: true };
+  const lan = o.lan.length ? o.lan : ["127.0.0.1"];
+  return { addresses: lan.map((a) => hostWithPort(a, o.port)), advertised: false };
 }
 
 export function lanAddress(): string {

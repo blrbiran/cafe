@@ -13,7 +13,7 @@ import { readTlsConfig } from "./tls/trust.ts";
 import { issueLeaf, localAddresses, missingSans, publicKeyOf } from "./tls/certs.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
-export { Daemon, assertDaemonAddress, hostWithPort, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
+export { Daemon, assertDaemonAddress, hostWithPort, joinAddresses, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
 export { CafeConfig, CONFIG_KEYS, cafeHome, configKeyPath, isConfigKey, configApplyMode, configInitialized, configPath, diffConfig, homeId, loadConfig, saveConfig, setConfigValue } from "./config.ts";
 export { Registry } from "./registry.ts";
 export { LlmRouter, RulesRouter, listRouterModels, type CompleteFn, type Router } from "./router.ts";
