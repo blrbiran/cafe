@@ -936,6 +936,36 @@ const printThreads = (list: ThreadMeta[], agents: Map<string, AgentRecord>) =>
     .join("\n") || "(no threads)";
 
 program
+  .command("channel")
+  .description("channel-scoped views (v4-11)")
+  .addCommand(
+    new Command("list")
+      .description("list channels with Thread counts and teams")
+      .action(async () => {
+        await ensureDaemon();
+        const list = await api<{ name: string; threads: number; teams: { team: string; host: string }[] }[]>("/api/channels");
+        out(
+          list.map((c) => `#${c.name.padEnd(24)} ${String(c.threads).padStart(4)} thread(s)${c.teams.length ? `  teams: ${c.teams.map((t) => `${t.team}@${t.host}`).join(", ")}` : ""}`).join("\n") || "(no channels)",
+          list,
+        );
+      }),
+  )
+  .addCommand(
+    new Command("threads")
+      .argument("<name>")
+      .option("--after <ms>", "only Threads with activity after this timestamp", Number)
+      .option("--limit <n>", "", Number, 30)
+      .action(async (name: string, o) => {
+        await ensureDaemon();
+        const q = new URLSearchParams({ limit: String(o.limit), ...(o.after ? { after: String(o.after) } : {}) });
+        const res = await api<{ threads: ThreadMeta[]; hasMore: boolean; exists: boolean }>(`/api/channels/${encodeURIComponent(name)}/threads?${q}`);
+        if (!res.exists) return out(`channel #${name}: no Threads and no team uses it`, res);
+        const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
+        out(printThreads(res.threads, agents) + (res.hasMore ? "\n(older Threads remain; page with --after/--limit)" : ""), res);
+      }),
+  );
+
+program
   .command("stats")
   .description("how each barista did in the last 7 days (used as a weak routing hint)")
   .action(async () => {

@@ -2,11 +2,13 @@ import { useSyncExternalStore } from "react";
 import type { AgentRecord, DaemonRecord, RegistryDelta, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { authState } from "./auth.ts";
-import { api, token, wsUrl, type SearchHit, type Snapshot, type ThreadDetail } from "./api.ts";
+import { api, token, wsUrl, type ChannelInfo, type SearchHit, type Snapshot, type ThreadDetail } from "./api.ts";
 
 export interface State {
   loaded: boolean;
   connected: boolean;
+  /** The channel the Feed is showing (v4-11); `default` unless the URL says otherwise. */
+  channel: string;
   error?: string;
   host: string;
   displayName?: string;
@@ -17,6 +19,8 @@ export interface State {
   agents: Record<string, AgentRecord>;
   daemons: DaemonRecord[];
   threads: ThreadMeta[];
+  /** Channel index for the Feed chips and Teams page (v4-11). */
+  channels: ChannelInfo[];
   /** The running daemon still serves an older web build than the one on disk. */
   webStale?: boolean;
   /** The open Thread detail, kept live while open. */
@@ -60,6 +64,7 @@ export interface LiveTurn {
 let state: State = {
   loaded: false,
   connected: false,
+  channel: "default",
   host: "",
   isRoot: false,
   rootOnline: false,
@@ -68,6 +73,7 @@ let state: State = {
   agents: {},
   daemons: [],
   threads: [],
+  channels: [],
   live: {},
   events: [],
   older: { loading: false, loaded: false, done: false },
@@ -104,7 +110,7 @@ function applySnapshot(s: Snapshot): void {
   // A re-snapshot (reconnect) must not drop older threads the user already loaded.
   const ids = new Set(fresh.map((t) => t.threadId));
   const oldest = fresh.reduce((m, t) => Math.min(m, t.createdAt), Number.POSITIVE_INFINITY);
-  const kept = state.threads.filter((t) => !ids.has(t.threadId) && t.createdAt < oldest);
+  const kept = state.threads.filter((t) => !ids.has(t.threadId) && t.createdAt < oldest && (t.channel ?? "default") === state.channel);
   const done = kept.length > 0 ? state.older.done : fresh.length < SNAPSHOT_LIMIT;
   set({
     loaded: true,
@@ -126,18 +132,48 @@ function applySnapshot(s: Snapshot): void {
 /** Fetch the next page of threads older than everything loaded. */
 export async function loadOlder(): Promise<void> {
   if (state.older.loading || state.older.done) return;
+  const channel = state.channel;
+  const seq = snapshotSeq;
   const before = state.threads.reduce((m, t) => Math.min(m, t.createdAt), Number.MAX_SAFE_INTEGER);
   set((s) => ({ older: { ...s.older, loading: true } }));
   try {
-    const page = (await api.threads(before, OLDER_PAGE)).map(norm);
+    const page = (await api.threads(before, OLDER_PAGE, channel)).map(norm);
+    if (seq !== snapshotSeq) return; // the channel changed while this page was in flight
     set((s) => {
       const ids = new Set(s.threads.map((t) => t.threadId));
       return { threads: [...s.threads, ...page.filter((t) => !ids.has(t.threadId))], older: { loading: false, loaded: true, done: page.length < OLDER_PAGE } };
     });
   } catch (err) {
+    if (seq !== snapshotSeq) return;
     set((s) => ({ error: (err as Error).message, older: { ...s.older, loading: false } }));
   }
 }
+
+/**
+ * Switch the Feed's channel (v4-11). The Thread list is per channel: reset it and re-snapshot rather
+ * than merging, so "Load older" and search can never mix scopes.
+ */
+export function setChannel(channel: string): void {
+  if (channel === state.channel) return;
+  snapshotSeq++;
+  searchSeq++;
+  set((s) => ({
+    channel,
+    threads: [],
+    older: { loading: false, loaded: false, done: false },
+    search: { q: "", loading: false },
+    live: {},
+    loaded: false,
+  }));
+  void refresh();
+}
+
+/** Call once from the shell when the URL's channel differs from the store (direct link/refresh). */
+export function syncChannel(channel: string): void {
+  if (channel !== state.channel) setChannel(channel);
+}
+
+let snapshotSeq = 0;
 
 let searchSeq = 0;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -151,15 +187,16 @@ export function setSearch(q: string): void {
     return;
   }
   set((s) => ({ search: { ...s.search, q, loading: true, error: undefined } }));
+  const channel = state.channel;
   searchTimer = setTimeout(() => {
     api
-      .search(q.trim(), SEARCH_LIMIT)
+      .search(q.trim(), SEARCH_LIMIT, channel)
       .then((rows) => {
-        if (seq !== searchSeq) return;
+        if (seq !== searchSeq || channel !== state.channel) return;
         set({ search: { q, loading: false, results: rows.map((r) => ({ meta: norm(r.meta), hits: r.hits })) } });
       })
       .catch((err) => {
-        if (seq !== searchSeq) return;
+        if (seq !== searchSeq || channel !== state.channel) return;
         set({ search: { q, loading: false, error: (err as Error).message } });
       });
   }, 250);
@@ -168,9 +205,11 @@ export function setSearch(q: string): void {
 function upsertThread(raw: ThreadMeta): void {
   const meta = norm(raw);
   set((s) => {
+    // Live events from other channels must not leak into the visible Feed (v4-11).
+    const detail = s.detail && s.detail.meta.threadId === meta.threadId ? { ...s.detail, meta } : s.detail;
+    if ((meta.channel ?? "default") !== s.channel) return { detail };
     const i = s.threads.findIndex((t) => t.threadId === meta.threadId);
     const threads = i >= 0 ? s.threads.map((t, j) => (j === i ? meta : t)) : [meta, ...s.threads];
-    const detail = s.detail && s.detail.meta.threadId === meta.threadId ? { ...s.detail, meta } : s.detail;
     return { threads, detail };
   });
 }
@@ -281,12 +320,18 @@ function onNotification(method: string, params: any): void {
 }
 
 async function refresh(): Promise<void> {
+  const channel = state.channel;
+  const seq = ++snapshotSeq;
   try {
-    applySnapshot(await api.snapshot());
+    const [snap, channels] = await Promise.all([api.snapshot(channel), api.channels().catch(() => [] as ChannelInfo[])]);
+    if (seq !== snapshotSeq) return; // a channel switch happened while this request was in flight
+    applySnapshot(snap);
+    set({ channels });
     const open = state.detail?.meta.threadId;
     if (open) await openThread(open);
     await backfillEvents();
   } catch (err) {
+    if (seq !== snapshotSeq) return;
     set({ error: (err as Error).message });
   }
 }

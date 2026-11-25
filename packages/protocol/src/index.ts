@@ -375,6 +375,29 @@ export const ThreadMeta = z.object({
 });
 export type ThreadMeta = z.infer<typeof ThreadMeta>;
 
+/** A channel digest for an observer (v4-11): one summary, not an Order. */
+export const ChannelDigest = z.object({
+  digestId: z.number().int(),
+  channel: ChannelName,
+  since: z.number(),
+  threads: z.array(
+    z.object({
+      threadId: z.string(),
+      status: z.string(),
+      from: z.object({ id: z.string(), address: z.string(), host: z.string() }),
+      summary: z.string(),
+      targets: z.array(z.string()).default([]),
+      replies: z.number().int().default(0),
+      declined: z.number().int().default(0),
+      closedAt: z.number().optional(),
+      parentThreadId: z.string().optional(),
+    }),
+  ),
+  omitted: z.number().int().default(0),
+  partial: z.boolean().optional(),
+});
+export type ChannelDigest = z.infer<typeof ChannelDigest>;
+
 // ---------------------------------------------------------------------------
 // Wire frames (codex app-server style: id+method requests, id-only responses,
 // method-only notifications; no "jsonrpc" field).

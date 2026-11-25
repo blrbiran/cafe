@@ -791,6 +791,20 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (typeof olderThanDays !== "number" || olderThanDays < 1) throw new RpcError("bad_request", "olderThanDays (>= 1) required");
     return send(res, 200, daemon.prune(olderThanDays, dryRun !== false));
   }
+  if (m === "GET" && path === "/api/channels") return send(res, 200, daemon.channels());
+  if (m === "GET" && (match = /^\/api\/channels\/([^/]+)\/threads$/.exec(path))) {
+    const afterRaw = Number(url.searchParams.get("after"));
+    const beforeRaw = Number(url.searchParams.get("before"));
+    return send(
+      res,
+      200,
+      daemon.channelThreads(decodeURIComponent(match[1]!), {
+        ...(Number.isFinite(afterRaw) && afterRaw > 0 ? { after: afterRaw } : {}),
+        ...(Number.isFinite(beforeRaw) && beforeRaw > 0 ? { before: beforeRaw } : {}),
+        limit: parseLimit(url.searchParams.get("limit"), 50),
+      }),
+    );
+  }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)$/.exec(path))) {
     const rawLimit = url.searchParams.get("limit");
     const limit = rawLimit === null ? undefined : parseLimit(rawLimit, 200);

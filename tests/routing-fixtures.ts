@@ -140,15 +140,11 @@ export interface TeamCase extends EvalCase {
 }
 
 export const TEAM_CASES: TeamCase[] = [
-  // Today: a two-owner task is (and should stay) a multicast; these already pass.
+  // A two-owner task is (and should stay) a multicast; these already pass.
   { q: "the refund page shows a hydration error and the invoice total is wrong", expect: ["web", "billing"], mode: "multicast" },
   { q: "rotate the oauth client secret and update the docs about it", expect: ["security", "docs"], mode: "multicast" },
-  // A developer clarifying with its own leader: no routing decision can express this today.
-  { q: "which part of the acceptance test should I extend first?", expect: ["orchestrator"], blocked: "D1-escalate" },
-  // Three developers' work on one Thread: refused by thread_busy today.
-  { q: "implement the three independent screens", expect: ["dev-a", "dev-b", "dev-c"], mode: "multicast", blocked: "D2-parallel" },
-  // Everyone must deliver before the Thread closes.
-  { q: "write the code and the tests for the parser", expect: ["developer", "tester"], mode: "multicast", blocked: "D3-collect-all" },
+  // Escalation and sub-Threads are daemon behavior, not a router decision: covered by tests/escalate.test.ts.
+  // Parallel work is one multicast with `collect: all` (v4-11 §3.4/§3.6), covered by tests/collect-all.test.ts.
 ];
 
 export function agentRecords(host = "eval"): AgentRecord[] {

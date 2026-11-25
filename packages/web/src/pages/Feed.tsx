@@ -6,12 +6,13 @@ import { cardTime, useNow } from "../format.ts";
 import { bucketOf, outcome, askerOf, whoAddress, whyText } from "../outcome.ts";
 import { agentAddress, agentLabel } from "../display.ts";
 import { navigate, type Filter } from "../route.ts";
-import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setSearch, useStore, type SearchResult } from "../store.ts";
+import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setChannel, setSearch, useStore, type SearchResult } from "../store.ts";
 import { Empty, PageHeader, Pill, type Tone } from "../ui/bits.tsx";
 
-export function FeedPage({ filter }: { filter: Filter }) {
+export function FeedPage({ filter, channel }: { filter: Filter; channel: string }) {
   const t = useT();
   const threads = useStore((s) => s.threads);
+  const channels = useStore((s) => s.channels);
   const composer = useStore((s) => s.composer);
   const older = useStore((s) => s.older);
   const search = useStore((s) => s.search);
@@ -45,11 +46,27 @@ export function FeedPage({ filter }: { filter: Filter }) {
           </button>
         }
       />
-      {composer && <Composer initialTo={composer.to} />}
+      {composer && <Composer initialTo={composer.to} channel={channel} />}
       <div className="flex flex-wrap items-center gap-2">
+        <div role="group" aria-label="channel" className="flex flex-wrap gap-2">
+          {["default", ...channels.map((c) => c.name).filter((n) => n !== "default")].map((name) => (
+            <button
+              key={name}
+              type="button"
+              className="chip"
+              aria-pressed={channel === name}
+              onClick={() => {
+                setChannel(name);
+                navigate({ page: "feed", filter, channel: name });
+              }}
+            >
+              #{name}
+            </button>
+          ))}
+        </div>
         <div role="group" aria-label="filter" className="flex flex-wrap gap-2">
           {filters.map(([k, label]) => (
-            <button key={k} type="button" className="chip" aria-pressed={filter === k} onClick={() => navigate({ page: "feed", filter: k })}>
+            <button key={k} type="button" className="chip" aria-pressed={filter === k} onClick={() => navigate({ page: "feed", filter: k, channel })}>
               {label}
             </button>
           ))}
@@ -104,6 +121,7 @@ export function FeedPage({ filter }: { filter: Filter }) {
 }
 
 function SearchResults({ filter }: { filter: Filter }) {
+  const channel = useStore((s) => s.channel);
   const t = useT();
   // Relative times only ("3 min ago"); a 1 s tick re-rendered every result (#33).
   const now = useNow(30_000);
@@ -120,7 +138,7 @@ function SearchResults({ filter }: { filter: Filter }) {
       {rows.map(({ meta, hits }) => {
         const o = outcome(t, meta, agents, undefined, now);
         const ask = askerOf(t, meta);
-        const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter });
+        const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter, channel });
         return (
           <article key={meta.threadId} className="card flex flex-col gap-2.5 px-4.5 py-4">
             <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
@@ -186,13 +204,14 @@ function ElapsedText({ since }: { since: number }) {
 }
 
 function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) {
+  const channel = useStore((s) => s.channel);
   const t = useT();
   const agents = useStore((s) => s.agents);
   const live = useStore((s) => s.live[meta.threadId]);
   const bucket = bucketOf(meta);
   // "3 min ago" only; an in-progress card's elapsed time ticks in <ElapsedText>.
   const now = useNow(30_000);
-  const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter });
+  const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter, channel });
 
   // In-progress cards show "why this agent", which needs the routing decision: fetch it lazily.
   useEffect(() => {
@@ -268,7 +287,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
 
 const ThreadCard = memo(ThreadCardImpl);
 
-function Composer({ initialTo }: { initialTo?: string }) {
+function Composer({ initialTo, channel }: { initialTo?: string; channel: string }) {
   const t = useT();
   const agents = useStore((s) => s.agents);
   const daemons = useStore((s) => s.daemons);
@@ -303,9 +322,9 @@ function Composer({ initialTo }: { initialTo?: string }) {
         attachments.push(await api.uploadAttachment(file, (pct) => setUploading({ name: file.name, pct })));
       }
       setUploading(undefined);
-      const r = await api.createOrder({ body, to: broadcast ? undefined : to || undefined, broadcast: broadcast || undefined, ...(attachments.length ? { attachments } : {}) });
+      const r = await api.createOrder({ body, to: broadcast ? undefined : to || undefined, broadcast: broadcast || undefined, channel, ...(attachments.length ? { attachments } : {}) });
       closeComposer();
-      navigate({ page: "thread", threadId: r.threadId });
+      navigate({ page: "thread", threadId: r.threadId, channel });
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -325,6 +344,9 @@ function Composer({ initialTo }: { initialTo?: string }) {
       <label className="cap" htmlFor="cafe-q">
         {t.yourQuestion}
       </label>
+      <div className="hint">
+        {t.postTo} <span className="mono">#{channel}</span>
+      </div>
       <textarea
         id="cafe-q"
         ref={ref}

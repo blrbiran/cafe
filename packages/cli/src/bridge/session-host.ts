@@ -22,7 +22,8 @@ export type HostMessage =
   | { type: "ready"; address: string; socket: string }
   | { type: "status"; address?: string; paused: boolean }
   | { type: "order"; orderId: string; marker: string; text: string }
-  | { type: "cancel"; orderId: string };
+  | { type: "cancel"; orderId: string }
+  | { type: "digest"; text: string };
 
 export interface DoneBody {
   orderId: string;
@@ -187,6 +188,11 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     }
     queue.push({ h, stopBeat: keepAlive(h) });
     pump();
+  });
+  client.onDigest((d) => {
+    const lines = d.threads.map((t) => `- ${t.status} ${t.summary.slice(0, 120)} (${t.replies} replies, ${t.declined} declined)${t.closedAt ? " closed" : ""}`);
+    const text = `cafe channel #${d.channel} digest${d.partial ? " (partial: root offline)" : ""}: ${d.threads.length} changed Thread(s)${d.omitted ? `, ${d.omitted} omitted` : ""}\n${lines.join("\n")}\nThis is an observation, not an Order. To act, call cafe_ask with a fresh question.`;
+    if (!paused && !stopped) opts.send({ type: "digest", text });
   });
   client.onCancel(({ orderId, by }) => {
     const i = queue.findIndex((q) => q.h.order.orderId === orderId);

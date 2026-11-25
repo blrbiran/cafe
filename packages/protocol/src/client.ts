@@ -9,6 +9,7 @@ import {
   type AgentRecord,
   type AgentStatus,
   type Attachment,
+  type ChannelDigest,
   type CreateOrderParams,
   type Order,
   type RoutingDecision,
@@ -68,6 +69,7 @@ export class CafeClient {
   private orderListeners = new Set<Listener<OrderHandle>>();
   private cancelListeners = new Set<Listener<{ orderId: string; threadId: string; by: string }>>();
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
+  private digestListeners = new Set<Listener<ChannelDigest>>();
   /** Recent events, so a listener attached after a fast thread closed can still read it. */
   private recent: ThreadEnvelope[] = [];
   private connectListeners = new Set<Listener<AgentRecord | undefined>>();
@@ -95,6 +97,12 @@ export class CafeClient {
   onThreadEvent(fn: Listener<ThreadEnvelope>): () => void {
     this.eventListeners.add(fn);
     return () => this.eventListeners.delete(fn);
+  }
+
+  /** A channel digest for an observer (v4-11). One summarized notification, not an Order. */
+  onDigest(fn: Listener<ChannelDigest>): () => void {
+    this.digestListeners.add(fn);
+    return () => this.digestListeners.delete(fn);
   }
 
   /** Thread events already seen by this client (newest last), for late subscribers. */
@@ -143,6 +151,9 @@ export class CafeClient {
         this.recent.push(env);
         if (this.recent.length > 500) this.recent.splice(0, this.recent.length - 500);
         for (const fn of this.eventListeners) fn(env);
+      });
+      peer.on(Methods.channelDigest, ({ digest }: { digest: ChannelDigest }) => {
+        for (const fn of this.digestListeners) fn(digest);
       });
       ws.addEventListener("message", (e) => void peer.receive(String(e.data)));
       ws.addEventListener("open", async () => {

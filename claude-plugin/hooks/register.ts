@@ -12,6 +12,7 @@ type HostMessage =
   | { type: 'status'; address?: string; paused: boolean }
   | { type: 'order'; orderId: string; marker: string; text: string }
   | { type: 'cancel'; orderId: string }
+  | { type: 'digest'; text: string }
 
 type Current = { orderId: string; marker: string; turnId?: string; cancelled: boolean }
 
@@ -20,6 +21,8 @@ let socket: string | undefined
 let address: string | undefined
 let paused = false
 let current: Current | undefined
+/** A digest that arrived while an Order turn was running; submitted once the turn ends (v4-11). */
+let pendingDigest: string | undefined
 
 const status = ($: EngineInterface) =>
   $.ui.status(address ? (paused ? `☕ ${address} (paused)` : `☕ ${address}`) : undefined)
@@ -63,6 +66,10 @@ async function handle($: EngineInterface, msg: HostMessage) {
     if (current?.orderId !== msg.orderId) return
     current.cancelled = true
     if (current.turnId) await $.turn.abort({ turnId: current.turnId }).catch(() => {})
+  } else if (msg.type === 'digest') {
+    // One summarized observation, queued behind an in-flight Order rather than interrupting it.
+    if (current) pendingDigest = msg.text
+    else void $.prompt.submit({ text: msg.text }).catch(() => {})
   }
   status($)
 }
@@ -176,6 +183,11 @@ export const register: Register = on => {
       current = undefined
       const error = e.reason === 'error' || e.reason === 'refusal' ? e.reason : undefined
       void post($, '/done', { orderId: order.orderId, text: e.answer, aborted: e.isAborted, error })
+      if (pendingDigest) {
+        const text = pendingDigest
+        pendingDigest = undefined
+        void $.prompt.submit({ text }).catch(() => {})
+      }
     }
     return next(e)
   })

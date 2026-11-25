@@ -411,6 +411,16 @@ export class Store {
     return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 
+  /** Per-channel counts for /api/channels (v4-11). */
+  channelStats(): { channel: string; threads: number; lastActivityAt: number }[] {
+    const rows = this.db.prepare("SELECT COALESCE(channel, 'default') AS channel, COUNT(*) AS n, MAX(created_at) AS at FROM threads GROUP BY COALESCE(channel, 'default')").all() as {
+      channel: string;
+      n: number;
+      at: number;
+    }[];
+    return rows.map((r) => ({ channel: r.channel, threads: r.n, lastActivityAt: r.at }));
+  }
+
   /** Finished threads whose last activity is before `cutoff` (candidates for pruning). */
   /** Rows whose last activity is older than the cutoff and that already finished (#34: push both filters to SQL). */
   staleThreads(cutoff: number, statuses: ThreadMeta["status"][] = ["done", "failed", "cancelled"]): ThreadMeta[] {

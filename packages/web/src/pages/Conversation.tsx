@@ -117,7 +117,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
 
   const back = (
     <div>
-      <a className="linkbtn" href={hashFor({ page: "feed", filter: "all" })}>
+      <a className="linkbtn" href={hashFor({ page: "feed", filter: "all", channel: detail?.meta.channel ?? "default" })}>
         {t.back}
       </a>
     </div>

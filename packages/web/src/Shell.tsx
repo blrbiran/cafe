@@ -234,8 +234,10 @@ export function Shell({
   const baristas = Object.values(agents)
     .filter((a) => a.role === "barista")
     .sort((a, b) => a.host.localeCompare(b.host) || a.address.localeCompare(b.address));
+  const navChannel = route.page === "feed" ? route.channel : route.page === "thread" ? (route.channel ?? "default") : "default";
   const nav: { page: Route["page"]; label: string; count: number; live?: boolean; route: Route }[] = [
-    { page: "feed", label: t.navFeed, count: active, live: active > 0, route: { page: "feed", filter: "all" } },
+    { page: "feed", label: t.navFeed, count: active, live: active > 0, route: { page: "feed", filter: "all", channel: navChannel } },
+    { page: "teams", label: t.navTeams, count: 0, route: { page: "teams" } },
     { page: "network", label: t.navNetwork, count: daemons.filter((d) => d.online).length, route: { page: "network" } },
     { page: "live", label: t.navLive, count: 0, route: { page: "live" } },
   ];

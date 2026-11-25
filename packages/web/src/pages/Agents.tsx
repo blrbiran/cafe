@@ -174,7 +174,7 @@ function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; 
         </div>
       )}
       {current && (
-        <a className="well block text-sm no-underline hover:border-line-strong" href={hashFor({ page: "thread", threadId: current.threadId })}>
+        <a className="well block text-sm no-underline hover:border-line-strong" href={hashFor({ page: "thread", threadId: current.threadId, channel: current.channel ?? "default" })}>
           <span className="text-muted">{t.nowAnswering}</span> <span className="text-fg-strong">“{current.summary.slice(0, 80)}{current.summary.length > 80 ? "…" : ""}”</span>
         </a>
       )}
@@ -197,7 +197,7 @@ function AgentCard({ a, daemons, threads, recent, stats, t }: { a: AgentRecord; 
           disabled={status === "offline"}
           onClick={() => {
             openComposer(a.address);
-            navigate({ page: "feed", filter: "all" });
+            navigate({ page: "feed", filter: "all", channel: "default" });
           }}
         >
           {t.askIt}

@@ -24,6 +24,35 @@ export interface ThreadDetail {
   hasMore?: boolean;
 }
 
+export interface ChannelInfo {
+  name: string;
+  threads: number;
+  lastActivityAt?: number;
+  teams: { team: string; host: string }[];
+}
+
+export interface TeamView {
+  team: string;
+  host: string;
+  channel: string;
+  hostOnline?: boolean;
+  online: number;
+  total: number;
+  openThreads: number;
+  lastActivityAt?: number;
+  partial?: boolean;
+  roster: {
+    name: string;
+    duty?: string;
+    mode: string;
+    dir: string;
+    observer?: boolean;
+    address?: string;
+    status?: string;
+    currentThread?: string;
+  }[];
+}
+
 /**
  * The daemon token on another machine (#97): read once from a `#token=` / `?token=` link or the
  * token prompt, kept in this browser, and sent only as `Authorization: Bearer`.
@@ -126,12 +155,25 @@ export interface SearchHit {
 }
 
 export const api = {
-  snapshot: () => call<Snapshot>("GET", "/api/snapshot"),
+  snapshot: (channel?: string) => call<Snapshot>("GET", `/api/snapshot${channel ? `?channel=${encodeURIComponent(channel)}` : ""}`),
   connectors: (signal: AbortSignal) => call<ConnectorStatusRow[]>("GET", "/api/connectors", undefined, signal),
   /** Threads created before `before` (ms), newest first. */
-  threads: (before: number, limit: number) => call<ThreadMeta[]>("GET", `/api/threads?before=${before}&limit=${limit}`),
+  threads: (before: number, limit: number, channel?: string) => call<ThreadMeta[]>("GET", `/api/threads?before=${before}&limit=${limit}${channel ? `&channel=${encodeURIComponent(channel)}` : ""}`),
   /** Full-text search over questions and answers (all threads, not only the loaded ones). */
-  search: (q: string, limit: number) => call<{ meta: ThreadMeta; hits: SearchHit[] }[]>("GET", `/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  search: (q: string, limit: number, channel?: string) => call<{ meta: ThreadMeta; hits: SearchHit[] }[]>("GET", `/api/search?q=${encodeURIComponent(q)}&limit=${limit}${channel ? `&channel=${encodeURIComponent(channel)}` : ""}`),
+  /** Teams replicated to this daemon (v4-11). */
+  teams: () => call<TeamView[]>("GET", "/api/teams"),
+  /** Channel index: counts plus the teams using each channel. */
+  channels: () => call<ChannelInfo[]>("GET", "/api/channels"),
+  /** One channel's Threads, newest activity first (observer/Web paging). */
+  channelThreads: (name: string, opts: { after?: number; before?: number; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (opts.after) qs.set("after", String(opts.after));
+    if (opts.before) qs.set("before", String(opts.before));
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    const q = qs.toString();
+    return call<{ threads: ThreadMeta[]; hasMore: boolean; exists: boolean }>("GET", `/api/channels/${encodeURIComponent(name)}/threads${q ? `?${q}` : ""}`);
+  },
   thread: (id: string, opts?: { limit?: number; before?: string }) => {
     const qs = new URLSearchParams();
     if (opts?.limit) qs.set("limit", String(opts.limit));
@@ -140,7 +182,7 @@ export const api = {
     return call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}${q ? `?${q}` : ""}`);
   },
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
-  createOrder: (p: { body: string; to?: string; broadcast?: boolean; kind?: "order" | "notice"; threadId?: string; attachments?: Attachment[] }) =>
+  createOrder: (p: { body: string; to?: string; broadcast?: boolean; kind?: "order" | "notice"; threadId?: string; channel?: string; attachments?: Attachment[] }) =>
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),

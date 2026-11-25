@@ -4,13 +4,14 @@ import { TokenGate } from "./ui/TokenGate.tsx";
 import { PlainHttpBanner } from "./ui/Security.tsx";
 import { Shell } from "./Shell.tsx";
 import { navigate, useRoute } from "./route.ts";
-import { closeThread, openThread, useStore } from "./store.ts";
+import { closeThread, openThread, syncChannel, useStore } from "./store.ts";
 import { useT } from "./i18n.ts";
 import { FeedPage } from "./pages/Feed.tsx";
 import { ConversationPage } from "./pages/Conversation.tsx";
 import { AgentsPage } from "./pages/Agents.tsx";
 import { NetworkPage } from "./pages/Network.tsx";
 import { LivePage } from "./pages/Live.tsx";
+import { TeamsPage } from "./pages/Teams.tsx";
 
 /** Keep an element mounted while it animates out, then unmount it. */
 function usePresence(open: boolean, ms = 160): { mounted: boolean; closing: boolean } {
@@ -44,6 +45,12 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const threadId = route.page === "thread" ? route.threadId : undefined;
   const from = route.page === "thread" ? (route.from ?? "all") : "all";
+  const channel = route.page === "thread" ? (route.channel ?? "default") : route.page === "feed" ? route.channel : "default";
+
+  // A direct link or refresh carries the channel in the URL; keep the store in step.
+  useEffect(() => {
+    if (route.page === "feed" || route.page === "thread") syncChannel(channel);
+  }, [route.page, channel]);
   const detail = usePresence(!!threadId);
   const settings = usePresence(settingsOpen);
   // Remember the last Thread so the drawer still has content while it animates out.
@@ -62,7 +69,7 @@ export function App() {
 
   const closeDetail = () => {
     const id = threadId;
-    navigate({ page: "feed", filter: from });
+    navigate({ page: "feed", filter: from, channel });
     // Put focus back on the card that opened the drawer.
     if (id) setTimeout(() => document.querySelector<HTMLElement>(`[data-thread-id="${id}"]`)?.focus(), 0);
   };
@@ -141,10 +148,12 @@ export function App() {
         <NetworkPage />
       ) : route.page === "live" ? (
         <LivePage />
+      ) : route.page === "teams" ? (
+        <TeamsPage />
       ) : route.page === "thread" ? (
-        <FeedPage filter={from} />
+        <FeedPage filter={from} channel={channel} />
       ) : (
-        <FeedPage filter={route.filter} />
+        <FeedPage filter={route.filter} channel={route.channel} />
       )}
     </Shell>
   );

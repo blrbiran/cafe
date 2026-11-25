@@ -42,6 +42,7 @@ import {
   type ThreadEventBody,
   type ThreadMeta,
   type TeamRecord,
+  type ChannelDigest,
 } from "@cafe/protocol";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { Peer, RpcError } from "@cafe/protocol/peer";
@@ -79,6 +80,8 @@ export interface Timing {
   unicastDeadlineMs: number;
   /** After the first final answer in a multicast/broadcast, skip silent targets after this long (#39). */
   graceMs: number;
+  /** Observer channel digest cadence (v4-11). */
+  digestIntervalMs: number;
   reconnectMinMs: number;
   reconnectMaxMs: number;
   /** Root: how often to recompute and push routing hints when there are new outcomes. */
@@ -286,6 +289,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private pendingPulls = new Map<string, { a: Attachment; threadId: string }>();
   private pullTimer?: ReturnType<typeof setInterval>;
   private stagingTimer?: ReturnType<typeof setInterval>;
+  private digestTimer?: ReturnType<typeof setInterval>;
+  private digestSeq = 0;
+  /** observerId → channel → last digest timestamp. */
+  private digestSince = new Map<string, Map<string, number>>();
 
   constructor(opts: DaemonOptions) {
     super();
@@ -315,6 +322,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       linkIdleMs: 5 * 60_000,
       linkPingMs: Number(process.env.CAFE_LINK_PING_MS) || 30_000,
       leafCheckIntervalMs: 5 * 60_000,
+      digestIntervalMs: Number(process.env.CAFE_DIGEST_INTERVAL_MS) || 60_000,
       refusedRecentMs: 10 * 60_000,
       refusedForgetMs: 24 * 3600_000,
       enrolRetryBaseMs: 5_000,
@@ -343,6 +351,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }, 24 * 3600_000);
     this.stagingTimer.unref?.();
+    this.digestTimer = setInterval(() => {
+      try {
+        this.emitDigests();
+      } catch (err) {
+        this.log(`digest failed: ${(err as Error).message}`);
+      }
+    }, this.timing.digestIntervalMs);
+    this.digestTimer.unref?.();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
       this.hintsTimer.unref?.();
@@ -925,7 +941,33 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
   }
 
-  /** Route an explicit `to: <team>` (v4-11). Returns agents, or a visible failure. */
+  /** Channel index for the Web (v4-11): DB counts plus the teams that use each channel. */
+  channels() {
+    const stats = new Map(this.store.channelStats().map((s) => [s.channel, s]));
+    for (const t of this.teams()) {
+      const s = stats.get(t.channel) ?? { channel: t.channel, threads: 0, lastActivityAt: 0 };
+      stats.set(t.channel, s);
+    }
+    return [...stats.values()]
+      .map((s) => ({
+        name: s.channel,
+        threads: s.threads,
+        lastActivityAt: s.lastActivityAt || undefined,
+        teams: this.teams()
+          .filter((t) => t.channel === s.channel)
+          .map((t) => ({ team: t.team, host: t.host })),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** A page of one channel's Threads for an observer (v4-11), newest activity first. */
+  channelThreads(channel: string, opts: { after?: number; before?: number; limit?: number } = {}) {
+    const limit = Number.isInteger(opts.limit) && opts.limit! > 0 ? Math.min(opts.limit!, 200) : 50;
+    const all = this.store.listThreadsIn(channel, 500, undefined, opts.before ?? Number.MAX_SAFE_INTEGER);
+    const filtered = opts.after === undefined ? all : all.filter((m) => (m.lastActivityAt ?? m.createdAt) > opts.after!);
+    const sorted = filtered.sort((a, b) => (b.lastActivityAt ?? b.createdAt) - (a.lastActivityAt ?? a.createdAt));
+    return { threads: sorted.slice(0, limit).map((m) => this.summaryMeta(m)), hasMore: sorted.length > limit, exists: all.length > 0 || this.teams().some((t) => t.channel === channel) };
+  }
   private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "ambiguous_address" } {
     let teams = this.teams().filter((t) => t.team === name && (!host || t.host === host));
     if (!teams.length) return { ids: [], failure: "unknown_team" };
@@ -941,6 +983,64 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const orch = online.filter((m) => m.duty === "orchestrator");
     const chosen = orch.length === 1 ? orch : online;
     return { ids: chosen.map((m) => this.registry.all().find((r) => r.host === t.host && r.team === t.team && (r.member ?? r.name) === m.name)!.agentId) };
+  }
+
+  /** Send a notification to an Agent wherever it is registered (v4-11 digests). */
+  private notifyAgent(agentId: string, method: string, params: Record<string, unknown>): void {
+    const local = this.agents.get(agentId);
+    if (local) return local.notify(method, params);
+    const rec = this.registry.get(agentId);
+    if (!rec || rec.host === this.host) return;
+    if (this.isRoot) {
+      this.children.get(rec.host)?.notify(method, { ...params, agentId });
+      return;
+    }
+    if (this.rootOnline) return this.uplink!.notify(method, { ...params, agentId });
+    this.links.get(rec.host)?.peer.notify(method, { ...params, agentId });
+  }
+
+  /**
+   * One digest per observer per channel while there is new activity (v4-11). It is assembled from the
+   * Threads this daemon can see; a child marks it partial because it sees only its own Host.
+   */
+  private emitDigests(): void {
+    const now = Date.now();
+    for (const rec of this.registry.all()) {
+      if (!rec.observer) continue;
+      for (const channel of channelsOf(rec)) {
+        const since = this.digestSince.get(rec.agentId)?.get(channel) ?? 0;
+        const changed = this.store
+          .listThreadsIn(channel, 200)
+          .filter((m) => (m.lastActivityAt ?? m.createdAt) > since)
+          .sort((a, b) => (b.lastActivityAt ?? b.createdAt) - (a.lastActivityAt ?? a.createdAt));
+        if (!changed.length) continue;
+        const digest: ChannelDigest = {
+          digestId: ++this.digestSeq,
+          channel,
+          since,
+          threads: changed.slice(0, 20).map((m) => ({
+            threadId: m.threadId,
+            status: m.status,
+            from: m.from,
+            summary: m.summary,
+            targets: m.targets,
+            replies: (m.replies ?? []).length,
+            declined: (m.declines ?? []).length,
+            ...(m.closedAt ? { closedAt: m.closedAt } : {}),
+            ...(m.parentThreadId ? { parentThreadId: m.parentThreadId } : {}),
+          })),
+          omitted: Math.max(0, changed.length - 20),
+          ...(this.isRoot ? {} : { partial: true }),
+        };
+        let map = this.digestSince.get(rec.agentId);
+        if (!map) {
+          map = new Map();
+          this.digestSince.set(rec.agentId, map);
+        }
+        map.set(channel, now);
+        this.notifyAgent(rec.agentId, Methods.channelDigest, { digest });
+      }
+    }
   }
 
   private storeTeam(rec: TeamRecord, from?: Peer): void {
@@ -2752,6 +2852,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.storeTeam({ ...x.team, host }, peer);
       return {};
     });
+    peer.on(Methods.channelDigest, (x: { agentId?: string; digest: ChannelDigest }) => {
+      if (x.agentId) this.notifyAgent(x.agentId, Methods.channelDigest, { digest: x.digest });
+      return {};
+    });
     peer.on(Methods.registryRemove, (x: { agentIds: string[] }) => {
       const own = x.agentIds.filter((id) => this.registry.get(id)?.host === host);
       this.broadcastDelta(this.registry.remove(own));
@@ -3054,6 +3158,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.teamUpsert, (x: { team: TeamRecord }) => {
       this.storeTeam(x.team, peer);
+      return {};
+    });
+    peer.on(Methods.channelDigest, (x: { agentId?: string; digest: ChannelDigest }) => {
+      if (x.agentId) this.agents.get(x.agentId)?.notify(Methods.channelDigest, { digest: x.digest });
       return {};
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
@@ -3744,6 +3852,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.pruneInterval);
     clearInterval(this.pullTimer);
     clearInterval(this.stagingTimer);
+    clearInterval(this.digestTimer);
     clearInterval(this.lagTimer);
     clearInterval(this.leafTimer);
     clearTimeout(this.enrolTimer);

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { DEFAULT_PORT, type AgentRecord, type Attachment, type Order, type ThreadEnvelope } from "@cafe/protocol";
+import { DEFAULT_PORT, type AgentRecord, type Attachment, type ChannelDigest, type Order, type ThreadEnvelope } from "@cafe/protocol";
 import { loadAgentIdentity, loadTeamMember, readCafeFile } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 
@@ -384,6 +384,20 @@ export default function cafe(pi: ExtensionAPI) {
         void drain();
       });
       c.onThreadEvent(onThreadEvent);
+      c.onDigest((d: ChannelDigest) => {
+        // One summarized observation, not one turn per event. `triggerTurn` queues it behind the
+        // current turn, the same way an Order is queued (v4-11).
+        const lines = d.threads.map((t) => `- ${t.status} ${t.summary.slice(0, 120)} (${t.replies} replies, ${t.declined} declined)${t.closedAt ? " closed" : ""}`);
+        pi.sendMessage(
+          {
+            customType: "cafe-digest",
+            content: `☕ cafe channel #${d.channel} digest${d.partial ? " (partial: root offline)" : ""}: ${d.threads.length} changed Thread(s)${d.omitted ? `, ${d.omitted} omitted` : ""}\n${lines.join("\n")}\nThis is an observation, not an Order. To act, call cafe_ask with a fresh question.`,
+            display: true,
+            details: { digest: d },
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      });
       c.onCancel(onCancelled);
       c.onConnect((rec) => {
         setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");
