@@ -162,6 +162,24 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
   标注**已经有了**：横幅 + 警告色）；#71–#73；Web 标注「哪段加密」与局域网 https 一起出原型（Q120）；「移除一台离线
   机器」（Q119 B，未做）。
 
+- **给测试者的复核清单**（纯文本，可直接转发）：
+
+```
+cafe 台账复核建议（2026-11-25，#91–#94）
+
+1. #91：Root 重启后 openssl x509 -in ~/.cafe/tls/<host>.crt -noout -ext subjectAltName 应含本机所有 IPv4（en0 + utun）。
+   不重启验证：cafe daemon renew-cert --san <名字>（会写进 security.tls.sans）；doctor 在缺地址时点名报 warn。
+   回归测试：tests/tls-multi-address.test.ts。注意：你手工热换发时补的 SAN 不在配置里，以后的自动续期以「本机地址 +
+   security.tls.sans」为准，VPN 地址只要在 utun 上就会自动带上。
+2. #92：/api/daemons 里 TLS 子节点为 wss://；ws:// 的历史 knownDaemons 不再广播；清除 pin 回到子节点自报地址；
+   Root 上 Test 一台「上行在、直连不通」的机器返回 online:true, via:"uplink", address, code。tests/tls-addresses.test.ts。
+3. #93：明文探针一次后：10 分钟内 doctor fail，之后 warn「refused … Nm ago」且 doctor.ok 为 true，24 小时后消失；
+   cafe daemon status 的 tls 行同口径。持续重试的明文 child 一直 fail。按 owner 裁定不加清除命令。tests/tls-refused-age.test.ts。
+4. #94：cafe config get security.tls.port / caFingerprint / pins 可读；拼错给 did-you-mean；config set 用同一套 key；
+   未入网的子节点 cafe root show 打印 expected 指纹。tests/config-keys.test.ts。
+5. #27：Network 页的「版本落后」标注早已存在（横幅 + 警告色），剩余是 Root 主动推送升级通知，建议收窄。
+```
+
 ### 2026-11-25 — 台账复核后三批：#90 乱码、#31 关、端口/后台会话、#33 Web 空转、#18 收窄、daemon 启动
 
 - **一句话**：按 `../cafe_dogfooding/issue-20261119.md` 重新核对开放项（以代码为准），用户裁定「先修 #90、发版时机
