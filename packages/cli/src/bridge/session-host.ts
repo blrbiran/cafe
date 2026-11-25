@@ -3,7 +3,7 @@ import { chmodSync, existsSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadIdentity } from "@cafe/protocol/cafe-file";
+import { loadAgentIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import { buildFollowup, buildPrompt, DECLINE_MARKER } from "../serve.ts";
 
@@ -90,8 +90,8 @@ export function isBackgroundSession(pid: number, read: (pid: number) => ProcInfo
 export async function runSessionHost(opts: SessionHostOptions): Promise<{ client?: CafeClient; socket?: string; stop: () => Promise<void> }> {
   const log = opts.log ?? ((m: string) => console.error(`[cafe session] ${m}`));
   const dir = resolve(opts.dir);
-  const { cafe, file } = loadIdentity(dir);
-  if (!file || cafe.role !== "barista") {
+  const { cafe, file, identity: baseIdentity } = loadAgentIdentity(dir);
+  if (!file || baseIdentity.role !== "barista") {
     opts.send({ type: "none", reason: !file ? `no .cafe in ${dir} or its parents` : `${file} is not a barista` });
     return { stop: async () => {} };
   }
@@ -125,7 +125,7 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     if (!next) return;
     next.stopBeat(); // `current` takes over with its own heartbeat
     const h = next.h;
-    const self = { address: client.record?.address ?? cafe.name, description: cafe.description };
+    const self = { address: client.record?.address ?? baseIdentity.name, description: baseIdentity.description };
     const body = answered.has(h.order.threadId) ? buildFollowup(h.order, h.attachments) : buildPrompt(h.order, self, REPLY_NOTE, h.attachments);
     const marker = orderMarker(h.order.orderId);
     current = { h, started: false, cancelled: false, stopBeat: keepAlive(h) };
@@ -206,7 +206,7 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
 
   const pid = opts.pid ?? process.ppid;
   const background = opts.background ?? isBackgroundSession(pid);
-  const identity = () => ({ ...cafe, mode: "tui" as const, agent: opts.agent, cwd: dir, pid, ...(background ? { background } : {}) });
+  const identity = () => ({ ...baseIdentity, mode: "tui" as const, agent: opts.agent, cwd: dir, pid, ...(background ? { background } : {}) });
 
   // Control socket for the mod. Unix socket, owner-only.
   const socket = join(opts.socketDir ?? tmpdir(), `cafe-session-${process.pid}-${Math.random().toString(36).slice(2, 8)}.sock`);
@@ -235,7 +235,7 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
 
   const rec = await client.connect(identity());
   log(`${opts.agent} session ${rec?.address} ready in ${dir}`);
-  opts.send({ type: "ready", address: rec?.address ?? cafe.name, socket });
+  opts.send({ type: "ready", address: rec?.address ?? baseIdentity.name, socket });
   ready = true;
 
   return {

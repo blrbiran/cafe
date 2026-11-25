@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
+import type { TeamSpec } from "@cafe/protocol";
 import { openWorkerLog, type CappedLineFile } from "./proc/cappedLog.ts";
 import { probeGroup, readProcessStart, signalGroup } from "./proc/processStart.ts";
 
@@ -24,11 +25,18 @@ export interface BaristaSpec {
   tui?: boolean;
   /** With `tui`: the Codex thread to use. */
   thread?: string;
+  /** v4-11: this spec starts one worker per roster member; `dir` is the roster directory. */
+  team?: { rosterDir: string; spec: TeamSpec };
 }
 
 interface Worker {
   spec: BaristaSpec;
   slot: number;
+  /** Roster member this worker runs (team specs only). */
+  member?: string;
+  /** The member's own working directory (may differ from spec.dir). */
+  cwd?: string;
+  rosterDir?: string;
   child?: ChildProcess;
   /** `ps lstart` of the guard (process-group leader), recorded for reaping after a crash. */
   startedAt?: string;
@@ -49,6 +57,11 @@ interface Worker {
 
 export interface WorkerInfo {
   dir: string;
+  /** The member's working directory (team specs); `dir` is the roster directory. */
+  cwd?: string;
+  member?: string;
+  /** Set for supervised team workers. */
+  rosterDir?: string;
   /** pi, omp, codex or claude. */
   agent: string;
   slot: number;
@@ -188,10 +201,11 @@ export class Supervisor {
 
   start(spec: BaristaSpec, persist = true): WorkerInfo[] {
     const dir = resolve(spec.dir);
-    const existing = this.workers.filter((w) => w.spec.dir === dir);
+    if (spec.team) return this.startTeam(dir, spec.team.spec, persist);
+    const existing = this.workers.filter((w) => w.spec.dir === dir && !w.rosterDir);
     // A Barista that gave up (#82) is replaced by a new start; a live one is not.
     if (existing.length && !existing.every((w) => w.failed)) throw new Error(`barista already running in ${dir}`);
-    if (existing.length) this.workers = this.workers.filter((w) => w.spec.dir !== dir);
+    if (existing.length) this.workers = this.workers.filter((w) => w.spec.dir !== dir || w.rosterDir);
     const { cafe } = loadIdentity(dir);
     const name = dir.split(/[\\/]/).filter(Boolean).pop() ?? "barista";
     // The leaf name alone collided for /a/work and /b/work (#102): keep it for readability and add a
@@ -204,14 +218,70 @@ export class Supervisor {
       this.launch(w);
     }
     if (persist) this.save();
-    return this.list().filter((w) => w.dir === dir);
+    return this.list().filter((w) => w.dir === dir && !w.member);
+  }
+
+  /**
+   * One worker per headless roster member (v4-11). Idempotent per `(rosterDir, member)`: an existing
+   * live worker or a worker in restart backoff is left alone, so `team start` can fill gaps.
+   * TUI members are never started here (the person owns that terminal).
+   */
+  startTeam(rosterDir: string, team: TeamSpec, persist = true): WorkerInfo[] {
+    const dir = resolve(rosterDir);
+    const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
+    // Upsert the full roster into every existing worker of this team, so save() persists all members.
+    for (const w of this.workers) {
+      if (w.rosterDir === dir) w.spec = { ...w.spec, team: { rosterDir: dir, spec: team } };
+    }
+    for (const member of team.members) {
+      if (member.mode === "tui") continue;
+      const already = this.workers.find((w) => w.rosterDir === dir && w.member === member.name && !w.failed);
+      if (already) continue;
+      this.workers = this.workers.filter((w) => !(w.rosterDir === dir && w.member === member.name));
+      const memberDir = resolve(dir, member.dir);
+      const runner = member.agent ?? team.agent ?? "pi";
+      const native = runner === "codex" || runner === "claude";
+      const base: BaristaSpec = {
+        dir,
+        team: { rosterDir: dir, spec: team },
+        ...(native ? { agent: runner as "codex" | "claude" } : { bin: member.bin ?? (runner === "pi" ? undefined : runner) }),
+        ...(member.access ? { access: member.access === "read-only" ? "read-only" : "workspace-write" } : {}),
+      };
+      const w: Worker = {
+        spec: base,
+        slot: 1,
+        member: member.name,
+        cwd: memberDir,
+        rosterDir: dir,
+        restarts: 0,
+        stopping: false,
+        quickFailures: 0,
+        failed: false,
+        tail: [],
+        logPath: join(this.logDir, `barista-${member.name}-${createHash("sha256").update(memberDir).digest("hex").slice(0, 8)}-${rosterTag.slice(0, 4)}-1.log`),
+      };
+      this.workers.push(w);
+      this.launch(w);
+    }
+    if (persist) this.save();
+    return this.list().filter((w) => w.rosterDir === dir);
+  }
+
+  /** Stop supervised workers of one team, optionally one member. Never touches a TUI or plain Barista. */
+  stopTeam(rosterDir: string, member?: string): number {
+    const target = resolve(rosterDir);
+    const ws = this.workers.filter((w) => w.rosterDir === target && (!member || w.member === member));
+    for (const w of ws) this.kill(w);
+    this.workers = this.workers.filter((w) => !ws.includes(w));
+    this.save();
+    return ws.length;
   }
 
   stop(dir: string): number {
     const target = resolve(dir);
-    const ws = this.workers.filter((w) => w.spec.dir === target);
+    const ws = this.workers.filter((w) => w.spec.dir === target && !w.rosterDir);
     for (const w of ws) this.kill(w);
-    this.workers = this.workers.filter((w) => w.spec.dir !== target);
+    this.workers = this.workers.filter((w) => w.spec.dir !== target || w.rosterDir);
     this.save();
     return ws.length;
   }
@@ -219,6 +289,9 @@ export class Supervisor {
   list(): WorkerInfo[] {
     return this.workers.map((w) => ({
       dir: w.spec.dir,
+      ...(w.cwd ? { cwd: w.cwd } : {}),
+      ...(w.member ? { member: w.member } : {}),
+      ...(w.rosterDir ? { rosterDir: w.rosterDir } : {}),
       agent: w.spec.agent ?? (w.spec.bin ?? this.piBin).split(/[\\/]/).pop()!,
       slot: w.slot,
       pid: w.child?.pid,
@@ -257,6 +330,7 @@ export class Supervisor {
         log = undefined;
       }
     };
+    const workDir = w.cwd ?? w.spec.dir;
     const bin = w.spec.agent ? process.execPath : (w.spec.bin ?? this.piBin);
     const args = w.spec.agent
       ? [
@@ -268,15 +342,17 @@ export class Supervisor {
           "--agent",
           w.spec.agent,
           "--dir",
-          w.spec.dir,
+          workDir,
+          ...(w.member ? ["--member", w.member, "--team-dir", w.rosterDir!] : []),
           ...(w.spec.access === "workspace-write" ? ["--write"] : []),
           ...(w.spec.model ? ["--model", w.spec.model] : []),
           ...(w.spec.tui ? ["--tui"] : []),
           ...(w.spec.thread ? ["--thread", w.spec.thread] : []),
         ]
       : [GUARD, bin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
+    const env = w.member ? { ...this.env, CAFE_TEAM_MEMBER: w.member, CAFE_TEAM_DIR: w.rosterDir! } : this.env;
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.
-    const child = spawn(process.execPath, args, { cwd: w.spec.dir, env: this.env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
+    const child = spawn(process.execPath, args, { cwd: workDir, env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
     // Attach 'error' first: an unhandled spawn error would crash the daemon.
     child.on("error", (err) => note(`spawn error: ${err.message}`));
     w.child = child;

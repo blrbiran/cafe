@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parse } from "yaml";
-import { CafeFile } from "./index.ts";
+import { CafeDocument, type AgentIdentity, type CafeFile, type TeamMember, type TeamSpec } from "./index.ts";
 
 export const CAFE_FILE_NAME = ".cafe";
 
@@ -26,7 +26,7 @@ export function findCafeFile(start: string): string | undefined {
 
 const MINIMAL = "minimal file:\nname: my-agent\ndescription: what this agent can answer\n";
 
-export function readCafeFile(path: string): CafeFile {
+export function readCafeFile(path: string): CafeDocument {
   let raw: unknown;
   try {
     const st = statSync(path, { throwIfNoEntry: false });
@@ -35,22 +35,114 @@ export function readCafeFile(path: string): CafeFile {
   } catch (err) {
     throw new Error(`invalid .cafe at ${path}: ${(err as Error).message}`);
   }
-  const parsed = CafeFile.safeParse(raw);
+  const parsed = CafeDocument.safeParse(raw);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ");
     throw new Error(`invalid .cafe at ${path}: ${issues}\n${MINIMAL}`);
   }
+  validateTeam(parsed.data, path);
   return parsed.data;
 }
 
+/** Lowercase and replace anything outside `[a-z0-9_-]`; dots (valid in a name) become dashes. */
+export function sanitizeChannel(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
 /**
- * Resolve the identity for an Agent started in `cwd`. Without a `.cafe`,
- * the Agent joins anonymously as a Customer named after the directory.
+ * Cross-field team rules that zod cannot express. Mutates the parsed team so callers see the
+ * concrete channel and each member's effective channel list.
  */
-export function loadIdentity(cwd: string): { file?: string; cafe: CafeFile } {
+function validateTeam(doc: CafeDocument, path: string): void {
+  const team = doc.team;
+  if (!team) return;
+  const fail = (msg: string): never => {
+    throw new Error(`invalid .cafe at ${path}: ${msg}`);
+  };
+  const teamName = team.name ?? doc.name;
+  const channel = team.channel ?? sanitizeChannel(teamName);
+  if (!/^[a-z0-9_-]{1,64}$/.test(channel) || channel === "default") {
+    fail(`team channel '${channel}' is invalid or reserved; set team.channel explicitly`);
+  }
+  team.name = teamName;
+  team.channel = channel;
+  const seen = new Set<string>();
+  for (const m of team.members) {
+    if (seen.has(m.name)) fail(`team member '${m.name}' is listed twice`);
+    seen.add(m.name);
+    m.channels = m.channels?.length ? m.channels : [channel];
+    if (!m.channels.includes(channel)) fail(`team member '${m.name}' must include the team channel '${channel}' in channels`);
+    if (m.observer && !m.channels.includes(channel)) fail(`observer '${m.name}' must include the team channel '${channel}'`);
+  }
+}
+
+/** Load a team roster member by name. `teamDir` is the directory holding the roster `.cafe`. */
+export function loadTeamMember(teamDir: string, memberName: string): { file: string; cafe: CafeDocument; team: TeamSpec; member: TeamMember } {
+  const file = join(resolve(teamDir), CAFE_FILE_NAME);
+  const cafe = readCafeFile(file);
+  if (!cafe.team) throw new Error(`${file} has no team block`);
+  const member = cafe.team.members.find((m) => m.name === memberName);
+  if (!member) {
+    throw new Error(`unknown team member '${memberName}' in ${file}; roster: ${cafe.team.members.map((m) => m.name).join(", ")}`);
+  }
+  return { file, cafe, team: cafe.team, member };
+}
+
+/**
+ * The identity a process should register. A member selected by `member`/`CAFE_TEAM_MEMBER` (with
+ * `teamDir`/`CAFE_TEAM_DIR`) wins over the top-level `.cafe` identity; its roster is authoritative
+ * even when the member's own directory has no `.cafe` (v4-11).
+ */
+export function loadAgentIdentity(cwd: string): { file?: string; cafe: CafeDocument; team?: TeamSpec; member?: TeamMember; identity: Omit<AgentIdentity, "mode" | "cwd"> } {
+  const memberName = process.env.CAFE_TEAM_MEMBER;
+  const teamDir = process.env.CAFE_TEAM_DIR;
+  if (memberName) {
+    const rosterDir = teamDir ?? cwd;
+    const loaded = loadTeamMember(rosterDir, memberName);
+    const { team, member, file } = loaded;
+    return {
+      file,
+      cafe: loaded.cafe,
+      team,
+      member,
+      identity: {
+        name: member.name,
+        description: member.description,
+        tags: member.tags,
+        scope: member.scope,
+        role: "barista",
+        concurrency: 1,
+        team: team.name,
+        teamChannel: team.channel,
+        teamDir: resolve(rosterDir),
+        member: member.name,
+        ...(member.duty ? { duty: member.duty } : {}),
+        channels: member.channels ?? [team.channel!],
+        ...(member.observer ? { observer: true } : {}),
+      },
+    };
+  }
   const file = findCafeFile(cwd);
-  if (file) return { file, cafe: readCafeFile(file) };
+  const cafe = file ? readCafeFile(file) : CafeDocument.parse({ name: (resolve(cwd).split(/[\\/]/).filter(Boolean).pop() ?? "anon").replace(/[^a-zA-Z0-9_.-]/g, "-") || "anon", role: "customer" });
+  return {
+    file,
+    cafe,
+    identity: { name: cafe.name, description: cafe.description, tags: cafe.tags, scope: cafe.scope, role: cafe.role, concurrency: cafe.concurrency },
+  };
+}
+export function loadIdentity(cwd: string): { file?: string; cafe: CafeFile; document: CafeDocument } {
+  const file = findCafeFile(cwd);
+  if (file) {
+    const document = readCafeFile(file);
+    // `cafe` keeps the pre-v4-11 shape (no team block), so spreading it into an AgentIdentity stays valid.
+    return { file, cafe: document, document };
+  }
   const base = resolve(cwd).split(/[\\/]/).filter(Boolean).pop() ?? "anon";
   const name = base.replace(/[^a-zA-Z0-9_.-]/g, "-") || "anon";
-  return { cafe: CafeFile.parse({ name, role: "customer" }) };
+  const document = CafeDocument.parse({ name, role: "customer" });
+  return { cafe: document, document };
 }

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadIdentity } from "@cafe/protocol/cafe-file";
+import { loadAgentIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import type { Order } from "@cafe/protocol";
 import { extractAttachments } from "./artifacts.ts";
@@ -101,9 +101,10 @@ export function buildFollowup(order: Order, attachments?: Array<{ name: string; 
 export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; stop: () => void }> {
   const log = opts.log ?? ((m: string) => console.error(`[cafe serve] ${m}`));
   const dir = resolve(opts.dir);
-  const { cafe, file } = loadIdentity(dir);
+  const loaded = loadAgentIdentity(dir);
+  const { file, identity } = loaded;
   if (!file) throw new Error(`no .cafe found in ${dir} or its parents; a Barista needs an identity`);
-  if (cafe.role !== "barista") throw new Error(`${file} declares role "${cafe.role}"; set role: barista to receive questions`);
+  if (identity.role !== "barista") throw new Error(`${file} declares role "${identity.role}"; set role: barista to receive questions`);
 
   const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log });
   // An Order is acknowledged on arrival, so it needs heartbeats while it waits for a free slot.
@@ -115,7 +116,7 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
     active++;
     void client.setStatus("busy").catch(() => {});
     const stopBeat = keepAlive(h);
-    const prompt = buildPrompt(h.order, { address: client.record?.address ?? cafe.name, description: cafe.description }, undefined, h.attachments);
+    const prompt = buildPrompt(h.order, { address: client.record?.address ?? identity.name, description: identity.description }, undefined, h.attachments);
     let tmp: string | undefined;
     let cmd = opts.exec;
     if (cmd.includes("{prompt_file}")) {
@@ -154,7 +155,7 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
   };
 
   const pump = () => {
-    while (active < cafe.concurrency && queue.length) {
+    while (active < (identity.concurrency ?? 1) && queue.length) {
       const next = queue.shift()!;
       next.stopBeat(); // `run` takes over with its own heartbeat
       void run(next.h);
@@ -173,7 +174,7 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
     log(`cancelled by ${by}: ${orderId}`);
   });
 
-  const rec = await client.connect({ ...cafe, mode: "cli", agent: "command", command: commandLabel(opts.exec), cwd: dir, pid: process.pid });
+  const rec = await client.connect({ ...identity, mode: "cli", agent: "command", command: commandLabel(opts.exec), cwd: dir, pid: process.pid });
   log(`serving as ${rec?.address} with: ${opts.exec}`);
   return {
     client,

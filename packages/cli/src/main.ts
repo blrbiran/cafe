@@ -14,6 +14,7 @@ import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
+import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { joinAddresses } from "@cafe/daemon";
 import { joinText } from "./join-text.ts";
 import { tlsLine } from "./tls-line.ts";
@@ -1393,6 +1394,8 @@ barista
   .command("start")
   .description("start a Barista for a directory and let the daemon supervise it")
   .option("--dir <dir>", "directory to run in (its .cafe defines identity)", process.cwd())
+  .option("--member <name>", "start this roster member (reads the team .cafe)")
+  .option("--team-dir <dir>", "directory holding the roster .cafe (with --member)")
   .option("--agent <name>", "pi (default), omp (oh-my-pi), codex (codex app-server) or claude (claude -p)")
   .option("--write", "codex / claude only: allow editing files in --dir (default: read-only)")
   .option("--model <model>", "codex / claude only: model to use")
@@ -1423,9 +1426,16 @@ barista
       ...(native && o.model ? { model: o.model } : {}),
       ...(native && o.tui ? { tui: true } : {}),
       ...(native && o.thread ? { thread: o.thread } : {}),
+      ...(o.member ? { member: o.member } : {}),
+      ...(o.teamDir ? { teamDir: resolve(o.teamDir) } : {}),
     };
     const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir, ...spec }) });
     const how = o.tui ? " (answers in the running Codex session)" : native ? (o.write ? " (may edit files)" : " (read-only)") : "";
+    // A member's cwd is the roster entry's dir, not --dir; that check belongs to `cafe team status`.
+    if (o.member) {
+      out(`started ${ws.length} worker(s) in ${dir}${how}`, ws);
+      return;
+    }
     // "started" must mean it came up: wait for it to register, or report how it failed (#82).
     const outcome = await awaitBarista(dir);
     if (outcome.failed) {
@@ -1460,6 +1470,102 @@ barista
     const registered = await api<any[]>("/api/agents").then((as) => as.filter((a) => a.role === "barista").length).catch(() => 0);
     out(`(no supervised workers)${registered ? `\n${registered} registered barista(s) are connected; run \`cafe agents\` to list them` : ""}`, ws);
   });
+const rosterAt = (dir: string, teamDir?: string) => {
+  const rosterDir = resolve(teamDir ?? dir);
+  const file = join(rosterDir, ".cafe");
+  const doc = readCafeFile(file);
+  if (!doc.team) throw new Error(`${file} has no team block; add one (see README)`);
+  return { rosterDir, team: doc.team };
+};
+
+const team = program.command("team").description("agent teams declared in .cafe (v4-11)");
+team
+  .command("start")
+  .argument("[members...]", "only these roster members")
+  .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
+  .option("--team-dir <dir>", "same as --dir (explicit roster)")
+  .option("--dry-run", "print the plan")
+  .option("--force", "start a headless member even if an unowned same-name agent is online")
+  .action(async (names: string[], o) => {
+    await ensureDaemon();
+    const { rosterDir, team: spec } = rosterAt(o.dir, o.teamDir);
+    const unknown = names.filter((n) => !spec.members.some((m) => m.name === n));
+    if (unknown.length) throw new Error(`unknown member(s): ${unknown.join(", ")}; roster: ${spec.members.map((m) => m.name).join(", ")}`);
+    const selected = names.length ? spec.members.filter((m) => names.includes(m.name)) : spec.members;
+    const agents = await api<AgentRecord[]>("/api/agents");
+    const workers = await api<{ rosterDir?: string; member?: string }[]>("/api/baristas");
+    const online = new Set(agents.filter((a) => a.team === spec.name && a.member).map((a) => a.member!));
+    const supervised = new Set(workers.filter((w) => w.rosterDir === rosterDir && w.member).map((w) => w.member!));
+    const missingHeadless = selected.filter((m) => m.mode !== "tui" && (o.force || (!online.has(m.name) && !supervised.has(m.name))));
+    const missingTui = selected.filter((m) => m.mode === "tui" && !online.has(m.name));
+    const plan = {
+      rosterDir,
+      team: spec.name,
+      channel: spec.channel,
+      present: selected.filter((m) => online.has(m.name) || supervised.has(m.name)).map((m) => m.name),
+      start: missingHeadless.map((m) => m.name),
+      tui: missingTui.map((m) => m.name),
+    };
+    if (o.dryRun) return out(JSON.stringify(plan, null, 2), plan);
+    if (missingHeadless.length) {
+      await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: { ...spec, members: missingHeadless } }) });
+    }
+    const lines = [
+      `${spec.name} (#${spec.channel}) in ${rosterDir}`,
+      `started ${missingHeadless.length} headless member(s)${missingHeadless.length ? `: ${missingHeadless.map((m) => m.name).join(", ")}` : ""}`,
+      ...missingTui.map((m) => {
+        const dir = resolve(rosterDir, m.dir);
+        const runner = m.agent ?? spec.agent ?? "pi";
+        return runner === "codex"
+          ? `start ${m.name}: cafe barista run --agent codex --tui --dir ${dir} --member ${m.name} --team-dir ${rosterDir}`
+          : `start ${m.name}: open ${runner} in ${dir} with CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${rosterDir}, then run /cafe-team ${m.name}`;
+      }),
+    ];
+    out(lines.join("\n"), plan);
+  });
+team
+  .command("status")
+  .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
+  .option("--team-dir <dir>", "same as --dir (explicit roster)")
+  .action(async (o) => {
+    await ensureDaemon();
+    const { team: spec } = rosterAt(o.dir, o.teamDir);
+    const all = await api<any[]>("/api/teams");
+    const local = (await api<{ host: string }>("/api/health")).host;
+    const t = all.find((x) => x.team === spec.name && x.host === local) ?? all.find((x) => x.team === spec.name);
+    if (!t) return out(`team ${spec.name}: no roster published yet (start a member or run cafe team start)`, null);
+    const rows = t.roster.map((m: any) => ({
+      member: m.name,
+      duty: m.duty ?? "-",
+      mode: m.mode,
+      dir: m.dir,
+      status: m.status ?? "offline",
+      address: m.address ?? "-",
+      ...(m.observer ? { observer: true } : {}),
+      ...(m.currentThread ? { currentThread: m.currentThread } : {}),
+    }));
+    const lines = rows.map((r: any) => `${r.status.padEnd(8)} ${r.member.padEnd(16)} ${r.duty.padEnd(14)} ${r.mode.padEnd(8)} ${r.address}${r.observer ? " (observer)" : ""}${r.currentThread ? `  thread ${r.currentThread}` : ""}`);
+    out([`team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: root offline)" : ""}`, ...lines].join("\n"), t);
+  });
+team
+  .command("stop")
+  .argument("[members...]")
+  .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
+  .option("--team-dir <dir>", "same as --dir (explicit roster)")
+  .action(async (names: string[], o) => {
+    await ensureDaemon();
+    const { rosterDir } = rosterAt(o.dir, o.teamDir);
+    let stopped = 0;
+    if (names.length) {
+      for (const m of names) {
+        const r = (await api(`/api/baristas?dir=${encodeURIComponent(rosterDir)}&team=1&member=${encodeURIComponent(m)}`, { method: "DELETE" })) as { stopped: number };
+        stopped += r.stopped;
+      }
+    } else {
+      stopped = ((await api(`/api/baristas?dir=${encodeURIComponent(rosterDir)}&team=1`, { method: "DELETE" })) as { stopped: number }).stopped;
+    }
+    out(`stopped ${stopped} supervised member worker(s); TUI sessions are untouched`, { stopped });
+  });
 barista
   .command("run")
   .description("run a Codex / Claude Code Barista in the foreground (what `barista start --agent codex|claude` supervises)")
@@ -1469,9 +1575,13 @@ barista
   .option("--model <model>", "model to use")
   .option("--tui", "codex only: attach to the Codex TUI session already running in --dir (this command does not open a UI)")
   .option("--thread <id>", "with --tui: the Codex thread to use (required when --dir has more than one idle session)")
+  .option("--member <name>", "register as this roster member")
+  .option("--team-dir <dir>", "directory holding the roster .cafe (with --member)")
   .action(async (o) => {
     if (!BRIDGED_AGENTS.includes(o.agent)) throw new Error(`--agent must be ${BRIDGED_AGENTS.join(" or ")}`);
     if (!process.env.CAFE_DAEMON) await ensureDaemon();
+    if (o.member) process.env.CAFE_TEAM_MEMBER = o.member;
+    if (o.teamDir) process.env.CAFE_TEAM_DIR = resolve(o.teamDir);
     const { stop } = await runBridge({
       agent: o.agent as AgentKind,
       dir: o.dir,

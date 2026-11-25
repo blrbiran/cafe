@@ -41,7 +41,9 @@ import {
   type ThreadEnvelope,
   type ThreadEventBody,
   type ThreadMeta,
+  type TeamRecord,
 } from "@cafe/protocol";
+import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { Peer, RpcError } from "@cafe/protocol/peer";
 import { type CafeConfig, diffConfig, loadConfig, saveConfig } from "./config.ts";
 import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints.ts";
@@ -238,6 +240,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private idempotentOrders = new Map<string, IdempotentOrder>();
   /** Agents registered on this Host (authoritative local set, survives Registry snapshots). */
   private local = new Map<string, AgentRecord>();
+  /** v4-11 team rosters by `<host>/<team>`; the Root is authoritative and children replicate. */
+  private teamRecords = new Map<string, TeamRecord>();
 
   /** Root side: connected child Daemons by host. */
   private children = new Map<string, Peer>();
@@ -787,6 +791,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.agents.set(record.agentId, peer);
       this.local.set(record.agentId, record);
       this.publishAgents([record]);
+      this.learnTeam(record);
       this.log(`registered ${record.address} (${identity.mode}, ${identity.role})`);
       return record;
     });
@@ -847,6 +852,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private agentEvent(peer: Peer, p: { orderId: string; threadId: string }, event: ThreadEventBody): {} {
     if (!peer.meta.agentId) throw new RpcError("not_registered", "agent/register first");
+    const rec = this.local.get(peer.meta.agentId);
+    if (rec?.activeThreadId === p.threadId && ((event.type === "order.replied" && event.final) || event.type === "order.declined")) {
+      const next = { ...rec };
+      delete next.activeThreadId;
+      this.local.set(rec.agentId, next);
+      this.publishAgents([next]);
+    }
     this.recordEvent({ eventId: ulid(), threadId: p.threadId, orderId: p.orderId, host: this.host, at: Date.now(), event });
     return {};
   }
@@ -865,6 +877,104 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) this.broadcastDelta(this.registry.upsert(records));
     else if (this.rootOnline) this.uplink!.notify(Methods.registryUpsert, { records });
     else this.registry.upsert(records); // Root down: keep a local view; resynced on reconnect.
+  }
+
+  // -------------------------------------------------------------------------
+  // Teams (v4-11)
+  // -------------------------------------------------------------------------
+
+  /** The live team view used by /api/teams and the Web. Rosters come from team/upsert; online members from the registry. */
+  teams() {
+    const byKey = new Map(this.teamRecords);
+    // A team started only by TUIs (no `team start`) still appears: derive from live registrations.
+    for (const r of this.registry.all()) {
+      if (!r.team || !r.teamChannel) continue;
+      const key = `${r.host}/${r.team}`;
+      const rec = byKey.get(key) ?? { team: r.team, host: r.host, channel: r.teamChannel, members: [], revision: 0 };
+      const name = r.member ?? r.name;
+      if (!rec.members.some((m) => m.name === name)) {
+        rec.members = [...rec.members, { name, duty: r.duty, description: r.description, tags: r.tags, scope: r.scope, mode: "headless" as const, dir: r.cwd }];
+      }
+      byKey.set(key, rec);
+    }
+    const partial = !this.isRoot && !this.rootOnline;
+    return [...byKey.values()].map((t) => {
+      const agents = this.registry.all().filter((r) => r.host === t.host && r.team === t.team);
+      const roster = t.members.map((m) => {
+        const a = agents.find((r) => (r.member ?? r.name) === m.name);
+        return {
+          name: m.name,
+          ...(m.duty ? { duty: m.duty } : {}),
+          mode: m.mode,
+          dir: m.dir,
+          ...(m.observer ? { observer: true } : {}),
+          ...(a ? { address: a.address, status: a.status, ...(a.activeThreadId ? { currentThread: a.activeThreadId } : {}) } : {}),
+        };
+      });
+      const threads = [...this.metas.values()].filter((m) => (m.channel ?? DEFAULT_CHANNEL) === t.channel);
+      return {
+        ...t,
+        hostOnline: t.host === this.host || this.children.has(t.host),
+        roster,
+        online: roster.filter((m) => "status" in m && m.status !== "offline").length,
+        total: t.members.length,
+        openThreads: threads.filter((m) => m.status === "routing" || m.status === "delivering" || m.status === "working").length,
+        ...(threads.length ? { lastActivityAt: Math.max(...threads.map((m) => m.lastActivityAt ?? m.createdAt)) } : {}),
+        ...(partial ? { partial: true } : {}),
+      };
+    });
+  }
+
+  /** Route an explicit `to: <team>` (v4-11). Returns agents, or a visible failure. */
+  private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "ambiguous_address" } {
+    let teams = this.teams().filter((t) => t.team === name && (!host || t.host === host));
+    if (!teams.length) return { ids: [], failure: "unknown_team" };
+    if (teams.length > 1) {
+      // Prefer the sender's Host, then a team sharing the sender's channel.
+      const sameHost = teams.filter((t) => t.host === sender.host);
+      if (sameHost.length === 1) teams = sameHost;
+      else return { ids: [], failure: "ambiguous_team" };
+    }
+    const t = teams[0]!;
+    const online = t.roster.filter((m) => m.status && m.status !== "offline" && !m.observer);
+    if (!online.length) return { ids: [], failure: "team_offline" };
+    const orch = online.filter((m) => m.duty === "orchestrator");
+    const chosen = orch.length === 1 ? orch : online;
+    return { ids: chosen.map((m) => this.registry.all().find((r) => r.host === t.host && r.team === t.team && (r.member ?? r.name) === m.name)!.agentId) };
+  }
+
+  private storeTeam(rec: TeamRecord, from?: Peer): void {
+    const key = `${rec.host}/${rec.team}`;
+    const current = this.teamRecords.get(key);
+    if (current && (current.revision ?? 0) > (rec.revision ?? 0)) return;
+    this.teamRecords.set(key, rec);
+    if (this.isRoot) for (const child of this.children.values()) if (child !== from) child.notify(Methods.teamUpsert, { team: rec });
+  }
+
+  /** A registering member teaches this daemon its roster (from teamDir when readable) and publishes it. */
+  private learnTeam(rec: AgentRecord): void {
+    if (!rec.team || !rec.teamChannel) return;
+    const key = `${rec.host}/${rec.team}`;
+    const previous = this.teamRecords.get(key)?.members ?? [];
+    let members: TeamRecord["members"] = previous;
+    if (rec.teamDir) {
+      try {
+        const doc = readCafeFile(join(rec.teamDir, ".cafe"));
+        members = doc.team?.members ?? previous;
+      } catch (err) {
+        this.log(`cannot read team roster at ${rec.teamDir}: ${(err as Error).message}`);
+      }
+    }
+    // Keep members learned from earlier registrations (a TUI-only team has no roster file in reach).
+    members = [...members];
+    for (const m of previous) if (!members.some((x) => x.name === m.name)) members.push(m);
+    const name = rec.member ?? rec.name;
+    if (!members.some((m) => m.name === name)) {
+      members.push({ name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels });
+    }
+    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision: Date.now() };
+    this.storeTeam(team);
+    if (!this.isRoot && this.rootOnline) this.uplink!.notify(Methods.teamUpsert, { team });
   }
 
   // -------------------------------------------------------------------------
@@ -1597,14 +1707,33 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   private explicitDecision(order: Order): RoutingDecision {
     const ids = this.explicitTargets(order);
-    return {
-      targets: ids,
-      mode: ids.length === 1 ? "unicast" : "multicast",
-      reason: ids.length ? `explicit address ${order.to}` : `no online barista at ${order.to}`,
-      router: "explicit",
-      candidates: [],
-      ...(ids.length ? {} : { failure: "no_online_barista" as const }),
-    };
+    if (ids.length) {
+      return {
+        targets: ids,
+        mode: ids.length === 1 ? "unicast" : "multicast",
+        reason: `explicit address ${order.to}`,
+        router: "explicit",
+        candidates: [],
+      };
+    }
+    // Not an Agent: `to: <team>` (optionally `team@host`) resolves to its orchestrator or members.
+    const parsed = order.to ? parseAddress(this.normalizeAddress(order.to)) : undefined;
+    if (parsed) {
+      const team = this.resolveTeamTarget(parsed.name, parsed.host, order.from);
+      if (team.ids.length) {
+        return {
+          targets: team.ids,
+          mode: team.ids.length === 1 ? "unicast" : "multicast",
+          reason: `team ${parsed.name}${parsed.host ? `@${parsed.host}` : ""}`,
+          router: "explicit",
+          candidates: [],
+        };
+      }
+      if (team.failure) {
+        return { targets: [], mode: "multicast", reason: `team ${order.to}: ${team.failure}`, router: "explicit", candidates: [], failure: team.failure };
+      }
+    }
+    return { targets: [], mode: "unicast", reason: `no online barista at ${order.to}`, router: "explicit", candidates: [], failure: "no_online_barista" };
   }
 
   private explicitTargets(order: Order): string[] {
@@ -1814,6 +1943,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private deliverLocal(order: Order, agentId: string): void {
     const peer = this.agents.get(agentId);
     if (!peer) return this.relayFailure(order, agentId, "agent not connected");
+    const rec = this.local.get(agentId);
+    if (rec && rec.activeThreadId !== order.threadId) {
+      const next = { ...rec, activeThreadId: order.threadId };
+      this.local.set(agentId, next);
+      this.publishAgents([next]);
+    }
     const foreign = (order.attachments ?? []).some((a) => a.host && a.host !== this.host);
     if (!foreign) return this.notifyLocal(order, agentId, peer);
     // The origin may be another Host: fetch the blobs before the Barista starts.
@@ -2613,6 +2748,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.registryUpsert, (x: { records: AgentRecord[] }) => {
       this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
     });
+    peer.on(Methods.teamUpsert, (x: { team: TeamRecord }) => {
+      this.storeTeam({ ...x.team, host }, peer);
+      return {};
+    });
     peer.on(Methods.registryRemove, (x: { agentIds: string[] }) => {
       const own = x.agentIds.filter((id) => this.registry.get(id)?.host === host);
       this.broadcastDelta(this.registry.remove(own));
@@ -2650,6 +2789,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Send snapshot after the initialize response.
     queueMicrotask(() => {
       peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all() });
+      // v4-11: replay this Host's teams (and every replicated roster) so a reconnecting child has them.
+      for (const team of this.teamRecords.values()) peer.notify(Methods.teamUpsert, { team });
       this.pushHints(peer);
     });
     return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, host: this.host, isRoot: true, registryVersion: this.registry.version };
@@ -2910,6 +3051,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.registrySnapshot, (x: { version: number; records: AgentRecord[] }) => {
       const remote = x.records.filter((r) => r.host !== this.host);
       this.registry.applySnapshot(x.version, [...remote, ...this.local.values()]);
+    });
+    peer.on(Methods.teamUpsert, (x: { team: TeamRecord }) => {
+      this.storeTeam(x.team, peer);
+      return {};
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
     peer.on(Methods.rootMoved, (x: { addresses?: string[] }) => this.rememberRootAddresses(x?.addresses ?? []));

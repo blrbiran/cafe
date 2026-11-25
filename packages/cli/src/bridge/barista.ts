@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { loadIdentity } from "@cafe/protocol/cafe-file";
+import { loadAgentIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import { buildFollowup, buildPrompt, DECLINE_MARKER } from "../serve.ts";
 import { extractAttachments } from "../artifacts.ts";
@@ -42,9 +42,9 @@ const REPLY_NOTE =
 export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClient; stop: () => Promise<void> }> {
   const log = opts.log ?? ((m: string) => console.error(`[cafe ${opts.agent}] ${m}`));
   const dir = resolve(opts.dir);
-  const { cafe, file } = loadIdentity(dir);
+  const { file, identity } = loadAgentIdentity(dir);
   if (!file) throw new Error(`no .cafe found in ${dir} or its parents; a Barista needs an identity`);
-  if (cafe.role !== "barista") throw new Error(`${file} declares role "${cafe.role}"; set role: barista to receive questions`);
+  if (identity.role !== "barista") throw new Error(`${file} declares role "${identity.role}"; set role: barista to receive questions`);
   const access: Access = opts.access ?? "read-only";
   const engineOpts = { dir, access, model: opts.model, bin: opts.bin, log };
   if (opts.tui && opts.agent !== "codex") throw new Error("--tui is for --agent codex; Claude Code sessions join through the cafe plugin (`cafe claude install`)");
@@ -65,7 +65,7 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
     current = { orderId: h.order.orderId, abort };
     void client.setStatus("busy").catch(() => {});
     const stopBeat = keepAlive(h);
-    const self = { address: client.record?.address ?? cafe.name, description: cafe.description };
+    const self = { address: client.record?.address ?? identity.name, description: identity.description };
     log(`→ ${h.order.from.address}: ${h.order.body.slice(0, 80)}`);
     try {
       const resume = await client.getSession(h.order.threadId, opts.agent).catch(() => undefined);
@@ -145,8 +145,8 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
   }
   const rec = await client.connect(
     opts.tui
-      ? { ...cafe, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }
-      : { ...cafe, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid },
+      ? { ...identity, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }
+      : { ...identity, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid },
   );
   // Name the session, not only "the running Codex session": with several open, the person must be
   // able to check which one was attached (#100).

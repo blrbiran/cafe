@@ -11,7 +11,8 @@ import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ulid } from "ulid";
 import { WebSocketServer } from "ws";
-import { CreateOrderParams, Methods, type ThreadEnvelope } from "@cafe/protocol";
+import { CreateOrderParams, Methods, TeamSpec, type ThreadEnvelope } from "@cafe/protocol";
+import { loadTeamMember } from "@cafe/protocol/cafe-file";
 import { RpcError } from "@cafe/protocol/peer";
 import type { Daemon } from "./daemon.ts";
 import { homeId, loadConfig, saveConfig } from "./config.ts";
@@ -814,6 +815,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     daemon.kick(match[1]!);
     return send(res, 200, { ok: true });
   }
+  if (m === "GET" && path === "/api/teams") return send(res, 200, daemon.teams());
   if (path === "/api/baristas") {
     const sup = daemon.supervisor;
     if (m !== "POST" && !sup) throw new RpcError("unavailable", "barista supervisor disabled");
@@ -822,10 +824,25 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       const body = await readJson(req);
       // Unknown fields are refused, not ignored: `bin`/`args` used to start any local executable,
       // and silently ignoring them would start the default pi instead (#65).
-      const allowed = new Set(["dir", "agent", "access", "model", "tui", "thread"]);
+      const allowed = new Set(["dir", "agent", "access", "model", "tui", "thread", "member", "teamDir", "team"]);
       const extra = Object.keys(body).filter((k) => !allowed.has(k));
       if (extra.length) throw new RpcError("bad_request", `unknown field(s): ${extra.join(", ")}; cafe only starts its own agents (pi, omp, codex, claude)`);
-      const { dir, agent, access, model, tui, thread } = body;
+      const { dir, agent, access, model, tui, thread, member, teamDir, team } = body;
+      if (body.team !== undefined) {
+        // A full roster from `cafe team start`: the roster directory is the spec key.
+        if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
+        if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
+        return send(res, 200, sup.startTeam(resolve(dir), TeamSpec.parse(team)));
+      }
+      if (member !== undefined) {
+        if (typeof member !== "string" || !member) throw new RpcError("bad_request", "member must be a roster name");
+        const rosterDir = resolve(typeof teamDir === "string" && teamDir ? teamDir : (dir as string));
+        if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
+        const loaded = loadTeamMember(rosterDir, member);
+        if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
+        const one = { ...loaded.team, members: loaded.team.members.filter((m) => m.name === member) };
+        return send(res, 200, sup.startTeam(rosterDir, one));
+      }
       // Only cafe's own agents (#65). A free-form `bin`/`args` meant any local executable could be
       // started with any argv by any page that reached this API; `cafe barista start --agent` is the
       // supported path and it never needed more than these fields.
@@ -842,7 +859,11 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
       return send(res, 200, sup.start({ dir, ...native, ...(access ? { access } : {}), ...(model ? { model } : {}), ...(tui ? { tui } : {}), ...(thread ? { thread } : {}) }));
     }
-    if (m === "DELETE") return send(res, 200, { stopped: sup!.stop(url.searchParams.get("dir") ?? "") });
+    if (m === "DELETE") {
+      const dir = url.searchParams.get("dir") ?? "";
+      if (url.searchParams.get("team") === "1") return send(res, 200, { stopped: sup!.stopTeam(dir, url.searchParams.get("member") ?? undefined) });
+      return send(res, 200, { stopped: sup!.stop(dir) });
+    }
   }
   if (m === "POST" && path === "/api/root") {
     const { root } = await readJson(req);

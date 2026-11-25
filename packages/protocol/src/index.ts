@@ -32,6 +32,43 @@ export const ChannelName = z.string().regex(/^[a-z0-9_-]{1,64}$/, "channel names
 export type ChannelName = z.infer<typeof ChannelName>;
 export const DEFAULT_CHANNEL = "default";
 
+/** One roster entry in a `.cafe` team block (v4-11). */
+export const TeamMember = z.object({
+  name: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/, "member name may only contain [a-zA-Z0-9_.-]"),
+  duty: z.string().min(1).max(64).optional(),
+  description: z.string().default(""),
+  tags: z.array(z.string()).default([]),
+  scope: z.array(z.string()).default([]),
+  mode: z.enum(["headless", "tui"]).default("headless"),
+  dir: z.string().default("."),
+  channels: z.array(ChannelName).optional(),
+  observer: z.boolean().optional(),
+  collect: z.enum(["any", "all"]).optional(),
+  agent: z.string().optional(),
+  bin: z.string().optional(),
+  access: z.enum(["read-only", "write"]).optional(),
+});
+export type TeamMember = z.infer<typeof TeamMember>;
+
+export const TeamSpec = z.object({
+  name: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/, "team name may only contain [a-zA-Z0-9_.-]").optional(),
+  channel: ChannelName.optional(),
+  agent: z.string().optional(),
+  members: z.array(TeamMember).min(1),
+});
+export type TeamSpec = z.infer<typeof TeamSpec>;
+
+/** A roster replicated to the Root (v4-11). */
+export const TeamRecord = z.object({
+  team: z.string(),
+  host: z.string(),
+  channel: ChannelName,
+  members: z.array(TeamMember),
+  revision: z.number().int().optional(),
+  hostOnline: z.boolean().optional(),
+});
+export type TeamRecord = z.infer<typeof TeamRecord>;
+
 /** Contents of a `.cafe` Cafe File. */
 export const CafeFile = z.object({
   name: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/, "name may only contain [a-zA-Z0-9_.-]"),
@@ -42,6 +79,10 @@ export const CafeFile = z.object({
   concurrency: z.number().int().min(1).default(1),
 });
 export type CafeFile = z.infer<typeof CafeFile>;
+
+/** A `.cafe` file: the top-level identity plus an optional team roster (v4-11). */
+export const CafeDocument = CafeFile.extend({ team: TeamSpec.optional() });
+export type CafeDocument = z.infer<typeof CafeDocument>;
 
 export const AgentStatus = z.enum(["idle", "busy", "offline"]);
 export type AgentStatus = z.infer<typeof AgentStatus>;
@@ -69,6 +110,8 @@ export const AgentIdentity = CafeFile.extend({
   teamChannel: ChannelName.optional(),
   /** Roster entry name inside the team. */
   member: z.string().optional(),
+  /** Local directory holding the roster `.cafe` (same Host only; lets the daemon read the full roster). */
+  teamDir: z.string().optional(),
   /** Free-form responsibility label used as a routing signal. */
   duty: z.string().min(1).max(64).optional(),
   /** Channels this Agent receives from; the first entry is its home channel. Absent = ["default"]. */
@@ -461,6 +504,11 @@ export const Methods = {
   threadBackfill: "thread/backfill",
   rootMoved: "root/moved",
   daemonsChanged: "daemons/changed",
+  /** v4-11: a daemon publishes a full team roster (revision-guarded) to the Root / children. */
+  teamUpsert: "team/upsert",
+  teamRemove: "team/remove",
+  /** v4-11: a channel digest for an observer (not an Order). */
+  channelDigest: "channel/digest",
   /** Root→children: a Host was forgotten (v4-8); drop its address, link and pins. */
   hostForgotten: "cafe/hostForgotten",
 } as const;

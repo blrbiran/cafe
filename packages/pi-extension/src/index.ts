@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_PORT, type AgentRecord, type Attachment, type Order, type ThreadEnvelope } from "@cafe/protocol";
-import { loadIdentity } from "@cafe/protocol/cafe-file";
+import { loadAgentIdentity, loadTeamMember, readCafeFile } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 
 const STATUS_KEY = "cafe";
@@ -365,8 +365,8 @@ export default function cafe(pi: ExtensionAPI) {
     startupError = undefined;
     if (client) return;
     try {
-      const { cafe: id } = loadIdentity(ctx.cwd);
-      role = id.role;
+      const { identity } = loadAgentIdentity(ctx.cwd);
+      role = identity.role;
       const addr = daemonAddr();
       if (!(await ensureDaemon(addr))) {
         startupError = "daemon unreachable";
@@ -390,7 +390,7 @@ export default function cafe(pi: ExtensionAPI) {
         void refreshRegistry(c);
       });
       try {
-        await c.connect({ ...id, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
+        await c.connect({ ...identity, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
         client = c;
       } catch (err) {
         startupError = `cannot connect to the cafe daemon at ${addr}: ${(err as Error).message}`;
@@ -578,6 +578,33 @@ export default function cafe(pi: ExtensionAPI) {
   } catch (err) {
     // A user-owned /cafe command wins; the tools and the skill still work.
     console.warn(`cafe: /cafe command not registered: ${(err as Error).message}`);
+  }
+
+  // v4-11: choose the roster member this session registers as. A TUI cannot isolate context, so the
+  // selection is picked up on the next session start; we set the env var and say so.
+  try {
+    pi.registerCommand("cafe-team", {
+      description: "list the team roster or select the member this session registers as",
+      handler: async (args, ctx) => {
+        const teamDir = process.env.CAFE_TEAM_DIR;
+        if (!teamDir) return ctx.ui.notify("CAFE_TEAM_DIR is not set; start this session with --team-dir <roster dir>", "warning");
+        const name = args.trim();
+        try {
+          if (!name) {
+            const doc = readCafeFile(`${teamDir}/.cafe`);
+            const members = doc.team?.members.map((m) => `${m.name} (${m.duty ?? "member"}${m.observer ? ", observer" : ""})`).join(", ");
+            return ctx.ui.notify(`roster: ${members || "(no members)"}\nselect with /cafe-team <name>`);
+          }
+          const loaded = loadTeamMember(teamDir, name);
+          process.env.CAFE_TEAM_MEMBER = name;
+          ctx.ui.notify(`will register as ${name} (${loaded.member.duty ?? "member"}) on the next session start. A TUI cannot isolate context, so restart the session (or /reload-plugins) for the role to take effect.`);
+        } catch (err) {
+          ctx.ui.notify((err as Error).message, "error");
+        }
+      },
+    });
+  } catch (err) {
+    console.warn(`cafe: /cafe-team command not registered: ${(err as Error).message}`);
   }
 
   // ---------------------------------------------------------------------------
