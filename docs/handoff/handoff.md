@@ -135,6 +135,68 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
+### 2026-11-26 — v4-11 实现自审修复 + v4-12 混合版本能力声明（已推送 main，未发版）
+
+- **一句话**：独立 subagent 对已推送的 v4-11 实现做了代码审阅（20 条：4 P1 / 12 P2 / 4 P3），
+  确认并修复了全部 P1/P2；随后按 `docs/specs/v4-12-capabilities.md`（经独立 subagent 两轮审阅后修订）
+  实现了混合版本能力声明；验证全绿并推送 origin main；**未发版**（建议 0.1.6）。
+- **v4-11 安全/授权（批 1）**：
+  - `bindAgentMethods` 移到 `initialize` 成功之后：修复了任意网络 socket 在握手前就能
+    `agent/register` / `order/create` 的鉴权绕过。
+  - `/api/baristas` 的 `team` 分支只接受成员名，channel/agent/bin 一律从磁盘 `.cafe` 读取
+    （修复 #65 的嵌套绕过）。
+  - `escalate` 改用**该 Order 自己的** `tracking.targets` 证明投递，不再用跨轮累积的
+    `ThreadMeta.targets`。
+  - 合成 roster 保留 `observer`；裸名字跨主机同名时优先发送方主机，否则 `ambiguous_address`。
+- **名册/托管（批 2）**：supervisor `save()` 持久化“实际在管的成员集合”（部分 start 不再缩小、
+  stop 一人不再复活）；启动前校验成员目录，spawn error 走正常退避；presence 只看本机且失败 worker
+  视为缺失；native session 以 team/member 为键（同 cwd 的两个成员不再互相 resume）；权威 `.cafe`
+  替换成员集合、revision 严格递增、equal 忽略、forget host 清 teams；子机重连后重发本地 roster；
+  `team start` 对 Claude 不再提示 pi 才有的 `/cafe-team`。
+- **摘要/查询（批 3）**：只有 observer 注册所在的 daemon 发布摘要；游标按 channel 持久化
+  （重启不再回放）；channel 历史/摘要按 `last_activity` 查询（新增列 + 索引），旧 Thread 的新回复
+  不再落在“最新 500 条创建时间”之外；CafeClient 按 digestId 去重并在重连时清空；Claude 的 digest
+  改为队列；恢复的订单重新按同一策略上 deadline。
+- **诚实失败/Web（批 4）**：pi/MCP/CLI 对 `parent_offline`/`unknown_team`/空 channel 立即报错
+  （CLI exit 1），空池给 `no_channel_members` 或 `no_online_barista`；Web/MCP 把
+  `order.declined {skipped}` 显示为截止沉默；子机 team 视图始终 `partial`，`hostOnline` 用 registry；
+  切 channel 不再卸载 Feed（保留草稿）；`loadOlder` 用 channel generation，不再被同 channel 重连卡住。
+- **v4-12 混合版本（批 5，`docs/specs/v4-12-capabilities.md` + plan）**：
+  - daemon 在 `initialize`、`/api/health`、`/api/snapshot`、`/api/daemons` 声明
+    `features: ["teams","channels","escalate","collect","digests"]`；子机记录 `rootFeatures`。
+  - **absence = 未确认，不是“不支持”**（v4-11 的 0.1.5 构建不声明）：客户端再用
+    `agent/register` echo 证明身份字段、`cafe team` 用 `GET /api/teams` 探测。
+  - 语义降级 warn-and-continue（owner 2026-11-26 决定）：channel/escalate/collect/team 身份；
+    文本含 host、版本、观察到的去向与“先重启再升级”提示。CLI stderr + `--json` warnings、MCP/pi
+    工具结果、pi 启动 notify。
+  - observer：确认不支持时**发送前拒绝**；未声明时注册后比对 echo，被剥离则立即断开并拒绝。
+  - **注册表发布按 peer 过滤**：旧 daemon 不会收到 observer 或只在非 default channel 的 agent，
+    因此它的 `eligible()` 选不到它们（修复审阅的 P1）。
+  - `cafe team *` 与 `barista start --member` 在**任何写操作前**探测 teams（旧 0.1.5 会把
+    `DELETE ?team=1` 当普通 `stop(dir)`）。
+  - 子机的 Root 不支持 channels 时，channel 订单本地路由；roster 无法上送时
+    `rosterShared: false` 并只记一次日志。
+  - Web：snapshot 无 features 且 `/api/channels` 探测失败时进入 legacy 视图（强制 default、隐藏
+    chips、banner）；Teams 端点缺失显示“unavailable”而不是空名册。
+- **验证**：`npm run typecheck`；`npm test` **两遍 675/675（126 文件）**；`routing:eval` 67/67；
+  `build:web` 56 modules / 376.25 kB；`test:release` 17/17；`test:claude-plugin` 5/5；本机 Root 已
+  重启，`/api/health.features` 与 `/api/snapshot.features` 均为五项，`cafe doctor` 全绿
+  （含新增的 `features` 检查）。
+- **行为变化（请审核）**：① 握手前不再有任何 agent RPC；② `team start/stop` 在旧 daemon 上直接
+  失败且不发写请求；③ supervisor 重启只恢复实际在管的成员；④ 摘要有唯一发布者且游标持久化；
+  ⑤ channel 历史/摘要按活动时间排序；⑥ 立即路由失败时 `cafe ask` 非零退出；⑦ 切 channel 保留
+  草稿；⑧ 混合版本会给警告（observer 会被拒）；⑨ 旧 peer 收不到 observer/非 default channel 的记录；
+  ⑩ 子机 team 视图始终 `partial` 且带 `rosterShared`。
+- **诚实边界**：Claude session-host 目前只把混合版本警告写日志（hook 没有 warning 消息类型）；
+  旧 daemon 的模拟来自测试里的 protocol-1 假 daemon，没有打包 0.1.5 tarball 的端到端对比；注册表
+  过滤只影响升级后新连上的 peer，升级前已缓存的记录仍可能留在旧 peer 上；Web legacy 视图只在
+  自定义新 bundle + 旧 API 时出现（daemon 通常服务自己的 bundle）。
+- **仍需你本人**：审核上面的行为变化；发版（建议 0.1.6）；真机 team dogfooding；Discord 实测；
+  ssh1 复核 #91；证书安装（你说先不做）。
+- **下一步候选**：Claude hook 的 warning/refusal 消息；Web 子 Thread 导航（escalate 的父/子链接）；
+  pi/Claude 的 `/cafe-team` 运行时重新注册；#34 snapshot 分页 / #33 虚拟列表；#18 只读 token；
+  #27 升级通知；#73 orca 反向 connector。
+
 ### 2026-11-25 — v4-11 team/channel 全量落地（批次 A–E，已推送 main）
 
 - **一句话**：team/channel 从设计到实现全部完成（#71/#72）：显式 escalate 子 thread、channel 路由、`collect: all`、`.cafe` 名册、`cafe team`、observer digest、Web Teams 页；验证全绿并推送 origin main；**未发版**（建议 0.1.6）。
@@ -1184,6 +1246,15 @@ A real two-machine run already happened on 2026-11-19 (Mac Root + ssh1 Docker ch
 - **Connectors survive a daemon restart.** They are detached processes; after changing `packages/connector/**` run `cafe connector restart <name>` too (Discord ran stale code for hours on 2026-11-24).
 - **A second local TLS daemon collides on 4778.** An isolated test daemon on the same machine as the real Root must set `security.tls.port` (only `EADDRINUSE` is printed otherwise).
 - **playwright-cli `goto` to the same URL with a new hash does not reload** the page: after a rebuild, `reload` before taking screenshots.
+
+- **Agent RPC is bound after `initialize` (v4-12).** `accept()` used to call `bindAgentMethods` before the handshake, so any socket that could open `/ws` could `agent/register`/`order/create` without a token. Keep the bind inside the initialize handler after the token/protocol/TLS checks.
+- **An absent feature list is not incapability (v4-12).** v4-11 shipped under version 0.1.5 without advertising `features`; treat absence as unconfirmed and probe (`agent/register` echo, `GET /api/teams`). Only a present list may support "does not support" copy.
+- **Old peers must not learn observers or channel-only agents (v4-12).** An old `eligible()` ignores `observer` and `channels`; `registry/sync`, `registry/snapshot` and `registryDelta` are filtered per peer (`publishableTo`). Filtering at registration alone is not enough.
+- **Team writes preflight `GET /api/teams` (v4-12).** A tagged 0.1.5 daemon handles `DELETE /api/baristas?team=1` as a plain `stop(dir)`; never send a team POST/DELETE before the probe succeeds.
+- **Digests: one publisher, a persisted per-channel cursor (v4-12).** Every daemon sees the network registry; only the observer's registration host may publish. The cursor lives in the store kv, so a restart does not replay old activity.
+- **Team session keys are `team/member`, not cwd (v4-12).** Native members often share `dir: .`; keying sessions by cwd lets them resume each other's conversation.
+- **Roster membership follows the file, not the union (v4-12).** An authoritative `.cafe` replaces members (removals take effect), revisions increase strictly, and `forgetHost` drops that host's teams. The reconnect path republishes local rosters when the Root advertises `teams`.
+- **Channel history/digests page by `last_activity` (v4-12).** The column is migrated and backfilled; the creation-ordered window missed replies on old Threads.
 - **`Order.variants` (#39)**: delivery-only. `dispatch()` sends `body = variants[agentId] ?? body` with `variants` stripped; do not write per-variant text into `history()` or `order.created`, and do not attach variants to a unicast. The rules split is deliberately narrow (explicit two-clause punctuation only).
 
 ## 9. Working with this user
