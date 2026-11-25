@@ -70,6 +70,8 @@ export class CafeClient {
   private cancelListeners = new Set<Listener<{ orderId: string; threadId: string; by: string }>>();
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
   private digestListeners = new Set<Listener<ChannelDigest>>();
+  /** Digest ids already dispatched on this connection (reconnect/replay protection). */
+  private seenDigests = new Set<number>();
   /** Recent events, so a listener attached after a fast thread closed can still read it. */
   private recent: ThreadEnvelope[] = [];
   private connectListeners = new Set<Listener<AgentRecord | undefined>>();
@@ -136,6 +138,7 @@ export class CafeClient {
 
   private open(): Promise<AgentRecord | undefined> {
     return new Promise((resolve, reject) => {
+      this.seenDigests.clear();
       const ws = this.connectSocket();
       this.ws = ws;
       const peer = new Peer(ws);
@@ -153,6 +156,14 @@ export class CafeClient {
         for (const fn of this.eventListeners) fn(env);
       });
       peer.on(Methods.channelDigest, ({ digest }: { digest: ChannelDigest }) => {
+        // A reconnect may replay a digest; the id is a publisher-local sequence, so the set is
+        // cleared on every open (a restarted daemon starts again at 1) (v4-11 review).
+        if (this.seenDigests.has(digest.digestId)) return;
+        this.seenDigests.add(digest.digestId);
+        if (this.seenDigests.size > 1000) {
+          const oldest = this.seenDigests.values().next().value;
+          if (oldest !== undefined) this.seenDigests.delete(oldest);
+        }
         for (const fn of this.digestListeners) fn(digest);
       });
       ws.addEventListener("message", (e) => void peer.receive(String(e.data)));

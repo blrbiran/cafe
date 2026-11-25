@@ -130,6 +130,44 @@ describe("restart & reconnect", () => {
     expect(d.daemon.thread(res.threadId)!.meta.replies[0]).toMatchObject({ agentId: rec!.agentId, text: "answered after restart" });
   });
 
+  it("re-arms a recovered unicast collect:all deadline", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-restart-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1", security: { mode: "plaintext" } }));
+    const timing = { ...FAST, heartbeatIntervalMs: 800 };
+    const opts = { home, timing, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "none") };
+    let d = await runDaemon(opts);
+    const port = d.server.port;
+    const addr = `127.0.0.1:${port}`;
+
+    // Acked, heartbeating, never answering: without a recovered deadline it would stay open.
+    const b = new CafeClient({ daemon: addr, reconnect: true });
+    b.onOrder((h) =>
+      void (async () => {
+        await h.ack();
+        const stop = keepAlive(h, 300);
+        await new Promise((r) => setTimeout(r, 5000));
+        stop();
+      })().catch(() => {}),
+    );
+    await b.connect(identity("slow"));
+    cleanup.push(() => b.close());
+
+    const res = await fetch(`http://${addr}/api/orders`, {
+      method: "POST",
+      body: JSON.stringify({ body: "slow job", to: "slow", collect: "all", deadlineMs: 2000 }),
+    }).then((r) => r.json());
+    await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "working", 5000);
+
+    await d.stop();
+    d = await runDaemon({ ...opts, port });
+    cleanup.push(() => d.stop());
+    await waitFor(() => d.daemon.thread(res.threadId)?.meta.status !== "working", 6000);
+    // The deadline, not a lost heartbeat: a silent collect:all target is recorded as skipped.
+    const events = d.daemon.thread(res.threadId)!.events;
+    expect(events.some((e) => e.event.type === "order.declined" && e.event.skipped)).toBe(true);
+  });
+
   it("fails a recovered order whose barista never comes back", async () => {
     const home = mkdtempSync(join(tmpdir(), "cafe-restart-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));

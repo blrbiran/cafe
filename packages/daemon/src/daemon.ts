@@ -978,10 +978,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** A page of one channel's Threads for an observer (v4-11), newest activity first. */
   channelThreads(channel: string, opts: { after?: number; before?: number; limit?: number } = {}) {
     const limit = Number.isInteger(opts.limit) && opts.limit! > 0 ? Math.min(opts.limit!, 200) : 50;
-    const all = this.store.listThreadsIn(channel, 500, undefined, opts.before ?? Number.MAX_SAFE_INTEGER);
-    const filtered = opts.after === undefined ? all : all.filter((m) => (m.lastActivityAt ?? m.createdAt) > opts.after!);
-    const sorted = filtered.sort((a, b) => (b.lastActivityAt ?? b.createdAt) - (a.lastActivityAt ?? a.createdAt));
-    return { threads: sorted.slice(0, limit).map((m) => this.summaryMeta(m)), hasMore: sorted.length > limit, exists: all.length > 0 || this.teams().some((t) => t.channel === channel) };
+    // Activity, not creation: a follow-up on an old Thread is exactly what an observer must see.
+    const all = this.store.listThreadsInByActivity(channel, { ...(opts.after !== undefined ? { after: opts.after } : {}), ...(opts.before !== undefined ? { before: opts.before } : {}), limit: 500 });
+    return {
+      threads: all.slice(0, limit).map((m) => this.summaryMeta(m)),
+      hasMore: all.length > limit,
+      exists: all.length > 0 || this.store.listThreadsIn(channel, 1).length > 0 || this.teams().some((t) => t.channel === channel),
+    };
   }
   private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "ambiguous_address" } {
     let teams = this.teams().filter((t) => t.team === name && (!host || t.host === host));
@@ -1021,13 +1024,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private emitDigests(): void {
     const now = Date.now();
     for (const rec of this.registry.all()) {
-      if (!rec.observer) continue;
+      // Only the daemon the observer REGISTERED on publishes. Every daemon can see the network
+      // registry, so without this a Root and a child both wake the same observer for one Thread
+      // (v4-11 review). A child's digest is partial by design; an observer on the Root gets the
+      // network view.
+      if (!rec.observer || rec.host !== this.host) continue;
       for (const channel of channelsOf(rec)) {
         const since = this.digestSince.get(rec.agentId)?.get(channel) ?? 0;
-        const changed = this.store
-          .listThreadsIn(channel, 200)
-          .filter((m) => (m.lastActivityAt ?? m.createdAt) > since)
-          .sort((a, b) => (b.lastActivityAt ?? b.createdAt) - (a.lastActivityAt ?? a.createdAt));
+        const changed = this.store.listThreadsInByActivity(channel, { after: since, limit: 200 });
         if (!changed.length) continue;
         const digest: ChannelDigest = {
           digestId: ++this.digestSeq,
@@ -2872,10 +2876,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (st === "pending") this.armAck(t, id);
         else if (st === "acked") this.armHeartbeat(t, id);
       }
-      if (routed.decision.mode !== "unicast" || order.kind === "notice") {
-        const remaining = order.createdAt + (order.deadlineMs ?? this.timing.broadcastDeadlineMs) - Date.now();
-        t.deadline = setTimeout(() => this.finishOnDeadline(t), Math.max(0, remaining));
-      }
+      // A recovered Order gets the same upper bound as a fresh one: a barista that acked before the
+// restart and keeps heartbeating must not hold a unicast `collect: all` open forever.
+      const defaultMs = routed.decision.mode !== "unicast" || order.kind === "notice" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
+      const remaining = order.createdAt + (order.deadlineMs ?? defaultMs) - Date.now();
+      t.deadline = setTimeout(() => this.finishOnDeadline(t), Math.max(0, remaining));
       this.maybeClose(t);
     }
     if (n) this.log(`recovered ${n} open order(s)`);

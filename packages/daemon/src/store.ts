@@ -87,7 +87,14 @@ export class Store {
       this.db.exec("ALTER TABLE threads ADD COLUMN channel TEXT");
       this.db.exec("UPDATE threads SET channel = COALESCE(json_extract(meta, '$.channel'), 'default')");
     }
+    // v4-12: channel history and observer digests page by ACTIVITY, not creation time. An old
+    // Thread that receives a reply must not fall outside the newest-500-by-creation window.
+    if (!threadCols.has("last_activity")) {
+      this.db.exec("ALTER TABLE threads ADD COLUMN last_activity INTEGER");
+      this.db.exec("UPDATE threads SET last_activity = COALESCE(json_extract(meta, '$.lastActivityAt'), created_at)");
+    }
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_created ON threads(channel, created_at DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_activity ON threads(channel, last_activity DESC)");
     this.upsertIndexRows = this.prepareIndexRows();
   }
 
@@ -375,8 +382,8 @@ export class Store {
   putThread(meta: ThreadMeta): number {
     const json = JSON.stringify(meta);
     this.db
-      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, meta) VALUES (?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, meta=excluded.meta")
-      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", json);
+      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, last_activity, meta) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, last_activity=excluded.last_activity, meta=excluded.meta")
+      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", meta.lastActivityAt ?? meta.createdAt, json);
     return Buffer.byteLength(json);
   }
 
@@ -408,6 +415,21 @@ export class Store {
     const rows = (status
       ? this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, status, at, n)
       : this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, at, n)) as { meta: string }[];
+    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+  }
+
+  /**
+   * One channel's Threads by last activity, newest first (v4-12). `after`/`before` are activity
+   * cursors (exclusive). This is the observer/digest view: a reply on an old Thread belongs here
+   * even when the Thread is far outside the newest-created window.
+   */
+  listThreadsInByActivity(channel: string, opts: { after?: number; before?: number; limit?: number } = {}): ThreadMeta[] {
+    const n = Number.isInteger(opts.limit) && (opts.limit ?? 0) > 0 ? Math.min(opts.limit!, 10_000) : 200;
+    const after = Number.isFinite(opts.after) && (opts.after ?? 0) > 0 ? opts.after! : 0;
+    const before = Number.isFinite(opts.before) ? opts.before! : Number.MAX_SAFE_INTEGER;
+    const rows = this.db
+      .prepare("SELECT meta FROM threads WHERE channel = ? AND last_activity > ? AND last_activity < ? ORDER BY last_activity DESC, thread_id DESC LIMIT ?")
+      .all(channel, after, before, n) as { meta: string }[];
     return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
   }
 

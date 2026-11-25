@@ -22,7 +22,7 @@ let address: string | undefined
 let paused = false
 let current: Current | undefined
 /** A digest that arrived while an Order turn was running; submitted once the turn ends (v4-11). */
-let pendingDigest: string | undefined
+let pendingDigests: string[] = []
 
 const status = ($: EngineInterface) =>
   $.ui.status(address ? (paused ? `☕ ${address} (paused)` : `☕ ${address}`) : undefined)
@@ -68,8 +68,14 @@ async function handle($: EngineInterface, msg: HostMessage) {
     if (current.turnId) await $.turn.abort({ turnId: current.turnId }).catch(() => {})
   } else if (msg.type === 'digest') {
     // One summarized observation, queued behind an in-flight Order rather than interrupting it.
-    if (current) pendingDigest = msg.text
-    else void $.prompt.submit({ text: msg.text }).catch(() => {})
+    // It is a queue, not a slot: two channels (or two intervals) during one long Order must all
+    // get their turn (v4-11 review).
+    if (current) {
+      pendingDigests.push(msg.text)
+      if (pendingDigests.length > 20) pendingDigests.splice(0, pendingDigests.length - 20)
+    } else {
+      void $.prompt.submit({ text: msg.text }).catch(() => {})
+    }
   }
   status($)
 }
@@ -183,10 +189,8 @@ export const register: Register = on => {
       current = undefined
       const error = e.reason === 'error' || e.reason === 'refusal' ? e.reason : undefined
       void post($, '/done', { orderId: order.orderId, text: e.answer, aborted: e.isAborted, error })
-      if (pendingDigest) {
-        const text = pendingDigest
-        pendingDigest = undefined
-        void $.prompt.submit({ text }).catch(() => {})
+      if (pendingDigests.length) {
+        for (const text of pendingDigests.splice(0)) void $.prompt.submit({ text }).catch(() => {})
       }
     }
     return next(e)
