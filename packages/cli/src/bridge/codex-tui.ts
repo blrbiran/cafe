@@ -6,7 +6,7 @@ import type { Engine, EngineOptions, TurnRequest, TurnResult } from "./engine.ts
 type Json = Record<string, any>;
 
 export interface CodexTuiOptions extends EngineOptions {
-  /** Codex thread to use; default: the most recently active one whose cwd is `dir`. */
+  /** Codex thread to use; default: the only idle session in `dir` (several open: ask for --thread). */
   thread?: string;
   /** How long a queued question may wait for the session to pick it up (default CAFE_INJECT_TIMEOUT_MS or 120 s). */
   injectTimeoutMs?: number;
@@ -65,15 +65,56 @@ export class CodexTuiEngine implements Engine {
     return this.ready;
   }
 
-  /** The session to ask: the configured thread, else the newest non-ephemeral thread started in `dir`. */
-  async findThread(server: AppServer): Promise<string | undefined> {
-    if (this.opts.thread) return this.opts.thread;
+  /** Sessions whose cwd is `dir`, newest first. Ephemeral threads are not real sessions. */
+  private async candidates(server: AppServer): Promise<Json[]> {
     const want = real(this.opts.dir);
     const res = await server.request<Json>("thread/list", { limit: 50 });
     const rows = ((res.data ?? []) as Json[]).filter((t) => !t.ephemeral && typeof t.cwd === "string" && (t.cwd === this.opts.dir || real(t.cwd) === want));
     rows.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-    return rows[0]?.id;
+    return rows;
   }
+
+  /**
+   * A session another process is in the middle of a turn shows `interrupted` with no `completedAt`
+   * (see the class comment). Injecting there would start a turn in someone's live conversation (#100).
+   */
+  private async busy(server: AppServer, threadId: string): Promise<boolean> {
+    const res = await server.request<Json>("thread/turns/list", { threadId, limit: 1 }).catch(() => undefined);
+    const turn = ((res?.data ?? []) as Json[])[0];
+    if (!turn) return false;
+    return turn.completedAt == null && turn.status !== "completed";
+  }
+
+  /**
+   * Which session to ask. `--thread` wins. A directory with one session uses it and names it; with
+   * several open the command refuses and lists them, because "the most recently updated one" is very
+   * often the session the person is typing in (#100). A running turn only matters when choosing
+   * between several: queueing into one known session is the whole point of a TUI Barista.
+   */
+  async chooseThread(server: AppServer): Promise<{ ok: true; threadId: string } | { ok: false; error: string }> {
+    if (this.opts.thread) return { ok: true, threadId: this.opts.thread };
+    const rows = await this.candidates(server);
+    if (!rows.length) return { ok: false, error: `no Codex session in ${this.opts.dir}` };
+    if (rows.length === 1) return { ok: true, threadId: rows[0]!.id };
+    const idle: string[] = [];
+    const busy: string[] = [];
+    for (const row of rows.slice(0, 10)) (await this.busy(server, row.id) ? busy : idle).push(row.id);
+    if (idle.length === 1) return { ok: true, threadId: idle[0]! };
+    if (!idle.length) {
+      return {
+        ok: false,
+        error: `every Codex session in ${this.opts.dir} is in the middle of a turn (${busy.join(", ")}); wait for the turn to finish and run this command again, or pass --thread <id>`,
+      };
+    }
+    const names = [...idle, ...busy.map((id) => `${id} (busy)`)].join(", ");
+    return {
+      ok: false,
+      error: `several Codex sessions in ${this.opts.dir}: ${names}; pass --thread <id> to choose one (cafe never guesses — the newest is often the session you are typing in)`,
+    };
+  }
+
+  /** The session picked at startup stays the session: every question goes into the same queue. */
+  private picked?: string;
 
   /**
    * Startup preflight (#40): a TUI Barista is only useful next to a running
@@ -83,12 +124,13 @@ export class CodexTuiEngine implements Engine {
   async probe(): Promise<{ ok: true; threadId: string } | { ok: false; error: string }> {
     try {
       const server = await this.start();
-      const threadId = await this.findThread(server);
-      if (!threadId) {
+      const choice = await this.chooseThread(server);
+      if (!choice.ok) {
         await this.close();
-        return { ok: false, error: `no Codex session in ${this.opts.dir}` };
+        return choice;
       }
-      return { ok: true, threadId };
+      this.picked = choice.threadId;
+      return choice;
     } catch (err) {
       await this.close();
       return { ok: false, error: (err as Error).message };
@@ -103,7 +145,12 @@ export class CodexTuiEngine implements Engine {
     let threadId: string | undefined;
     try {
       server = await this.start();
-      threadId = await this.findThread(server);
+      threadId = this.opts.thread ?? this.picked;
+      if (!threadId) {
+        const choice = await this.chooseThread(server);
+        if (!choice.ok) return { status: "failed", text: "", error: choice.error };
+        threadId = this.picked = choice.threadId;
+      }
     } catch (err) {
       return { status: "failed", text: "", error: (err as Error).message };
     }

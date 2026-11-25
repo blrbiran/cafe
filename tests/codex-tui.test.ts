@@ -17,7 +17,7 @@ afterEach(async () => {
 
 type Item = { id: string; clientUserMessageId: string; text: string };
 
-async function setup(opts: { thread?: string; injectTimeoutMs?: number; threads?: (dir: string) => object[] } = {}) {
+async function setup(opts: { thread?: string; injectTimeoutMs?: number; threads?: (dir: string) => object[]; beforeBridge?: (state: string) => void } = {}) {
   const root = await startDaemon("root", { mode: "root" });
   cleanup.push(root.stop);
   const tmp = mkdtempSync(join(tmpdir(), "cafe-codex-tui-"));
@@ -27,19 +27,22 @@ async function setup(opts: { thread?: string; injectTimeoutMs?: number; threads?
   mkdirSync(dir);
   mkdirSync(state);
   writeFileSync(join(dir, ".cafe"), "name: coder\ndescription: answers questions about the code\n");
+  // One idle session in the directory unless a test asks for more: the Barista never guesses when
+  // several are open (#100).
   const threads = opts.threads?.(dir) ?? [
-    { id: "old", cwd: dir, updatedAt: 100, ephemeral: false },
     { id: "live", cwd: dir, updatedAt: 300, ephemeral: false },
     { id: "side", cwd: dir, updatedAt: 400, ephemeral: true },
     { id: "elsewhere", cwd: tmp, updatedAt: 500, ephemeral: false },
   ];
   writeFileSync(join(state, "threads.json"), JSON.stringify(threads));
+  opts.beforeBridge?.(state);
   process.env.FAKE_CODEX_STATE = state;
   process.env.FAKE_CODEX_LOG = join(tmp, "codex.log");
   cleanup.push(() => {
     delete process.env.FAKE_CODEX_STATE;
     delete process.env.FAKE_CODEX_LOG;
   });
+  const logs: string[] = [];
   const b = await runBridge({
     agent: "codex",
     tui: true,
@@ -48,7 +51,7 @@ async function setup(opts: { thread?: string; injectTimeoutMs?: number; threads?
     daemon: root.addr,
     bin: FAKE,
     tuiTiming: { pollMs: 25, injectTimeoutMs: opts.injectTimeoutMs ?? 5000 },
-    log: process.env.BRIDGE_DEBUG ? (m) => console.log("BRIDGE", m) : () => {},
+    log: process.env.BRIDGE_DEBUG ? (m) => console.log("BRIDGE", m) : (m) => logs.push(m),
   });
   cleanup.push(b.stop);
   const c = await customer(root.addr);
@@ -79,21 +82,23 @@ async function setup(opts: { thread?: string; injectTimeoutMs?: number; threads?
     },
   };
   const ask = async (body: string, threadId?: string) => c.ask({ body, to: "coder", threadId });
-  return { root, dir, tui, c, ask };
+  return { root, dir, tui, c, ask, logs };
 }
 
 const replyOf = (events: { event: { type: string } }[]) => (events.find((e) => e.event.type === "order.replied")?.event as { text: string } | undefined)?.text;
 const declineOf = (events: { event: { type: string } }[]) => events.find((e) => e.event.type === "order.declined")?.event as { reason: string; unavailable?: boolean } | undefined;
 
 describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
-  it("queues into the newest session started in its directory and answers with the turn's final message", async () => {
-    const { root, tui, c, ask } = await setup();
+  it("uses the only session in its directory, says which one, and answers with the turn's final message", async () => {
+    const { root, tui, c, ask, logs } = await setup();
     expect(root.daemon.registry.all().find((r) => r.name === "coder")).toMatchObject({ mode: "tui", agent: "codex" });
     expect(root.daemon.registry.all().find((r) => r.name === "coder")?.access).toBeUndefined();
+    // The person must be able to tell which Codex session is being used (#100).
+    expect(logs.join("\n")).toContain("live");
 
     const a = await ask("what is x");
     await waitFor(() => tui.queue().length === 1);
-    expect(tui.queue("old")).toEqual([]);
+    expect(tui.queue("side")).toEqual([]);
     const item = tui.take();
     expect(item.text).toContain("Question:\nwhat is x");
     const done = untilClosed(c, a.threadId, a.orderId);
@@ -160,7 +165,13 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
   });
 
   it("--thread pins the session; with no session in the directory it declines as unavailable", async () => {
-    const pinned = await setup({ thread: "old" });
+    const pinned = await setup({
+      thread: "old",
+      threads: (dir) => [
+        { id: "old", cwd: dir, updatedAt: 100, ephemeral: false },
+        { id: "live", cwd: dir, updatedAt: 300, ephemeral: false },
+      ],
+    });
     const a = await pinned.ask("pinned?");
     await waitFor(() => pinned.tui.queue("old").length === 1);
     expect(pinned.tui.queue("live")).toEqual([]);
@@ -168,6 +179,40 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     const done = untilClosed(pinned.c, a.threadId, a.orderId);
     pinned.tui.turn(item, { status: "completed", answer: "from old", completedAt: 1 }, "old");
     expect(replyOf(await done)).toBe("from old");
+  });
+
+  // #100: the silent default used to be "the most recently updated session in the directory", which in
+  // real use is exactly the session the person is typing in. Guessing is not safe; ask for a choice.
+  it("refuses to guess between several Codex sessions and lists them", async () => {
+    await expect(
+      setup({
+        threads: (dir) => [
+          { id: "old", cwd: dir, updatedAt: 100, ephemeral: false },
+          { id: "live", cwd: dir, updatedAt: 300, ephemeral: false },
+        ],
+      }),
+    ).rejects.toThrow(/several Codex sessions[\s\S]*live[\s\S]*old[\s\S]*--thread/);
+  });
+
+  it("skips a session that is already running a turn", async () => {
+    const { tui, c, ask, logs } = await setup({
+      threads: (dir) => [
+        { id: "old", cwd: dir, updatedAt: 100, ephemeral: false },
+        { id: "live", cwd: dir, updatedAt: 300, ephemeral: false },
+      ],
+      // Another process sees a running turn as `interrupted` with no `completedAt`.
+      beforeBridge: (state) => {
+        writeFileSync(join(state, "turns-live.json"), JSON.stringify([{ id: "turn-running", status: "interrupted", completedAt: null, items: [] }]));
+      },
+    });
+    expect(logs.join("\n")).toContain("old");
+    const a = await ask("not into the busy one");
+    await waitFor(() => tui.queue("old").length === 1);
+    expect(tui.queue("live")).toEqual([]);
+    const item = tui.take("old");
+    const done = untilClosed(c, a.threadId, a.orderId);
+    tui.turn(item, { status: "completed", answer: "from the idle session", completedAt: 2 }, "old");
+    expect(replyOf(await done)).toBe("from the idle session");
   });
 
   it("refuses to start when there is no Codex session in its directory", async () => {
@@ -252,7 +297,7 @@ describe("barista start reports a Barista that cannot start (#82)", () => {
     const r = await cli(root.addr, {}, "barista", "start", "--dir", dir);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("this worker cannot start here");
-    expect(r.stderr).toMatch(/barista-work-1\.log/);
+    expect(r.stderr).toMatch(/barista-work-[0-9a-f]{8}-1\.log/);
     expect(root.daemon.supervisor!.list()).toEqual([]);
   }, 30_000);
 });

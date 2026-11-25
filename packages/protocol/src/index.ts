@@ -224,7 +224,7 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), note: z.string().optional() }),
   z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), attachments: z.array(Attachment).optional() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
-  z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional() }),
+  z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional(), /** The thread closed first; this target was never asked to do anything wrong (#101). */ skipped: z.boolean().optional() }),
   z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string(), /** Operational failure (timeout), not "this topic is not mine". */ unavailable: z.boolean().optional() }),
   z.object({ type: z.literal("order.cancelled"), by: z.string() }),
   /** One Order finished. The Thread stays open for Follow-ups. */

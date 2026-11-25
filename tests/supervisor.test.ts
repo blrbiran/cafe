@@ -78,7 +78,7 @@ describe("supervisor", () => {
     await waitFor(() => JSON.parse(readFileSync(join(home, "baristas.runtime.json"), "utf8")).length === 2, 5000);
 
     // Worker output reaches the per-worker log.
-    const log = join(home, "logs", "barista-work-1.log");
+    const log = sup.list()[0]!.log;
     await waitFor(() => readFileSync(log, "utf8").includes("fake pi"), 5000);
     expect(sup.stop(dir)).toBe(2);
     await waitFor(() => pidsIn(pidfile).every((p) => !alive(p)), 5000);
@@ -92,7 +92,7 @@ describe("supervisor", () => {
     sup.start({ dir });
     await waitFor(() => pidsIn(pidfile).length >= 3, 8000);
     expect(sup.list()[0]!.restarts).toBeGreaterThanOrEqual(2);
-    expect(readFileSync(join(home, "logs", "barista-work-1.log"), "utf8")).toContain("exited code=3");
+    expect(readFileSync(sup.list()[0]!.log, "utf8")).toContain("exited code=3");
   });
 
   it("workers die with the supervising process (parent-death guard)", async () => {
@@ -146,7 +146,8 @@ describe("supervisor", () => {
     const sup = new Supervisor({ home, daemonAddr: "127.0.0.1:1", token: "t", piBin: "/nonexistent/pi", graceMs: 200, backoffBaseMs: 300 });
     cleanup.push(() => sup.shutdown());
     sup.start({ dir });
-    await waitFor(() => existsSync(join(home, "logs", "barista-work-1.log")) && readFileSync(join(home, "logs", "barista-work-1.log"), "utf8").includes("not found"), 5000);
+    const log = sup.list()[0]!.log;
+    await waitFor(() => existsSync(log) && readFileSync(log, "utf8").includes("not found"), 5000);
     await new Promise((r) => setTimeout(r, 700));
     // base 300ms doubling: at most ~2 restarts in ~1s.
     expect(sup.list()[0]!.restarts).toBeLessThanOrEqual(3);
@@ -190,7 +191,8 @@ describe("supervisor failed state (#82)", () => {
     expect(w.running).toBe(false);
     expect(w.lastError).toContain("no Codex session");
     expect(w.lastError).toContain("next: start codex");
-    expect(w.log).toBe(join(home, "logs", "barista-work-1.log"));
+    // #102: the log name carries a short hash of the full directory, so two `work` dirs cannot collide.
+    expect(w.log).toMatch(new RegExp(`^${join(home, "logs", "barista-work")}-[0-9a-f]{8}-1\\.log$`));
     // The daemon log hears about it, not only the per-worker log.
     expect(logged.join("\n")).toMatch(/gave up after 3 failed starts/);
     await new Promise((r) => setTimeout(r, 300));
@@ -206,5 +208,26 @@ describe("supervisor failed state (#82)", () => {
     expect(again).toHaveLength(1);
     expect(sup.list()).toHaveLength(1);
     await waitFor(() => sup.list()[0]?.state === "running", 5000);
+  });
+
+  // #102: `barista-<basename>-<slot>.log` made two different `…/work` directories share one log.
+  it("gives same-named directories in different paths different worker logs", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cafe-sup-same-"));
+    const home = join(root, "home");
+    const a = join(root, "a", "work");
+    const b = join(root, "b", "work");
+    mkdirSync(home);
+    mkdirSync(a, { recursive: true });
+    mkdirSync(b, { recursive: true });
+    writeFileSync(join(a, ".cafe"), "name: worker\n");
+    writeFileSync(join(b, ".cafe"), "name: worker\n");
+    cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+    const sup = new Supervisor({ home, daemonAddr: "127.0.0.1:1", token: "t", piBin: FAKE_PI, extension: "/dev/null", graceMs: 200 });
+    cleanup.push(() => sup.shutdown());
+
+    const wa = sup.start({ dir: a })[0]!;
+    const wb = sup.start({ dir: b })[0]!;
+    expect(wa.log).not.toBe(wb.log);
+    await waitFor(() => existsSync(wa.log) && existsSync(wb.log), 5000);
   });
 });

@@ -131,6 +131,7 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
   });
 
   // A TUI session works under the person's own permissions and approvals: no access level of ours to report.
+  let tuiThread: string | undefined;
   if (opts.tui) {
     // Don't register an agent that would decline every Order: a TUI Barista needs
     // a Codex session in its directory (#40).
@@ -140,13 +141,17 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
         `cannot start a Codex TUI barista: ${probe.error}\nnext: start codex in ${dir} (or pass --thread <id>) and run this command again`,
       );
     }
+    tuiThread = probe.threadId;
   }
   const rec = await client.connect(
     opts.tui
       ? { ...cafe, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }
       : { ...cafe, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid },
   );
-  log(`${opts.agent} barista ${rec?.address} ready (${opts.tui ? `answers in the running Codex session${opts.thread ? ` ${opts.thread}` : ""}` : access})`);
+  // Name the session, not only "the running Codex session": with several open, the person must be
+  // able to check which one was attached (#100).
+  const where = opts.tui ? `answers in Codex session ${tuiThread} (${dir}; pass --thread <id> to use another)` : access;
+  log(`${opts.agent} barista ${rec?.address} ready (${where})`);
   return {
     client,
     stop: async () => {

@@ -1812,9 +1812,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (s !== "pending" && s !== "acked") continue;
       this.clearTimer(t, id);
       t.targets.set(id, "done");
-      // Reuses the decline event with `unavailable`, so it is auditable and does
-      // not count against the Barista in routing hints.
-      this.emitEvent(t.order, { type: "order.declined", agentId: id, reason: "skipped: another Barista answered first", unavailable: true }, { skipTrack: true });
+      // Reuses the decline event so the skip is auditable, but marks it `skipped`: the thread closed
+      // first, so this is neither a refusal on the topic nor a decline in the books (#101).
+      this.emitEvent(t.order, { type: "order.declined", agentId: id, reason: "skipped: another Barista answered first", unavailable: true, skipped: true }, { skipTrack: true });
     }
     this.maybeClose(t);
   }
@@ -2160,7 +2160,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.emit("thread", env, meta);
     if (env.event.type === "order.cancelled") this.notifyCancelled(env);
     if (env.event.type === "order.replied" && env.event.final) this.recordOutcome(env, env.event.agentId, "answered");
-    else if (env.event.type === "order.declined") this.recordOutcome(env, env.event.agentId, "declined", env.event.unavailable);
+    else if (env.event.type === "order.declined" && !env.event.skipped) this.recordOutcome(env, env.event.agentId, "declined", env.event.unavailable);
     else if (env.event.type === "order.failed" && env.event.agentId) this.recordOutcome(env, env.event.agentId, "failed");
     if (!opts.skipTrack) this.track(env);
   }
@@ -2346,7 +2346,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (ev.final) pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at }, MAX_META_REPLIES);
         break;
       case "order.declined":
-        pushBounded(meta.declines, { agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at }, MAX_META_DECLINES);
+        // A grace skip is not a decline: with a late reply the same agent would sit in both lists (#101).
+        if (!ev.skipped) pushBounded(meta.declines, { agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at }, MAX_META_DECLINES);
         break;
       case "order.closed":
         meta.status = ev.status;

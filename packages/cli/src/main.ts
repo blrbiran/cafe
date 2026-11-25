@@ -1375,8 +1375,8 @@ barista
   .option("--agent <name>", "pi (default), omp (oh-my-pi), codex (codex app-server) or claude (claude -p)")
   .option("--write", "codex / claude only: allow editing files in --dir (default: read-only)")
   .option("--model <model>", "codex / claude only: model to use")
-  .option("--tui", "codex only: answer in the Codex session running in --dir (the TUI), not a headless one")
-  .option("--thread <id>", "with --tui: the Codex thread to use (default: the newest session started in --dir)")
+  .option("--tui", "codex only: attach to the Codex TUI session already running in --dir (this command does not open a UI)")
+  .option("--thread <id>", "with --tui: the Codex thread to use (required when --dir has more than one idle session)")
   .action(async (o) => {
     const native = BRIDGED_AGENTS.includes(o.agent);
     if ((o.write || o.model) && !native) throw new Error("--write and --model are for --agent codex or claude");
@@ -1446,8 +1446,8 @@ barista
   .option("--dir <dir>", "directory whose .cafe gives the identity (and where the agent works)", process.cwd())
   .option("--write", "allow editing files in --dir (default: read-only)")
   .option("--model <model>", "model to use")
-  .option("--tui", "codex only: answer in the running Codex session in --dir")
-  .option("--thread <id>", "with --tui: the Codex thread to use")
+  .option("--tui", "codex only: attach to the Codex TUI session already running in --dir (this command does not open a UI)")
+  .option("--thread <id>", "with --tui: the Codex thread to use (required when --dir has more than one idle session)")
   .action(async (o) => {
     if (!BRIDGED_AGENTS.includes(o.agent)) throw new Error(`--agent must be ${BRIDGED_AGENTS.join(" or ")}`);
     if (!process.env.CAFE_DAEMON) await ensureDaemon();

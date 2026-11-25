@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -193,9 +194,12 @@ export class Supervisor {
     if (existing.length) this.workers = this.workers.filter((w) => w.spec.dir !== dir);
     const { cafe } = loadIdentity(dir);
     const name = dir.split(/[\\/]/).filter(Boolean).pop() ?? "barista";
+    // The leaf name alone collided for /a/work and /b/work (#102): keep it for readability and add a
+    // short hash of the full path so two workers never interleave in one log.
+    const tag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
     // A running session answers one question at a time: one worker per TUI Barista.
     for (let slot = 1; slot <= (spec.tui ? 1 : cafe.concurrency); slot++) {
-      const w: Worker = { spec: { ...spec, dir }, slot, restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${slot}.log`) };
+      const w: Worker = { spec: { ...spec, dir }, slot, restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${tag}-${slot}.log`) };
       this.workers.push(w);
       this.launch(w);
     }
