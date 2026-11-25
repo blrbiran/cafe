@@ -27,6 +27,11 @@ export type AgentRole = z.infer<typeof AgentRole>;
 export const AgentMode = z.enum(["tui", "headless", "cli", "web"]);
 export type AgentMode = z.infer<typeof AgentMode>;
 
+/** A message scope (v4-11). `default` is implicit; channels are not security boundaries. */
+export const ChannelName = z.string().regex(/^[a-z0-9_-]{1,64}$/, "channel names use a-z, 0-9, _ and -, at most 64 chars");
+export type ChannelName = z.infer<typeof ChannelName>;
+export const DEFAULT_CHANNEL = "default";
+
 /** Contents of a `.cafe` Cafe File. */
 export const CafeFile = z.object({
   name: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/, "name may only contain [a-zA-Z0-9_.-]"),
@@ -57,8 +62,26 @@ export const AgentIdentity = CafeFile.extend({
   background: z.boolean().optional(),
   /** On reconnect: ask to keep the agentId/Address from the previous connection. */
   resumeAgentId: z.string().optional(),
+  // --- v4-11 agent teams. All optional: an old client registers unchanged. ---
+  /** Team name the process belongs to. */
+  team: z.string().optional(),
+  /** The team's channel (so the Web and `to: <team>` need no roster). */
+  teamChannel: ChannelName.optional(),
+  /** Roster entry name inside the team. */
+  member: z.string().optional(),
+  /** Free-form responsibility label used as a routing signal. */
+  duty: z.string().min(1).max(64).optional(),
+  /** Channels this Agent receives from; the first entry is its home channel. Absent = ["default"]. */
+  channels: z.array(ChannelName).optional(),
+  /** Observers are never routing targets; they receive channel digests instead. */
+  observer: z.boolean().optional(),
 });
 export type AgentIdentity = z.infer<typeof AgentIdentity>;
+
+/** The channels an Agent/record receives from (v4-11). */
+export function channelsOf(a: { channels?: string[] }): string[] {
+  return a.channels?.length ? a.channels : [DEFAULT_CHANNEL];
+}
 
 /** A Registry entry. */
 export const AgentRecord = AgentIdentity.extend({
@@ -164,6 +187,10 @@ export const Order = z.object({
   /** Files attached to this Order; the blobs stay on their origin Host. */
   attachments: z.array(Attachment).optional(),
   parentOrderId: z.string().optional(),
+  /** The Thread holding the parent Order (v4-11 sub-Thread link). */
+  parentThreadId: z.string().optional(),
+  /** This Order was created with an explicit escalation (v4-11). */
+  escalate: z.boolean().optional(),
   /** Agent ids already involved upstream in this call chain. */
   chain: z.array(z.string()).default([]),
   depth: z.number().int().min(0).default(0),
@@ -175,6 +202,18 @@ export const Order = z.object({
   history: z.array(z.object({ from: z.string(), role: z.enum(["customer", "barista"]), text: z.string() })).default([]),
 });
 export type Order = z.infer<typeof Order>;
+
+/** Why a sub-Order could not be delivered (v4-11). Appears on RoutingDecision.failure and order.failed. */
+export const SubOrderFailure = z.enum([
+  "parent_offline",
+  "unknown_team",
+  "team_offline",
+  "ambiguous_team",
+  "ambiguous_address",
+  "no_online_barista",
+  "no_channel_members",
+]);
+export type SubOrderFailure = z.infer<typeof SubOrderFailure>;
 
 export const RoutingDecision = z.object({
   targets: z.array(z.string()),
@@ -193,6 +232,8 @@ export const RoutingDecision = z.object({
   whyNot: z.array(z.object({ agentId: z.string(), reason: z.string() })).optional(),
   /** How many Baristas received this Order (targets.length). */
   fanout: z.number().int().min(0).optional(),
+  /** Machine-readable failure when targets is empty (v4-11). */
+  failure: SubOrderFailure.optional(),
   /**
    * Per-target question text for a multicast Order (v4-7 #39). Delivery-only: `dispatch()` sends
    * target `t` the text `variants[t]`, falling back to the Order's `body`.
@@ -247,6 +288,11 @@ export const ThreadMeta = z.object({
   threadId: z.string(),
   orderId: z.string(),
   kind: OrderKind,
+  /** Message scope (v4-11); absent on Threads older than channels. */
+  channel: ChannelName.optional(),
+  /** Set when this Thread is a clarification/escalation of another Thread (v4-11). */
+  parentThreadId: z.string().optional(),
+  parentOrderId: z.string().optional(),
   from: Party,
   /** Provenance of the first question; absent on older Threads. */
   origin: OrderOrigin.optional(),
@@ -316,6 +362,13 @@ export const CreateOrderParams = z.object({
   kind: OrderKind.default("order"),
   to: z.string().optional(),
   parentOrderId: z.string().optional(),
+  /** The Thread holding the parent Order (v4-11); used when it is no longer in the daemon's memory. */
+  parentThreadId: z.string().optional(),
+  /**
+   * Explicit escalation (v4-11): requires parentOrderId and creates a sub-Thread whose target is
+   * the parent Order's sender. Without this flag, parentOrderId keeps its provenance meaning.
+   */
+  escalate: z.boolean().optional(),
   /** Follow-up: continue this Thread (default targets: Baristas that replied in it). */
   threadId: z.string().optional(),
   deadlineMs: z.number().int().optional(),

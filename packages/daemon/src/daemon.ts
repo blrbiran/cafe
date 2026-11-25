@@ -1362,13 +1362,27 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private async createOrderInner(p: CreateOrderParams, peer?: Peer): Promise<CreatedOrder> {
     if (this.draining) throw new RpcError("daemon_draining", "the daemon is draining for an update; retry after it restarts");
     const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
-    const parent = p.parentOrderId ? this.knownOrders.get(p.parentOrderId) : undefined;
+    if (p.escalate && !p.parentOrderId) throw new RpcError("unknown_parent", "escalate: true requires parentOrderId");
+    const parent = p.parentOrderId ? this.findParentOrder(p.parentOrderId, p.parentThreadId) : undefined;
+    if (p.escalate && !parent) throw new RpcError("unknown_parent", `cannot find parent order ${p.parentOrderId}`);
+    if (p.escalate && p.parentThreadId && parent!.threadId !== p.parentThreadId) {
+      throw new RpcError("unknown_parent", `parent order ${p.parentOrderId} is not in thread ${p.parentThreadId}`);
+    }
+    // Only a Barista that actually received the parent Order may escalate it: an Order id alone
+    // must not be a routing bypass for any caller (v4-11 review).
+    if (p.escalate && peer?.meta.agentId) {
+      const parentMeta = this.metas.get(parent!.threadId) ?? this.store.getThread(parent!.threadId);
+      if (!parentMeta?.targets.includes(peer.meta.agentId)) {
+        throw new RpcError("not_a_target", "escalate: only a Barista that received the parent Order may escalate it");
+      }
+    }
     const depth = parent ? parent.depth + 1 : 0;
     if (depth > MAX_ORDER_DEPTH) throw new RpcError("too_deep", `order depth ${depth} exceeds ${MAX_ORDER_DEPTH}`);
 
-    // Follow-up: continue an existing Thread.
+    // Follow-up: continue an existing Thread. An escalation is always a NEW sub-Thread: one open
+    // Order per Thread is the invariant that keeps replies/history/cancel unambiguous (v4-11).
     let prior: ThreadMeta | undefined;
-    if (p.threadId) {
+    if (!p.escalate && p.threadId) {
       prior = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
       if (!prior) throw new RpcError("not_found", `unknown thread ${p.threadId}`);
       const open = [...this.tracking.values()].find((x) => x.order.threadId === p.threadId && x.status === "open");
@@ -1384,7 +1398,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.close(open, "cancelled");
       }
     }
-    const threadId = prior?.threadId ?? ulid();
+    const threadId = p.escalate ? ulid() : prior?.threadId ?? ulid();
     // Blobs were uploaded to this daemon before the Order; move them into the Thread now.
     const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
     const order: Order = {
@@ -1399,6 +1413,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       body: p.body,
       ...(attachments?.length ? { attachments } : {}),
       parentOrderId: p.parentOrderId,
+      ...(p.escalate ? { parentThreadId: p.parentThreadId ?? parent?.threadId, escalate: true } : p.parentThreadId ? { parentThreadId: p.parentThreadId } : {}),
       chain: [...(parent?.chain ?? []), ...(parent ? [parent.from.id] : [])],
       depth,
       deadlineMs: p.deadlineMs,
@@ -1420,7 +1435,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
     if (decision.targets.length === 0) {
-      this.emitEvent(order, { type: "order.failed", reason: "no barista available" });
+      this.emitEvent(order, { type: "order.failed", reason: decision.failure ?? "no barista available" });
       this.close(t, "failed");
       return { orderId: order.orderId, threadId: order.threadId, decision };
     }
@@ -1455,7 +1470,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return out.slice(-12);
   }
 
+  /**
+   * The parent Order of a sub-Thread (v4-11). `knownOrders` is memory and bounded, so fall back to
+   * the parent Thread's JSONL. Returning undefined is a hard `unknown_parent`, never a router guess.
+   */
+  private findParentOrder(orderId: string, parentThreadId?: string): Order | undefined {
+    const known = this.knownOrders.get(orderId);
+    if (known) return known;
+    if (!parentThreadId) return undefined;
+    const meta = this.metas.get(parentThreadId) ?? this.store.getThread(parentThreadId);
+    if (!meta) return undefined;
+    for (const env of this.store.readEventsTail(meta.file, 500)) {
+      if (env.event.type === "order.created" && env.orderId === orderId) return env.event.order;
+    }
+    return undefined;
+  }
+
   private async route(order: Order, answeredBefore: string[] = [], broadcast = false): Promise<RoutingDecision> {
+    if (order.escalate) return this.routeEscalation(order, broadcast);
     const candidates = this.eligible(order);
     if (answeredBefore.length && !order.to) {
       const answered = answeredBefore.filter((id) => candidates.some((c) => c.agentId === id));
@@ -1469,16 +1501,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         };
       }
     }
-    if (order.to) {
-      const ids = this.registry.resolve(this.normalizeAddress(order.to)).filter((id) => candidates.some((c) => c.agentId === id));
-      return {
-        targets: ids,
-        mode: ids.length === 1 ? "unicast" : "multicast",
-        reason: ids.length ? `explicit address ${order.to}` : `no online barista at ${order.to}`,
-        router: "explicit",
-        candidates: [],
-      };
-    }
+    if (order.to) return this.explicitDecision(order);
     if (broadcast) {
       return {
         targets: candidates.map((c) => c.agentId),
@@ -1497,6 +1520,66 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     return this.router.decide({ order, candidates, hints: this.hintsFor(candidates) });
+  }
+
+  /**
+   * An escalation is a sub-Thread that never consults the router: explicit target, else the channel
+   * when broadcast was asked for, else the parent Order's sender. Parent offline is a visible
+   * failure — never a broadcast to unrelated agents (v4-11, the #72 dogfooding bug).
+   */
+  private routeEscalation(order: Order, broadcast: boolean): RoutingDecision {
+    if (order.to) return this.explicitDecision(order);
+    if (broadcast) {
+      const candidates = this.eligible(order);
+      return {
+        targets: candidates.map((c) => c.agentId),
+        mode: "broadcast",
+        reason: "escalation asked everyone in the channel",
+        router: "explicit",
+        candidates: [],
+        ...(candidates.length ? {} : { failure: "no_channel_members" as const }),
+      };
+    }
+    const parent = order.parentOrderId ? this.findParentOrder(order.parentOrderId, order.parentThreadId) : undefined;
+    const rec = parent ? this.registry.get(parent.from.id) : undefined;
+    if (rec && rec.role === "barista" && rec.status !== "offline") {
+      return { targets: [rec.agentId], mode: "unicast", reason: `escalate to parent ${rec.address}`, router: "explicit", candidates: [] };
+    }
+    return {
+      targets: [],
+      mode: "unicast",
+      reason: `parent ${parent?.from.address ?? order.parentOrderId} is not an online barista`,
+      router: "explicit",
+      candidates: [],
+      failure: "parent_offline",
+    };
+  }
+
+  /**
+   * Explicit addressing is the escape hatch (v4-11): any online barista, any channel, observers
+   * included, and the chain is bypassed. Without it a sub-agent could never name its parent.
+   */
+  private explicitDecision(order: Order): RoutingDecision {
+    const ids = this.explicitTargets(order);
+    return {
+      targets: ids,
+      mode: ids.length === 1 ? "unicast" : "multicast",
+      reason: ids.length ? `explicit address ${order.to}` : `no online barista at ${order.to}`,
+      router: "explicit",
+      candidates: [],
+      ...(ids.length ? {} : { failure: "no_online_barista" as const }),
+    };
+  }
+
+  private explicitTargets(order: Order): string[] {
+    if (!order.to) return [];
+    return this.registry
+      .resolve(this.normalizeAddress(order.to))
+      .filter((id) => id !== order.from.id)
+      .filter((id) => {
+        const r = this.registry.get(id);
+        return !!r && r.role === "barista" && r.status !== "offline";
+      });
   }
 
   private dispatch(t: Tracking, agentId: string): void {
@@ -2297,6 +2380,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         threadId: env.threadId,
         orderId: env.orderId,
         kind: ev.order.kind,
+        ...(ev.order.parentThreadId ? { parentThreadId: ev.order.parentThreadId } : {}),
+        ...(ev.order.parentOrderId ? { parentOrderId: ev.order.parentOrderId } : {}),
         from: ev.order.from,
         ...(ev.order.origin ? { origin: ev.order.origin } : {}),
         ...(ev.order.via ? { via: ev.order.via } : {}),
