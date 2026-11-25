@@ -265,6 +265,7 @@ npm install
 npm run typecheck
 npm test                     # vitest：多 daemon 端到端测试（假 barista、假 LLM）
 npm run build:web            # 构建 web UI → packages/web/dist
+npm run perf:tls             # 同一个临时 daemon 上 TLS 与明文的开销对比（只出报告，不当门槛）
 
 npm link --workspace @cafe/cli    # 可选：把 `cafe` 装到 PATH
 cafe daemon start --root

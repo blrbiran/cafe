@@ -269,6 +269,7 @@ npm install
 npm run typecheck
 npm test                     # vitest: multi-daemon end-to-end tests (fake baristas, fake LLM)
 npm run build:web            # build the web UI → packages/web/dist
+npm run perf:tls             # TLS cost vs plaintext on one scratch daemon (report, not a gate)
 
 npm link --workspace @cafe/cli    # optional: put `cafe` on PATH
 cafe daemon start --root

@@ -21,7 +21,8 @@
     "test:release": "node scripts/test-release.mjs",
     "test:claude-plugin": "claude plugin validate claude-plugin && claude plugin test claude-plugin",
     "routing:eval": "node scripts/router-eval.ts",
-    "perf:store": "node scripts/perf-store.ts"
+    "perf:store": "node scripts/perf-store.ts",
+    "perf:tls": "node scripts/perf-tls.ts"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

@@ -397,3 +397,12 @@ handler now passes whether the socket is encrypted (`req.socket.encrypted`) to `
 Tests: `tests/tls-accept.test.ts` (refused uplink + reason, refused `peer`, `ui` still served, plaintext
 Daemon unaffected, a refused Host that rejoins over TLS), `tests/doctor.test.ts` ("cafe doctor on a TLS
 machine"), `tests/web-host-reason.test.ts`.
+
+### perf:tls (#61 criterion 5, 2026-11-25)
+
+`npm run perf:tls` starts one scratch TLS Root and compares its plaintext and TLS ports on loopback:
+three alternating rounds, median p95 per transport. Measured on the owner's Mac (Node 22.23):
+new connection (connect + handshake + `initialize`) **+2 to +6 ms p95** — target met every run;
+steady round trip p95 is 0.05–0.1 ms on both, and the TLS difference is **within ±0.04 ms** — the
+"within 10%" target flips between −14% and +55% across runs at that scale, so it is reported but
+is not a meaningful gate on loopback. An absolute bound (e.g. "< 0.1 ms p95") is the honest form.
