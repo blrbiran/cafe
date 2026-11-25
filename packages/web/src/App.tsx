@@ -1,6 +1,7 @@
 import { useEffect, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent } from "react";
 import { authState } from "./auth.ts";
 import { TokenGate } from "./ui/TokenGate.tsx";
+import { PlainHttpBanner } from "./ui/Security.tsx";
 import { Shell } from "./Shell.tsx";
 import { navigate, useRoute } from "./route.ts";
 import { closeThread, openThread, useStore } from "./store.ts";
@@ -116,6 +117,17 @@ export function App() {
         ) : undefined
       }
     >
+      <PlainHttpBanner
+        onHowTo={() => {
+          setSettingsOpen(true);
+          // Open the trust steps in the Settings drawer once it has rendered.
+          setTimeout(() => {
+            const d = document.querySelector<HTMLDetailsElement>("#encrypted-access details");
+            if (d) d.open = true;
+            document.getElementById("encrypted-access")?.scrollIntoView({ block: "start" });
+          }, 50);
+        }}
+      />
       {error && (
         <div role="alert" className="well text-sm" data-tone="danger">
           {error}

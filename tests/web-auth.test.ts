@@ -75,7 +75,9 @@ describe("requests carry the token in a header only (#97)", () => {
     const files = readdirSync(dir, { recursive: true }).map(String).filter((f) => /\.tsx?$/.test(f));
     for (const f of files) {
       const src = readFileSync(join(dir, f), "utf8");
-      expect(src, f).not.toMatch(/token=\$\{/);
+      // A query/path token reaches the server (logs, proxies). A `#token=` fragment never does; v4-9
+      // uses one to carry the token to the encrypted address, so only a non-fragment one is refused.
+      expect(src, f).not.toMatch(/(?<!#)token=\$\{/);
       expect(src, f).not.toMatch(/withToken/);
     }
   });

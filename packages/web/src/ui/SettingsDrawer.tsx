@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { EncryptedAccess } from "./Security.tsx";
 import { api, forgetToken, token, type BaristaInfo, type DoctorCheck, type RuntimeConfig } from "../api.ts";
 import { agentAddress, agentLabel, removableAgentAliases, removableHostAliases } from "../display.ts";
 import { useT } from "../i18n.ts";
@@ -29,7 +30,7 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [dir, setDir] = useState("");
   const [agentKind, setAgentKind] = useState("pi");
   const [write, setWrite] = useState(false);
-  const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: { address: string; caFingerprint?: string } }>();
+  const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: { address: string; caFingerprint?: string }; web?: { https: string[] } }>();
   const [joinCopied, setJoinCopied] = useState<string | null>(null);
   const [rt, setRt] = useState<RuntimeConfig>();
   const [advertise, setAdvertise] = useState("");
@@ -535,6 +536,8 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
             </button>
           </div>
         </section>
+
+        <EncryptedAccess />
 
         {conn?.join && (
           <section className="mb-5 border-b border-line pb-4">

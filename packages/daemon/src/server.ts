@@ -108,8 +108,8 @@ function hostOnly(host: string): string {
  * when it came from one of these: a DNS-rebinding page arrives with its own
  * domain in `Host`, and an IP that belongs to this machine cannot be rebound.
  */
-function allowedHosts(daemon: Daemon): Set<string> {
-  if (hostCache?.daemon === daemon) return hostCache.hosts;
+function allowedHosts(daemon: Daemon, fresh = false): Set<string> {
+  if (hostCache?.daemon === daemon && !fresh) return hostCache.hosts;
   const hosts = new Set<string>(["localhost", "127.0.0.1", "::1", daemon.config.host.toLowerCase()]);
   const advertise = daemon.config.advertise;
   if (advertise) hosts.add(hostOnly(advertise));
@@ -119,13 +119,26 @@ function allowedHosts(daemon: Daemon): Set<string> {
   hostCache = { daemon, hosts };
   return hosts;
 }
-let hostCache: { daemon: Daemon; hosts: Set<string> } | undefined;
+let hostCache: { daemon: Daemon; hosts: Set<string>; at?: number } | undefined;
+
+/**
+ * An address that came up after the cache was built (a VPN, a DHCP change) is ours too. Rebuild on a
+ * miss, at most once a second, so an unknown Host cannot make every request walk the interfaces.
+ */
+function isOurHost(daemon: Daemon, host: string): boolean {
+  if (allowedHosts(daemon).has(host)) return true;
+  const now = Date.now();
+  if (hostCache && hostCache.daemon === daemon && hostCache.at && now - hostCache.at < 1000) return false;
+  const hosts = allowedHosts(daemon, true);
+  hostCache!.at = now;
+  return hosts.has(host);
+}
 
 function hostAllowed(req: IncomingMessage, daemon: Daemon): boolean {
   const raw = req.headers.host;
   // HTTP/1.1 requires Host; a missing one is not a browser we can vouch for.
   if (!raw) return false;
-  return allowedHosts(daemon).has(hostOnly(raw));
+  return isOurHost(daemon, hostOnly(raw));
 }
 
 /**
@@ -150,7 +163,7 @@ function originAllowed(req: IncomingMessage, daemon: Daemon): boolean {
   if (url.protocol !== `${scheme}:`) return false;
   if (url.host.toLowerCase() !== hostOnlyPort(host)) return false;
   // Belt and braces: a forged Host that is not one of ours still fails.
-  return allowedHosts(daemon).has(url.hostname.toLowerCase());
+  return isOurHost(daemon, hostOnly(url.host.toLowerCase()));
 }
 
 /** `Host` header reduced to what an Origin must match: lowercase host:port, default port dropped. */
@@ -337,6 +350,17 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
           return send(res, 401, { error: "unauthorized", message: "token mismatch or wrong Root address; compare `cafe config get token` on both hosts" });
         }
         return await api(daemon, req, res, url, webStale, recent);
+      }
+      // The CA as a file a phone or laptop can install to trust the TLS port's Web UI (v4-9). Public
+      // like GET /api/tls: a CA certificate is not a secret; the key never leaves tls/ca.key.
+      // Only once the Host is on the network: a temporary CA (Root unreachable) is replaced at enrolment.
+      if (path === "/ca.crt" && (req.method === "GET" || req.method === "HEAD") && daemon.tlsContext?.network) {
+        res.writeHead(200, {
+          "content-type": "application/x-x509-ca-cert",
+          "content-disposition": 'attachment; filename="cafe-ca.crt"',
+          "cache-control": "no-cache",
+        });
+        return void res.end(req.method === "HEAD" ? undefined : daemon.tlsContext.ca);
       }
       const key = path === "/" ? "index.html" : path.slice(1);
       const file = statics.get(key);
@@ -561,7 +585,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     // The trust anchor a person or a child Host needs to enrol: the CA and its fingerprint. Public
     // on purpose (a CA certificate is not a secret); the private key never appears here.
     return daemon.tlsContext
-      ? send(res, 200, { ca: daemon.tlsContext.ca, fingerprint256: daemon.tlsContext.caFingerprint, ...(daemon.tlsPort ? { tlsPort: daemon.tlsPort } : {}) })
+      ? send(res, 200, {
+          ca: daemon.tlsContext.ca,
+          fingerprint256: daemon.tlsContext.caFingerprint,
+          ...(daemon.tlsPort ? { tlsPort: daemon.tlsPort } : {}),
+          // The encrypted Web addresses the leaf names (v4-9); public like the rest of this answer, so
+          // the token prompt can offer them before the person has a token.
+          ...(daemon.webHttps() ? { web: daemon.webHttps() } : {}),
+        })
       : send(res, 200, { ca: null, fingerprint256: null, note: "TLS is off (security.mode: plaintext)" });
   }
   if (m === "POST" && path === "/api/tls/leaf") {
@@ -652,6 +683,8 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       ...(token ? { tokenHint: token.length >= 12 ? `${"•".repeat(token.length - 4)}${token.slice(-4)}` : "•".repeat(8) } : {}),
       // How another machine joins this Root (#18): the address and CA pin, never the token itself.
       ...(daemon.isRoot ? { join: daemon.joinHint() } : {}),
+      // Where another device opens this Web encrypted (v4-9); absent when TLS is off.
+      ...(daemon.webHttps() ? { web: { https: daemon.webHttps() } } : {}),
     });
   }
   if (m === "GET" && path === "/api/config") return send(res, 200, daemon.runtimeConfig());

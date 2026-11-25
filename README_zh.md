@@ -88,7 +88,7 @@ cafe host forget ssh9                      # 仅 Root：移除一台离线机器
 `cafe mcp install` 只让宿主**提问**。要让它**回答**，启动 Barista：`cafe barista start --dir <dir> --agent codex|claude`，或 `cafe serve --preset codex|claude`（默认只读，`--write` 才放开写入）。
 - **CLI**：`cafe ask "..."`、`cafe ask --to billing "..."`、`cafe ask --thread <id> "追问"`、`cafe inbox`、`cafe thread <id>`、`cafe tail`（全网 routed / delivered / acked / replied / closed 事件；`--json` 输出 JSONL，`--host` / `--type` / `--thread` 过滤，默认隐藏心跳）。
 - **Web**：打开 `http://127.0.0.1:4777/`。导航固定、内容独立滚动；点对话从右侧打开，列表位置不变；导航里的 Agents 可展开看已注册 agent；设置里改显示名/别名、路由模型和后台 Barista；实况页是全网事件流。
-- **从另一台设备打开 Web**（同一网络里的笔记本或手机）：打开 `http://<这台机器的地址>:4777/`。页面会要一次 token——在运行 cafe 的机器上执行 `cafe config get token`，把输出粘贴进去——之后保存在那个浏览器里（设置 →「在此浏览器忘记 token」）。也可以用链接 `http://<地址>:4777/#token=<token>` 免输入：`#` 后面的部分不会发到服务器，页面打开后会从地址栏去掉。token 只放在 `Authorization: Bearer` 请求头里，不出现在任何 URL 中。4777 是明文 HTTP，只在你信任的网络里这样用。
+- **从另一台设备打开 Web**（同一网络里的笔记本或手机）：用**加密地址** `https://<这台机器的地址>:4778/`（TLS 端口提供同一套 Web；`cafe daemon status` 的 `web:` 行会打印它，Web 设置 →「加密访问」列出所有地址）。第一次打开前，让那台设备信任 cafe 的证书：在设置里点「下载 cafe 证书」（或 `http://<地址>:4777/ca.crt`），装成受信任的根证书（macOS、iOS、Windows、Android、Firefox 的步骤都在那个面板里），并**在 cafe 那台机器的终端里用 `cafe root show` 核对指纹**，不要只看下载它的那个页面。信任它之后，持有 cafe CA 私钥的人可以冒充任何 https 网站给这台设备；不再用 cafe 时把它删掉。页面会要一次 token——粘贴 `cafe config get token` 的输出——之后保存在那个浏览器里（设置 →「在此浏览器忘记 token」）；链接 `…/#token=<token>` 可以免输入（`#` 后面的部分不会发到服务器，页面打开后会从地址栏去掉）。token 只放在 `Authorization: Bearer` 请求头里。明文的 `http://<地址>:4777/` 仍然能用，但会显示「未加密」提示，并给出一个带上 token 跳到加密地址的链接。还没加入网络的机器不提供证书（它在用临时证书）。见 [`docs/specs/v4-9-lan-https.md`](docs/specs/v4-9-lan-https.md)。
 
 ## 作为 Barista
 

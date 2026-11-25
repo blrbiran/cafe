@@ -17,6 +17,7 @@ import { daemonHttpUrl } from "@cafe/protocol/urls";
 import { joinAddresses } from "@cafe/daemon";
 import { joinText } from "./join-text.ts";
 import { tlsLine } from "./tls-line.ts";
+import { webLine } from "./web-line.ts";
 import { formatApiError } from "./errors.ts";
 import { uploadAttachment as uploadArtifact } from "./artifacts.ts";
 import { PRESETS, presetCommand, serve } from "./serve.ts";
@@ -706,6 +707,7 @@ daemon
     const h = await api("/api/health");
     const cfg = await api<{ pending?: { key: string; file: unknown; running: unknown; mode: "hot" | "restart-required" }[] }>("/api/config");
     const pending = cfg.pending ?? [];
+    const settings = await api<{ web?: { https: string[] } }>("/api/settings").catch(() => ({}) as { web?: { https: string[] } });
     const fmt = (v: unknown) => (v === undefined ? "(not set)" : typeof v === "string" ? v : JSON.stringify(v));
     out(
       [
@@ -713,6 +715,7 @@ daemon
         `mode:      ${s.isRoot ? "root" : "daemon"}`,
         `version:   ${h.version ?? "unknown"}`,
         `url:       ${base()}`,
+        `web:       ${webLine(base(), settings.web?.https)}`,
         `advertise: ${loadConfig().advertise ?? "(not set; other machines use any local address)"}`,
         `root:      ${s.isRoot ? "self" : loadConfig().root ? `${loadConfig().root} (${s.rootOnline ? "online" : "offline"})` : "mDNS discovery"}`,
         `tls:       ${tlsLine(h.tls)}`,

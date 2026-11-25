@@ -406,3 +406,5 @@ new connection (connect + handshake + `initialize`) **+2 to +6 ms p95** — targ
 steady round trip p95 is 0.05–0.1 ms on both, and the TLS difference is **within ±0.04 ms** — the
 "within 10%" target flips between −14% and +55% across runs at that scale, so it is reported but
 is not a meaningful gate on loopback. An absolute bound (e.g. "< 0.1 ms p95") is the honest form.
+
+See also [v4-9](v4-9-lan-https.md): the TLS port serves the Web UI to other devices (`/ca.crt`, `/api/tls.web`).

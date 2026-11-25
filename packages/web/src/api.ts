@@ -173,7 +173,9 @@ export const api = {
     call<BaristaInfo[]>("POST", "/api/baristas", p),
   stopBarista: (dir: string) => call<{ stopped: boolean }>("DELETE", `/api/baristas?dir=${encodeURIComponent(dir)}`),
   /** Root and a masked token for the Settings panel; never the full secret. */
-  settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: JoinHint }>("GET", "/api/settings"),
+  settings: () => call<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: JoinHint; web?: { https: string[] } }>("GET", "/api/settings"),
+  /** Public (no token needed): the CA, its fingerprint and the TLS port, or nulls when TLS is off. */
+  tls: () => call<{ ca: string | null; fingerprint256: string | null; tlsPort?: number }>("GET", "/api/tls"),
   /** What the daemon is running plus config.yml changes it has not applied yet. */
   config: () => call<RuntimeConfig>("GET", "/api/config"),
   saveConfig: (p: { advertise?: string | null; retentionDays?: number | null }) =>

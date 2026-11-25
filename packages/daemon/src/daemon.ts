@@ -8,7 +8,7 @@ import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
 import { pinnedIdentityCheck } from "./tls/trust.ts";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
-import { localAddresses, missingSans, sanList } from "./tls/certs.ts";
+import { localAddresses, missingSans, sanCovers, sanList } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -498,6 +498,27 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const fp = this.tlsStatus().caFingerprint;
     const j = joinAddresses({ advertise: this.config.advertise, port: this.config.port, lan: localAddresses() });
     return { address: j.addresses[0]!, ...j, ...(fp ? { caFingerprint: `sha256:${fp}` } : {}) };
+  }
+
+  /**
+   * Encrypted Web addresses for other devices (v4-9): the TLS port serves the same Web UI. One
+   * `https://` per address `joinAddresses()` offers, keeping only those the current leaf names (a
+   * DHCP change waits for the next renewal) and never a loopback address. `undefined` while TLS is
+   * off or the Host is not on the network yet: its temporary CA is replaced at enrolment, so a
+   * person must not be asked to trust it.
+   */
+  webHttps(): string[] | undefined {
+    const ctx = this.tlsContext;
+    if (!ctx?.network || !this.tlsPort) return undefined;
+    const cert = ctx.current().cert;
+    const advertise = this.config.advertise ? bareHost(this.config.advertise) : undefined;
+    return joinAddresses({ advertise, port: this.tlsPort, lan: localAddresses() })
+      .addresses.map((a) => bareHost(a))
+      .filter((h) => {
+        const name = h.replace(/^\[|\]$/g, "");
+        return !/^127\.|^localhost$|^::1$/.test(name) && sanCovers(cert, name);
+      })
+      .map((h) => `https://${hostWithPort(h, this.tlsPort!)}/`);
   }
 
   tlsStatus(): {
