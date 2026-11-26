@@ -141,7 +141,19 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-27 — 任务生命周期与事件授权（本地已提交，待推送 main，未发版）
+### 2026-11-27 — 补报读路径与 dogfooding 回归
+
+- **接手。** 用 `git status --short --branch`、`git log --oneline -6` 和 `git rev-list --left-right --count main...origin/main` 核对代码、交接提交和推送状态。下节的任务生命周期批次已上 `main`。本轮沿用其设计与计划，新增的是已知缺陷的回归修复。
+- **补报。** CLI JSON 的 `reports` 与直接 `replies` 分列，CLI 文本和 MCP `cafe_wait` 显示 `result report`。选定 Order 的 SSE 仍在该轮终态关闭，随后通过 `/api/threads/:id/result?orderId=…` 读取已经落地的补报和该 Order 的任务状态。等补报的人在前门提交之后可以再次读取。`cafe wait <threadId> --order <orderId>` 支持旧轮次，错误的 Order 返回 404。Root 与请求者 Host 的同步沿用已有的 `thread/reports`，有效范围以精确 Order 为准。旧 daemon 的 CLI 回退读取最新 Thread 状态。
+- **搜索。** `order.reported` 可走 FTS 和短查询回退。同一 Thread 即使已有旧索引，也会在升级时补扫一次。回填按旧到新，每次启动最多处理 4,000 条 Thread，完成标记持久化，更多记录会在后续启动继续处理。
+- **体验。** #118 支持 `cafe thread show <id>`。#146 历史有更早事件时给出可直接运行的 `--before <eventId>` 命令。#133/#134/#185 的频道路径使用 `(last_activity, thread_id)` 游标与 `limit + 1`，同毫秒边界不漏项，子 Thread 和通用列表游标仍是独立范围。#135 频道活跃度取最后活动。#150 Pi/omp 无正文时发 operational decline。#115 更新客户端前门名称与 playbook 并拒绝陈旧名册版本，已运行进程热切换自己的职责和 Claude 会话内的提示刷新仍待验证。
+- **心跳与追问。** #153 心跳续租，仍可通过协议与全局实时事件观察。新的心跳跳过 JSONL 和逐 Thread SSE，保留落盘游标的重放语义。旧 JSONL 与其中的游标继续可读。#155 追问向前读取最近 12 条问题与最终答复，心跳不占条数。#129 daemon、Pi/omp 和 `cafe serve` 共用 1,500 字符的首尾节选，标示截断并保留结论。极长的旧日志仍可能需要同步扫描。#131 列表标明创建时间或该轮关闭时间。
+- **台账判断。** 外部 dogfooding 台账是独立工作区资料，本轮只读。#111、#120/#121/#194、#147/#148、#154/#156/#162/#181 的修复证据见历史节与测试。建议按实现、跨 Host 验证和实际用户判据分开确认。#160 的 `cafe connect` 地址用于发现 TLS 端口和公开 CA，HTTPS Web 地址用途不同。仅开放 TLS 端口的部署及说明可单独核验。
+- **仍需处理。** Release 门槛包括跨 Host 独立身份、#137 cancel/replace 归属、#138 HTTP `replyAs` 调用者认证、#149 HTTP 订单来源、#180 幂等调用方作用域。#182 的 JSON 上限已落地，请求超过 1 MiB 返回 413，附件继续走上传路径。下一批优先统一 CLI、Web、MCP、连接器和 relay 的身份及兼容交互，先做 spec 的独立 builder review，再写 plan。团队目录与权限 #127/#144/#161/#183/#184，以及 #139 级联取消和 #176 派单预期仍待设计或实现。
+- **验证。** 最终代码通过全量 Vitest（131 文件、786 项）、TypeScript、Web check/build、routing 67/67、隔离打包冒烟 17/17。Claude 插件测试通过 6/6，校验仍有既有的 `setTimeout` 类型环境与缺图标警告。独立审阅覆盖补报、分页、请求体、心跳回放和历史截断，已处理发现的行为回归。
+- **运行与环境。** 工作区本机 Root 使用 0.2.0，最终代码已 stop/start，`cafe doctor` 全绿。第二物理 Host、混合版本实网与 npm 发布仍待 operator。`.vitest/` 保留为未跟踪目录，首轮 RTK 默认 reporter 更新了其中的 JSON，后续走 `rtk proxy` 与隔离的附件路径。
+
+### 2026-11-27 — 任务生命周期与事件授权（历史记录，已合入 main）
 
 - **接手入口。** 设计 [task lifecycle and event auth](../superpowers/specs/2026-11-26-task-lifecycle-and-event-auth-design.md)（经独立 builder check 两轮，“nothing important left”），计划 [implementation plan](../superpowers/plans/2026-11-26-task-lifecycle-and-event-auth.md)，逐任务记录在 `.superpowers/sdd/2026-11-26-task-lifecycle-and-event-auth/progress.md`（该目录被 git 忽略，仅本地）。用 `git status --short --branch`、`git log --oneline -5` 核对现场；`.vitest/` 是既有未跟踪目录，本轮未触碰，测试统一用隔离的 `--attachmentsDir`。提交在本地 `<git log --oneline -1>` 可见；自动安全审查拒绝了向公开仓库 `origin main` 的 push，需 operator 显式确认后 `git push origin HEAD:main`（origin/main 已验证是 HEAD 的祖先，可快进）。
 - **任务时限（#181/#156/#154）。** unicast 默认硬上限从 10 分钟改为 2 小时；ack/heartbeat 仍按 lease 判“没进展”；`deadlineMs` 必须是 1–2147483647 的整数，否则 `bad_request`；硬期限按 `createdAt + deadlineMs` 绝对时刻执行，路由耗时会消耗同一期限，到期前不再投递；恢复沿用同一绝对时刻。`recover()` 改为 `(createdAt, threadId)` keyset 分页直到空页，不再只恢复最近 1000 个 open Thread。
