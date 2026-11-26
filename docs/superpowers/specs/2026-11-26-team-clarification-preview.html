@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cafe 团队会话原型</title>
+<style>
+  :root { color-scheme: light; font: 1rem/1.55 system-ui, sans-serif; color: #29261e; background: #f6f4ee; }
+  body { max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { margin: 0; font: 2rem/1.2 Georgia, serif; }
+  .muted { color: #685f50; }
+  article, details { background: #fff; border: 1px solid #d9d1c4; border-radius: .8rem; padding: 1rem; margin: .75rem 0; }
+  article > :first-child { margin-top: 0; }
+  article > :last-child { margin-bottom: 0; }
+  #question { border-inline-start: .3rem solid #905719; }
+  label, textarea { display: block; width: 100%; box-sizing: border-box; }
+  textarea, button { font: inherit; margin-top: .4rem; padding: .45rem; }
+  button { background: #563319; color: #fff; border: 0; border-radius: .35rem; cursor: pointer; }
+  summary { cursor: pointer; }
+</style>
+<main>
+  <header>
+    <h1>为解析器补单元测试</h1>
+    <p class="muted">交互原型 · 示例数据 · 回复只在此页面演示</p>
+    <p id="status" role="status">团队正在处理 · 有一项需要你决定</p>
+  </header>
+  <article aria-label="团队进度">
+    <strong>前门</strong>
+    <p>已请测试成员准备测试。确认范围后会继续。</p>
+  </article>
+  <article id="question" aria-labelledby="question-heading">
+    <h2 id="question-heading">请确认测试范围</h2>
+    <p>测试成员问：除了新语法，是否要覆盖旧格式的兼容行为？</p>
+    <form>
+      <label for="answer">给测试成员的回复</label>
+      <textarea id="answer" rows="3" required>请一起覆盖旧格式。</textarea>
+      <button type="submit">回复测试成员</button>
+    </form>
+    <p id="sent" role="status" hidden></p>
+  </article>
+  <details>
+    <summary id="task">测试成员 · 等待确认</summary>
+    <p>从这项任务可以查看往来和测试结果。</p>
+    <button type="button" id="finish" hidden>演示测试完成</button>
+    <p id="result" role="status" hidden>测试成员：补充了新语法和旧格式的用例，测试通过。</p>
+  </details>
+</main>
+<script>
+  const form = document.querySelector('form');
+  const sent = document.querySelector('#sent');
+  const status = document.querySelector('#status');
+  const task = document.querySelector('#task');
+  const finish = document.querySelector('#finish');
+  const result = document.querySelector('#result');
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const answer = document.querySelector('#answer').value.trim();
+    if (!answer) return;
+    sent.textContent = `已回复测试成员：${answer}`;
+    sent.hidden = false;
+    form.hidden = true;
+    status.textContent = '团队正在处理';
+    task.textContent = '测试成员 · 进行中';
+    finish.hidden = false;
+  });
+  finish.addEventListener('click', () => {
+    result.hidden = false;
+    finish.hidden = true;
+    task.textContent = '测试成员 · 已完成';
+    status.textContent = '测试已完成 · 等待前门汇报';
+  });
+</script>
+</html>

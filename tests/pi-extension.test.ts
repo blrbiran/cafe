@@ -86,10 +86,12 @@ afterEach(async () => {
   delete process.env.CAFE_INJECT_TIMEOUT_MS;
   delete process.env.CAFE_HEARTBEAT_MS;
   delete process.env.CAFE_HOST_AGENT;
+  delete process.env.CAFE_TEAM_DIR;
+  delete process.env.CAFE_TEAM_MEMBER;
 });
 
-async function setup() {
-  const root = await startDaemon("root", { mode: "root" });
+async function setup(digestIntervalMs?: number) {
+  const root = await startDaemon("root", { mode: "root", ...(digestIntervalMs ? { timing: { digestIntervalMs } } : {}) });
   cleanup.push(root.stop);
   process.env.CAFE_DAEMON = root.addr;
   const pi = fakePi();
@@ -165,6 +167,83 @@ describe("pi extension", () => {
     const types = (await closed).map((e) => e.event.type);
     expect(types).toContain("order.declined");
     expect(types).not.toContain("order.replied");
+  });
+
+  it("shows an observer digest without waking a model turn", async () => {
+    writeFileSync(join(dir, ".cafe"), "name: demo\nteam:\n  members:\n    - { name: orch, duty: orchestrator }\n    - { name: widgets, observer: true }\n");
+    process.env.CAFE_TEAM_DIR = dir;
+    process.env.CAFE_TEAM_MEMBER = "widgets";
+    const { pi, c, root } = await setup(35);
+    const worker = await barista(root.addr, identity("worker", { channels: ["demo"] }));
+    cleanup.push(() => worker.client.close());
+    await c.ask({ body: "status check", to: "worker", channel: "demo" });
+    await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-digest"));
+    expect(pi.sent.find((s) => s.message.customType === "cafe-digest")?.options.triggerTurn).toBe(false);
+  });
+
+  it("passes explicit broadcast through to every eligible Barista", async () => {
+    const { pi, root } = await setup();
+    for (const name of ["alpha", "beta", "gamma", "delta"]) {
+      const agent = await barista(root.addr, identity(name));
+      cleanup.push(() => agent.client.close());
+    }
+    const result = await pi.tools.get("cafe_ask").execute("b1", { body: "roll call", broadcast: true, collect: "all", wait: true });
+    for (const name of ["alpha", "beta", "gamma", "delta"]) expect(result.content[0].text).toContain(`${name}#1@root`);
+  });
+
+  it("wakes the sender once with the final results of an asynchronous collect-all Order", async () => {
+    const { pi, root } = await setup();
+    for (const name of ["alpha", "beta"]) {
+      const agent = await barista(root.addr, identity(name));
+      cleanup.push(() => agent.client.close());
+    }
+    await pi.tools.get("cafe_ask").execute("b2", { body: "roll call", broadcast: true, collect: "all" });
+    await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-reply" && s.message.details.event === "order.closed"));
+    const wakeups = pi.sent.filter((s) => s.message.customType === "cafe-reply" && s.options.triggerTurn);
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.message.content).toContain("alpha says: roll call");
+    expect(wakeups[0]?.message.content).toContain("beta says: roll call");
+  });
+
+  it("recovers the final collect-all result after reconnecting", async () => {
+    const { pi, root } = await setup();
+    const replies: Array<() => Promise<void>> = [];
+    for (const name of ["alpha", "beta"]) {
+      const agent = await barista(root.addr, identity(name), async (h) => { replies.push(() => h.reply(`${name} finished`)); });
+      cleanup.push(() => agent.client.close());
+    }
+    await pi.tools.get("cafe_ask").execute("b3", { body: "roll call", broadcast: true, collect: "all" });
+    await waitFor(() => replies.length === 2);
+    const sender = root.daemon.registry.all().find((r) => r.name === "widgets")!;
+    root.daemon.kick(sender.agentId);
+    await waitFor(() => !root.daemon.registry.get(sender.agentId));
+    await replies[0]!();
+    await replies[1]!();
+    await waitFor(() => pi.sent.some((s) => s.message.details?.event === "order.closed" && s.options.triggerTurn));
+    const results = pi.sent.filter((s) => s.message.details?.event === "order.closed" && s.options.triggerTurn);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.message.content).toContain("alpha finished");
+    expect(results[0]!.message.content).toContain("beta finished");
+  });
+
+  it("links an explicit delegation to the incoming Order's Thread", async () => {
+    const { pi, c, root } = await setup();
+    let delivered: Parameters<typeof orderPrompt>[0] | undefined;
+    const agent = await barista(root.addr, identity("tester"), async (h) => {
+      delivered = h.order;
+      await h.reply("checks passed");
+    });
+    cleanup.push(() => agent.client.close());
+    const parent = await c.ask({ body: `check the release ${"x".repeat(1000)}`, to: "widgets" });
+    await waitFor(() => orders(pi).length === 1);
+    const result = await pi.tools.get("cafe_ask").execute("d1", { body: "run the release checks", to: "tester", delegate: true });
+    const id = /threadId ([A-Z0-9]+)/.exec(result.content[0].text)?.[1];
+    expect(id).toBeTruthy();
+    expect(root.daemon.thread(id!)?.meta.parentThreadId).toBe(parent.threadId);
+    await waitFor(() => !!delivered);
+    expect(delivered?.parentContext).toHaveLength(640);
+    expect(delivered?.parentContext).toMatch(/^check the release .*…$/);
+    expect(orderPrompt(delivered!)).toContain(`Parent task (${parent.threadId}):\ncheck the release`);
   });
 
   it("cafe_ask: async replies are injected as cafe-reply; wait=true returns them", async () => {

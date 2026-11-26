@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CafeClient } from "@cafe/protocol/client";
+import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { FAST, barista, identity, startDaemon, waitFor } from "./helpers.ts";
 
 // v4-11 review: a roster read from an authoritative `.cafe` must replace membership (removing a
@@ -30,19 +31,24 @@ describe("team roster updates", () => {
     const d = await startDaemon("ros1", { mode: "root" });
     cleanup.push(d.stop);
 
+    const stale = mkdtempSync(join(tmpdir(), "cafe-roster-copy-"));
+    writeFileSync(join(stale, ".cafe"), roster(["dev1"]));
+    cleanup.push(() => rmSync(stale, { recursive: true, force: true }));
+    const publish = (path: string) => d.daemon.publishRoster(path, readCafeFile(join(path, ".cafe")).team!);
+    publish(dir);
+    const before = d.daemon.teams()[0]!.revision;
+
     const c = new CafeClient({ daemon: d.addr });
     cleanup.push(() => c.close());
-    await c.connect(member("dev1", dir));
-    await waitFor(() => d.daemon.teams()[0]?.roster.length === 3, 5000);
+    await c.connect(member("dev1", stale));
+    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["orch", "dev1", "dev2"]);
+    expect(d.daemon.teams()[0]!.revision).toBe(before);
+    expect(() => publish(stale)).toThrow(/roster directory/i);
 
-    // dev2 is removed from the file; a fresh registration re-reads it.
     writeFileSync(join(dir, ".cafe"), roster(["dev1"]));
-    c.close();
-    const again = new CafeClient({ daemon: d.addr });
-    cleanup.push(() => again.close());
-    await again.connect(member("dev1", dir));
-    await waitFor(() => d.daemon.teams()[0]?.roster.length === 2, 5000);
+    publish(dir);
     expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["orch", "dev1"]);
+    expect(d.daemon.teams()[0]!.revision).toBeGreaterThan(before!);
   });
 
   it("removes a forgotten Host's teams from memory and teams.json", async () => {

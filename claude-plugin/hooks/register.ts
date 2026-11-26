@@ -21,8 +21,7 @@ let socket: string | undefined
 let address: string | undefined
 let paused = false
 let current: Current | undefined
-/** A digest that arrived while an Order turn was running; submitted once the turn ends (v4-11). */
-let pendingDigests: string[] = []
+let latestDigest: string | undefined
 
 const status = ($: EngineInterface) =>
   $.ui.status(address ? (paused ? `☕ ${address} (paused)` : `☕ ${address}`) : undefined)
@@ -67,15 +66,7 @@ async function handle($: EngineInterface, msg: HostMessage) {
     current.cancelled = true
     if (current.turnId) await $.turn.abort({ turnId: current.turnId }).catch(() => {})
   } else if (msg.type === 'digest') {
-    // One summarized observation, queued behind an in-flight Order rather than interrupting it.
-    // It is a queue, not a slot: two channels (or two intervals) during one long Order must all
-    // get their turn (v4-11 review).
-    if (current) {
-      pendingDigests.push(msg.text)
-      if (pendingDigests.length > 20) pendingDigests.splice(0, pendingDigests.length - 20)
-    } else {
-      void $.prompt.submit({ text: msg.text }).catch(() => {})
-    }
+    latestDigest = msg.text
   }
   status($)
 }
@@ -112,6 +103,7 @@ async function host($: EngineInterface, cwd: string) {
   socket = undefined
   address = undefined
   current = undefined
+  latestDigest = undefined
   status($)
 }
 
@@ -129,7 +121,7 @@ async function registerCommand($: EngineInterface) {
       await $.command.register({
         name,
         description: 'cafe session: show this session\'s address, or stop / resume answering questions',
-        argumentHint: '[on|off]',
+        argumentHint: '[on|off|digest]',
       })
       commandName = name
       return
@@ -144,6 +136,7 @@ async function cafeCommand($: EngineInterface, e: { args: string }) {
   try {
     const arg = e.args.trim()
     if (!socket) return { text: 'This directory has no .cafe Barista identity, or the cafe session-host is not running.' }
+    if (arg === 'digest') return { text: latestDigest ?? 'No cafe digest received yet.' }
     if (arg === 'off' || arg === 'on') {
       const r = await post($, '/pause', { paused: arg === 'off' })
       if (r?.ok) paused = arg === 'off'
@@ -189,9 +182,6 @@ export const register: Register = on => {
       current = undefined
       const error = e.reason === 'error' || e.reason === 'refusal' ? e.reason : undefined
       void post($, '/done', { orderId: order.orderId, text: e.answer, aborted: e.isAborted, error })
-      if (pendingDigests.length) {
-        for (const text of pendingDigests.splice(0)) void $.prompt.submit({ text }).catch(() => {})
-      }
     }
     return next(e)
   })

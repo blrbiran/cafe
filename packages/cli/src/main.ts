@@ -1120,6 +1120,7 @@ program
   .description("show a thread's full event log, or download one of its attachments")
   .argument("<threadId>")
   .option("--download <attachmentId>", "download this attachment")
+  .option("--children", "include linked tasks and their latest results")
   .option("--out <dir>", "download directory", ".")
   .action(async (id: string, o) => {
     if (o.download) {
@@ -1149,14 +1150,22 @@ program
     const targets = t.meta.targetStates?.length
       ? `targets: ${t.meta.targetStates.map((s) => `${agents.get(s.agentId)?.address ?? s.agentId} ${s.state}`).join(", ")}`
       : undefined;
+    const children = o.children
+      ? (await api<ThreadMeta[]>(`/api/threads?parent=${encodeURIComponent(id)}`)).filter((child) => child.parentThreadId === id)
+      : undefined;
+    const childView = children ? await api<{ isRoot?: boolean }>("/api/health").catch(() => undefined) : undefined;
     const lines = [
       `${t.meta.from.address}: ${t.meta.summary}`,
       ...((t.meta.channel ?? "default") !== "default" ? [`channel: #${t.meta.channel}`] : []),
       ...(targets ? [targets] : []),
       ...att,
       ...t.events.map((e) => describe(e, agents)).filter(Boolean),
+      ...(children ? ["", "Linked tasks:", ...(childView?.isRoot === false ? ["  This Host's view may omit tasks on other Hosts. Check the Root for the network view."] : []), ...(children.length ? children.flatMap((child) => [
+        `  ${child.threadId} [${child.status}] ${child.summary}`,
+        ...child.replies.map((reply) => `    ${agents.get(reply.agentId)?.address ?? reply.agentId}: ${reply.text}`),
+      ]) : ["  (none)"])] : []),
     ];
-    out(lines.join("\n"), t);
+    out(lines.join("\n"), children ? { ...t, children } : t);
   });
 
 program
@@ -1642,12 +1651,15 @@ team
       `started ${missingHeadless.length} headless member(s)${missingHeadless.length ? `: ${missingHeadless.map((m) => m.name).join(", ")}` : ""}`,
       ...missingTui.map((m) => {
         const dir = resolve(rosterDir, m.dir);
-        const runner = m.agent ?? spec.agent ?? "pi";
-        return runner === "codex"
-          ? `start ${m.name}: cafe barista run --agent codex --tui --dir ${dir} --member ${m.name} --team-dir ${rosterDir}`
-          : runner === "claude"
-            ? `start ${m.name}: open Claude Code in ${dir} with CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${rosterDir} (the session picks the member up at start)`
-            : `start ${m.name}: open ${runner} in ${dir} with CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${rosterDir}, then run /cafe-team ${m.name}`;
+        const agent = m.agent ?? spec.agent ?? "pi";
+        const quote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+        if (agent === "codex") {
+          return `start ${m.name}: cafe barista run --agent codex --tui --dir ${quote(dir)} --member ${m.name} --team-dir ${quote(rosterDir)}`;
+        }
+        const runner = agent === "claude" ? agent : m.bin ?? agent;
+        const command = `cd ${quote(dir)} && CAFE_TEAM_MEMBER=${m.name} CAFE_TEAM_DIR=${quote(rosterDir)} ${runner}`;
+        const prerequisite = runner === "claude" ? "cafe claude install" : "cafe extension install";
+        return `start ${m.name}: ${command}\n  First-time setup: ${prerequisite}`;
       }),
     ];
     out(lines.join("\n"), plan);
@@ -1736,6 +1748,7 @@ team
     const roster = (t?.roster ?? spec.members).map((m: any) => ({
       name: m.name,
       ...(m.duty ? { duty: m.duty } : {}),
+      ...(m.dutyAliases?.length ? { dutyAliases: m.dutyAliases } : {}),
       online: m.status ? m.status !== "offline" : false,
     }));
     const orch = roster.find((m: any) => m.duty === "orchestrator");

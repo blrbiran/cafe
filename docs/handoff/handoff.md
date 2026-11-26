@@ -141,6 +141,17 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
+### 2026-11-26 — Team 派单与反馈收口
+
+- **接手入口**。设计见 [team delivery](../superpowers/specs/2026-11-26-team-delivery-design.md)，实施与剩余范围见 [plan](../superpowers/plans/2026-11-26-team-delivery.md)。设计经独立审查，已实现批次也做了两轮独立代码审查。用 `git status --short --branch` 和 `git log --oneline -5` 核对现场。
+- **名册与运行器**。`team start` / `team sync` 从首次显式发布的 canonical 目录更新权威名册，目录绑定存本机 KV。现有无绑定名册在首次显式发布时认领。成员注册只会更新在线信息或维护 loose roster。仓库中的 `agent` 限 pi/omp/codex/claude，兼容 `bin: pi|omp`。恢复托管进程时也通过 `TeamLaunchSpec` 校验。名册目录迁移、工作目录授权范围（#144/#161/#183）和同步后停止已移除进程（#184）仍待处理。
+- **寻址**。仅显式发布的团队有前门。团队 duty 和广播按团队名册限收件人，共用 channel 且无法确认团队时提示歧义。只有 loose roster 的普通 channel 仍可广播。无显式 channel 的团队或成员点名首单继承目标 channel。前门自投递被拒。多人团队回合后的追问要求点名。新单直达地址也会排除已移除成员。
+- **派单与消耗**。pi/omp 的 `cafe_ask` 支持 `delegate: true`、`broadcast: true`。通过本机真实投递记录附有界父任务摘要，同机双 daemon 测试覆盖跨 Host 的委派。投递记录是有限的内存记录，重启或淘汰后摘要可能缺失。团队追问投送当前收件人自己的历史答复。`collect: all` 异步结果合并唤醒一次，pi/omp 通过 exact Order replay 恢复连接断开期间的结果。pi/omp digest 只展示，Claude digest 用 `/cafe-barista digest` 查看最近一份。
+- **用户入口**。`dutyAliases` 是前门参考短语。任意自然语言仍先进入前门，确定性测试显式派了开发、测试两类子单。`cafe team start` 给出 TUI 启动命令。`cafe thread <id> --children` 可查看本机能见到的关联任务和结果摘要，子机提示到 Root 查跨机任务。#179 的 JSONL 追加保留原有半行并分隔下一条完整事件。
+- **下一轮优先**。#171 目前仅区分 `parent_not_agent`，人工回问与答复送回 agent 尚未接通。#120/#121/#194 目前有 CLI 按需查看，父会话的跨机实时结果及前门最终汇报仍待做。审核 [可点击原型](../superpowers/specs/2026-11-26-team-clarification-preview.html) 后，用明确的请求者身份绑定实现答复，再验证断线、重启和跨机。另有 #16/#27/#39 等既有 backlog，本批未逐项核验。
+- **验证**。TypeScript、128 文件 / 712 测试、routing 67/67、Web check/build、隔离打包冒烟 17/17、隔离 Claude 插件测试 6/6 全过。插件校验仍报告既有的 `setTimeout` 类型环境和缺 icon 警告。未跑真实浏览器或付费模型回归。
+- **运行态与外部操作**。本机 Root 仍用 0.2.0 workspace link，已 stop / start，`cafe doctor` 全绿。外部 issue ledger 只读，`issuemd check` 无结构错误。npm 发布归 operator。真机第二 Host、混合版本实网和付费模型 dogfood 待测。需要打包时从当前代码重新构建，本批冒烟用的是独立 scratch checkout。
+
 ### 2026-11-26 (follow-up) — v4-13 team dogfood + 0.2.0 local release candidate
 
 - **用户已同意的方向**：团队是显式派单/回报协议，不是共享聊天室或内建任务引擎。保留一个 orchestrator 前台、成员显式派单、子 Thread、显式 broadcast；Cafe 不管理 DAG、git/worktree 或合并策略。

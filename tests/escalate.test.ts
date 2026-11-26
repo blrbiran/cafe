@@ -129,6 +129,21 @@ describe("explicit escalation (v4-11)", () => {
     expect(bystanderSaw).toBe(0);
   });
 
+  it("explains when the parent requester is a person", async () => {
+    const d = await startDaemon("human-parent", { mode: "root" });
+    cleanup.push(d.stop);
+    const dev = await barista(d.addr, identity("dev"));
+    cleanup.push(() => dev.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const parent = await c.ask({ body: "check the parser", to: "dev" });
+    await untilClosed(c, parent.threadId);
+    const question = await dev.client.ask({ body: "which syntax?", escalate: true, parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    expect(question.decision.targets).toEqual([]);
+    expect(question.decision.failure).toBe("parent_not_agent");
+    expect(question.decision.reason).toMatch(/original conversation/);
+  });
+
   it("rejects an escalation whose parent cannot be resolved", async () => {
     const d = await startDaemon("esc3", { mode: "root", timing: FAST });
     cleanup.push(d.stop);

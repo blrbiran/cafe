@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse, stringify } from "yaml";
 import { formatApiError } from "../packages/cli/src/errors.ts";
-import { startDaemon } from "./helpers.ts";
+import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
 const BIN = resolve(import.meta.dirname, "../packages/cli/bin/cafe.js");
 const homes: string[] = [];
@@ -49,6 +49,58 @@ function cafeAsync(h: string, addr: string, ...args: string[]): Promise<{ status
     p.on("close", (status) => resolve({ status, stdout, stderr }));
   });
 }
+
+describe("team setup guidance", () => {
+  it("prints a complete omp launch command for a TUI member", async () => {
+    const d = await startDaemon("tui-guide", { mode: "root", noSupervisor: false });
+    cleanup.push(d.stop);
+    const roster = join(d.home, "team workspace");
+    mkdirSync(roster);
+    writeFileSync(join(roster, ".cafe"), "name: guide\nteam:\n  members:\n    - { name: orch, duty: orchestrator, mode: tui, agent: omp }\n");
+    const result = await cafeAsync(d.home, d.addr, "team", "start", "--dir", roster);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`cd '${roster}' && CAFE_TEAM_MEMBER=orch CAFE_TEAM_DIR='${roster}' omp`);
+    expect(result.stdout).toContain("cafe extension install");
+  });
+});
+
+describe("thread child results", () => {
+  it("ignores unrelated Threads from daemons without a parent filter", async () => {
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/api/threads/t1") return res.end(JSON.stringify({ meta: { from: { address: "asker" }, summary: "task" }, events: [] }));
+      if (req.url === "/api/threads?parent=t1") return res.end(JSON.stringify([
+        { threadId: "unrelated", parentThreadId: "t2", summary: "unrelated task", replies: [] },
+      ]));
+      if (req.url === "/api/health") return res.end(JSON.stringify({ isRoot: false }));
+      res.end("[]");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+    const result = await cafeAsync(home(), addr, "thread", "t1", "--children");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).not.toContain("unrelated task");
+    expect(result.stdout).toContain("Check the Root");
+  });
+  it("shows a child result after the parent has closed", async () => {
+    const d = await startDaemon("thread-children", { mode: "root" });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("worker"), async (h) => h.reply(h.order.body === "parent" ? "assigned" : "checks passed"));
+    cleanup.push(() => worker.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const parent = await c.ask({ body: "parent", to: "worker" });
+    await untilClosed(c, parent.threadId);
+    const child = await c.ask({ body: "tests", to: "worker", parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    await untilClosed(c, child.threadId);
+    const result = await cafeAsync(d.home, d.addr, "thread", parent.threadId, "--children");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(child.threadId);
+    expect(result.stdout).toContain("checks passed");
+  });
+});
 
 describe("thread show skipped targets (#111)", () => {
   it.each([

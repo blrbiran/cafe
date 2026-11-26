@@ -66,6 +66,9 @@ export function buildPrompt(
     lines.push("", "Attachments on this machine:");
     for (const a of attachments) lines.push(`- ${a.name} (${a.mime}, ${a.size} bytes)${a.path ? `: ${a.path}` : ""}`);
   }
+  if (order.parentContext && order.parentThreadId) {
+    lines.push("", `Parent task (${order.parentThreadId}):`, order.parentContext);
+  }
   if (order.turn > 1 && order.history.length) {
     lines.push("", `This is a follow-up (turn ${order.turn}). Earlier in this conversation:`);
     for (const h of order.history) lines.push(`[${h.role === "customer" ? "asked" : "answered"} by ${h.from}]`, h.text.slice(0, 1500), "");

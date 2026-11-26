@@ -134,6 +134,7 @@ export function orderPrompt(order: Order, self?: AgentRecord, attachments?: Arra
       : [`☕ cafe Order from ${order.from.address}${to}`, `orderId: ${order.orderId} · threadId: ${order.threadId}`, ""];
   return [
     ...head,
+    ...(order.parentContext && order.parentThreadId ? [`Parent task (${order.parentThreadId}):\n${order.parentContext}`, ""] : []),
     order.body,
     ...(attachments?.length ? ["", "Attachments on this machine:", ...attachments.map((a) => `- ${a.name} (${a.mime}, ${a.size} bytes)${a.path ? `: ${a.path}` : ""}`)] : []),
     "",
@@ -219,7 +220,8 @@ export default function cafe(pi: ExtensionAPI) {
   let current: Working | undefined;
   let draining = false;
   /** Open Orders this session asked: threadId → the Order (and its waiter in wait mode). */
-  const asked = new Map<string, { orderId: string; onEvent?: (env: ThreadEnvelope) => void }>();
+  type Asked = { orderId: string; onEvent?: (env: ThreadEnvelope) => void; collected?: Map<string, string> };
+  const asked = new Map<string, Asked>();
   /** orderIds already queued or served, so a redelivery after a reconnect is not run twice. */
   const known = new Set<string>();
   /** Events that arrive before order/create returns (the daemon fans out during creation). */
@@ -257,17 +259,28 @@ export default function cafe(pi: ExtensionAPI) {
     }
     if (env.orderId !== entry.orderId) return;
     if (entry.onEvent) return entry.onEvent(env);
-    const text = describeEvent(env, addrOf);
+    let text = describeEvent(env, addrOf);
+    const closed = env.event.type === "order.closed";
+    if (entry.collected) {
+      if (!closed) {
+        if (text && (env.event.type === "order.declined" || (env.event.type === "order.replied" && env.event.final))) {
+          entry.collected.set(env.eventId, text.slice(0, HISTORY_TURN_CHARS));
+          if (entry.collected.size > 20) entry.collected.delete(entry.collected.keys().next().value!);
+        }
+        return;
+      }
+      text = [...entry.collected.values(), "", text, "See the Thread for the complete results."].join("\n\n");
+    }
     if (text) {
       pi.sendMessage(
         { customType: "cafe-reply", content: text, display: true, details: { threadId: env.threadId, orderId: env.orderId, event: env.event.type } },
-        { triggerTurn: env.event.type !== "order.closed", deliverAs: "followUp" },
+        { triggerTurn: !closed || entry.collected !== undefined, deliverAs: "followUp" },
       );
     }
-    if (env.event.type === "order.closed") asked.delete(env.threadId);
+    if (closed) asked.delete(env.threadId);
   }
 
-  function track(threadId: string, entry: { orderId: string; onEvent?: (env: ThreadEnvelope) => void }): void {
+  function track(threadId: string, entry: Asked): void {
     asked.set(threadId, entry);
     const buf = early.get(threadId);
     early.delete(threadId);
@@ -385,8 +398,7 @@ export default function cafe(pi: ExtensionAPI) {
       });
       c.onThreadEvent(onThreadEvent);
       c.onDigest((d: ChannelDigest) => {
-        // One summarized observation, not one turn per event. `triggerTurn` queues it behind the
-        // current turn, the same way an Order is queued (v4-11).
+        // An observation can be displayed without queuing an extra model turn.
         const lines = d.threads.map((t) => `- ${t.status} ${t.summary.slice(0, 120)} (${t.replies} replies, ${t.declined} declined)${t.closedAt ? " closed" : ""}`);
         pi.sendMessage(
           {
@@ -395,7 +407,7 @@ export default function cafe(pi: ExtensionAPI) {
             display: true,
             details: { digest: d },
           },
-          { triggerTurn: true, deliverAs: "followUp" },
+          { triggerTurn: false },
         );
       });
       c.onTeamContext((tc) => {
@@ -416,6 +428,14 @@ export default function cafe(pi: ExtensionAPI) {
       c.onConnect((rec) => {
         setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");
         void refreshRegistry(c);
+        for (const [threadId, entry] of asked) {
+          if (!entry.collected) continue;
+          void c.resumeOrderResults(threadId, entry.orderId).then((events) => {
+            for (const event of events) onThreadEvent(event);
+          }).catch(() => {
+            ctxRef?.ui.notify(`cafe: could not resume results for ${threadId}; use /cafe thread ${threadId} to check`, "warning");
+          });
+        }
       });
       try {
         await c.connect({ ...identity, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
@@ -686,14 +706,20 @@ export default function cafe(pi: ExtensionAPI) {
       to: Type.Optional(Type.String({ description: "Explicit address; omit to let the router decide." })),
       threadId: Type.Optional(Type.String({ description: "Continue a previous conversation (thread) with whoever answered in it. Do not combine with escalate." })),
       escalate: Type.Optional(Type.Boolean({ description: "Ask the sender of the Order this session is currently handling a clarifying question (creates a sub-thread)." })),
+      delegate: Type.Optional(Type.Boolean({ description: "Assign work from the current Order to an explicit recipient in a new child Thread." })),
+      broadcast: Type.Optional(Type.Boolean({ description: "Explicitly ask all eligible members in the selected scope." })),
       channel: Type.Optional(Type.String({ description: "Post to this channel instead of the agent's home channel (channels are scopes, not secrets)." })),
       collect: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("all")], { description: "any: first answer wins; all: wait for every target or the deadline." })),
       wait: Type.Optional(Type.Boolean({ description: "Block until all replies are in." })),
     }),
     async execute(_id, params, signal) {
       const c = requireClient();
-      const parentOrderId = params.escalate ? current?.handle.order.orderId : undefined;
-      const parentThreadId = params.escalate ? current?.handle.order.threadId : undefined;
+      if (params.delegate && (!current || !params.to || params.threadId || params.escalate || params.broadcast)) {
+        throw new Error("Delegation requires a current Order and one explicit recipient, without threadId, escalate, or broadcast.");
+      }
+      const parent = params.escalate || params.delegate ? current?.handle.order : undefined;
+      const parentOrderId = parent?.orderId;
+      const parentThreadId = parent?.threadId;
       const ask = async () => {
         try {
           const res = await c.ask({
@@ -703,6 +729,7 @@ export default function cafe(pi: ExtensionAPI) {
             parentOrderId,
             parentThreadId,
             escalate: params.escalate || undefined,
+            broadcast: params.broadcast,
             channel: params.channel,
             collect: params.collect,
           });
@@ -725,7 +752,7 @@ export default function cafe(pi: ExtensionAPI) {
       if (!params.wait) {
         const res = await ask();
         const warnings = c.drainWarnings().map((w) => `warning: ${w}`);
-        track(res.threadId, { orderId: res.orderId });
+        track(res.threadId, { orderId: res.orderId, ...(params.collect === "all" ? { collected: new Map() } : {}) });
         return text(
           [
             ...warnings,

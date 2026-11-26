@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSyn
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
-import type { TeamMember, TeamSpec } from "@cafe/protocol";
+import { TeamLaunchSpec, type TeamMember, type TeamSpec } from "@cafe/protocol";
 import { openWorkerLog, type CappedLineFile } from "./proc/cappedLog.ts";
 import { probeGroup, readProcessStart, signalGroup } from "./proc/processStart.ts";
 
@@ -227,6 +227,7 @@ export class Supervisor {
    * TUI members are never started here (the person owns that terminal).
    */
   startTeam(rosterDir: string, team: TeamSpec, persist = true): WorkerInfo[] {
+    team = TeamLaunchSpec.parse(team);
     const dir = resolve(rosterDir);
     const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
     // Refuse a roster with a missing worktree before starting anything: spawn would otherwise fail
@@ -257,10 +258,11 @@ export class Supervisor {
       const memberDir = resolve(dir, member.dir);
       const runner = member.agent ?? team.agent ?? "pi";
       const native = runner === "codex" || runner === "claude";
+      const flavor = member.bin ?? runner;
       const base: BaristaSpec = {
         dir,
         team: { rosterDir: dir, spec: { ...team, members: [member] } },
-        ...(native ? { agent: runner as "codex" | "claude" } : { bin: member.bin ?? (runner === "pi" ? undefined : runner) }),
+        ...(native ? { agent: runner } : flavor === "omp" ? { bin: "omp" } : {}),
         ...(member.access ? { access: member.access === "read-only" ? "read-only" : "workspace-write" } : {}),
       };
       const w: Worker = {

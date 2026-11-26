@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { TeamSpec } from "@cafe/protocol";
 import { FAST, barista, customer, identity, startDaemon, waitFor } from "./helpers.ts";
 
 const cleanup: Array<() => Promise<void> | void> = [];
@@ -9,10 +10,17 @@ afterEach(async () => {
 const member = (name: string, duty: string, extra = {}) =>
   identity(name, { team: "myteam", teamChannel: "myteam", member: name, duty, channels: ["myteam"], ...extra });
 
-describe("team records and team addressing (v4-11)", () => {
+const publishedTeam = TeamSpec.parse({
+  name: "myteam",
+  channel: "myteam",
+  members: [{ name: "orch", duty: "orchestrator" }, { name: "dev", duty: "developer" }, { name: "watch", duty: "monitor", observer: true }],
+});
+
+describe("team records and team addressing", () => {
   it("lists the roster with online members and routes to the orchestrator", async () => {
     const d = await startDaemon("tm1", { mode: "root", timing: { ...FAST, graceMs: 60 } });
     cleanup.push(d.stop);
+    d.daemon.publishRoster(d.home, publishedTeam);
     const orch = await barista(d.addr, member("orch", "orchestrator"));
     cleanup.push(() => orch.client.close());
     const dev = await barista(d.addr, member("dev", "developer"));
@@ -38,6 +46,7 @@ describe("team records and team addressing (v4-11)", () => {
   it("fails honestly when the orchestrator is offline (never multicasts the team)", async () => {
     const d = await startDaemon("tm2", { mode: "root", timing: { ...FAST, graceMs: 60 } });
     cleanup.push(d.stop);
+    d.daemon.publishRoster(d.home, publishedTeam);
     const orch = await barista(d.addr, member("orch", "orchestrator"));
     const dev = await barista(d.addr, member("dev", "developer"));
     cleanup.push(() => dev.client.close());

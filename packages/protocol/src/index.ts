@@ -32,10 +32,13 @@ export const ChannelName = z.string().regex(/^[a-z0-9_-]{1,64}$/, "channel names
 export type ChannelName = z.infer<typeof ChannelName>;
 export const DEFAULT_CHANNEL = "default";
 
+const DutyAliases = z.array(z.string().trim().min(1).max(64)).max(8);
+
 /** One roster entry in a `.cafe` team block (v4-11). */
 export const TeamMember = z.object({
   name: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/, "member name may only contain [a-zA-Z0-9_.-]"),
   duty: z.string().min(1).max(64).optional(),
+  dutyAliases: DutyAliases.optional(),
   description: z.string().default(""),
   tags: z.array(z.string()).default([]),
   scope: z.array(z.string()).default([]),
@@ -58,6 +61,15 @@ export const TeamSpec = z.object({
 });
 export type TeamSpec = z.infer<typeof TeamSpec>;
 
+export const TeamAgent = z.enum(["pi", "omp", "codex", "claude"]);
+const TeamBin = z.enum(["pi", "omp"]);
+
+/** Local launch configuration. The replicated roster retains its backward-compatible shape. */
+export const TeamLaunchSpec = TeamSpec.extend({
+  agent: TeamAgent.optional(),
+  members: z.array(TeamMember.extend({ agent: TeamAgent.optional(), bin: TeamBin.optional() })).min(1),
+});
+
 /** A roster replicated to the Root (v4-11; v4-13 adds the authoritative flag and content hash). */
 export const TeamRecord = z.object({
   team: z.string(),
@@ -79,6 +91,7 @@ export type TeamRecord = z.infer<typeof TeamRecord>;
 export const TeamRosterEntry = z.object({
   name: z.string(),
   duty: z.string().optional(),
+  dutyAliases: DutyAliases.optional(),
   online: z.boolean().default(false),
 });
 export type TeamRosterEntry = z.infer<typeof TeamRosterEntry>;
@@ -136,7 +149,9 @@ export function renderTeamPlaybook(input: { team: string; channel: string; self:
     lines.push(
       "Your job as orchestrator:",
       "- Split the task. Assign each part to one member at a time with to: \"<member>\".",
-      "- When you assign inside the task you received, pass its parent_order_id and parent_thread_id so the work forms a sub-thread tree the person can follow.",
+      ...roster.flatMap((m) => m.duty && m.dutyAliases?.length ? [`- Job phrases for ${m.duty}: ${m.dutyAliases.join(", ")}.`] : []),
+      "- In pi or omp, set delegate: true when assigning from the current Order. With other clients, pass its parent Order and Thread identifiers.",
+      "- Send interim progress while delegated work is pending. Use the final reply to report the outcome.",
       "- Do not do the work yourself unless it is small; keep your context for the task and the reports.",
       "- Report to the person who asked you with a normal reply. Say what was done, where, and what is still open.",
     );
@@ -163,7 +178,7 @@ export const CafeFile = z.object({
 export type CafeFile = z.infer<typeof CafeFile>;
 
 /** A `.cafe` file: the top-level identity plus an optional team roster (v4-11). */
-export const CafeDocument = CafeFile.extend({ team: TeamSpec.optional() });
+export const CafeDocument = CafeFile.extend({ team: TeamLaunchSpec.optional() });
 export type CafeDocument = z.infer<typeof CafeDocument>;
 
 export const AgentStatus = z.enum(["idle", "busy", "offline"]);
@@ -322,6 +337,8 @@ export const Order = z.object({
   parentOrderId: z.string().optional(),
   /** The Thread holding the parent Order (v4-11 sub-Thread link). */
   parentThreadId: z.string().optional(),
+  /** Short excerpt of the parent task, derived by the sending daemon for a known participant. */
+  parentContext: z.string().max(640).optional(),
   /** This Order was created with an explicit escalation (v4-11). */
   escalate: z.boolean().optional(),
   /** Agent ids already involved upstream in this call chain. */
@@ -332,13 +349,14 @@ export const Order = z.object({
   /** 1 for the first Order of a Thread; >1 for Follow-ups. */
   turn: z.number().int().min(1).default(1),
   /** Earlier turns of the Thread, oldest first (Follow-ups only). */
-  history: z.array(z.object({ from: z.string(), role: z.enum(["customer", "barista"]), text: z.string() })).default([]),
+  history: z.array(z.object({ from: z.string(), agentId: z.string().optional(), role: z.enum(["customer", "barista"]), text: z.string() })).default([]),
 });
 export type Order = z.infer<typeof Order>;
 
 /** Why a sub-Order could not be delivered (v4-11; v4-13 adds the team-session failures). */
 export const SubOrderFailure = z.enum([
   "parent_offline",
+  "parent_not_agent",
   "unknown_team",
   "team_offline",
   "ambiguous_team",
@@ -353,6 +371,7 @@ export const SubOrderFailure = z.enum([
   "unknown_duty",
   /** v4-13: two teams own one channel, so its default recipient is not unique. */
   "ambiguous_channel",
+  "self_delivery",
   /** v4-13: a follow-up's responders and targets are all offline. */
   "responders_offline",
 ]);

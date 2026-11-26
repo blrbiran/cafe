@@ -888,10 +888,17 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       }
       if (member !== undefined) {
         if (typeof member !== "string" || !member) throw new RpcError("bad_request", "member must be a roster name");
-        const rosterDir = resolve(typeof teamDir === "string" && teamDir ? teamDir : (dir as string));
         if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
-        const loaded = loadTeamMember(rosterDir, member);
+        const rosterDir = resolve(typeof teamDir === "string" && teamDir ? teamDir : dir);
+        const loaded = (() => {
+          try {
+            return loadTeamMember(rosterDir, member);
+          } catch (err) {
+            throw new RpcError("bad_request", (err as Error).message);
+          }
+        })();
         if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
+        daemon.publishRoster(rosterDir, loaded.team);
         const one = { ...loaded.team, members: loaded.team.members.filter((m) => m.name === member) };
         return send(res, 200, sup.startTeam(rosterDir, one));
       }

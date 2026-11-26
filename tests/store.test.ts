@@ -18,6 +18,14 @@ afterEach(() => {
 const env = (i: number): ThreadEnvelope => ({ eventId: `E${i}`, threadId: "T", orderId: "O", host: "h", at: i, event: { type: "order.heartbeat", agentId: "A" } });
 
 describe("Store", () => {
+  it("keeps the next event readable after a partially written line", () => {
+    const store = new Store(temp());
+    const file = store.threadFile("T", 0);
+    writeFileSync(file, `${JSON.stringify(env(1))}\n{"eventId":"partial`);
+    store.appendEvent(file, env(2));
+    expect(store.readEvents(file).map((e) => e.eventId)).toEqual(["E1", "E2"]);
+    expect(store.readEventsTail(file, 1).map((e) => e.eventId)).toEqual(["E2"]);
+  });
   it("reads only the tail of a long event file", () => {
     const home = temp();
     const store = new Store(home);

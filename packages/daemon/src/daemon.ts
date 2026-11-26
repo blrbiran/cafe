@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createHash, X509Certificate } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { ulid } from "ulid";
@@ -48,9 +48,9 @@ import {
   type TeamContext,
   type TeamRosterEntry,
   type TeamRosterUpdate,
+  TeamLaunchSpec,
   renderTeamPlaybook,
 } from "@cafe/protocol";
-import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { Peer, RpcError } from "@cafe/protocol/peer";
 import { type CafeConfig, diffConfig, loadConfig, saveConfig } from "./config.ts";
 import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints.ts";
@@ -248,6 +248,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private uis = new Set<Peer>();
   /** Orders seen here (origin or relayed), for parent/chain lookup. */
   private knownOrders = new Map<string, Order>();
+  /** The exact prompt excerpt associated with an Order delivered to a local recipient. */
+  private deliveredParentBodies = new Map<string, string>();
   /** idempotencyKey → the first Order created with it (short window, bounded; v4-3 Q4). */
   private idempotentOrders = new Map<string, IdempotentOrder>();
   /** Agents registered on this Host (authoritative local set, survives Registry snapshots). */
@@ -915,6 +917,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.store.setAgentSession(k.kind, k.cwd, k.threadId, p.sessionId);
       return {};
     });
+    peer.on("order/resume-results", (p: { threadId: string; orderId: string }) => {
+      const meta = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
+      const order = meta ? this.findParentOrder(p.orderId, p.threadId) : undefined;
+      if (!meta || !order || order.threadId !== p.threadId || order.from.id !== peer.meta.agentId) {
+        throw new RpcError("not_found", "no matching Order for this agent");
+      }
+      this.subscribe(p.threadId, peer);
+      return this.store.readOrderEvents(meta.file, p.orderId)
+        .filter(({ event }) => event.type === "order.closed" || event.type === "order.declined" || (event.type === "order.replied" && event.final))
+        .slice(-21).map((env) => env.event.type === "order.replied" ? { ...env, event: { ...env.event, text: env.event.text.slice(0, 1500), attachments: undefined } } : env);
+    });
     peer.on("thread/subscribe", (p: { threadId: string }) => {
       this.subscribe(p.threadId, peer);
       return {};
@@ -954,8 +967,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // Teams (v4-11)
   // -------------------------------------------------------------------------
 
-  /** The live team view used by /api/teams and the Web. Rosters come from team/upsert; online members from the registry. */
-  teams() {
+  /** Published and loose rosters, without computing any Thread statistics. */
+  private liveRosters(): TeamRecord[] {
     const byKey = new Map(this.teamRecords);
     // A team started only by TUIs (no `team start`) still appears: derive from live registrations.
     // An authoritative `.cafe` roster owns membership, and a tombstone must not be resurrected.
@@ -971,8 +984,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       byKey.set(key, next);
     }
-    return [...byKey.values()]
-      .filter((t) => !t.removed)
+    return [...byKey.values()].filter((t) => !t.removed);
+  }
+
+  /** The live team view used by /api/teams and the Web. */
+  teams() {
+    return this.liveRosters()
       .map((t) => {
         const agents = this.registry.all().filter((r) => r.host === t.host && r.team === t.team && r.teamChannel === t.channel);
         const roster = t.members.map((m) => {
@@ -980,6 +997,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           return {
             name: m.name,
             ...(m.duty ? { duty: m.duty } : {}),
+            ...(m.dutyAliases?.length ? { dutyAliases: m.dutyAliases } : {}),
             mode: m.mode,
             dir: m.dir,
             ...(m.observer ? { observer: true } : {}),
@@ -1044,8 +1062,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * `to: <team>` has one meaning in v4-13: the team's front door, its orchestrator. Reaching every
    * member requires an explicit `broadcast`.
    */
-  private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "no_orchestrator" } {
-    let teams = this.teams().filter((t) => t.team === name && (!host || t.host === host));
+  private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "no_orchestrator" | "self_delivery" } {
+    let teams = this.liveRosters().filter((t) => t.team === name && (!host || t.host === host));
     if (!teams.length) return { ids: [], failure: "unknown_team" };
     if (teams.length > 1) {
       // Prefer the sender's Host, then a team sharing the sender's own team channel.
@@ -1059,27 +1077,48 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         else return { ids: [], failure: "ambiguous_team" };
       }
     }
-    const t = teams[0]!;
-    const orch = t.roster.find((m) => m.duty === "orchestrator");
-    if (!orch) return { ids: [], failure: "no_orchestrator" };
-    if (!orch.status || orch.status === "offline") return { ids: [], failure: "team_offline" };
-    const rec = this.registry.all().find((r) => r.host === t.host && r.team === t.team && r.teamChannel === t.channel && (r.member ?? r.name) === orch.name);
-    if (!rec) return { ids: [], failure: "team_offline" };
-    return { ids: [rec.agentId] };
+    return this.teamFrontDoor(teams[0]!, sender);
   }
 
-  /** `to: <duty>`: the unique eligible member with that duty (v4-13). */
-  private resolveDuty(order: Order, duty: string, host?: string): { ids: string[]; failure?: "ambiguous_duty" | "unknown_duty" | "no_online_barista" } {
+  private teamFrontDoor(team: TeamRecord, sender: Party): { ids: string[]; failure?: "no_orchestrator" | "team_offline" | "self_delivery" } {
+    const leads = team.members.filter((m) => m.duty === "orchestrator");
+    if (!team.authoritative || leads.length !== 1 || leads[0]!.observer) return { ids: [], failure: "no_orchestrator" };
+    const online = this.registry.all().filter((r) => this.isTeamMember(r, team) && (r.member ?? r.name) === leads[0]!.name &&
+      r.role === "barista" && !r.observer && r.status !== "offline" && (this.rootOnline || r.host === this.host || this.peerUrls.has(r.host)));
+    if (online.length !== 1) return { ids: [], failure: "team_offline" };
+    if (online[0]!.agentId === sender.id) return { ids: [], failure: "self_delivery" };
+    return { ids: [online[0]!.agentId] };
+  }
+
+  private isTeamMember(rec: AgentRecord, team: TeamRecord): boolean {
+    return rec.host === team.host && rec.team === team.team && rec.teamChannel === team.channel &&
+      team.members.some((m) => m.name === (rec.member ?? rec.name) && !m.observer);
+  }
+
+  private teamScope(order: Order): { team?: TeamRecord; ambiguous?: true } {
+    if (!order.channel || order.channel === DEFAULT_CHANNEL) return {};
+    const owners = this.liveRosters().filter((t) => t.channel === order.channel);
+    if (owners.every((t) => !t.authoritative)) return {};
+    const sender = this.registry.get(order.from.id);
+    if (sender?.team && sender.teamChannel === order.channel) {
+      const own = owners.find((t) => t.authoritative && this.isTeamMember(sender, t));
+      return own ? { team: own } : { ambiguous: true };
+    }
+    if (owners.length === 1 && owners[0]!.authoritative) return { team: owners[0] };
+    return owners.length ? { ambiguous: true } : {};
+  }
+
+  /** A duty is a roster label in the current team scope. */
+  private resolveDuty(order: Order, duty: string, host?: string): { ids: string[]; failure: "ambiguous_channel" | "ambiguous_duty" | "unknown_duty" | "no_online_barista" } | { ids: string[]; failure?: undefined } {
+    const { team, ambiguous } = this.teamScope(order);
+    if (ambiguous) return { ids: [], failure: "ambiguous_channel" };
+    if (!team || (host && host !== team.host)) return { ids: [], failure: "unknown_duty" };
     const want = duty.trim().toLowerCase();
-    const matches = (r: { duty?: string }) => (r.duty ?? "").trim().toLowerCase() === want;
-    const candidates = this.eligible(order).filter((r) => matches(r) && (!host || r.host === host));
+    const names = new Set(team.members.filter((m) => !m.observer && m.duty?.trim().toLowerCase() === want).map((m) => m.name));
+    const candidates = this.eligible(order).filter((r) => this.isTeamMember(r, team) && names.has(r.member ?? r.name));
     if (candidates.length > 1) return { ids: [], failure: "ambiguous_duty" };
     if (candidates.length === 1) return { ids: [candidates[0]!.agentId] };
-    // Distinguish "nobody owns this duty in this scope" from "the owner is offline".
-    const known = this.registry
-      .all()
-      .some((r) => r.role === "barista" && !r.observer && matches(r) && (!host || r.host === host) && channelsOf(r).includes(order.channel ?? DEFAULT_CHANNEL));
-    return { ids: [], failure: known ? "no_online_barista" : "unknown_duty" };
+    return { ids: [], failure: names.size ? "no_online_barista" : "unknown_duty" };
   }
 
   /** Send a notification to an Agent wherever it is registered (v4-11 digests). */
@@ -1156,7 +1195,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const agents = this.registry.all().filter((r) => r.host === rec.host && r.team === rec.team && r.teamChannel === rec.channel);
     return rec.members.map((m) => {
       const a = agents.find((r) => (r.member ?? r.name) === m.name);
-      return { name: m.name, ...(m.duty ? { duty: m.duty } : {}), online: !!a && a.status !== "offline" };
+      return { name: m.name, ...(m.duty ? { duty: m.duty } : {}), ...(m.dutyAliases?.length ? { dutyAliases: m.dutyAliases } : {}), online: !!a && a.status !== "offline" };
     });
   }
 
@@ -1231,38 +1270,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       return;
     }
-    let members: TeamRecord["members"] = current?.members ?? [];
-    let authoritative = current?.authoritative === true;
-    if (rec.teamDir) {
-      try {
-        const doc = readCafeFile(join(rec.teamDir, ".cafe"));
-        if (doc.team?.name === rec.team && doc.team.channel === rec.teamChannel) {
-          // The file owns membership: a member removed from `.cafe` disappears here too. Live
-          // status is derived from the registry, so a file without statuses is not a downgrade.
-          members = doc.team.members;
-          authoritative = true;
-        } else if (doc.team) {
-          // A registration may not point at another team's roster and borrow its membership.
-          this.log(`teamDir ${rec.teamDir} is team ${doc.team.name} (#${doc.team.channel}), not ${rec.team} (#${rec.teamChannel}); ignoring it`);
-        }
-      } catch (err) {
-        this.log(`cannot read team roster at ${rec.teamDir}: ${(err as Error).message}`);
-      }
-    }
-    // Without a readable roster (a sibling-worktree TUI, or the Root hearing a child registration)
-    // keep members learned earlier. An authoritative roster is never grown by a registration: a
-    // removed member that is still running must not reappear (v4-13).
+    // Registration reports presence. Only a local operator publishing a roster can set its membership.
+    if (current?.authoritative) return;
+    const members = current?.members ?? [];
     const name = rec.member ?? rec.name;
-    if (authoritative) {
-      if (!members.some((m) => m.name === name)) {
-        this.log(`member ${name} is not in the authoritative roster of ${rec.team}; ignoring its team registration`);
-        return;
-      }
-    } else if (!members.some((m) => m.name === name)) {
-      members = [...members, { name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels, observer: rec.observer }];
-    }
+    if (members.some((m) => m.name === name)) return;
+    const member: TeamRecord["members"][number] = { name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels, observer: rec.observer };
     const revision = Math.max(Date.now(), (current?.revision ?? 0) + 1);
-    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision, authoritative };
+    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members: [...members, member], revision, authoritative: false };
     this.storeTeam(team, undefined, { skipAgentId: rec.agentId });
     if (!this.isRoot && this.rootOnline) {
       if (this.rootSupports("teams")) {
@@ -1282,9 +1297,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * this is the only operation that clears a tombstone, and it always publishes the full roster.
    */
   publishRoster(rosterDir: string, team: TeamSpec): void {
+    const parsed = TeamLaunchSpec.safeParse(team);
+    if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
+    team = parsed.data;
     if (!team.name || !team.channel) return;
     const key = rosterKey({ host: this.host, team: team.name, channel: team.channel });
     const previous = this.teamRecords.get(key);
+    const canonical = realpathSync(rosterDir);
+    const owners = new Map(Object.entries(this.store.getKv<Record<string, string>>("rosterOwners") ?? {}));
+    const owner = owners.get(key);
+    if (owner && owner !== canonical) {
+      throw new RpcError("bad_request", `team ${team.name} uses roster directory ${owner}; run cafe team sync there`);
+    }
+    if (!owner) {
+      owners.set(key, canonical);
+      this.store.setKv("rosterOwners", Object.fromEntries(owners));
+    }
     const members = team.members.map((m) => ({ ...m, channels: m.channels?.length ? m.channels : [team.channel!] }));
     this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1), authoritative: true, removed: false });
     if (!this.isRoot && this.rootOnline && this.rootSupports("teams")) {
@@ -1318,7 +1346,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const orch = team.roster.find((m) => m.duty === "orchestrator");
     const self = team.roster.find((m) => m.name === (rec.member ?? rec.name));
     if (!orch || !self) return undefined;
-    const roster = team.roster.map((m) => ({ name: m.name, ...(m.duty ? { duty: m.duty } : {}), online: !!m.status && m.status !== "offline" }));
+    const roster = this.rosterEntries(team);
     const playbook = renderTeamPlaybook({ team: team.team, channel: team.channel, self: { name: self.name, ...(self.duty ? { duty: self.duty } : {}), online: true }, orchestrator: orch.name, roster });
     return {
       team: team.team,
@@ -1874,6 +1902,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     const depth = parent ? parent.depth + 1 : 0;
+    const parentContext = parent && parent.threadId === p.parentThreadId
+      ? parent.from.id === from.id
+        ? summarize(parent.body, 639)
+        : this.deliveredParentBodies.get(`${parent.orderId}:${from.id}`)
+      : undefined;
     if (depth > MAX_ORDER_DEPTH) throw new RpcError("too_deep", `order depth ${depth} exceeds ${MAX_ORDER_DEPTH}`);
 
     // Follow-up: continue an existing Thread. An escalation is always a NEW sub-Thread: one open
@@ -1931,6 +1964,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       body: p.body,
       ...(attachments?.length ? { attachments } : {}),
       parentOrderId: p.parentOrderId,
+      ...(parentContext ? { parentContext } : {}),
       ...(p.escalate ? { parentThreadId: p.parentThreadId ?? parent?.threadId, escalate: true } : p.parentThreadId ? { parentThreadId: p.parentThreadId } : {}),
       chain: [...(parent?.chain ?? []), ...(parent ? [parent.from.id] : [])],
       depth,
@@ -1939,6 +1973,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       turn: prior ? prior.turns + 1 : 1,
       history: prior ? this.history(prior) : [],
     };
+    // Keep the selected recipient and the stored channel aligned for fresh explicit orders.
+    const explicit = !p.escalate && !prior && !p.channel && order.to ? this.explicitDecision(order) : undefined;
+    const target = explicit?.targets[0];
+    const targetChannel = target ? this.registry.get(target)?.teamChannel : undefined;
+    if (targetChannel) order.channel = targetChannel;
     this.knownOrders.set(order.orderId, order);
     if (peer) this.subscribe(order.threadId, peer);
 
@@ -1951,7 +1990,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.tracking.set(order.orderId, t);
     this.emitEvent(order, { type: "order.created", order });
 
-    const decision = await this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
+    const decision = explicit ?? await this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
     t.decision = decision;
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
@@ -2003,7 +2042,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const env of this.store.readEventsTail(meta.file, 200)) {
       const ev = env.event;
       if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: ev.order.body.slice(0, 4000) });
-      else if (ev.type === "order.replied" && ev.final) out.push({ from: this.registry.get(ev.agentId)?.address ?? ev.agentId, role: "barista", text: ev.text.slice(0, 4000) });
+      else if (ev.type === "order.replied" && ev.final) out.push({ agentId: ev.agentId, from: this.registry.get(ev.agentId)?.address ?? ev.agentId, role: "barista", text: ev.text.slice(0, 4000) });
     }
     return out.slice(-12);
   }
@@ -2033,6 +2072,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // targets, then fails honestly. It never falls through to rules/LLM: a clarification
       // broadcast to an unrelated agent is worse than an error (#72).
       const responders = (followUp.responders ?? []).filter((id) => eligibleIds.has(id));
+      const prior = (followUp.priorTargets ?? []).filter((id) => eligibleIds.has(id));
+      const next = responders.length ? responders : prior;
+      const scope = this.teamScope(order);
+      if (next.length > 1 && (scope.team || scope.ambiguous)) {
+        const names = next.map((id) => this.registry.get(id)?.address ?? id).join(", ");
+        return { targets: [], mode: "unicast", reason: `choose a recipient for this follow-up with to: ${names}`, router: "followup", candidates: [], failure: "ambiguous_address" };
+      }
       if (responders.length) {
         return {
           targets: responders,
@@ -2042,7 +2088,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           candidates: [],
         };
       }
-      const prior = (followUp.priorTargets ?? []).filter((id) => eligibleIds.has(id));
       if (prior.length) {
         return {
           targets: prior,
@@ -2062,44 +2107,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       };
     }
     if (order.to) return this.explicitDecision(order);
-    if (broadcast) {
-      return this.channelFailure(order, {
-        targets: candidates.map((c) => c.agentId),
-        mode: "broadcast",
-        reason: "customer asked everyone",
-        router: "explicit",
-        candidates: [],
-      });
-    }
-    // v4-13: a fresh message in a team channel goes to the team's front door, not everyone.
+    if (broadcast) return this.broadcastDecision(order, candidates);
+    // A fresh message with a team channel goes to the team's front door.
     const channel = order.channel ?? DEFAULT_CHANNEL;
     if (channel !== DEFAULT_CHANNEL) {
-      const owners = this.teams().filter((t) => t.channel === channel);
+      const owners = this.liveRosters().filter((t) => t.channel === channel);
       if (owners.length > 1) {
-        return {
-          targets: [],
-          mode: "unicast",
-          reason: `channel #${channel} is used by ${owners.length} teams (${owners.map((t) => `${t.team}@${t.host}`).join(", ")}); address one with to:`,
-          router: "explicit",
-          candidates: [],
-          failure: "ambiguous_channel",
-        };
+        return { targets: [], mode: "unicast", reason: `channel #${channel} is used by several teams; address one with to:`, router: "explicit", candidates: [], failure: "ambiguous_channel" };
       }
-      if (owners.length === 1) {
-        const t = owners[0]!;
-        const orch = t.roster.find((m) => m.duty === "orchestrator");
-        if (!orch) {
-          return { targets: [], mode: "unicast", reason: `team ${t.team} has no orchestrator`, router: "explicit", candidates: [], failure: "no_orchestrator" };
-        }
-        if (!orch.status || orch.status === "offline") {
-          return { targets: [], mode: "unicast", reason: `team ${t.team} front door (${orch.name}) is offline; start it`, router: "explicit", candidates: [], failure: "team_offline" };
-        }
-        const rec = this.registry.all().find((r) => r.host === t.host && r.team === t.team && r.teamChannel === t.channel && (r.member ?? r.name) === orch.name);
-        if (!rec) {
-          return { targets: [], mode: "unicast", reason: `team ${t.team} front door (${orch.name}) is offline; start it`, router: "explicit", candidates: [], failure: "team_offline" };
-        }
-        return { targets: [rec.agentId], mode: "unicast", reason: `team ${t.team} front door (orchestrator)`, router: "explicit", candidates: [] };
-      }
+      const owner = owners[0];
+      if (owner) return this.frontDoorDecision(owner.team, this.teamFrontDoor(owner, order.from));
     }
     await this.routerReady();
     if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
@@ -2117,6 +2134,20 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     return this.channelFailure(order, await this.router.decide({ order, candidates, hints: this.hintsFor(candidates) }));
+  }
+
+  private frontDoorDecision(name: string, result: ReturnType<Daemon["resolveTeamTarget"]>): RoutingDecision {
+    const reason = result.failure === "self_delivery"
+      ? `you are the front door of ${name}; address a member explicitly`
+      : result.failure ? `team ${name}: ${result.failure}` : `team ${name} front door (orchestrator)`;
+    return { targets: result.ids, mode: "unicast", reason, router: "explicit", candidates: [], failure: result.failure };
+  }
+
+  private broadcastDecision(order: Order, candidates: AgentRecord[]): RoutingDecision {
+    const { team, ambiguous } = this.teamScope(order);
+    if (ambiguous) return { targets: [], mode: "broadcast", reason: `channel #${order.channel} is shared; select a team before broadcasting`, router: "explicit", candidates: [], failure: "ambiguous_channel" };
+    const targets = (team ? candidates.filter((r) => this.isTeamMember(r, team)) : candidates).map((r) => r.agentId);
+    return this.channelFailure(order, { targets, mode: "broadcast", reason: team ? `explicit broadcast to team ${team.team}` : "customer asked everyone", router: "explicit", candidates: [] });
   }
 
   /**
@@ -2139,19 +2170,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   private routeEscalation(order: Order, broadcast: boolean): RoutingDecision {
     if (order.to) return this.explicitDecision(order);
-    if (broadcast) {
-      const candidates = this.eligible(order);
-      return {
-        targets: candidates.map((c) => c.agentId),
-        mode: "broadcast",
-        reason: "escalation asked everyone in the channel",
-        router: "explicit",
-        candidates: [],
-        ...(candidates.length ? {} : { failure: "no_channel_members" as const }),
-      };
-    }
+    if (broadcast) return this.broadcastDecision(order, this.eligible(order));
     const parent = order.parentOrderId ? this.findParentOrder(order.parentOrderId, order.parentThreadId) : undefined;
     const rec = parent ? this.registry.get(parent.from.id) : undefined;
+    if (parent && (parent.from.id.startsWith("cli:") || rec?.role === "customer")) {
+      return { targets: [], mode: "unicast", reason: "the requester is a person; ask for clarification in the original conversation", router: "explicit", candidates: [], failure: "parent_not_agent" };
+    }
     if (rec && rec.role === "barista" && rec.status !== "offline") {
       return { targets: [rec.agentId], mode: "unicast", reason: `escalate to parent ${rec.address}`, router: "explicit", candidates: [] };
     }
@@ -2194,18 +2218,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const parsed = order.to ? parseAddress(this.normalizeAddress(order.to)) : undefined;
     if (parsed) {
       const team = this.resolveTeamTarget(parsed.name, parsed.host, order.from);
-      if (team.ids.length) {
-        return {
-          targets: team.ids,
-          mode: "unicast",
-          reason: `team ${parsed.name}${parsed.host ? `@${parsed.host}` : ""} front door (orchestrator)`,
-          router: "explicit",
-          candidates: [],
-        };
-      }
-      // An existing team's failure is the answer; only "no such team" falls through to a duty.
-      if (team.failure && team.failure !== "unknown_team") {
-        return { targets: [], mode: "unicast", reason: `team ${order.to}: ${team.failure}`, router: "explicit", candidates: [], failure: team.failure };
+      if (team.failure !== "unknown_team") return this.frontDoorDecision(order.to!, team);
+      const scope = this.teamScope(order).team;
+      if (scope && (!parsed.host || parsed.host === scope.host) && scope.members.some((member) => member.name === parsed.name)) {
+        return { targets: [], mode: "unicast", reason: `team member ${parsed.name} is not online`, router: "explicit", candidates: [], failure: "no_online_barista" };
       }
       const duty = this.resolveDuty(order, parsed.name, parsed.host);
       if (duty.ids.length) {
@@ -2235,7 +2251,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       .filter((id) => id !== order.from.id)
       .filter((id) => {
         const r = this.registry.get(id);
-        return !!r && r.role === "barista" && r.status !== "offline";
+        return !!r && r.role === "barista" && r.status !== "offline" && this.inTeamRoster(r);
       });
   }
 
@@ -2253,9 +2269,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * a Barista's prompt cannot leak another target's question. The recorded Order keeps `body`.
    */
   private forTarget(order: Order, agentId: string, variants: Record<string, string> | undefined): Order {
-    if (!variants) return order;
+    const rec = this.registry.get(agentId);
+    const history = order.turn > 1 && rec?.teamChannel && rec.teamChannel === order.channel
+      ? order.history.filter((entry) => entry.role === "customer" || entry.agentId === agentId)
+      : order.history;
+    if (!variants && history === order.history) return order;
     const { variants: _drop, ...rest } = order;
-    return { ...rest, body: variants[agentId] ?? order.body };
+    return { ...rest, history, body: variants?.[agentId] ?? order.body };
   }
 
   /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally or directly (ADR-0004). */
@@ -2464,6 +2484,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private notifyLocal(order: Order, agentId: string, peer: Peer): void {
     peer.notify(Methods.orderDeliver, { order, attachmentPaths: this.attachmentPaths(order) });
+    this.deliveredParentBodies.set(`${order.orderId}:${agentId}`, summarize(order.body, 639));
+    if (this.deliveredParentBodies.size > 2048) this.deliveredParentBodies.delete(this.deliveredParentBodies.keys().next().value!);
     this.emitEvent(order, { type: "order.delivered", agentId });
   }
 

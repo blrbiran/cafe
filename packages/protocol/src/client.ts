@@ -446,6 +446,11 @@ export class CafeClient {
     return res;
   }
 
+  async resumeOrderResults(threadId: string, orderId: string): Promise<ThreadEnvelope[]> {
+    if (!this.peer) throw new Error("not connected to cafe daemon");
+    return this.peer.request("order/resume-results", { threadId, orderId });
+  }
+
   async cancel(threadId: string): Promise<void> {
     await this.req(Methods.orderCancel, { threadId });
   }

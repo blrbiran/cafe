@@ -174,25 +174,35 @@ cafe team stop             # stop supervised members; TUI sessions are untouched
 cafe team remove <team>    # remove the roster (refuses while a member is online)
 ```
 
-A TUI member registers by starting the session with
-`CAFE_TEAM_MEMBER=<name> CAFE_TEAM_DIR=<roster dir>`; in pi/omp, `/cafe-team
-<name>` lists the roster and records the choice for the next session start
-(a TUI cannot isolate context, so a restart is what makes the role real).
-Codex TUIs use `cafe barista run --agent codex --tui --dir <dir> --member <name>
---team-dir <dir>`.
+`cafe team start` and `cafe team sync` publish the authoritative roster from
+its original directory on this Host. A member may launch from a separate
+worktree. Its registration updates presence while the published roster keeps
+its membership. Use `agent: pi|omp|codex|claude` for the host program.
+Existing `bin: pi` and `bin: omp` entries are supported.
+
+For a TUI member, follow the launch command printed by `cafe team start`.
+Install the integration first with `cafe extension install` for pi/omp or
+`cafe claude install` for Claude Code. The launch command sets the working
+directory and the member identity. Codex uses `cafe barista run --agent codex --tui`.
 
 **Channels are message scopes, not permissions.** The Feed has channel chips
 and the composer shows `→ #channel`; `cafe ask --channel <name>` posts
 elsewhere. A member's fresh question defaults to its home channel (the first
 one it lists).
 
-**A team has one front door.** `to: <team>` reaches the orchestrator, not
-everyone; a fresh message in the team channel with no `to:` does the same.
-`to: <member>` assigns one member, `to: <duty>` asks the unique member with
-that duty (`ambiguous_duty` names the candidates). Reaching every member
-requires an explicit `broadcast: true`. A follow-up goes to the previous
-turn's final responders (then that turn's targets); if none are online it
-fails as `responders_offline` instead of falling back to the router.
+**A team has one front door.** `to: <team>` and a fresh message in its channel
+reach the orchestrator. `to: <member>` addresses a member by name. Within a
+team, `to: <duty>` asks the unique online member with that duty. A member can
+list `dutyAliases: ["write unit tests"]` as a hint for the orchestrator when
+it chooses whom to assign. A team broadcast requires `broadcast: true` and
+stays within that team. If a shared channel has no clear team scope, Cafe asks
+for an explicit target. A follow-up after several team members answered
+also asks for a recipient. A follow-up with no online prior recipient fails
+as `responders_offline`.
+
+In pi/omp, use `cafe_ask` with `delegate: true` and `to` while handling an Order
+to create a child Thread. Use `cafe thread <threadId> --children` to see the
+linked tasks and their latest results.
 
 A registering member receives a **team playbook** (its duty, the roster, how
 to assign/report/escalate) in the registration result. When `.cafe` membership

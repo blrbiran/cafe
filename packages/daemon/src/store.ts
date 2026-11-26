@@ -119,9 +119,18 @@ export class Store {
 
   /** Append one event line; returns the bytes written (for /api/health counters). */
   appendEvent(file: string, env: ThreadEnvelope): number {
-    const line = `${JSON.stringify(env)}\n`;
-    appendFileSync(file, line);
-    return Buffer.byteLength(line);
+    const fd = openSync(file, "a+");
+    try {
+      const size = fstatSync(fd).size;
+      const tail = Buffer.alloc(1);
+      // Preserve a torn record as-is and separate it from the next complete record.
+      const separator = size > 0 && readSync(fd, tail, 0, 1, size - 1) === 1 && tail[0] !== 0x0a ? "\n" : "";
+      const line = `${separator}${JSON.stringify(env)}\n`;
+      appendFileSync(fd, line);
+      return Buffer.byteLength(line);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   readEvents(file: string): ThreadEnvelope[] {

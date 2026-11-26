@@ -114,6 +114,18 @@ test('a cancel aborts the running turn, or the Order\'s turn as soon as it start
   host.close()
 })
 
+test('an observer digest is available on demand without starting a turn', async ($, on) => {
+  const host = fakeHost(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true } as any)
+  await settle()
+  await host.feed({ type: 'ready', address: 'w#1@mac', socket: '/tmp/s.sock' })
+  await host.feed({ type: 'digest', text: 'Three completed tasks' })
+  expect(host.submits).toEqual([])
+  const out = await $.command.run({ command: 'cafe-barista', args: 'digest' } as any)
+  expect(JSON.stringify(out)).toContain('Three completed tasks')
+  host.close()
+})
+
 test('a non-interactive run (claude -p, SDK) never joins the network', async ($, on) => {
   const host = fakeHost(on)
   await $.session.start({ cwd: '/w', surface: null, isInteractive: false } as any)
