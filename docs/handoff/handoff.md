@@ -141,9 +141,19 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-### 2026-11-27 — 任务生命周期与事件授权（本地已提交，待推送 main，未发版）
+### 2026-11-27 — Order reports and conversation history
 
-- **接手入口。** 设计 [task lifecycle and event auth](../superpowers/specs/2026-11-26-task-lifecycle-and-event-auth-design.md)（经独立 builder check 两轮，“nothing important left”），计划 [implementation plan](../superpowers/plans/2026-11-26-task-lifecycle-and-event-auth.md)，逐任务记录在 `.superpowers/sdd/2026-11-26-task-lifecycle-and-event-auth/progress.md`（该目录被 git 忽略，仅本地）。用 `git status --short --branch`、`git log --oneline -5` 核对现场；`.vitest/` 是既有未跟踪目录，本轮未触碰，测试统一用隔离的 `--attachmentsDir`。提交在本地 `<git log --oneline -1>` 可见；自动安全审查拒绝了向公开仓库 `origin main` 的 push，需 operator 显式确认后 `git push origin HEAD:main`（origin/main 已验证是 HEAD 的祖先，可快进）。
+- Start with `git status --short --branch` and `git log --oneline -6`. The [lifecycle design](../superpowers/specs/2026-11-26-task-lifecycle-and-event-auth-design.md) and [implementation plan](../superpowers/plans/2026-11-26-task-lifecycle-and-event-auth.md) explain the Order and task contracts.
+- `cafe wait <threadId> --order <orderId>` reads status for the selected historical Order. CLI JSON includes completed result reports in `reports`. CLI text and MCP `cafe_wait` show the report text. The Order stream ends at the terminal event. A subsequent wait can read reports that arrived afterward.
+- Reports are searchable through FTS and the short-query fallback. A bounded upgrade scan indexes older reports in batches. The scan handles up to 4,000 Threads per startup and records progress.
+- Thread history can page backward by event ID. Channel activity pages use `(last_activity, thread_id)` to preserve entries with matching timestamps. Thread listings label creation and closure times. Follow-up excerpts retain the start and end of long messages. Heartbeats still renew leases and appear on live feeds. The resumable Thread stream sends journaled events and can replay legacy heartbeat entries.
+- JSON request bodies are limited to 1 MiB. Large content can use the artifact upload route. Pi and omp send an operational decline when a run produces no answer. The protocol client refreshes the team front door from roster updates and ignores stale revisions.
+- Verification for this batch passed across 131 test files and 786 tests, TypeScript, Web check/build, routing evaluation (67/67), package smoke (17/17), and Claude plugin tests (6/6). The local workspace Root passed `cafe doctor` after restart.
+- Before release, continue the authorization work described in the lifecycle design. Review the caller identity spec independently before writing its implementation plan. Physical second-Host and mixed-version deployment tests remain pending. The package version is still 0.2.0.
+
+### 2026-11-27 — 任务生命周期与事件授权（历史记录，已合入 main）
+
+- **接手入口。** 设计 [task lifecycle and event auth](../superpowers/specs/2026-11-26-task-lifecycle-and-event-auth-design.md)（经独立 builder check 两轮，“nothing important left”），计划 [implementation plan](../superpowers/plans/2026-11-26-task-lifecycle-and-event-auth.md)，逐任务记录在 `.superpowers/sdd/2026-11-26-task-lifecycle-and-event-auth/progress.md`（该目录被 git 忽略，仅本地）。用 `git status --short --branch`、`git log --oneline -5` 核对现场；`.vitest/` 是既有未跟踪目录，本轮未触碰，测试统一用隔离的 `--attachmentsDir`。这批提交已经合入并推送。以本节上方的最新记录为准。
 - **任务时限（#181/#156/#154）。** unicast 默认硬上限从 10 分钟改为 2 小时；ack/heartbeat 仍按 lease 判“没进展”；`deadlineMs` 必须是 1–2147483647 的整数，否则 `bad_request`；硬期限按 `createdAt + deadlineMs` 绝对时刻执行，路由耗时会消耗同一期限，到期前不再投递；恢复沿用同一绝对时刻。`recover()` 改为 `(createdAt, threadId)` keyset 分页直到空页，不再只恢复最近 1000 个 open Thread。
 - **串行容量。** 单个 Cafe 会话固定只启动一个 worker，`.cafe` 配 `concurrency > 1` 时 `barista start` 打印一条 warning；pi/omp 扩展与 codex/claude bridge 注册时一律报 `concurrency: 1`。真正的并行需要不同的成员身份和目录（#144 的共享目录问题仍单列）。
 - **父任务状态。** `ThreadMeta` 新增可选 `reportedOrderId`（由 `order.reported` 事件写入的唯一索引值）与派生的 `taskStatus`（`working` / `awaiting_report` / `done` / `failed` / `cancelled` / `unknown`）。父 Order 自己的 `status` 与直接回复数不变。判定只使用与该 `parentOrderId` 精确匹配、且经投递或人类所有者证明的子 Thread；澄清子 Thread 不计入。Root 用本地全量子项索引；非 Root 列表用一条批量 `thread/task-statuses` 请求取 Root 结果，Root 不可用时只对本地已知的关联工作标 `unknown`（普通会话不因此变成 unknown）。详情页可单独向 Root 取完整视图。子 Thread 也可以是父（嵌套委派），详情对任何发单在本机的 Thread 都投影。
