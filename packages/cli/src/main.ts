@@ -1103,7 +1103,12 @@ function runsAs(a: Pick<AgentRecord, "mode" | "agent" | "access" | "background">
 
 const printThreads = (list: ThreadMeta[], agents: Map<string, AgentRecord>) =>
   list
-    .map((t) => `${t.status.padEnd(9)} ${t.threadId}  ${time(t.createdAt)}  ${(t.channel ?? "default") === "default" ? "" : `#${t.channel} `}${t.from.address} → ${t.targets.map((id) => agents.get(id)?.address ?? id).join(",") || "-"}  ${t.summary.replace(/\s+/g, " ").slice(0, 60)}`)
+    .map((t) => {
+      const when = t.closedAt === undefined ? `created ${time(t.createdAt)}` : `closed ${time(t.closedAt)}`;
+      const channel = (t.channel ?? "default") === "default" ? "" : `#${t.channel} `;
+      const targets = t.targets.map((id) => agents.get(id)?.address ?? id).join(",") || "-";
+      return `${t.status.padEnd(9)} ${t.threadId}  ${when}  ${channel}${t.from.address} → ${targets}  ${t.summary.replace(/\s+/g, " ").slice(0, 60)}`;
+    })
     .join("\n") || "(no threads)";
 
 program

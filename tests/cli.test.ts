@@ -160,6 +160,25 @@ describe("thread child results", () => {
     expect([page.threads[0].threadId, older.threads[0].threadId].sort()).toEqual([a.threadId, b.threadId].sort());
   });
 
+  it("labels creation and completion times in Thread listings", async () => {
+    const d = await startDaemon("thread-times", { mode: "root" });
+    cleanup.push(d.stop);
+    const thread = await d.daemon.createOrder({ kind: "order", body: "Check timestamps" });
+    const row = d.daemon.store.getThread(thread.threadId)!;
+    const createdAt = Date.UTC(2026, 10, 27, 12, 0, 0);
+    const closedAt = createdAt + 42_000;
+    for (const status of ["done", "failed", "cancelled"] as const) {
+      d.daemon.store.putThread({ ...row, status, createdAt, closedAt });
+      const result = await cafeAsync(d.home, d.addr, "threads");
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain(`closed ${new Date(closedAt).toLocaleTimeString()}`);
+      expect(result.stdout).not.toContain(`created ${new Date(createdAt).toLocaleTimeString()}`);
+    }
+    d.daemon.store.putThread({ ...row, status: "working", createdAt, closedAt: undefined });
+    const result = await cafeAsync(d.home, d.addr, "threads");
+    expect(result.stdout).toContain(`created ${new Date(createdAt).toLocaleTimeString()}`);
+  });
+
   it("labels an HTTP reply as an operator override in Thread output", async () => {
     const d = await startDaemon("operator-reply", { mode: "root" });
     cleanup.push(d.stop);

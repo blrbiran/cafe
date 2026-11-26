@@ -29,6 +29,7 @@ import {
   PROTOCOL_VERSION,
   RegistryDelta,
   channelsOf,
+  compactHistoryText,
   formatAddress,
   parseAddress,
   projectTaskStatus,
@@ -2175,7 +2176,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       orderId: ulid(), threadId, kind: "order", from: parent.from, channel: meta.channel, origin: "human", body: text,
       clarificationRecipient: meta.from, parentThreadId, parentOrderId: parent.orderId, parentContext: summarize(parent.body, 639),
       chain: [], depth: parent.depth + 1, createdAt: Date.now(), turn: 2, deadlineMs: this.timing.unicastDeadlineMs,
-      history: [{ from: meta.from.address, agentId: meta.from.id, role: "barista", text: meta.clarification.question.slice(0, 4000) }],
+      history: [{ from: meta.from.address, agentId: meta.from.id, role: "barista", text: compactHistoryText(meta.clarification.question) }],
     };
     if (!this.isRoot && !this.rootOnline) this.markBackfill(threadId);
     const tracking: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map(), decision };
@@ -2224,10 +2225,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     );
     for (const env of events) {
       const ev = env.event;
-      if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: ev.order.body.slice(0, 4000) });
+      if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: compactHistoryText(ev.order.body) });
       else if (ev.type === "order.replied" && ev.final) {
         const speaker = this.registry.get(ev.agentId)?.address ?? ev.agentId;
-        out.push({ agentId: ev.agentId, from: speaker, role: "barista", text: ev.source === "operator" ? `[operator override for ${speaker} — not the Barista's own words] ${ev.text.slice(0, 3900)}` : ev.text.slice(0, 4000) });
+        const text = ev.source === "operator" ? `[operator override for ${speaker} — not the Barista's own words] ${ev.text}` : ev.text;
+        out.push({ agentId: ev.agentId, from: speaker, role: "barista", text: compactHistoryText(text) });
       }
     }
     return out;
@@ -3135,8 +3137,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // download still works after the origin Host goes offline again.
     if (meta?.from.host === this.host) for (const a of carried ?? []) this.enqueuePull(a, env.threadId);
     if (meta) {
-      this.appendEvent(meta.file, env);
-      // Thread creation / closure is durable immediately; heartbeats and interim events can wait.
+      // Heartbeats renew leases and remain visible live. Recovery only needs durable acks.
+      if (event.type !== "order.heartbeat") this.appendEvent(meta.file, env);
+      // Thread creation and closure are durable immediately; activity updates can wait.
       if (env.event.type === "order.created" || env.event.type === "order.closed") {
         const pending = this.metaFlush.get(meta.threadId);
         if (pending) clearTimeout(pending);

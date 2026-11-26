@@ -11,6 +11,16 @@ export const MAX_ORDER_DEPTH = 4;
 /** Events a Thread read returns when the caller gives no page size (#31). */
 export const DEFAULT_THREAD_PAGE = 200;
 
+/** Bound each history excerpt while retaining the conclusion of long messages (#129). */
+export function compactHistoryText(text: string): string {
+  const limit = 1500;
+  if (text.length <= limit) return text;
+  const marker = "\n…[truncated]…\n";
+  const content = limit - marker.length;
+  const tail = Math.floor(content / 2);
+  return text.slice(0, content - tail).replace(/[\uD800-\uDBFF]$/, "") + marker + text.slice(-tail).replace(/^[\uDC00-\uDFFF]/, "");
+}
+
 /** Public status of a connector installed on the daemon serving the page. */
 export interface ConnectorStatusRow {
   name: string;

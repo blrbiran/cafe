@@ -121,9 +121,13 @@ describe("single root", () => {
     const c = await customer(root.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "slowly please", to: "slowish@root" });
+    const stream = await fetch(`http://${root.addr}/api/threads/${res.threadId}/stream?orderId=${res.orderId}`, { signal: AbortSignal.timeout(4500) });
     const events = await untilClosed(c, res.threadId, res.orderId);
+    expect(await stream.text()).not.toContain('"type":"order.heartbeat"');
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "still here" });
     expect(events.find((e) => e.event.type === "order.failed")).toBeUndefined();
+    expect(events.some((e) => e.event.type === "order.heartbeat")).toBe(true);
+    expect(root.daemon.thread(res.threadId)?.events.map((e) => e.event.type)).not.toContain("order.heartbeat");
   });
 
   it("uses an injected LLM router", async () => {

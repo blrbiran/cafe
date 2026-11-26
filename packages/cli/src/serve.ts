@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadAgentIdentity } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
-import type { Order } from "@cafe/protocol";
+import { compactHistoryText, type Order } from "@cafe/protocol";
 import { extractAttachments } from "./artifacts.ts";
 
 /**
@@ -71,7 +71,7 @@ export function buildPrompt(
   }
   if (order.turn > 1 && order.history.length) {
     lines.push("", `This is a follow-up (turn ${order.turn}). Earlier in this conversation:`);
-    for (const h of order.history) lines.push(`[${h.role === "customer" ? "asked" : "answered"} by ${h.from}]`, h.text.slice(0, 1500), "");
+    for (const h of order.history) lines.push(`[${h.role === "customer" ? "asked" : "answered"} by ${h.from}]`, compactHistoryText(h.text), "");
   }
   lines.push(
     "",

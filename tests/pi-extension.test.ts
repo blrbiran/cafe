@@ -334,7 +334,7 @@ describe("pi extension", () => {
     const first = await c.ask({ body: "how many widgets?", to: "widgets@root" });
     await waitFor(() => orders(pi).length === 1);
     let closed = untilClosed(c, first.threadId, first.orderId);
-    await runTurn(pi, "42 widgets");
+    await runTurn(pi, `42 widgets ${"x".repeat(6000)} END-OF-RESULT`);
     await closed;
 
     const second = await c.ask({ body: "and yesterday?", threadId: first.threadId });
@@ -344,6 +344,8 @@ describe("pi extension", () => {
     expect(prompt).toContain("follow-up (turn 2)");
     expect(prompt).toContain("how many widgets?");
     expect(prompt).toContain("42 widgets");
+    expect(prompt).toContain("END-OF-RESULT");
+    expect(prompt).toContain("[truncated]");
     expect(prompt).toContain("and yesterday?");
     closed = untilClosed(c, first.threadId, second.orderId);
     await runTurn(pi, "40 yesterday");

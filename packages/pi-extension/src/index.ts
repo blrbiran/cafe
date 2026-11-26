@@ -5,11 +5,12 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { DEFAULT_PORT, type AgentRecord, type Attachment, type ChannelDigest, type Order, type ThreadEnvelope } from "@cafe/protocol";
+import { compactHistoryText, DEFAULT_PORT, type AgentRecord, type Attachment, type ChannelDigest, type Order, type ThreadEnvelope } from "@cafe/protocol";
 import { loadAgentIdentity, loadTeamMember, readCafeFile } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 
 const STATUS_KEY = "cafe";
+const COLLECTED_RESULT_CHARS = 1500;
 
 export function daemonAddr(): string {
   return process.env.CAFE_DAEMON ?? `127.0.0.1:${DEFAULT_PORT}`;
@@ -105,15 +106,10 @@ export function lastAssistantText(messages: readonly unknown[]): string | undefi
   return undefined;
 }
 
-const HISTORY_TURN_CHARS = 1500;
-
 /** Compact transcript of the earlier turns of a Thread, oldest first. */
 export function formatHistory(history: Order["history"]): string {
   return history
-    .map((h) => {
-      const text = h.text.length > HISTORY_TURN_CHARS ? `${h.text.slice(0, HISTORY_TURN_CHARS)} …[truncated]` : h.text;
-      return `[${h.role} ${h.from}]\n${text}`;
-    })
+    .map((h) => `[${h.role} ${h.from}]\n${compactHistoryText(h.text)}`)
     .join("\n\n");
 }
 
@@ -267,7 +263,7 @@ export default function cafe(pi: ExtensionAPI) {
     if (entry.collected) {
       if (!closed) {
         if (text && (env.event.type === "order.declined" || (env.event.type === "order.replied" && env.event.final))) {
-          entry.collected.set(env.eventId, text.slice(0, HISTORY_TURN_CHARS));
+          entry.collected.set(env.eventId, text.slice(0, COLLECTED_RESULT_CHARS));
           if (entry.collected.size > 20) entry.collected.delete(entry.collected.keys().next().value!);
         }
         return;

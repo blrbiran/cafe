@@ -153,7 +153,7 @@ describe("explicit escalation (v4-11)", () => {
     });
     const parent = await (await post("/api/orders", { body: "check parsing", to: "tester" }, owner)).json() as Delegated;
     await waitFor(() => remote.daemon.thread(parent.threadId)?.meta.status === "done");
-    const question = await worker.client.ask({ body: "old syntax too?", escalate: true, parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    const question = await worker.client.ask({ body: `${"Background. ".repeat(400)}Include old syntax too?`, escalate: true, parentOrderId: parent.orderId, parentThreadId: parent.threadId });
     expect(question.decision).toMatchObject({ needsHuman: true, targets: [] });
     const path = `/api/threads/${parent.threadId}/clarifications/${question.threadId}/answer`;
     const input = { clarificationOrderId: question.orderId, text: "yes, cover old syntax" };
@@ -166,7 +166,7 @@ describe("explicit escalation (v4-11)", () => {
     expect((await post(path, { ...input, text: "a conflicting answer" }, owner)).ok).toBe(false);
     await waitFor(() => root.daemon.thread(question.threadId)?.meta.replies.some((r) => r.text === "continuing the parser checks") === true);
     expect(received).toHaveLength(2);
-    expect(received[1]).toMatchObject({ threadId: question.threadId, body: input.text });
+    expect(received[1]).toMatchObject({ threadId: question.threadId, body: input.text, history: [{ text: expect.stringContaining("Include old syntax too?") }] });
     expect(root.daemon.thread(parent.threadId)?.meta).toMatchObject({ status: "done", turns: 1 });
   });
 

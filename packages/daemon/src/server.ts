@@ -1027,14 +1027,18 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
     seen.add(env.eventId);
     write(env);
   };
-  daemon.on("thread", onEvent);
+  // Only journaled events can serve as resume cursors. Replay still includes historical heartbeats.
+  const onLiveEvent = (env: ThreadEnvelope) => {
+    if (env.event.type !== "order.heartbeat") onEvent(env);
+  };
+  daemon.on("thread", onLiveEvent);
   const counts = daemon.streamCounts;
   counts.sse++;
   const done = () => {
     if (finished) return;
     finished = true;
     if (ping) clearInterval(ping);
-    daemon.off("thread", onEvent);
+    daemon.off("thread", onLiveEvent);
     counts.sse = Math.max(0, counts.sse - 1);
   };
   // Register cleanup before the replay: the replay itself can end the response.
