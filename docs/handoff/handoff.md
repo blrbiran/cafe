@@ -132,8 +132,41 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 - **Channels are scopes, not permissions (v4-11).** `eligible()` filters by `channels` and excludes observers; an explicit `to:` may cross channels. A registered agent's fresh Order defaults to its home channel (`channels[0]`). One `.cafe` = one team; rosters replicate to the Root with a revision and persist in `teams.json`.
 - **`collect: all` has no grace (v4-11).** Deadline silences are `order.declined {skipped: true, reason: "deadline"}`, never declines; `ThreadMeta.targetStates` is the display truth.
 - **Observers are never routed to (v4-11).** They receive one digest per interval per channel; a child digest is `partial` while the Root is offline. A digest wakes one turn, queued behind an in-flight Order.
+- **A team has exactly one orchestrator (v4-13).** A `.cafe` team with 0 or >1 orchestrators is a hard error; the orchestrator is the team's front door. `to: <team>` and a fresh message in the team channel with no `to:` reach **only** the orchestrator; reaching everyone requires an explicit `broadcast: true`. A team with no orchestrator cannot be addressed as a team (`no_orchestrator`).
+- **A follow-up never falls back to the router (v4-13).** Targets are the previous turn's final responders, then that turn's `targetStates` targets, then `responders_offline`. An explicit `to:` or `broadcast: true` overrides. Do not reintroduce a rules/LLM fallback for follow-ups.
+- **An authoritative `.cafe` roster owns membership (v4-13).** `publishRoster` publishes the full roster and sets `authoritative`; `teams()` never grows an authoritative roster from live registrations; a member removed from `.cafe` is not eligible even while its process runs. `contentHash` makes an identical re-publish a no-op.
+- **Removal is a tombstone, not a delete (v4-13).** `removed: true` with a newer revision stays in `teams.json`; a delayed `team/upsert` loses; only `cafe team start`/`team sync` (a person action) clears it.
+- **`team-sessions` is a separate feature flag (v4-13).** `teams` (v4-11) is not enough: a v4-12 daemon would multicast `to: <team>`. A new client refuses channel/escalate/`collect: all`/team identity/team target on a daemon that does not advertise the capability, **before** the Order exists; a warning is not a downgrade.
+- **Root owns the complete digest while online (v4-13 #109).** The Root publishes for every observer in its registry; a child publishes `partial` only while the Root is offline. `digestId` is `host:seq`; the client dedupes by id and `(publisher, channel, since)`.
 
 ## 5. Waiting on the user (start the next session here)
+
+### 2026-11-26 (later) — v4-13 团队会话：一个前台 + playbook + 名册生命周期；#107/#111/#112/#114（已推送 main，未发版）
+
+- **一句话**：按用户逐条拍板把 team 从 v4-11 的“频道里一堆 agent”改成 **一个 orchestrator 前台**：`to: <team>` 和 team channel 的默认收件人都只到 orchestrator，全员必须显式 `broadcast`；成员注册时收到 playbook，名册变化推一条 `team/roster` 注记；同时修掉 #107/#108/#109/#110/#111/#112/#113/#114。设计经独立 subagent 审阅（5 个 must-fix 全部折进 spec）。**未发版**（建议 **0.2.0**，因为 team 路由语义是破坏性变更）。
+- **Spec/plan**：`docs/specs/v4-13-team-sessions.md`（rev 2，含审阅修正）、`docs/superpowers/plans/2026-11-26-team-sessions.md`。v4-11 的 team 路由章节被取代；roster/channel/escalate/collect 原语保留。
+- **团队语义（用户 2026-11-26 拍板，勿悄悄推翻）**：
+  - `.cafe` 必须有且只有一个 `duty: orchestrator`；0/多个硬失败。没有老 roster 需要兼容，**不保留 legacy 组播回退**。
+  - `to: <team>` = 只发给 orchestrator；fresh team-channel 消息无 `to:` 也发给 orchestrator；`broadcast: true` 才是全员；`to: <member>` / `to: <duty>` 是显式派单（同名 agent 优先于 duty；多人 duty → `ambiguous_duty` 列名字）。
+  - 追问只发给上一轮最终回复者 → 上一轮 `targetStates` 的 targets → `responders_offline`；**绝不回落 rules/LLM**。显式 `to:`/`broadcast` 覆盖。
+  - 注册结果带 `teamContext`（playbook + roster + revision）；`team/roster` 是 daemon→agent 通知，不创建 Order、不触发 turn；`cafe team context` 可打印同一份。
+  - 名册：`publishRoster` 发完整 `.cafe` 名册并设 `authoritative`；`teams()` 不从 registry 给 authoritative 名册补人；`contentHash` 让相同内容重发是 no-op；`removed: true` tombstone 持久化，延迟 upsert 不会复活；`cafe team sync` 只发布不启动；`cafe team remove` 有在线成员时 409。
+  - 混合版本**硬拒绝**五项：`escalate` / 非 default `channel` / `to: <team>` / team 身份 / `collect: all`；`duty` 只警告。新增 `team-sessions` feature flag（`teams` 不够）。
+- **#109**：Root 在线时由 Root 给所有 observer 发完整摘要；child 只在 Root 离线时发 `partial`；`digestId` 改 `host:seq`；客户端按 id 和 `(publisher,channel,since)` 去重；child 接管时游标设为 now，避免回放。
+- **#108**：roster key 改 `(host, team, channel)`；同主机同名 team 不再合并；发送方按自己的 `teamChannel` 选，否则 `ambiguous_team`。**#113**：`team/remove` 实现、tombstone、channel 冲突 warning + `/api/channels.conflict`。
+- **#107**：Codex TUI `candidates()` 按 id 去重（保留最新行）。**#114**：store 读取路径统一补 `channel: "default"`（`getThread`/`listThreads`/`listThreadsIn`/`listThreadsInByActivity`/`openThreads`）。**#111**：`cafe thread show` 打 `targets:` 行，Web 显示最近一轮 targetStates。**#112**：`/api/threads?parent=` + Web 父/子链接，`threads.parent_thread_id` 列 + 索引。
+- **验证**：`vitest run` **127 文件 / 690 测试全过**（两轮全量：第一轮 686/686 后补了 4 个新测试；最后一轮 690/690）；`build:web` 56 modules / 380.00 kB；`routing:eval` **67/67**；`test:release` **17/17**；`test:claude-plugin` **5/5**。`tsc` 在主体实现完成时通过；**最后一次 tsc 被 sandbox classifier 拒绝**（理由与本轮改动无关），之后只改了 daemon 的 `team/roster` 转发、follow-up 的 `broadcast` 条件、测试与文档，全量 vitest（会编译所有文件）仍全绿。
+- **行为变化（请审核）**：① `to: <team>` 不再组播，只到 orchestrator；② team channel 新消息默认到 orchestrator；③ 追问不再回落 router；④ 混合版本对五项硬拒绝（不再只是警告）；⑤ `.cafe` 团队必须有且只有一个 orchestrator；⑥ `team start`/`team sync` 发布完整名册且相同内容不 bump revision；⑦ 名册变化会给在线成员一条 `team/roster` 注记；⑧ `team remove` 是 tombstone；⑨ #109 摘要发布者从“注册所在 daemon”改为“Root 在线时 Root 全量”；⑩ `cafe thread show`/Web 新增 targetStates 与子 Thread 链接。
+- **诚实边界**：
+  - Claude session-host 没有静默系统注记，`teamContext`/roster 注记会拼在**下一个 Order** 的前面；从名册变化到下一个 Order 之间它的视图是旧的，playbook 要求大任务前 `cafe team status`。
+  - Web 的 targetStates/子 Thread/Teams orchestrator 徽章只过了 `build:web`，**没有在真机浏览器 dogfood**。
+  - `team/roster` 的跨 daemon 转发（Root→child、child→uplink）已实现但只有同机测试覆盖；多机 team 需要真机验证。
+  - Root 在线时 Root 给远端 observer 发摘要依赖 observer 在 Root registry 里的记录；child 刚注册、registry 还没复制到的窗口内可能晚一个周期。
+  - `digestId` 从 number 变 string；`ChannelDigest` 接受两者，老客户端忽略 id 不受影响，但第三方脚本若把 id 当 number 会需要适配。
+  - 台账 `issue-20261119.md` 在仓库外，sandbox 拒绝了我执行 `issuemd close`；**状态未改**。下一轮可跑：
+    `issuemd close <file> 107 --criteria "…"` …（#107/#108/#109/#110/#111/#112/#113/#114；#71 保持“部分解决”，判据 1 现在可由 `to: <duty>`/orchestrator 完成，但 rules-router 的自然语言职责匹配仍未做，属 #39）。
+- **仍需你本人**：审核上面的行为变化；`cafe daemon restart` 后 `cafe doctor` 看 `team-sessions`；用真实 `.cafe`（一个 orchestrator + dev/tester）跑一次 `cafe team start`、`cafe team sync`、`cafe ask --to <team>`；发版 **0.2.0**；Discord 实测；ssh1 复核 #91；证书安装（你说先不做）。
+- **下一步候选**：#39 路由精度（含 duty 语义）、#27 全网升级、#18 只读 token、#33/#34 规模、#73 orca 反向 connector、#106 代理；真机多机 team（#108/#109 的跨机路径）。
 
 ### 2026-11-26 — v4-11 实现自审修复 + v4-12 混合版本能力声明（已推送 main，未发版）
 
