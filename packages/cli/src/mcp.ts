@@ -176,8 +176,12 @@ export function runMcp(opts: McpOptions): Promise<void> {
       clearTimeout(timer);
       ctrl.abort();
     }
+    const result = status ? await api<{ taskStatus?: ThreadMeta["taskStatus"]; reports: { agentId: string; text: string }[] }>(
+      `/api/threads/${encodeURIComponent(threadId)}/result?orderId=${encodeURIComponent(orderId)}`,
+    ).catch(() => undefined) : undefined;
     const lines = [`threadId: ${threadId}`, `orderId: ${orderId}`, `status: ${status ?? "still working"}`];
     for (const r of replies) lines.push("", `## ${r.source === "operator" ? `operator override for ${r.from}` : r.from}${r.final ? "" : " (progress)"}`, r.text);
+    for (const r of result?.reports ?? []) lines.push("", `## ${who(r.agentId)} (result report)`, r.text);
     if (notes.length) lines.push("", ...notes);
     if (!status) lines.push("", `Not answered yet. Call cafe_wait with threadId "${threadId}" to keep waiting, or cafe_cancel to give up.`);
     else if (status === "done") lines.push("", `Ask a follow-up with cafe_ask and threadId "${threadId}".`);

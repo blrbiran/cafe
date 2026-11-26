@@ -327,7 +327,12 @@ describe("team sessions (v4-13)", () => {
     await waitFor(() => hasReport(root.daemon.thread(parent.threadId)?.events ?? []).length === 1);
     origin.daemon.setRoot(root.addr);
     await waitFor(() => origin.daemon.rootOnline);
-    const detail = await (await fetch(`http://${origin.addr}/api/threads/${parent.threadId}`)).json();
+    const url = `http://${origin.addr}/api/threads/${parent.threadId}`;
+    await waitFor(async () => {
+      const result = await (await fetch(`${url}/result?orderId=${parent.orderId}`)).json();
+      return result.reports?.some((entry: { text: string }) => entry.text === report.text) === true;
+    });
+    const detail = await (await fetch(url)).json();
     expect(hasReport(detail.events)).toEqual([expect.objectContaining({ orderId: parent.orderId, event: { type: "order.reported", agentId: agent.rec.agentId, text: report.text } })]);
     expect(detail.meta.status).toBe("done");
   });

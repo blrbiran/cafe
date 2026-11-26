@@ -80,6 +80,8 @@ export class CafeClient {
   private seenDigests = new Set<string | number>();
   /** `(publisher, channel, since)` already dispatched; catches a replayed window with a new id. */
   private seenSince = new Set<string>();
+  /** Process-local revision guard; registration is the reconnect catch-up. */
+  private teamRosterRevision?: number;
   /** The playbook/roster from `agent/register` (v4-13); absent on an older daemon. */
   private _teamContext?: TeamContext;
   private teamContextListeners = new Set<Listener<TeamContext>>();
@@ -227,6 +229,7 @@ export class CafeClient {
       this.seenDigests.clear();
       this.seenSince.clear();
       this._teamContext = undefined;
+      this.teamRosterRevision = undefined;
       this.echoed.clear();
       this.daemonFeatures = undefined;
       const ws = this.connectSocket();
@@ -274,18 +277,22 @@ export class CafeClient {
         for (const fn of this.digestListeners) fn(digest);
       });
       peer.on(Methods.teamRoster, ({ update }: { update: TeamRosterUpdate }) => {
+        if (this.teamRosterRevision !== undefined && update.revision <= this.teamRosterRevision) return;
+        this.teamRosterRevision = update.revision;
         if (update.removedTeam) this.setTeamContext(undefined);
         else if (this._teamContext) {
-          // Re-render the playbook so it names the new roster; the static rules do not change.
+          const orchestrator = update.members.find((member) => member.duty === "orchestrator")?.name ?? this._teamContext.orchestrator;
+          // Re-render the playbook so it names the new roster and front door; the static rules do not change.
           this.setTeamContext({
             ...this._teamContext,
             revision: update.revision,
             roster: update.members,
+            orchestrator,
             playbook: renderTeamPlaybook({
               team: this._teamContext.team,
               channel: this._teamContext.channel,
               self: { name: this._teamContext.self.name, ...(this._teamContext.self.duty ? { duty: this._teamContext.self.duty } : {}), online: true },
-              orchestrator: this._teamContext.orchestrator,
+              orchestrator,
               roster: update.members,
             }),
           });
@@ -328,6 +335,7 @@ export class CafeClient {
               throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support team-sessions; team registration was refused`));
             }
             const registered = await peer.request<AgentRecord & { teamContext?: TeamContext }>(Methods.agentRegister, { ...identity, resumeProof: this.resumeProof });
+            this.teamRosterRevision = registered.teamContext?.revision;
             this.record = registered;
             this.setTeamContext(registered.teamContext);
             // With no advertisement, the echo still proves support: an old Daemon strips these.

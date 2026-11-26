@@ -442,7 +442,7 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
   let buf = "";
   let status = "unknown";
   let closedOrder: string | undefined;
-  const replies: unknown[] = [];
+  const repliesByOrder = new Map<string, unknown[]>();
   for await (const chunk of res.body as any as AsyncIterable<Uint8Array>) {
     buf += decoder.decode(chunk, { stream: true });
     let i: number;
@@ -454,7 +454,12 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
       const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
       // Earlier turns are replayed; only report on the Order being followed.
       if (opts.orderId && env.orderId !== opts.orderId) continue;
-      if (env.event.type === "order.replied") replies.push({ from: agents.get(env.event.agentId)?.address ?? env.event.agentId, text: env.event.text, final: env.event.final, ...(env.event.source ? { source: env.event.source } : {}) });
+      if (env.event.type === "order.replied") {
+        const replies = repliesByOrder.get(env.orderId) ?? [];
+        const { agentId, text, final, source } = env.event;
+        replies.push({ from: agents.get(agentId)?.address ?? agentId, text, final, ...(source ? { source } : {}) });
+        repliesByOrder.set(env.orderId, replies);
+      }
       if (env.event.type === "order.closed") {
         status = env.event.status;
         closedOrder = env.orderId;
@@ -472,16 +477,24 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
     : [];
   const pending = children.filter((c) => c.parentThreadId === threadId && c.parentOrderId === selectedOrder &&
     ((c.clarification && c.turns === 1) || ["routing", "delivering", "working"].includes(c.status)));
-  const taskDetail = selectedOrder
+  const result = closed && selectedOrder
+    ? await api<{ taskStatus?: ThreadMeta["taskStatus"]; reports: { agentId: string; text: string }[] }>(
+      `/api/threads/${encodeURIComponent(threadId)}/result?orderId=${encodeURIComponent(selectedOrder)}`,
+    ).catch(() => undefined)
+    : undefined;
+  // Older daemons only project the latest turn in the Thread detail.
+  const taskDetail = !result && selectedOrder
     ? await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`).catch(() => undefined)
     : undefined;
-  // The detail can move to a newer turn while this stream was closing: only use the followed Order's projection.
-  const taskStatus = taskDetail && taskDetail.meta.orderId === selectedOrder ? taskDetail.meta.taskStatus : undefined;
+  const taskStatus = result?.taskStatus ?? (taskDetail?.meta.orderId === selectedOrder ? taskDetail?.meta.taskStatus : undefined);
+  const reports = (result?.reports ?? []).map(({ agentId, text }) => ({ from: agents.get(agentId)?.address ?? agentId, text }));
+  const replies = selectedOrder ? repliesByOrder.get(selectedOrder) ?? [] : [...repliesByOrder.values()].flat();
   const displayedStatus = taskStatus === "working" || taskStatus === "awaiting_report" || taskStatus === "unknown"
     ? taskStatus
     : pending.length ? "working" : status;
-  if (JSON_OUT) console.log(JSON.stringify({ threadId, status: displayedStatus, ...(displayedStatus !== status ? { orderStatus: status } : {}), replies, ...(pending.length ? { pending } : {}), ...(taskStatus ? { taskStatus } : {}), ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
+  if (JSON_OUT) console.log(JSON.stringify({ threadId, status: displayedStatus, ...(displayedStatus !== status ? { orderStatus: status } : {}), replies, ...(reports.length ? { reports } : {}), ...(pending.length ? { pending } : {}), ...(taskStatus ? { taskStatus } : {}), ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
   else if (!opts.quiet) {
+    for (const report of reports) console.log(`\n## ${report.from} (result report)\n${report.text}\n`);
     if (taskStatus === "awaiting_report") console.log(`… delegated work finished; waiting for the front-door report`);
     else if (taskStatus === "unknown") console.log(`? linked task status is unknown while a Host is unavailable`);
     else if (!pending.length && status !== "unknown") console.log(`— ${status}`);
@@ -954,10 +967,11 @@ program
 
 program
   .command("wait")
-  .description("follow a thread until it closes")
+  .description("follow an Order until it closes")
   .argument("<threadId>")
-  .action(async (id: string) => {
-    const status = await follow(id);
+  .option("--order <orderId>", "a specific Order in the Thread (default: the latest one)")
+  .action(async (id: string, o) => {
+    const status = await follow(id, { orderId: o.order });
     process.exitCode = status === "done" ? 0 : 1;
   });
 
@@ -1116,14 +1130,21 @@ program
     new Command("threads")
       .argument("<name>")
       .option("--after <ms>", "only Threads with activity after this timestamp", Number)
-      .option("--limit <n>", "", Number, 30)
+      .option("--before <ms>", "only Threads with activity before this timestamp", Number)
+      .option("--cursor <cursor>", "continue from the previous page's nextCursor")
+      .option("--limit <n>", "Threads per page", Number, 30)
       .action(async (name: string, o) => {
         await ensureDaemon();
-        const q = new URLSearchParams({ limit: String(o.limit), ...(o.after ? { after: String(o.after) } : {}) });
-        const res = await api<{ threads: ThreadMeta[]; hasMore: boolean; exists: boolean }>(`/api/channels/${encodeURIComponent(name)}/threads?${q}`);
+        const q = new URLSearchParams({ limit: String(o.limit) });
+        if (o.after !== undefined) q.set("after", String(o.after));
+        if (o.before !== undefined) q.set("before", String(o.before));
+        if (o.cursor) q.set("cursor", o.cursor);
+        const res = await api<{ threads: ThreadMeta[]; hasMore: boolean; exists: boolean; nextCursor?: string }>(`/api/channels/${encodeURIComponent(name)}/threads?${q}`);
         if (!res.exists) return out(`channel #${name}: no Threads and no team uses it`, res);
         const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
-        out(printThreads(res.threads, agents) + (res.hasMore ? "\n(older Threads remain; page with --after/--limit)" : ""), res);
+        const more = res.nextCursor ? `\nOlder Threads remain. Keep your filters and add --cursor ${res.nextCursor}.`
+          : res.hasMore ? "\nOlder Threads remain. Use --before to narrow the time range." : "";
+        out(printThreads(res.threads, agents) + more, res);
       }),
   );
 
@@ -1201,8 +1222,10 @@ program
 
 program
   .command("thread")
-  .description("show a thread's full event log, or download one of its attachments")
+  .description("show a page of a thread's event log, or download one of its attachments")
   .argument("<threadId>")
+  .option("--before <eventId>", "show events older than this event")
+  .option("--limit <n>", "events per page", Number)
   .option("--download <attachmentId>", "download this attachment")
   .option("--children", "include linked tasks and their latest results")
   .option("--out <dir>", "download directory", ".")
@@ -1227,7 +1250,10 @@ program
       out(`downloaded ${path} (${bytes.length} bytes${sha ? `, sha256 ${sha}` : ""})`, { path, size: bytes.length, sha256: sha });
       return;
     }
-    const t = await api<{ meta: ThreadMeta; events: ThreadEnvelope[] }>(`/api/threads/${id}`);
+    const query = new URLSearchParams();
+    if (o.before) query.set("before", o.before);
+    if (o.limit !== undefined) query.set("limit", String(o.limit));
+    const t = await api<{ meta: ThreadMeta; events: ThreadEnvelope[]; hasMore?: boolean }>(`/api/threads/${encodeURIComponent(id)}${query.size ? `?${query}` : ""}`);
     const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
     const att = t.meta.attachments?.map((a) => `📎 ${a.name} (${a.size} bytes, id ${a.id})`) ?? [];
     // v4-13 (#111): `collect: all` is only useful when the silent member is visible.
@@ -1244,6 +1270,7 @@ program
       ...(targets ? [targets] : []),
       ...att,
       ...t.events.map((e) => describe(e, agents)).filter(Boolean),
+      ...(t.hasMore && t.events.length ? [`Older events remain. Run:\n  cafe thread ${id} --before ${t.events[0]!.eventId}`] : []),
       ...(children ? ["", "Linked tasks:", ...(childView?.isRoot === false ? ["  This Host's view may omit tasks on other Hosts. Check the Root for the network view."] : []), ...(children.length ? children.flatMap((child) => [
         child.clarification
           ? `  ${child.threadId} [${child.turns === 1 ? "needs your answer" : child.clarification.acknowledged ? "answer received" : child.status === "failed" ? "answer delivery failed" : "answer accepted"}] ${child.from.address}: ${child.clarification.question}`
@@ -2284,7 +2311,11 @@ if (WANTS_JSON) {
   quiet(program);
 }
 
-program.parseAsync().catch((err) => {
+// Accept the documented `thread show <id>` spelling alongside `thread <id>`.
+const argv = process.argv.slice(2);
+const commandIndex = argv.findIndex((arg) => !arg.startsWith("-"));
+if (argv[commandIndex] === "thread" && argv[commandIndex + 1] === "show") argv.splice(commandIndex + 1, 1);
+program.parseAsync(argv, { from: "user" }).catch((err) => {
   if (err instanceof CommanderError) {
     if (err.exitCode === 0) process.exit(0); // --help / --version under exitOverride
     const raw = err.message.replace(/^error: /, "");

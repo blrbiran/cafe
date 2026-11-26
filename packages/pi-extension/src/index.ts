@@ -368,8 +368,15 @@ export default function cafe(pi: ExtensionAPI) {
     if (!w) return;
     release(w);
     if (w.declined) return;
-    if (!w.lastText && aborted) await persist(() => w.handle.decline("aborted by the operator", { unavailable: true })).catch(() => {});
-    else await persist(() => w.handle.reply(w.lastText ?? "(no answer produced)", true)).catch(() => {});
+    const text = w.lastText;
+    if (!text) {
+      const reason = aborted
+        ? "aborted by the operator"
+        : w.frozen
+          ? "human took over the run before an answer was produced"
+          : "no answer produced";
+      await persist(() => w.handle.decline(reason, { unavailable: true })).catch(() => {});
+    } else await persist(() => w.handle.reply(text, true)).catch(() => {});
   }
 
   // ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ describe("activity-ordered channel threads", () => {
 
     const recent = store.listThreadsInByActivity("default", { after: now });
     expect(recent.map((m) => m.threadId)).toEqual(["old-but-active"]);
+    expect(store.channelStats()).toEqual([{ channel: "default", threads: 221, lastActivityAt: now + 1000 }]);
     // The creation-ordered window really does omit it; this is the bug the query replaces.
     expect(store.listThreadsIn("default", 200).some((m) => m.threadId === "old-but-active")).toBe(false);
   });

@@ -1109,13 +1109,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** A page of one channel's Threads for an observer (v4-11), newest activity first. */
-  channelThreads(channel: string, opts: { after?: number; before?: number; limit?: number } = {}) {
+  channelThreads(channel: string, opts: { after?: number; before?: number; cursor?: { at: number; threadId: string }; limit?: number } = {}) {
     const limit = Number.isInteger(opts.limit) && opts.limit! > 0 ? Math.min(opts.limit!, 200) : 50;
-    // Activity, not creation: a follow-up on an old Thread is exactly what an observer must see.
-    const all = this.store.listThreadsInByActivity(channel, { ...(opts.after !== undefined ? { after: opts.after } : {}), ...(opts.before !== undefined ? { before: opts.before } : {}), limit: 500 });
+    const all = this.store.listThreadsInByActivity(channel, { ...opts, limit: limit + 1 });
+    const last = all.length > limit ? all[limit - 1] : undefined;
     return {
       threads: all.slice(0, limit).map((m) => this.summaryMeta(m)),
-      hasMore: all.length > limit,
+      hasMore: !!last,
+      ...(last ? { nextCursor: `${last.lastActivityAt ?? last.createdAt}:${last.threadId}` } : {}),
       exists: all.length > 0 || this.store.listThreadsIn(channel, 1).length > 0 || this.teams().some((t) => t.channel === channel),
     };
   }
@@ -3597,8 +3598,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           throw new RpcError("bad_request", "each parent reference requires threadId and orderId");
         }
         const { threadId, orderId } = raw as { threadId: string; orderId: string };
-        const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
-        if (!meta || meta.from.host !== host || meta.orderId !== orderId) {
+        const meta = this.taskOrderMeta(threadId, orderId);
+        if (!meta || meta.from.host !== host) {
           return { threadId, orderId, taskStatus: "unknown" as const, childrenPartial: true };
         }
         const projected = await this.projectTaskMeta(meta, false);
@@ -3612,10 +3613,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         };
       }));
     });
-    peer.on("thread/reports", (p: { threadId: string }) => {
-      const meta = typeof p.threadId === "string" && (this.metas.get(p.threadId) ?? this.store.getThread(p.threadId));
+    peer.on("thread/reports", (p: { threadId: string; orderId?: string }) => {
+      if (typeof p.threadId !== "string") return [];
+      const meta = p.orderId ? this.taskOrderMeta(p.threadId, p.orderId) : this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
       if (!meta || meta.from.host !== host) return [];
-      return this.store.readEventsTail(meta.file, 200).filter((env) => env.event.type === "order.reported");
+      const events = p.orderId ? this.store.readOrderEvents(meta.file, p.orderId) : this.store.readEventsTail(meta.file, 200);
+      return events.filter((env) => env.event.type === "order.reported");
     });
     peer.on("thread/linked-detail", (p: { threadId: string; parentThreadId?: string; limit?: number; before?: string; clarificationOnly?: boolean }) => {
       if (typeof p.threadId !== "string") throw new RpcError("bad_request", "threadId is required");
@@ -4142,7 +4145,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       for (const env of this.store.readEvents(meta.file)) {
         const ev = env.event;
         const [who, text] =
-          ev.type === "order.created" ? [ev.order.from.address, ev.order.body] : ev.type === "order.replied" ? [this.registry.get(ev.agentId)?.address ?? ev.agentId, ev.text] : [undefined, undefined];
+          ev.type === "order.created" ? [ev.order.from.address, ev.order.body] : ev.type === "order.replied" || ev.type === "order.reported" ? [this.registry.get(ev.agentId)?.address ?? ev.agentId, ev.text] : [undefined, undefined];
         if (!text || !who) continue;
         const i = text.toLowerCase().indexOf(needle);
         if (i < 0) continue;
@@ -4161,8 +4164,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /**
-   * Index Threads that predate the search index (#34). Runs a bounded batch at startup and a few more
-   * times in the background so an upgraded daemon converges without blocking the event loop.
+   * Index Threads that predate search indexing and scan each existing Thread once for result reports.
+   * Runs bounded batches at startup so upgrades converge without blocking the event loop.
    */
   backfillSearchIndex(): void {
     const batch = 200;
@@ -4180,8 +4183,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       for (const m of todo) {
         try {
           for (const env of this.store.readEvents(m.file)) this.store.indexEvent(env, who);
+          this.store.markSearchBackfilled(m.threadId);
         } catch {
-          // An unreadable Thread must not stop the backfill.
+          // An unreadable Thread must not stop the backfill; it remains eligible on the next start.
         }
       }
       this.log(`search index: backfilled ${todo.length} thread(s) in ${Math.round(performance.now() - started)}ms`);
@@ -4578,6 +4582,43 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
+  /** Whether the selected Order was created in this Thread, including earlier turns. */
+  hasOrder(threadId: string, orderId: string): boolean {
+    return this.findParentOrder(orderId, threadId)?.threadId === threadId;
+  }
+
+  private taskOrderMeta(threadId: string, orderId: string): ThreadMeta | undefined {
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!meta || meta.orderId === orderId) return meta;
+    const order = this.findParentOrder(orderId, threadId);
+    const closed = this.closingEvent(threadId, orderId)?.event;
+    if (order?.threadId !== threadId || closed?.type !== "order.closed") return undefined;
+    const reported = this.store.findLastEvent(meta.file, (env) => env.orderId === orderId && env.event.type === "order.reported");
+    return {
+      ...meta,
+      orderId,
+      from: order.from,
+      origin: order.origin,
+      status: closed.status,
+      reportedOrderId: reported ? orderId : undefined,
+    };
+  }
+
+  /** Waiters read reports after the terminal Order stream has ended. */
+  async orderResult(threadId: string, orderId: string) {
+    let meta = this.taskOrderMeta(threadId, orderId);
+    if (!meta) return undefined;
+    if (!this.isRoot && this.rootOnline && this.rootSupports("team-child-view") && meta.from.host === this.host && meta.from.id.startsWith("cli:")) {
+      await this.catchUpReports(meta, orderId);
+      meta = this.taskOrderMeta(threadId, orderId) ?? meta;
+    }
+    const projected = await this.projectTaskMeta(meta, false);
+    const reports = this.store.readOrderEvents(meta.file, orderId).flatMap(({ event }) =>
+      event.type === "order.reported" ? [{ agentId: event.agentId, text: event.text }] : [],
+    );
+    return { taskStatus: projected.taskStatus, reports };
+  }
+
   async projectTaskMeta(meta: ThreadMeta, includeRemote = true): Promise<ThreadMeta> {
     const [projected] = await this.projectTaskMetas([meta]);
     if (!includeRemote) return projected;
@@ -4664,23 +4705,32 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return result;
   }
 
+  private async catchUpReports(meta: ThreadMeta, orderId?: string): Promise<void> {
+    const link = this.uplink!;
+    try {
+      const reports = await link.request<ThreadEnvelope[]>("thread/reports", { threadId: meta.threadId, orderId }, 2000);
+      for (const env of reports) {
+        if (env.threadId !== meta.threadId || (orderId && env.orderId !== orderId) || env.event.type !== "order.reported") continue;
+        if (!this.store.findLastEvent(meta.file, (event) => event.eventId === env.eventId)) this.recordEvent(env, { from: link, skipTrack: true });
+      }
+    } catch {
+      // Local reports remain readable while Root is unavailable.
+    }
+  }
+
   async linkedThreadDetail(threadId: string, opts: { limit?: number; before?: string }) {
     const local = this.thread(threadId, opts);
     if (this.isRoot || !this.rootOnline || !this.rootSupports("team-child-view")) return local;
-    const link = this.uplink!;
-    try {
-      if (!local || (local.meta.parentThreadId && local.meta.from.host !== this.host)) {
-        return await link.request<ReturnType<Daemon["thread"]>>("thread/linked-detail", { threadId, ...opts }, 2000) ?? local;
+    if (!local || (local.meta.parentThreadId && local.meta.from.host !== this.host)) {
+      try {
+        return await this.uplink!.request<ReturnType<Daemon["thread"]>>("thread/linked-detail", { threadId, ...opts }, 2000) ?? local;
+      } catch {
+        return local;
       }
-      if (local.meta.from.host === this.host && local.meta.from.id?.startsWith("cli:")) {
-        const reports = await link.request<ThreadEnvelope[]>("thread/reports", { threadId }, 2000);
-        for (const env of reports) {
-          if (!this.store.findLastEvent(local.meta.file, (e) => e.eventId === env.eventId)) this.recordEvent(env, { from: link, skipTrack: true });
-        }
-        return this.thread(threadId, opts);
-      }
-    } catch {
-      return local;
+    }
+    if (local.meta.from.host === this.host && local.meta.from.id?.startsWith("cli:")) {
+      await this.catchUpReports(local.meta);
+      return this.thread(threadId, opts);
     }
     return local;
   }

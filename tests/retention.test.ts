@@ -46,6 +46,61 @@ describe("search", () => {
     expect(short.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
   });
 
+  it("backfills reports from Threads that already have ordinary search rows", async () => {
+    const { root, c } = await setup();
+    const a = await c.ask({ body: "already indexed original request" });
+    await untilClosed(c, a.threadId, a.orderId);
+    const meta = root.daemon.thread(a.threadId)!.meta;
+    root.daemon.store.appendEvent(meta.file, {
+      eventId: "report-backfill-test",
+      threadId: a.threadId,
+      orderId: a.orderId,
+      host: "root",
+      at: Date.now(),
+      event: { type: "order.reported", agentId: "echo", text: "amber compass recovered" },
+    });
+
+    root.daemon.backfillSearchIndex();
+
+    const fts = await fetch(`http://${root.addr}/api/search?q=compass%20recover`).then((r) => r.json());
+    expect(fts.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
+  });
+
+  it("backfill candidates let older Threads progress ahead of newer indexed Threads", async () => {
+    const { root, c } = await setup();
+    const older = await c.ask({ body: "older indexed request" });
+    await untilClosed(c, older.threadId, older.orderId);
+    const newer = await c.ask({ body: "newer indexed request" });
+    await untilClosed(c, newer.threadId, newer.orderId);
+    (root.daemon.store as any).db.prepare("UPDATE threads SET created_at = 1 WHERE thread_id = ?").run(older.threadId);
+    (root.daemon.store as any).db.prepare("UPDATE threads SET created_at = 2 WHERE thread_id = ?").run(newer.threadId);
+
+    expect(root.daemon.store.threadsNeedingIndex(1).map((meta) => meta.threadId)).toEqual([older.threadId]);
+  });
+
+  it("finds result reports through FTS and short-query fallback", async () => {
+    const { root, c } = await setup();
+    const a = await c.ask({ body: "unrelated original request" });
+    await untilClosed(c, a.threadId, a.orderId);
+    const meta = root.daemon.thread(a.threadId)!.meta;
+    root.daemon.recordEvent({
+      eventId: "report-search-test",
+      threadId: a.threadId,
+      orderId: a.orderId,
+      host: "root",
+      at: Date.now(),
+      event: { type: "order.reported", agentId: "echo", text: "cobalt ledger reconciled" },
+    });
+
+    const fts = await fetch(`http://${root.addr}/api/search?q=ledger%20recon`).then((r) => r.json());
+    expect(fts.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
+    expect(fts[0].hits).toEqual([expect.objectContaining({ orderId: a.orderId, who: "echo", text: expect.stringContaining("ledger recon") })]);
+
+    const short = await fetch(`http://${root.addr}/api/search?q=co`).then((r) => r.json());
+    expect(short.map((x: any) => x.meta.threadId)).toEqual([a.threadId]);
+    expect(short[0].hits).toEqual([expect.objectContaining({ orderId: a.orderId, who: "echo", text: expect.stringContaining("cobalt") })]);
+  });
+
   it("a pruned Thread leaves the search index", async () => {
     const { root, c } = await setup();
     const a = await c.ask({ body: "vanishing zebra question" });

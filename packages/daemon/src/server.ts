@@ -198,10 +198,22 @@ function tokenOf(req: IncomingMessage): string | undefined {
   return h?.startsWith("Bearer ") ? h.slice(7) : undefined;
 }
 
+// Large content belongs in the separately bounded artifact upload endpoint.
+const MAX_JSON_BYTES = 1024 * 1024;
+
 async function readJson(req: IncomingMessage): Promise<any> {
+  const tooLarge = () => new RpcError("body_too_large", "JSON body exceeds 1 MiB; upload large content as an attachment");
+  if (Number(req.headers["content-length"]) > MAX_JSON_BYTES) throw tooLarge();
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  const text = Buffer.concat(chunks).toString("utf8");
+  let bytes = 0;
+  // Leave the socket open long enough to deliver a 413 if a chunked request exceeds the limit.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    const buf = chunk as Buffer;
+    bytes += buf.length;
+    if (bytes > MAX_JSON_BYTES) throw tooLarge();
+    chunks.push(buf);
+  }
+  const text = Buffer.concat(chunks, bytes).toString("utf8");
   return text ? JSON.parse(text) : {};
 }
 
@@ -400,6 +412,10 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       res.end(useGzip ? file.gz! : file.body);
     } catch (err) {
       const e = err as RpcError;
+      if (e.code === "body_too_large") {
+        res.setHeader("connection", "close");
+        return send(res, 413, { error: e.code, message: e.message });
+      }
       send(res, e.code === "not_found" ? 404 : e.code === "host_online" || e.code === "conflict" ? 409 : 400, { error: e.code ?? "error", message: e.message });
     }
   };
@@ -808,7 +824,13 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && (match = /^\/api\/channels\/([^/]+)\/threads$/.exec(path))) {
     const afterRaw = Number(url.searchParams.get("after"));
     const beforeRaw = Number(url.searchParams.get("before"));
+    const cursorRaw = url.searchParams.get("cursor");
+    const cursorParts = cursorRaw?.match(/^(\d+):([^:]+)$/);
+    if (cursorRaw !== null && (!cursorParts || !Number.isSafeInteger(Number(cursorParts[1])))) {
+      throw new RpcError("bad_request", "invalid channel page cursor");
+    }
     const page = daemon.channelThreads(decodeURIComponent(match[1]!), {
+      ...(cursorParts ? { cursor: { at: Number(cursorParts[1]), threadId: cursorParts[2]! } } : {}),
       ...(Number.isFinite(afterRaw) && afterRaw > 0 ? { after: afterRaw } : {}),
       ...(Number.isFinite(beforeRaw) && beforeRaw > 0 ? { before: beforeRaw } : {}),
       limit: parseLimit(url.searchParams.get("limit"), 50),
@@ -823,6 +845,12 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const t = await daemon.linkedThreadDetail(match[1]!, { ...(limit !== undefined ? { limit } : {}), ...(before ? { before } : {}) });
     if (!t) return send(res, 404, { error: "not_found" });
     return send(res, 200, { ...t, meta: await daemon.projectTaskMeta(t.meta) });
+  }
+  if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/result$/.exec(path))) {
+    const orderId = url.searchParams.get("orderId");
+    if (!orderId) throw new RpcError("bad_request", "orderId is required");
+    const result = await daemon.orderResult(match[1]!, orderId);
+    return result ? send(res, 200, result) : send(res, 404, { error: "not_found" });
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
   if (m === "POST" && path === "/api/orders") {
@@ -976,6 +1004,10 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   }
   // Follow one Order (default: the Thread's latest) until it closes; earlier turns are replayed for context.
   const until = orderId ?? thread.meta.orderId;
+  if (orderId !== undefined && orderId !== thread.meta.orderId && !daemon.hasOrder(threadId, orderId)) {
+    send(res, 404, { error: "not_found", message: "no matching Order on this Thread" });
+    return;
+  }
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   // A follow-up Thread keeps events after an earlier turn's close, and a late
   // broadcast can arrive after the response ended: never write then (#54).

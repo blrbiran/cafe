@@ -288,6 +288,28 @@ describe("pi extension", () => {
     expect(events.filter((e) => e.event.type === "order.replied").map((e) => (e.event as any).text)).toEqual(["7 widgets"]);
   });
 
+  it("declines as unavailable when the Order run produces no assistant text", async () => {
+    const { pi, c } = await setup();
+    const res = await c.ask({ body: "widgets?", to: "widgets@root" });
+    await waitFor(() => orders(pi).length === 1);
+    const closed = untilClosed(c, res.threadId, res.orderId);
+    await run(pi, [asCustom(orders(pi)[0]!), { role: "assistant", content: [{ type: "toolCall", name: "test" }] }]);
+    const events = await closed;
+    expect(events.some((e) => e.event.type === "order.replied" && e.event.text === "(no answer produced)")).toBe(false);
+    expect(events.find((e) => e.event.type === "order.declined")?.event).toMatchObject({ reason: "no answer produced", unavailable: true });
+  });
+
+  it("does not replace a run interrupted by a human with a placeholder reply", async () => {
+    const { pi, c } = await setup();
+    const res = await c.ask({ body: "widgets?", to: "widgets@root" });
+    await waitFor(() => orders(pi).length === 1);
+    const closed = untilClosed(c, res.threadId, res.orderId);
+    await run(pi, [asCustom(orders(pi)[0]!), user("also check the logs"), assistant("4")]);
+    const events = await closed;
+    expect(events.some((e) => e.event.type === "order.replied" && e.event.text === "(no answer produced)")).toBe(false);
+    expect(events.find((e) => e.event.type === "order.declined")?.event).toMatchObject({ reason: "human took over the run before an answer was produced", unavailable: true });
+  });
+
   it("a human message after the Order inside the same run does not become the Reply", async () => {
     const { pi, c } = await setup();
     const res = await c.ask({ body: "widgets?", to: "widgets@root" });

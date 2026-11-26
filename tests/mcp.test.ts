@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { keepAlive } from "@cafe/protocol/client";
 import { runMcp } from "../packages/cli/src/mcp.ts";
-import { barista, identity, startDaemon } from "./helpers.ts";
+import { barista, identity, startDaemon, waitFor } from "./helpers.ts";
 
 const CAFE = join(dirname(fileURLToPath(import.meta.url)), "..", "packages", "cli", "bin", "cafe.js");
 
@@ -113,6 +113,19 @@ describe("cafe mcp", () => {
     const wait = await m.call("cafe_wait", { threadId });
     expect(wait.text).toContain("status: done");
     expect(wait.text).toContain("slow answer to think");
+  });
+
+  it("shows an existing result report when waiting on a closed Order", async () => {
+    const { base, root } = await network();
+    const lead = await barista(root.addr, identity("lead"), (h) => h.reply("Assigned"));
+    cleanup.push(() => lead.client.close());
+    const order = await root.daemon.createOrder({ kind: "order", body: "Review the release", to: "lead" });
+    await waitFor(() => root.daemon.thread(order.threadId)?.meta.status === "done");
+    await lead.client.report({ threadId: order.threadId, orderId: order.orderId, text: "All checks passed" });
+
+    const result = await mcpClient(base).call("cafe_wait", { threadId: order.threadId, orderId: order.orderId });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("## lead#1@root (result report)\nAll checks passed");
   });
 
   it("reports declines and unknown agents as tool errors, and caps wait_seconds", async () => {

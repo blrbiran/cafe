@@ -87,6 +87,79 @@ describe("thread child results", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ status: "working", orderStatus: "done", pending: [{ summary: "test parser" }] });
   });
+  it("returns an existing result report separately from direct replies in JSON wait", async () => {
+    const d = await startDaemon("report-json", { mode: "root" });
+    cleanup.push(d.stop);
+    const lead = await barista(d.addr, identity("lead"), (h) => h.reply("Assigned"));
+    cleanup.push(() => lead.client.close());
+    const order = await d.daemon.createOrder({ kind: "order", body: "Review the release", to: "lead" });
+    await waitFor(() => d.daemon.thread(order.threadId)?.meta.status === "done");
+    await lead.client.report({ threadId: order.threadId, orderId: order.orderId, text: "All checks passed" });
+
+    const result = await cafeAsync(d.home, d.addr, "--json", "wait", order.threadId);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      status: "done",
+      replies: [{ from: lead.rec.address, text: "Assigned", final: true }],
+      reports: [{ from: lead.rec.address, text: "All checks passed" }],
+    });
+  });
+
+  it("reports the selected historical Order's state independently of a newer turn", async () => {
+    const d = await startDaemon("report-older-turn", { mode: "root" });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("worker"));
+    cleanup.push(() => worker.client.close());
+    const lead = await barista(d.addr, identity("lead"), async (h) => {
+      if (h.order.turn === 1) {
+        await lead.client.ask({ body: "Run checks", to: "worker", parentThreadId: h.order.threadId, parentOrderId: h.order.orderId });
+      }
+      await h.reply("Acknowledged");
+    });
+    cleanup.push(() => lead.client.close());
+    const first = await d.daemon.createOrder({ kind: "order", body: "Review the release", to: "lead" });
+    await waitFor(() => d.daemon.thread(first.threadId)?.meta.status === "done");
+    await d.daemon.createOrder({ kind: "order", body: "Unrelated follow-up", threadId: first.threadId, to: "lead" });
+    const result = await cafeAsync(d.home, d.addr, "--json", "wait", first.threadId, "--order", first.orderId);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ status: "awaiting_report", orderStatus: "done", taskStatus: "awaiting_report" });
+  });
+
+  it("accepts the documented thread show command and pages truncated history", async () => {
+    const d = await startDaemon("cli-history", { mode: "root" });
+    cleanup.push(d.stop);
+    const order = await d.daemon.createOrder({ kind: "order", body: "Original question" });
+    const latest = await cafeAsync(d.home, d.addr, "thread", "show", order.threadId, "--limit", "1");
+    expect(latest.status, latest.stderr).toBe(0);
+    expect(latest.stdout).toContain("Original question");
+    const cursor = /--before (\S+)/.exec(latest.stdout)?.[1];
+    expect(cursor).toBeTruthy();
+    const older = await cafeAsync(d.home, d.addr, "--json", "thread", order.threadId, "--before", cursor!, "--limit", "10");
+    expect(older.status, older.stderr).toBe(0);
+    const page = JSON.parse(older.stdout);
+    expect(page.hasMore).toBe(false);
+    expect(page.events[0]).toMatchObject({ event: { type: "order.created" } });
+    expect(page.events.map((event: { eventId: string }) => event.eventId)).not.toContain(cursor);
+  });
+
+  it("uses an older-page cursor for channel history, even when activity timestamps tie", async () => {
+    const d = await startDaemon("cli-channel-page", { mode: "root" });
+    cleanup.push(d.stop);
+    const [a, b] = await Promise.all(["First question", "Second question"].map((body) =>
+      d.daemon.createOrder({ kind: "order", body, channel: "history" }),
+    ));
+    for (const row of d.daemon.store.listThreadsIn("history")) d.daemon.store.putThread({ ...row, lastActivityAt: 100 });
+    const first = await cafeAsync(d.home, d.addr, "--json", "channel", "threads", "history", "--limit", "1");
+    expect(first.status, first.stderr).toBe(0);
+    const page = JSON.parse(first.stdout);
+    expect(page).toMatchObject({ hasMore: true, nextCursor: expect.any(String) });
+    const next = await cafeAsync(d.home, d.addr, "--json", "channel", "threads", "history", "--limit", "1", "--cursor", page.nextCursor);
+    expect(next.status, next.stderr).toBe(0);
+    const older = JSON.parse(next.stdout);
+    expect(older.hasMore).toBe(false);
+    expect([page.threads[0].threadId, older.threads[0].threadId].sort()).toEqual([a.threadId, b.threadId].sort());
+  });
+
   it("labels an HTTP reply as an operator override in Thread output", async () => {
     const d = await startDaemon("operator-reply", { mode: "root" });
     cleanup.push(d.stop);

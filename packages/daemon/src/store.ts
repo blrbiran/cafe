@@ -81,6 +81,7 @@ export class Store {
       -- shorter than 3 characters falls back to the JSONL scan.
       CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(event_id UNINDEXED, thread_id UNINDEXED, order_id UNINDEXED, who UNINDEXED, at UNINDEXED, text, tokenize='trigram');
       CREATE TABLE IF NOT EXISTS search_indexed (event_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS search_backfilled_threads (thread_id TEXT PRIMARY KEY);
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
@@ -163,11 +164,11 @@ export class Store {
   // Search index (#34)
   // ---------------------------------------------------------------------------
 
-  /** The searchable text of an event: the question (as ordered) or a Barista reply; undefined otherwise. */
+  /** The searchable text of an event: the question, a Barista reply, or a result report; undefined otherwise. */
   private static searchable(env: ThreadEnvelope, who: (agentId: string) => string): { who: string; text: string } | undefined {
     const ev = env.event;
     if (ev.type === "order.created") return { who: ev.order.from.address, text: ev.order.body };
-    if (ev.type === "order.replied") return { who: who(ev.agentId), text: ev.text };
+    if (ev.type === "order.replied" || ev.type === "order.reported") return { who: who(ev.agentId), text: ev.text };
     return undefined;
   }
 
@@ -220,12 +221,19 @@ export class Store {
     this.db.prepare("DELETE FROM search_indexed WHERE thread_id = ?").run(threadId);
   }
 
-  /** Threads with at least one event not yet in the search index, newest first (backfill after an upgrade). */
+  /** Threads requiring search-index work, including the one-time report upgrade scan, oldest first. */
   threadsNeedingIndex(limit: number): ThreadMeta[] {
     const rows = this.db
-      .prepare("SELECT meta FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM search_indexed) ORDER BY created_at DESC LIMIT ?")
+      .prepare(
+        "SELECT meta FROM threads WHERE thread_id NOT IN (SELECT thread_id FROM search_backfilled_threads) OR thread_id NOT IN (SELECT DISTINCT thread_id FROM search_indexed) ORDER BY created_at ASC LIMIT ?",
+      )
       .all(limit) as { meta: string }[];
     return rows.map((r) => threadMeta(r.meta));
+  }
+
+  /** Mark a Thread scanned for report events during the bounded search-index upgrade. */
+  markSearchBackfilled(threadId: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO search_backfilled_threads(thread_id) VALUES (?)").run(threadId);
   }
 
   /**
@@ -485,19 +493,21 @@ export class Store {
    * cursors (exclusive). This is the observer/digest view: a reply on an old Thread belongs here
    * even when the Thread is far outside the newest-created window.
    */
-  listThreadsInByActivity(channel: string, opts: { after?: number; before?: number; limit?: number } = {}): ThreadMeta[] {
+  listThreadsInByActivity(channel: string, opts: { after?: number; before?: number; cursor?: { at: number; threadId: string }; limit?: number } = {}): ThreadMeta[] {
     const n = Number.isInteger(opts.limit) && (opts.limit ?? 0) > 0 ? Math.min(opts.limit!, 10_000) : 200;
     const after = Number.isFinite(opts.after) && (opts.after ?? 0) > 0 ? opts.after! : 0;
     const before = Number.isFinite(opts.before) ? opts.before! : Number.MAX_SAFE_INTEGER;
+    const args = opts.cursor ? [opts.cursor.at, opts.cursor.threadId] : [];
+    const cursorFilter = opts.cursor ? " AND (last_activity, thread_id) < (?, ?)" : "";
     const rows = this.db
-      .prepare("SELECT meta FROM threads WHERE channel = ? AND last_activity > ? AND last_activity < ? ORDER BY last_activity DESC, thread_id DESC LIMIT ?")
-      .all(channel, after, before, n) as { meta: string }[];
+      .prepare(`SELECT meta FROM threads WHERE channel = ? AND last_activity > ? AND last_activity < ?${cursorFilter} ORDER BY last_activity DESC, thread_id DESC LIMIT ?`)
+      .all(channel, after, before, ...args, n) as { meta: string }[];
     return rows.map((r) => threadMeta(r.meta));
   }
 
   /** Per-channel counts for /api/channels (v4-11). */
   channelStats(): { channel: string; threads: number; lastActivityAt: number }[] {
-    const rows = this.db.prepare("SELECT COALESCE(channel, 'default') AS channel, COUNT(*) AS n, MAX(created_at) AS at FROM threads GROUP BY COALESCE(channel, 'default')").all() as {
+    const rows = this.db.prepare("SELECT COALESCE(channel, 'default') AS channel, COUNT(*) AS n, MAX(COALESCE(last_activity, created_at)) AS at FROM threads GROUP BY COALESCE(channel, 'default')").all() as {
       channel: string;
       n: number;
       at: number;

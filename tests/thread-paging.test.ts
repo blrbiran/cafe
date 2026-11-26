@@ -62,6 +62,14 @@ describe("limit validation", () => {
 });
 
 describe("thread stream", () => {
+  it("returns 404 when the selected Order does not belong to the Thread", async () => {
+    const d = await startDaemon("stream-order", { mode: "root" });
+    cleanup.push(d.stop);
+    const order = await d.daemon.createOrder({ kind: "order", body: "One question" });
+    const res = await fetch(`http://${d.addr}/api/threads/${order.threadId}/stream?orderId=unknown`, { signal: AbortSignal.timeout(1000) });
+    expect(res.status).toBe(404);
+  });
+
   it("returns 404 for an unknown Thread instead of an SSE stream that never closes", async () => {
     const d = await startDaemon("pc1", { mode: "root" });
     cleanup.push(d.stop);
