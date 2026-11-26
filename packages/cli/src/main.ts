@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -54,6 +54,19 @@ async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(formatApiError(body, res.status));
   return body as T;
+}
+
+function orderOwnerKey(): string {
+  const path = join(cafeHome(), "order-owner.key");
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(path, randomBytes(32).toString("hex"), { flag: "wx", mode: 0o600 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const key = readFileSync(path, "utf8");
+  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error("invalid Cafe CLI order ownership key");
+  return key;
 }
 
 /** Why the last `healthy()` check failed, as an error code (ECONNREFUSED = nothing is listening). */
@@ -345,6 +358,8 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
       return `… ${who(e.agentId)} is working on it`;
     case "order.replied":
       return `\n## ${who(e.agentId)}${e.final ? "" : " (interim)"}\n${e.text}\n`;
+    case "order.reported":
+      return `\n## ${who(e.agentId)} (result report)\n${e.text}\n`;
     case "order.declined":
       if (!e.skipped) return `✗ ${who(e.agentId)} declined: ${e.reason}`;
       return e.reason === "deadline"
@@ -416,6 +431,7 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
   const decoder = new TextDecoder();
   let buf = "";
   let status = "unknown";
+  let closedOrder: string | undefined;
   const replies: unknown[] = [];
   for await (const chunk of res.body as any as AsyncIterable<Uint8Array>) {
     buf += decoder.decode(chunk, { stream: true });
@@ -429,14 +445,32 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
       // Earlier turns are replayed; only report on the Order being followed.
       if (opts.orderId && env.orderId !== opts.orderId) continue;
       if (env.event.type === "order.replied") replies.push({ from: agents.get(env.event.agentId)?.address ?? env.event.agentId, text: env.event.text, final: env.event.final });
-      if (env.event.type === "order.closed") status = env.event.status;
-      if (!JSON_OUT && !opts.quiet) {
+      if (env.event.type === "order.closed") {
+        status = env.event.status;
+        closedOrder = env.orderId;
+      }
+      if (!JSON_OUT && !opts.quiet && env.event.type !== "order.closed") {
         const line = describe(env, agents);
         if (line) console.log(line);
       }
     }
   }
-  if (JSON_OUT) console.log(JSON.stringify({ threadId, status, replies, ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
+  const selectedOrder = opts.orderId ?? closedOrder;
+  const children = status === "done" && selectedOrder
+    ? await api<ThreadMeta[]>(`/api/threads?parent=${encodeURIComponent(threadId)}`).catch(() => [])
+    : [];
+  const pending = children.filter((c) => c.parentThreadId === threadId && c.parentOrderId === selectedOrder &&
+    ((c.clarification && c.turns === 1) || ["routing", "delivering", "working"].includes(c.status)));
+  if (JSON_OUT) console.log(JSON.stringify({ threadId, status: pending.length ? "working" : status, replies, ...(pending.length ? { orderStatus: status, pending } : {}), ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
+  else if (!opts.quiet) {
+    if (!pending.length && status !== "unknown") console.log(`— ${status}`);
+    for (const child of pending) {
+      if (child.clarification && child.turns === 1) {
+        console.log(`? ${child.from.address} needs your answer: ${child.clarification.question}\n  cafe answer ${threadId} ${child.threadId} '<answer>'`);
+      } else console.log(`… linked task still running: ${child.summary} (${child.threadId})`);
+    }
+    if (pending.length) console.log(`See results with cafe thread ${threadId} --children.`);
+  }
   return status;
 }
 
@@ -837,6 +871,7 @@ program
     for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
     const res = await api("/api/orders", {
       method: "POST",
+      ...(o.origin === "human" && !o.escalate && !o.notice ? { headers: { "x-cafe-order-owner": orderOwnerKey() } } : {}),
       body: JSON.stringify({
         body: words.join(" "),
         to: o.to,
@@ -866,6 +901,24 @@ program
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
     const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}), ...(warnings.length ? { warnings } : {}) });
     process.exitCode = status === "done" ? 0 : 1;
+  });
+
+program
+  .command("answer")
+  .description("answer a clarification from the original conversation")
+  .argument("<threadId>")
+  .argument("<clarificationThreadId>")
+  .argument("<text...>")
+  .action(async (parent: string, child: string, words: string[]) => {
+    const children = await api<ThreadMeta[]>(`/api/threads?parent=${encodeURIComponent(parent)}`);
+    const question = children.find((c) => c.threadId === child)?.clarification;
+    if (!question) throw new Error("clarification not found in that conversation");
+    const result = await api<{ orderId: string }>(`/api/threads/${encodeURIComponent(parent)}/clarifications/${encodeURIComponent(child)}/answer`, {
+      method: "POST",
+      headers: { "x-cafe-order-owner": orderOwnerKey() },
+      body: JSON.stringify({ clarificationOrderId: question.orderId, text: words.join(" ") }),
+    });
+    out(`Answer accepted. Check delivery with cafe thread ${parent} --children.`, result);
   });
 
 program
@@ -1161,7 +1214,10 @@ program
       ...att,
       ...t.events.map((e) => describe(e, agents)).filter(Boolean),
       ...(children ? ["", "Linked tasks:", ...(childView?.isRoot === false ? ["  This Host's view may omit tasks on other Hosts. Check the Root for the network view."] : []), ...(children.length ? children.flatMap((child) => [
-        `  ${child.threadId} [${child.status}] ${child.summary}`,
+        child.clarification
+          ? `  ${child.threadId} [${child.turns === 1 ? "needs your answer" : child.clarification.acknowledged ? "answer received" : child.status === "failed" ? "answer delivery failed" : "answer accepted"}] ${child.from.address}: ${child.clarification.question}`
+          : `  ${child.threadId} [${child.status}] ${child.summary}`,
+        ...(child.clarification && child.turns === 1 ? [`    cafe answer ${id} ${child.threadId} '<answer>'`] : []),
         ...child.replies.map((reply) => `    ${agents.get(reply.agentId)?.address ?? reply.agentId}: ${reply.text}`),
       ]) : ["  (none)"])] : []),
     ];

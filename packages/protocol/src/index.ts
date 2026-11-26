@@ -339,6 +339,12 @@ export const Order = z.object({
   parentThreadId: z.string().optional(),
   /** Short excerpt of the parent task, derived by the sending daemon for a known participant. */
   parentContext: z.string().max(640).optional(),
+  /** The issuing daemon has a private ownership credential for this human Order. */
+  humanClarifications: z.literal(true).optional(),
+  /** The first turn publishes a question for the owner of its human parent. */
+  needsHuman: z.literal(true).optional(),
+  /** A validated human answer, pinned to the Agent that published the question. */
+  clarificationRecipient: Party.optional(),
   /** This Order was created with an explicit escalation (v4-11). */
   escalate: z.boolean().optional(),
   /** Agent ids already involved upstream in this call chain. */
@@ -394,6 +400,8 @@ export const RoutingDecision = z.object({
   whyNot: z.array(z.object({ agentId: z.string(), reason: z.string() })).optional(),
   /** How many Baristas received this Order (targets.length). */
   fanout: z.number().int().min(0).optional(),
+  /** A question was published for the owner of the parent Order. */
+  needsHuman: z.literal(true).optional(),
   /** Machine-readable failure when targets is empty (v4-11). */
   failure: SubOrderFailure.optional(),
   /**
@@ -422,10 +430,12 @@ export type ThreadStatus = z.infer<typeof ThreadStatus>;
 export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.created"), order: Order }),
   z.object({ type: z.literal("order.routed"), decision: RoutingDecision }),
-  z.object({ type: z.literal("order.delivered"), agentId: z.string() }),
+  z.object({ type: z.literal("order.delivered"), agentId: z.string(), protectedIdentity: z.literal(true).optional() }),
   z.object({ type: z.literal("order.acked"), agentId: z.string() }),
   z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), note: z.string().optional() }),
   z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), attachments: z.array(Attachment).optional() }),
+  /** A result added by an original recipient after the human Order closed. */
+  z.object({ type: z.literal("order.reported"), agentId: z.string(), text: z.string() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
   z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional(), /** The thread closed first; this target was never asked to do anything wrong (#101). */ skipped: z.boolean().optional() }),
   z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string(), /** Operational failure (timeout), not "this topic is not mine". */ unavailable: z.boolean().optional() }),
@@ -455,6 +465,7 @@ export const ThreadMeta = z.object({
   /** Set when this Thread is a clarification/escalation of another Thread (v4-11). */
   parentThreadId: z.string().optional(),
   parentOrderId: z.string().optional(),
+  clarification: z.object({ orderId: z.string(), question: z.string(), acknowledged: z.boolean().optional() }).optional(),
   from: Party,
   /** Provenance of the first question; absent on older Threads. */
   origin: OrderOrigin.optional(),
@@ -483,6 +494,10 @@ export const ThreadMeta = z.object({
   replies: z.array(z.object({ agentId: z.string(), address: z.string().optional(), text: z.string(), at: z.number() })).default([]),
   /** Declines of the latest Order. */
   declines: z.array(z.object({ agentId: z.string(), address: z.string().optional(), reason: z.string(), at: z.number() })).default([]),
+  /** Derived in Thread detail: visible child Orders of this turn that still need work. */
+  pendingChildren: z.number().int().nonnegative().optional(),
+  /** True when the parent projection could not query all relevant Hosts. */
+  childrenPartial: z.boolean().optional(),
   /** Per-target state of the latest Order (v4-11); absent on old rows. */
   targetStates: z.array(z.object({ agentId: z.string(), state: z.enum(["pending", "acked", "replied", "declined", "failed", "skipped"]) })).optional(),
 });

@@ -135,13 +135,14 @@ export function orderPrompt(order: Order, self?: AgentRecord, attachments?: Arra
   return [
     ...head,
     ...(order.parentContext && order.parentThreadId ? [`Parent task (${order.parentThreadId}):\n${order.parentContext}`, ""] : []),
+    ...(order.clarificationRecipient ? [`This is the person's answer to your clarification. Continue the original work. If its Order already closed, use cafe_reply with reportThreadId=${order.parentThreadId} and reportOrderId=${order.parentOrderId} to send the result.`, ""] : []),
     order.body,
     ...(attachments?.length ? ["", "Attachments on this machine:", ...attachments.map((a) => `- ${a.name} (${a.mime}, ${a.size} bytes)${a.path ? `: ${a.path}` : ""}`)] : []),
     "",
     "Answer this Order directly; your final reply in this turn is sent back to the asker.",
     "If it is outside your responsibility or scope, call cafe_decline with a short reason instead of answering.",
     "For long work, you may send interim progress with cafe_reply.",
-    "An unrelated new question → cafe_ask without escalate. To ask the sender of THIS Order a clarifying question, call cafe_ask with escalate=true (it creates a sub-thread; do not pass threadId). To delegate, use `to:` or broadcast.",
+    "An unrelated new question → cafe_ask without escalate. To ask the sender of THIS Order a clarifying question, call cafe_ask with escalate=true (it creates a sub-thread; do not pass threadId). To assign linked work, call cafe_ask with delegate=true and an explicit to.",
     "A new Order defaults to this agent's home channel; pass channel to post elsewhere (channels are scopes, not secrets).",
   ].join("\n");
 }
@@ -733,7 +734,7 @@ export default function cafe(pi: ExtensionAPI) {
             channel: params.channel,
             collect: params.collect,
           });
-          if (res.decision?.targets?.length === 0) {
+          if (res.decision?.targets?.length === 0 && !res.decision.needsHuman) {
             // Never report "sent" when routing failed immediately (offline parent, empty channel).
             throw new Error(`The question was not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}.`);
           }
@@ -749,8 +750,11 @@ export default function cafe(pi: ExtensionAPI) {
         }
       };
       await refreshRegistry(c);
+      const res = await ask();
+      if (res.decision.needsHuman) {
+        return text(`Clarification ${res.threadId} is waiting for the person in the original conversation. Their answer will arrive as a new Cafe Order. Do not wait on this publishing Order.`);
+      }
       if (!params.wait) {
-        const res = await ask();
         const warnings = c.drainWarnings().map((w) => `warning: ${w}`);
         track(res.threadId, { orderId: res.orderId, ...(params.collect === "all" ? { collected: new Map() } : {}) });
         return text(
@@ -778,14 +782,10 @@ export default function cafe(pi: ExtensionAPI) {
             resolve(env.event.status);
           }
         };
-        void ask()
-          .then((res) => {
-            threadId = res.threadId;
-            orderId = res.orderId;
-            // Keyed on this Order: track() drops events of other Orders in the thread.
-            track(res.threadId, { orderId: res.orderId, onEvent });
-          })
-          .catch(reject);
+        threadId = res.threadId;
+        orderId = res.orderId;
+        // Keyed on this Order: track() drops events of other Orders in the thread.
+        track(res.threadId, { orderId: res.orderId, onEvent });
       });
       const status = await closed;
       const warnings = c.drainWarnings().map((w) => `warning: ${w}`);
@@ -801,12 +801,19 @@ export default function cafe(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cafe_reply",
     label: "cafe reply",
-    description: "Send an interim (non-final) reply for the cafe Order you are currently working on, optionally with local files attached. Your final answer is sent automatically at the end of the turn.",
+    description: "Send interim progress for the active Cafe Order. To report a result after a human Order closed, provide both reportThreadId and reportOrderId.",
     parameters: Type.Object({
       text: Type.String(),
-      attachments: Type.Optional(Type.Array(Type.String(), { description: "Local file paths to upload and attach to this reply." })),
+      reportThreadId: Type.Optional(Type.String({ description: "Original human Thread for a result report." })),
+      reportOrderId: Type.Optional(Type.String({ description: "Original human Order for a result report." })),
+      attachments: Type.Optional(Type.Array(Type.String(), { description: "Local file paths to upload and attach to this interim reply." })),
     }),
     async execute(_id, params) {
+      if (params.reportThreadId || params.reportOrderId) {
+        if (!params.reportThreadId || !params.reportOrderId || params.attachments?.length) throw new Error("A result report requires both original identifiers and text only.");
+        await requireClient().report({ threadId: params.reportThreadId, orderId: params.reportOrderId, text: params.text });
+        return text("Report added to the original human conversation.");
+      }
       if (!current) throw new Error("no cafe Order in progress");
       const attachments: Attachment[] = [];
       for (const path of params.attachments ?? []) attachments.push(await uploadAttachment(path));

@@ -62,6 +62,8 @@ import { describeFetchError } from "./net-errors.ts";
 
 /** A roster is unique per (host, team, channel): two same-named teams on one Host may differ by channel (v4-13, #108). */
 const rosterKey = (t: { host: string; team: string; channel: string }): string => `${t.host}/${t.team}/${t.channel}`;
+const OwnershipKey = AgentIdentity.shape.resumeAgentId.unwrap().regex(/^[0-9a-f]{64}$/);
+const ownershipDigest = (key: string): string => createHash("sha256").update(key).digest("hex");
 
 export interface DaemonOptions {
   config: CafeConfig;
@@ -829,21 +831,28 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // Fail anything that agent was working on.
       for (const t of this.tracking.values()) {
         const s = t.targets.get(agentId);
-        if (s === "pending" || s === "acked") this.targetFailed(t, agentId, "agent disconnected");
+        if ((s === "pending" || s === "acked") && !(s === "pending" && t.order.clarificationRecipient)) {
+          this.targetFailed(t, agentId, "agent disconnected");
+        }
       }
     }
   }
 
   private bindAgentMethods(peer: Peer): void {
     peer.on(Methods.agentRegister, (raw) => {
-      const { resumeAgentId, ...identity } = AgentIdentity.parse(raw);
-      // Resume a previous identity (reconnect, daemon restart) when it is not held by a live connection.
-      const prev = resumeAgentId && !this.agents.has(resumeAgentId) ? (this.local.get(resumeAgentId) ?? this.registry.get(resumeAgentId)) : undefined;
+      if (peer.meta.agentId) throw new RpcError("conflict", "connection is already registered");
+      const { resumeAgentId, resumeProof, ...identity } = AgentIdentity.extend({ resumeProof: OwnershipKey.optional() }).parse(raw);
+      const proof = resumeProof ? ownershipDigest(resumeProof) : undefined;
+      const priorProof = resumeAgentId ? this.store.getKv<string>(`agent-proof:${resumeAgentId}`) : undefined;
+      if (priorProof && priorProof !== proof) throw new RpcError("bad_identity", "agent resume proof does not match");
+      // Resume only an ID not held by a live connection. Retain compatibility with legacy, unprotected IDs.
+      const availableId = resumeAgentId && !this.agents.has(resumeAgentId) ? resumeAgentId : undefined;
+      const prev = availableId ? (this.local.get(availableId) ?? this.registry.get(availableId)) : undefined;
       const resumable = prev && prev.host === this.host && prev.name === identity.name ? prev : undefined;
       const now = Date.now();
       const record: AgentRecord = {
         ...identity,
-        agentId: resumable?.agentId ?? resumeAgentId ?? ulid(),
+        agentId: resumable?.agentId ?? (prev ? undefined : availableId) ?? ulid(),
         address: resumable?.address ?? formatAddress(identity.name, this.registry.nextInstance(identity.name, this.host), this.host),
         host: this.host,
         status: "idle",
@@ -853,6 +862,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         legacyAliases: resumable?.legacyAliases ?? [],
         ...(resumable?.displayName ? { displayName: resumable.displayName } : {}),
       };
+      if (proof) this.store.setKv(`agent-proof:${record.agentId}`, proof);
       peer.meta.agentId = record.agentId;
       peer.meta.party = { id: record.agentId, address: record.address, host: this.host } satisfies Party;
       this.agents.set(record.agentId, peer);
@@ -896,6 +906,34 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.orderDecline, (p: { orderId: string; threadId: string; reason: string; unavailable?: boolean }) =>
       this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason, ...(p.unavailable ? { unavailable: true } : {}) }),
     );
+    peer.on("order/report", async (p: { threadId: string; orderId: string; text: string }) => {
+      const agentId = peer.meta.agentId as string | undefined;
+      if (!agentId || this.agents.get(agentId) !== peer) throw new RpcError("not_registered", "agent/register first");
+      if (typeof p.threadId !== "string" || typeof p.orderId !== "string" || typeof p.text !== "string" || !p.text.trim() || p.text.length > 12_000) {
+        throw new RpcError("bad_request", "threadId, orderId and report text (up to 12000 characters) are required");
+      }
+      const order = this.findParentOrder(p.orderId, p.threadId);
+      if (order?.threadId !== p.threadId || !order.from.id.startsWith("cli:") || !this.wasDelivered(order, agentId, this.host, true)) {
+        throw new RpcError("not_a_target", "only a recipient of the original human Order can report its result");
+      }
+      if (!this.closingEvent(p.threadId, p.orderId)) throw new RpcError("order_open", "reply to the open Order instead");
+      const meta = this.metas.get(order.threadId) ?? this.store.getThread(order.threadId)!;
+      const duplicate = this.store.findLastEvent(meta.file, (env) => env.orderId === order.orderId &&
+        env.event.type === "order.reported" && env.event.agentId === agentId && env.event.text === p.text);
+      const report: ThreadEnvelope = duplicate ?? {
+        eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(),
+        event: { type: "order.reported", agentId, text: p.text },
+      };
+      if (!duplicate) {
+        if (!this.isRoot) this.markBackfill(order.threadId, true);
+        this.recordEvent(report);
+      }
+      if (!this.isRoot) {
+        if (!this.rootOnline) throw new RpcError("report_pending", "report saved on this Host and will sync when Root reconnects");
+        await this.uplink!.request(Methods.threadBackfill, { events: [report] }, 5000);
+      }
+      return {};
+    });
     peer.on(Methods.orderCancel, (p: { threadId: string }) => this.cancel(p.threadId, peer.meta.party?.address ?? "customer"));
     // Bridged Baristas (Codex / Claude) remember which external session continues a Thread (v3-1 Q79).
     const sessionKey = (p: { threadId?: unknown; kind?: unknown }) => {
@@ -1845,9 +1883,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * window return the first Order/Thread; the key is the caller's (a platform
    * event id for connectors, v4-3 Q4). Without a key nothing is deduplicated.
    */
-  async createOrder(p: CreateOrderParams, peer?: Peer): Promise<CreatedOrder> {
+  async createOrder(p: CreateOrderParams, peer?: Peer, ownerKey?: string): Promise<CreatedOrder> {
     const key = p.idempotencyKey;
-    if (!key) return this.createOrderInner(p, peer);
+    if (!key) return this.createOrderInner(p, peer, ownerKey);
     const now = Date.now();
     this.pruneIdempotent(now);
     const hit = this.idempotentOrders.get(key);
@@ -1857,7 +1895,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const entry: IdempotentOrder = { at: now, expiresAt: now + IDEMPOTENCY_WINDOW_MS };
     this.idempotentOrders.set(key, entry);
-    entry.pending = this.createOrderInner(p, peer);
+    entry.pending = this.createOrderInner(p, peer, ownerKey);
     try {
       const result = await entry.pending;
       entry.result = result;
@@ -1882,7 +1920,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  private async createOrderInner(p: CreateOrderParams, peer?: Peer): Promise<CreatedOrder> {
+  private async createOrderInner(p: CreateOrderParams, peer?: Peer, ownerKey?: string): Promise<CreatedOrder> {
     if (this.draining) throw new RpcError("daemon_draining", "the daemon is draining for an update; retry after it restarts");
     const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
     if (p.escalate && !p.parentOrderId) throw new RpcError("unknown_parent", "escalate: true requires parentOrderId");
@@ -1897,9 +1935,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // later turn would otherwise be accepted as the recipient of an earlier one.
     if (p.escalate && peer?.meta.agentId) {
       const delivery = this.tracking.get(parent!.orderId)?.targets.get(peer.meta.agentId);
-      if (!delivery || delivery === "failed") {
+      if ((!delivery || delivery === "failed") && !this.wasDelivered(parent!, from.id, this.host)) {
         throw new RpcError("not_a_target", "escalate: only a Barista that received the parent Order may escalate it");
       }
+    }
+    const needsHuman = Boolean(p.escalate && !p.to && !p.broadcast && parent?.humanClarifications &&
+      parent.from.id.startsWith("cli:") && peer && this.agents.get(from.id) === peer &&
+      this.wasDelivered(parent, from.id, this.host, true));
+    if (needsHuman && parent!.from.host !== this.host && (!this.rootOnline ||
+      (!this.isRoot && !this.rootSupports("human-clarifications")) ||
+      !this.daemons().some((d) => d.host === parent!.from.host && d.online && d.features?.includes("human-clarifications")))) {
+      throw new RpcError("parent_unavailable", "the original requester’s Host is offline or does not support human clarifications");
     }
     const depth = parent ? parent.depth + 1 : 0;
     const parentContext = parent && parent.threadId === p.parentThreadId
@@ -1915,6 +1961,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!p.escalate && p.threadId) {
       prior = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
       if (!prior) throw new RpcError("not_found", `unknown thread ${p.threadId}`);
+      if (prior.clarification) throw new RpcError("clarification_required", "answer the clarification from the original conversation");
       const tc = prior.channel ?? DEFAULT_CHANNEL;
       if (p.channel && p.channel !== tc) throw new RpcError("channel_mismatch", `thread ${prior.threadId} is in channel ${tc}`);
       const open = [...this.tracking.values()].find((x) => x.order.threadId === p.threadId && x.status === "open");
@@ -1950,6 +1997,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // Blobs were uploaded to this daemon before the Order; move them into the Thread now.
     const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
+    const owner = !peer && p.origin !== "agent" && !p.escalate && p.kind === "order" ? OwnershipKey.safeParse(ownerKey) : undefined;
     const order: Order = {
       orderId: ulid(),
       threadId,
@@ -1957,6 +2005,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       channel,
       ...(p.collect ? { collect: p.collect } : {}),
       from,
+      ...(owner?.success ? { humanClarifications: true as const } : {}),
+      ...(needsHuman ? { needsHuman: true as const } : {}),
       // A registered Agent asking through the protocol is relaying on someone's behalf.
       origin: p.origin ?? (peer?.meta.party ? "agent" : "human"),
       via: p.via ?? (peer?.meta.party ? { id: peer.meta.party.id, address: peer.meta.party.address } : undefined),
@@ -1978,6 +2028,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const target = explicit?.targets[0];
     const targetChannel = target ? this.registry.get(target)?.teamChannel : undefined;
     if (targetChannel) order.channel = targetChannel;
+    if (owner?.success) this.store.setKv(`human-owner:${order.orderId}`, ownershipDigest(owner.data));
     this.knownOrders.set(order.orderId, order);
     if (peer) this.subscribe(order.threadId, peer);
 
@@ -1990,10 +2041,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.tracking.set(order.orderId, t);
     this.emitEvent(order, { type: "order.created", order });
 
-    const decision = explicit ?? await this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
+    const decision: RoutingDecision = needsHuman
+      ? { targets: [], mode: "unicast", reason: "escalate to the person in the original conversation", router: "explicit", candidates: [], needsHuman: true }
+      : explicit ?? await this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
     t.decision = decision;
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
+    if (needsHuman) {
+      this.close(t, "done");
+      return { orderId: order.orderId, threadId: order.threadId, decision };
+    }
     if (decision.targets.length === 0) {
       this.emitEvent(order, { type: "order.failed", reason: decision.failure ?? "no barista available" });
       this.close(t, "failed");
@@ -2009,6 +2066,70 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       t.deadline = setTimeout(() => this.finishOnDeadline(t), order.deadlineMs ?? this.timing.unicastDeadlineMs);
     }
     return { orderId: order.orderId, threadId: order.threadId, decision };
+  }
+
+  /** Hydrate only the publishing turn when serving a missed clarification on its original Host. */
+  async catchUpClarification(parentThreadId: string, threadId: string): Promise<void> {
+    if (this.isRoot || !this.rootOnline || !this.rootSupports("team-child-view")) return;
+    const parent = this.metas.get(parentThreadId) ?? this.store.getThread(parentThreadId);
+    if (parent?.from.host !== this.host) return;
+    const link = this.uplink!;
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (meta?.clarification && this.closingEvent(threadId, meta.clarification.orderId)) return;
+    const page = await link.request<{ events: ThreadEnvelope[] } | undefined>("thread/linked-detail", { threadId, parentThreadId, clarificationOnly: true }, 2000);
+    const current = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    const known = new Set(current ? this.store.readEvents(current.file).map((env) => env.eventId) : []);
+    for (const env of page?.events ?? []) {
+      if (!known.has(env.eventId)) this.recordEvent(env, { from: link, skipTrack: true });
+    }
+  }
+
+  answerClarification(parentThreadId: string, threadId: string, input: { clarificationOrderId: string; text: string }, ownerKey?: string): CreatedOrder {
+    const key = OwnershipKey.safeParse(ownerKey);
+    const text = typeof input.text === "string" ? input.text.trim() : "";
+    if (!text || text.length > 12_000) throw new RpcError("bad_request", "answer text must be 1–12000 characters");
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!meta?.clarification || meta.clarification.orderId !== input.clarificationOrderId || meta.parentThreadId !== parentThreadId) {
+      throw new RpcError("not_found", "no matching clarification in this conversation");
+    }
+    const parent = this.linkedParent(meta);
+    const digest = parent && this.store.getKv<string>(`human-owner:${parent.orderId}`);
+    if (parent?.from.host !== this.host || !digest || !key.success || ownershipDigest(key.data) !== digest ||
+      !this.wasDelivered(parent, meta.from.id, meta.from.host, true)) {
+      throw new RpcError("not_owner", "open this conversation on its original Host with the client that asked the question");
+    }
+    const decision = this.clarificationAnswerRoute(meta.from);
+    // JSONL is the acceptance record. The metadata write can lag a journal append at a crash.
+    const committed = this.store.findLastEvent(meta.file, ({ event }) => event.type === "order.created" && !!event.order.clarificationRecipient);
+    if (committed?.event.type === "order.created" || meta.turns > 1) {
+      const answer = committed?.event.type === "order.created" ? committed.event.order : undefined;
+      if (answer?.body === text) return { orderId: answer.orderId, threadId, decision };
+      throw new RpcError("conflict", "this clarification already has an answer");
+    }
+    if (!this.closingEvent(threadId, meta.clarification.orderId)) throw new RpcError("conflict", "the clarification is still being published; retry shortly");
+    const rec = this.registry.get(meta.from.id);
+    if (!rec || rec.role !== "barista" || rec.host !== meta.from.host || rec.status === "offline" ||
+      (rec.host === this.host ? !this.agents.has(rec.agentId) : !this.rootOnline)) {
+      throw new RpcError("requester_offline", "the member who asked is offline; your answer has not been accepted");
+    }
+    const order: Order = {
+      orderId: ulid(), threadId, kind: "order", from: parent.from, channel: meta.channel, origin: "human", body: text,
+      clarificationRecipient: meta.from, parentThreadId, parentOrderId: parent.orderId, parentContext: summarize(parent.body, 639),
+      chain: [], depth: parent.depth + 1, createdAt: Date.now(), turn: 2, deadlineMs: this.timing.unicastDeadlineMs,
+      history: [{ from: meta.from.address, agentId: meta.from.id, role: "barista", text: meta.clarification.question.slice(0, 4000) }],
+    };
+    if (!this.isRoot && !this.rootOnline) this.markBackfill(threadId);
+    const tracking: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map(), decision };
+    this.tracking.set(order.orderId, tracking);
+    this.emitEvent(order, { type: "order.created", order });
+    this.emitEvent(order, { type: "order.routed", decision });
+    this.dispatch(tracking, meta.from.id);
+    tracking.deadline = setTimeout(() => this.finishOnDeadline(tracking), this.timing.unicastDeadlineMs);
+    return { orderId: order.orderId, threadId, decision };
+  }
+
+  private clarificationAnswerRoute(recipient: Party): RoutingDecision {
+    return { targets: [recipient.id], mode: "unicast", reason: "answer to the original clarification requester", router: "explicit", candidates: [] };
   }
 
   private eligible(order: Order): AgentRecord[] {
@@ -2057,10 +2178,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!parentThreadId) return undefined;
     const meta = this.metas.get(parentThreadId) ?? this.store.getThread(parentThreadId);
     if (!meta) return undefined;
-    for (const env of this.store.readEventsTail(meta.file, 500)) {
-      if (env.event.type === "order.created" && env.orderId === orderId) return env.event.order;
-    }
-    return undefined;
+    const found = this.store.findLastEvent(meta.file, (env) => env.event.type === "order.created" && env.orderId === orderId);
+    return found?.event.type === "order.created" ? found.event.order : undefined;
   }
 
   private async route(order: Order, followUp: { isFollowUp?: boolean; responders?: string[]; priorTargets?: string[] } = {}, broadcast = false): Promise<RoutingDecision> {
@@ -2282,6 +2401,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private deliver(order: Order, agentId: string): void {
     const rec = this.registry.get(agentId);
     if (!rec) return;
+    if (order.clarificationRecipient && (rec.host !== order.clarificationRecipient.host || agentId !== order.clarificationRecipient.id)) {
+      return this.relayFailure(order, agentId, "clarification requester unavailable");
+    }
     if (this.isRoot) {
       if (rec.host === this.host) return this.deliverLocal(order, agentId);
       const child = this.children.get(rec.host);
@@ -2416,8 +2538,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (changed) this.store.setKv("peerUrls", Object.fromEntries(this.peerUrls));
   }
 
-  private markBackfill(threadId: string): void {
-    if (this.rootOnline || this.backfill.has(threadId)) return;
+  private markBackfill(threadId: string, force = false): void {
+    if ((!force && this.rootOnline) || this.backfill.has(threadId)) return;
     this.backfill.set(threadId, Date.now());
     this.saveBackfill();
   }
@@ -2453,8 +2575,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private deliverLocal(order: Order, agentId: string): void {
+    if (order.clarificationRecipient && (agentId !== order.clarificationRecipient.id || this.host !== order.clarificationRecipient.host || !this.store.getKv<string>(`agent-proof:${agentId}`))) {
+      return this.relayFailure(order, agentId, "clarification requester unavailable");
+    }
     const peer = this.agents.get(agentId);
-    if (!peer) return this.relayFailure(order, agentId, "agent not connected");
+    if (!peer) {
+      // The issuing Host retries a pending answer to this exact identity until its deadline.
+      if (order.clarificationRecipient) return;
+      return this.relayFailure(order, agentId, "agent not connected");
+    }
     const rec = this.local.get(agentId);
     if (rec && rec.activeThreadId !== order.threadId) {
       const next = { ...rec, activeThreadId: order.threadId };
@@ -2486,7 +2615,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.notify(Methods.orderDeliver, { order, attachmentPaths: this.attachmentPaths(order) });
     this.deliveredParentBodies.set(`${order.orderId}:${agentId}`, summarize(order.body, 639));
     if (this.deliveredParentBodies.size > 2048) this.deliveredParentBodies.delete(this.deliveredParentBodies.keys().next().value!);
-    this.emitEvent(order, { type: "order.delivered", agentId });
+    this.emitEvent(order, { type: "order.delivered", agentId, ...(this.store.getKv<string>(`agent-proof:${agentId}`) ? { protectedIdentity: true } : {}) });
   }
 
   private relayFailure(order: Order, agentId: string, reason: string): void {
@@ -2495,7 +2624,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private armAck(t: Tracking, agentId: string): void {
     this.clearTimer(t, agentId);
-    t.timers.set(agentId, setTimeout(() => this.targetFailed(t, agentId, "no ack"), this.timing.ackTimeoutMs));
+    t.timers.set(agentId, setTimeout(() => {
+      if (!t.order.clarificationRecipient) return this.targetFailed(t, agentId, "no ack");
+      if (t.status !== "open" || t.targets.get(agentId) !== "pending") return;
+      this.armAck(t, agentId);
+      const rec = this.registry.get(agentId);
+      if (rec && rec.status !== "offline" && (rec.host === this.host ? this.agents.has(agentId) : this.rootOnline)) this.deliver(t.order, agentId);
+    }, this.timing.ackTimeoutMs));
   }
 
   private armHeartbeat(t: Tracking, agentId: string): void {
@@ -2532,6 +2667,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const t = this.tracking.get(env.orderId);
     if (!t) return;
     const ev = env.event;
+    if (t.order.clarificationRecipient && "agentId" in ev &&
+      (ev.agentId !== t.order.clarificationRecipient.id || env.host !== t.order.clarificationRecipient.host)) return;
     switch (ev.type) {
       case "order.acked":
         if (t.targets.get(ev.agentId) === "pending") t.targets.set(ev.agentId, "acked");
@@ -2937,9 +3074,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // Fan out first: tracking may synchronously emit follow-up events (e.g. order.closed).
 
-    for (const s of this.subscribers.get(env.threadId) ?? []) if (s !== opts.from) s.notify(Methods.threadEvent, env);
+    const parent = meta && this.linkedParent(meta);
+    const subscribers = new Set(this.subscribers.get(env.threadId));
+    if (parent?.from.host === this.host) {
+      for (const s of this.subscribers.get(parent.threadId) ?? []) subscribers.add(s);
+    }
+    for (const s of subscribers) if (s !== opts.from) s.notify(Methods.threadEvent, env);
     for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
-    if (this.isRoot) this.fanOutToChildren(env, opts.from);
+    if (this.isRoot) this.fanOutToChildren(env, opts.from, parent?.from.host);
     else if (this.rootOnline && opts.from !== this.uplink) this.uplink!.notify(Methods.threadEvent, env);
     for (const l of this.threadLinks.get(env.threadId) ?? []) {
       if (l === opts.from || l.isClosed) continue;
@@ -3028,10 +3170,32 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
+  /** An exact delivery, from the Order log rather than the Thread's cumulative targets. */
+  private wasDelivered(order: Order, agentId: string, host: string, protectedIdentity = false): boolean {
+    const meta = this.metas.get(order.threadId) ?? this.store.getThread(order.threadId);
+    return !!meta && !!this.store.findLastEvent(meta.file, (env) =>
+      env.orderId === order.orderId && env.host === host && env.event.type === "order.delivered" && env.event.agentId === agentId &&
+      (!protectedIdentity || env.event.protectedIdentity === true));
+  }
+
+  private parentLinks = new Map<string, Order>();
+
+  private linkedParent(meta: ThreadMeta): Order | undefined {
+    if (!meta.parentOrderId || !meta.parentThreadId) return undefined;
+    const cached = this.parentLinks.get(meta.threadId);
+    if (cached) return cached;
+    const parent = this.findParentOrder(meta.parentOrderId, meta.parentThreadId);
+    if (parent?.threadId !== meta.parentThreadId || !this.wasDelivered(parent, meta.from.id, meta.from.host)) return undefined;
+    if (this.parentLinks.size >= 2048) this.parentLinks.delete(this.parentLinks.keys().next().value!);
+    this.parentLinks.set(meta.threadId, parent);
+    return parent;
+  }
+
   /** Root: forward an event to every Host taking part in the Thread, except where it came from. */
-  private fanOutToChildren(env: ThreadEnvelope, from?: Peer): void {
+  private fanOutToChildren(env: ThreadEnvelope, from?: Peer, parentHost?: string): void {
     const meta = this.metas.get(env.threadId);
     const hosts = new Set<string>();
+    if (parentHost) hosts.add(parentHost);
     if (meta) {
       hosts.add(meta.from.host);
       for (const id of meta.targets) {
@@ -3073,6 +3237,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         ...(ev.order.channel ? { channel: ev.order.channel } : {}),
         ...(ev.order.parentThreadId ? { parentThreadId: ev.order.parentThreadId } : {}),
         ...(ev.order.parentOrderId ? { parentOrderId: ev.order.parentOrderId } : {}),
+        ...(ev.order.needsHuman ? { clarification: { orderId: ev.order.orderId, question: ev.order.body } } : {}),
         from: ev.order.from,
         ...(ev.order.origin ? { origin: ev.order.origin } : {}),
         ...(ev.order.via ? { via: ev.order.via } : {}),
@@ -3102,6 +3267,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.knownOrders.set(ev.order.orderId, ev.order);
       // A new turn: the Thread now reflects this Order. The title stays on the
       // first question so a multi-turn Thread is still recognisable in list views.
+      if (ev.order.turn < meta.turns) return meta;
       if (ev.order.orderId !== meta.orderId || meta.turns === 0) {
         const firstTurn = meta.turns === 0;
         meta.orderId = ev.order.orderId;
@@ -3142,6 +3308,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         break;
       case "order.acked":
         if (meta.status === "delivering" || meta.status === "routing") meta.status = "working";
+        if (meta.clarification && meta.turns > 1 && ev.agentId === meta.from.id) meta.clarification.acknowledged = true;
         setTargetState(ev.agentId, "acked", true);
         break;
       case "order.replied":
@@ -3178,6 +3345,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * timeouts fail the Order.
    */
   recover(): number {
+    // A crash after appending answer acceptance can leave a closed publication in SQLite.
+    // Repair the index from the journal so normal Order recovery can resume the original ID.
+    for (const meta of this.store.unansweredClarifications()) {
+      const answer = this.store.findLastEvent(meta.file, ({ event }) => event.type === "order.created" &&
+        !!event.order.clarificationRecipient && event.order.from.host === this.host);
+      if (!answer) continue;
+      const events = this.store.readOrderEvents(meta.file, answer.orderId);
+      for (const env of events) this.updateMeta(env);
+      const restored = this.metas.get(meta.threadId);
+      if (restored) this.writeMeta(restored);
+    }
     let n = 0;
     for (const meta of this.store.openThreads(1000)) {
       if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
@@ -3193,7 +3371,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
       this.tracking.set(order.orderId, t);
       n++;
-      const routed = events.find((e) => e.event.type === "order.routed")?.event;
+      const savedRoute = events.find((e) => e.event.type === "order.routed")?.event;
+      const routed = savedRoute ?? (order.clarificationRecipient
+        ? { type: "order.routed" as const, decision: this.clarificationAnswerRoute(order.clarificationRecipient) }
+        : undefined);
+      if (order.needsHuman) {
+        this.close(t, "done");
+        continue;
+      }
       if (!routed || routed.type !== "order.routed") {
         this.emitEvent(order, { type: "order.failed", reason: "daemon restarted before routing finished" });
         this.close(t, "failed");
@@ -3297,6 +3482,26 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
     peer.on("agent/kick", (x: { agentId: string }) => this.kick(x.agentId));
+    peer.on("thread/children", (p: { threadId: string; limit: number }) => {
+      if (typeof p.threadId !== "string") throw new RpcError("bad_request", "threadId is required");
+      return this.localChildren(p.threadId, Math.max(1, Math.min(200, Number(p.limit) || 200)))
+        .filter((child) => this.linkedParent(child)?.from.host === host);
+    });
+    peer.on("thread/reports", (p: { threadId: string }) => {
+      const meta = typeof p.threadId === "string" && (this.metas.get(p.threadId) ?? this.store.getThread(p.threadId));
+      if (!meta || meta.from.host !== host) return [];
+      return this.store.readEventsTail(meta.file, 200).filter((env) => env.event.type === "order.reported");
+    });
+    peer.on("thread/linked-detail", (p: { threadId: string; parentThreadId?: string; limit?: number; before?: string; clarificationOnly?: boolean }) => {
+      if (typeof p.threadId !== "string") throw new RpcError("bad_request", "threadId is required");
+      const meta = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
+      if (!meta || this.linkedParent(meta)?.from.host !== host) return undefined;
+      if (p.clarificationOnly) {
+        if (!meta.clarification || meta.parentThreadId !== p.parentThreadId) return undefined;
+        return { events: this.store.readOrderEvents(meta.file, meta.clarification.orderId).slice(0, 8) };
+      }
+      return this.thread(p.threadId, { limit: Math.min(200, Math.max(1, Number(p.limit) || 100)), before: p.before });
+    });
     peer.on(Methods.threadBackfill, (x: { events: ThreadEnvelope[] }) => {
       // Skip events already on file (the Root may have restarted and lost its in-memory dedupe set).
       const first = x.events[0];
@@ -4212,6 +4417,27 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
+  private localChildren(threadId: string, limit: number): ThreadMeta[] {
+    return this.store.listThreadsByParent(threadId, limit).map((meta) => this.summaryMeta(this.metas.get(meta.threadId) ?? meta));
+  }
+
+  async childView(threadId: string, limit: number): Promise<{ children: ThreadMeta[]; partial: boolean }> {
+    const local = this.localChildren(threadId, limit);
+    if (this.isRoot) return { children: local, partial: false };
+    const parent = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (parent?.from.host !== this.host || !this.rootOnline || !this.rootSupports("team-child-view")) {
+      return { children: local, partial: true };
+    }
+    try {
+      const remote = await this.uplink!.request<ThreadMeta[]>("thread/children", { threadId, limit }, 2000);
+      const byId = new Map(local.map((child) => [child.threadId, child]));
+      for (const child of remote) if (child.from.host !== this.host || !byId.has(child.threadId)) byId.set(child.threadId, child);
+      return { children: [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, limit), partial: false };
+    } catch {
+      return { children: local, partial: true };
+    }
+  }
+
   /** List views need the latest outcome, not the whole reply text. */
   summaryMeta(meta: ThreadMeta): ThreadMeta {
     return {
@@ -4246,6 +4472,27 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     };
     this.stats.snapshotMs = performance.now() - started;
     return result;
+  }
+
+  async linkedThreadDetail(threadId: string, opts: { limit?: number; before?: string }) {
+    const local = this.thread(threadId, opts);
+    if (this.isRoot || !this.rootOnline || !this.rootSupports("team-child-view")) return local;
+    const link = this.uplink!;
+    try {
+      if (!local || (local.meta.parentThreadId && local.meta.from.host !== this.host)) {
+        return await link.request<ReturnType<Daemon["thread"]>>("thread/linked-detail", { threadId, ...opts }, 2000) ?? local;
+      }
+      if (local.meta.from.host === this.host && local.meta.from.id?.startsWith("cli:")) {
+        const reports = await link.request<ThreadEnvelope[]>("thread/reports", { threadId }, 2000);
+        for (const env of reports) {
+          if (!this.store.findLastEvent(local.meta.file, (e) => e.eventId === env.eventId)) this.recordEvent(env, { from: link, skipTrack: true });
+        }
+        return this.thread(threadId, opts);
+      }
+    } catch {
+      return local;
+    }
+    return local;
   }
 
   thread(threadId: string, opts: { limit?: number; before?: string } = {}) {

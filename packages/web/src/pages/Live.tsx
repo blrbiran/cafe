@@ -24,6 +24,8 @@ function eventText(t: Dict, agents: Record<string, { address: string }>, env: Th
       return t.eventDelivered(name(ev.agentId));
     case "order.acked":
       return t.eventAcked(name(ev.agentId));
+    case "order.reported":
+      return `${name(ev.agentId)} · ${t.resultReport}`;
     case "order.replied":
       return t.eventReplied(name(ev.agentId), ev.final);
     case "order.declined":

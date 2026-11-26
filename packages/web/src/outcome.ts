@@ -6,7 +6,7 @@ import type { Tone } from "./ui/bits.tsx";
 export type Bucket = "active" | "answered" | "unanswered" | "cancelled";
 
 export function bucketOf(t: ThreadMeta): Bucket {
-  if (isActive(t.status)) return "active";
+  if (isActive(t.status) || (t.clarification && t.turns === 1)) return "active";
   if (t.status === "cancelled") return "cancelled";
   if (t.replies.length > 0) return "answered";
   return "unanswered";
@@ -43,6 +43,7 @@ export function askerOf(
  * `live` supplies the turn start (for follow-ups) and the current targets.
  */
 export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentRecord>, live: LiveTurn | undefined, now: number): { tone: Tone; text: string } {
+  if (meta.clarification && meta.turns === 1) return { tone: "warn", text: t.needsHuman };
   const startedAt = live?.startedAt ?? meta.turnStartedAt ?? (meta.turns <= 1 ? meta.createdAt : undefined);
   const names = (ids: string[]) => t.list([...new Set(ids.map((id) => whoName(id, agents, meta)))]);
   switch (bucketOf(meta)) {

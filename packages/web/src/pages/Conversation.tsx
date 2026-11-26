@@ -14,7 +14,7 @@ interface Turn {
   order?: Order;
   startedAt: number;
   decision?: RoutingDecision;
-  replies: { agentId: string; text: string; final: boolean; at: number; attachments?: Attachment[] }[];
+  replies: { agentId: string; text: string; final: boolean; at: number; attachments?: Attachment[]; report?: boolean }[];
   declines: { agentId: string; reason: string; at: number }[];
   /** `collect: all` deadline silences: recorded, but not a refusal (v4-11). */
   skips: { agentId: string; reason: string; at: number }[];
@@ -46,6 +46,9 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
       case "order.acked":
         turn.acked.add(ev.agentId);
         break;
+      case "order.reported":
+        turn.replies.push({ agentId: ev.agentId, text: ev.text, final: false, at: env.at, report: true });
+        break;
       case "order.replied":
         turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at, ...(ev.attachments?.length ? { attachments: ev.attachments } : {}) });
         break;
@@ -67,6 +70,7 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
 function turnOutcome(t: Dict, turn: Turn, active: boolean, agents: Record<string, AgentRecord>, meta: ThreadMeta, now: number): { tone: Tone; text: string } {
   const names = (ids: string[]) => t.list([...new Set(ids.map((id) => whoName(id, agents, meta)))]);
   const finals = turn.replies.filter((r) => r.final);
+  if (turn.decision?.needsHuman) return { tone: "warn", text: t.needsHuman };
   if (active) {
     const targets = turn.decision?.targets ?? [];
     if (!turn.decision || targets.length === 0) return { tone: "info", text: t.routing };
@@ -113,23 +117,38 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
 
   // v4-13 (#112): assignments and clarifications are separate Threads linked by parentThreadId.
   // The store carries the live ones; the API page catches children outside the snapshot.
-  const storeThreads = useStore((s) => s.threads);
-  const [fetchedChildren, setFetchedChildren] = useState<ThreadMeta[]>([]);
+  const connected = useStore((s) => s.connected);
+  const rootOnline = useStore((s) => s.rootOnline);
+  const childActivity = useStore((s) => s.linkedActivity);
+  const [childView, setChildView] = useState<{ threadId: string; children: ThreadMeta[]; partial: boolean }>();
   useEffect(() => {
     let alive = true;
-    api
-      .children(threadId)
-      .then((list) => alive && setFetchedChildren(list))
-      .catch(() => alive && setFetchedChildren([]));
+    const timer = setTimeout(() => {
+      api.children(threadId).then((view) => {
+        if (!alive) return;
+        setChildView((previous) => {
+          if (!view.partial || previous?.threadId !== threadId) return { ...view, threadId };
+          const known = new Map(previous.children.map((child) => [child.threadId, child]));
+          for (const child of view.children) {
+            const seen = known.get(child.threadId);
+            if (!seen || (child.lastActivityAt ?? 0) >= (seen.lastActivityAt ?? 0)) known.set(child.threadId, child);
+          }
+          return { threadId, partial: true, children: [...known.values()] };
+        });
+      }).catch(() => {
+        if (alive) setChildView((previous) => previous?.threadId === threadId
+          ? { ...previous, partial: true }
+          : { threadId, children: [], partial: true });
+      });
+    }, 80);
     return () => {
       alive = false;
+      clearTimeout(timer);
     };
-  }, [threadId, detail?.meta.status, detail?.meta.lastActivityAt]);
-  const children = useMemo(() => {
-    const map = new Map<string, ThreadMeta>();
-    for (const t of [...fetchedChildren, ...storeThreads]) if (t.parentThreadId === threadId) map.set(t.threadId, t);
-    return [...map.values()].sort((a, b) => b.createdAt - a.createdAt);
-  }, [fetchedChildren, storeThreads, threadId]);
+  }, [threadId, connected, rootOnline, childActivity]);
+  const children = useMemo(() => childView?.threadId === threadId ? childView.children.filter((t) => t.parentThreadId === threadId) : [], [childView, threadId]);
+  const linkedTasks = children.filter((child) => !child.clarification);
+  const clarificationThreads = children.filter((child) => child.clarification);
 
   const copy = () => {
     if (!detail) return;
@@ -213,6 +232,8 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
         </div>
       )}
 
+      {childView?.threadId === threadId && childView.partial && <p className="hint" role="status">{t.linkedTasksPartial}</p>}
+      {clarificationThreads.map((child) => <Clarification key={child.threadId} parent={meta.threadId} child={child} />)}
       {turns.map((turn, i) => {
         const active = threadActive && turn === last;
         const o = turnOutcome(t, turn, active, agents, meta, now);
@@ -285,27 +306,11 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
               )}
             </div>
             <Replies turn={turn} active={active} meta={meta} />
+            <LinkedTasks children={linkedTasks.filter((child) => child.parentOrderId === turn.orderId)} meta={meta} agents={agents} />
           </div>
         );
       })}
-      {children.length > 0 && (
-        <div className="card flex flex-col gap-2 px-5 py-4">
-          <div className="cap">{t.clarifications(children.length)}</div>
-          {children.map((c) => (
-            <a
-              key={c.threadId}
-              className="linkbtn flex flex-wrap items-baseline justify-between gap-2"
-              href={hashFor({ page: "thread", threadId: c.threadId, channel: c.channel ?? meta.channel ?? "default" })}
-            >
-              <span className="truncate">{c.summary}</span>
-              <span className="mono text-xs text-muted">
-                {c.status}
-                {c.closedAt ? ` · ${t.closedLabel}` : ""}
-              </span>
-            </a>
-          ))}
-        </div>
-      )}
+      <LinkedTasks children={linkedTasks.filter((child) => !turns.some((turn) => turn.orderId === child.parentOrderId))} meta={meta} agents={agents} />
       {meta.targetStates?.length ? (
         <div className="card flex flex-col gap-2 px-5 py-4">
           <div className="cap">{t.latestTargets}</div>
@@ -375,7 +380,8 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
           {rail}
         </div>
         <div className="border-t border-line bg-card px-5 py-3 max-md:px-4">
-          <FollowUp meta={meta} busy={threadActive} drawer />
+          {!meta.clarification && <FollowUp meta={meta} busy={threadActive} drawer />}
+          {meta.clarification && back}
         </div>
       </div>
     );
@@ -385,7 +391,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
     <>
       {back}
       {main}
-      <FollowUp meta={meta} busy={threadActive} />
+      {!meta.clarification && <FollowUp meta={meta} busy={threadActive} />}
     </>
   );
 }
@@ -423,11 +429,73 @@ function AttachmentList({ items }: { items?: Attachment[] }) {
   );
 }
 
+function LinkedTasks({ children, meta, agents }: { children: ThreadMeta[]; meta: ThreadMeta; agents: Record<string, AgentRecord> }) {
+  const t = useT();
+  if (!children.length) return null;
+  return (
+    <section className="card flex flex-col gap-2 px-5 py-4">
+      <h2 className="cap">{t.clarifications(children.length)}</h2>
+      {children.map((child) => (
+        <div key={child.threadId} className="flex flex-col gap-1">
+          <a className="linkbtn flex flex-wrap items-baseline justify-between gap-2"
+            href={hashFor({ page: "thread", threadId: child.threadId, channel: child.channel ?? meta.channel ?? "default" })}>
+            <span>{child.summary}</span>
+            <span className="text-xs text-muted">{t.linkedStatus[child.status]}</span>
+          </a>
+          {child.replies.map((reply) => (
+            <p key={`${reply.agentId}-${reply.at}`} className="text-sm text-muted">
+              {reply.address ?? whoAddress(reply.agentId, agents, child)} · {reply.text}
+            </p>
+          ))}
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function Clarification({ parent, child }: { parent: string; child: ThreadMeta }) {
+  const t = useT();
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [accepted, setAccepted] = useState(false);
+  const [error, setError] = useState<string>();
+  const question = child.clarification!;
+  const submitted = accepted || child.turns > 1;
+  const status = question.acknowledged ? t.clarificationReceived
+    : submitted && child.status === "failed" ? t.clarificationFailed
+    : submitted ? t.clarificationAccepted : t.needsHuman;
+  const id = `clarification-${child.threadId}`;
+  return (
+    <article className="well flex flex-col gap-2 px-3.5 py-2.5">
+      <div role="status" className="text-sm font-medium">{status} · {child.from.address}</div>
+      <div className="prose-text">{question.question}</div>
+      {!submitted && (
+        <form className="flex flex-col gap-2" onSubmit={(event) => {
+          event.preventDefault();
+          if (!text.trim() || sending) return;
+          setSending(true);
+          setError(undefined);
+          void api.answerClarification(parent, child.threadId, question.orderId, text)
+            .then(() => setAccepted(true))
+            .catch((err: Error) => setError(err.message))
+            .finally(() => setSending(false));
+        }}>
+          <label htmlFor={id} className="text-sm">{t.clarificationReply}</label>
+          <textarea id={id} className="field" rows={3} value={text} maxLength={12_000} required onChange={(event) => setText(event.target.value)} />
+          <button className="btn-sm self-start" type="submit" disabled={sending || !text.trim()}>{t.clarificationSubmit}</button>
+          {error && <p role="alert" className="text-sm">{error}</p>}
+        </form>
+      )}
+      <a className="linkbtn self-start" href={hashFor({ page: "thread", threadId: child.threadId, channel: child.channel ?? "default" })}>{t.clarificationThread}</a>
+    </article>
+  );
+}
+
 function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: ThreadMeta }) {
   const t = useT();
   const agents = useStore((s) => s.agents);
   const items = [
-    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.final ? "ok" : "info") as Tone, kind: r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
+    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.final ? "ok" : "info") as Tone, kind: r.report ? t.resultReport : r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
     ...turn.declines.map((d) => ({ key: `d-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "warn" as Tone, kind: t.kDecline, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
     ...turn.skips.map((d) => ({ key: `s-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "info" as Tone, kind: t.kSkipped, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
   ].sort((a, b) => a.at - b.at);

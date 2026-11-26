@@ -141,6 +141,15 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
+### 2026-11-26 — 人工澄清与父会话汇报（本地功能分支）
+
+- 接手 `feat/team-clarification-live-reporting`，从 `git status --short --branch`、`git log --oneline origin/main..HEAD` 核对现场。设计和验收清单见 [team delivery](../superpowers/specs/2026-11-26-team-delivery-design.md) 与 [parent loop plan](../superpowers/plans/2026-11-26-team-parent-loop.md)。上一批已推送的名册工作见下节。
+- #171。人类 CLI/Web 新单保存客户端所有权凭据的摘要。被投递的成员使用 `escalate` 发起澄清，父会话显示待答，答复由原发单 Host 核验，随后在澄清 Thread 创建只给原成员的续单。收到确认后显示已送达。成员在受理前离线时保留待答。同一答复重试复用原 Order。原始凭据不会复制到其他 Host。老 Order 没有所有权凭据，沿用 `parent_not_agent`。
+- #120/#121/#194。父会话按父 Order 投影子 Thread，自身保留逐 Order 结束语义。CLI 在原 Order 已结束且有待办时显示 `working`、`orderStatus` 和 `pending`，可用 `cafe thread <id> --children` 看结果。前门可用 `CafeClient.report()` 或 pi/omp `cafe_reply` 的 `reportThreadId`／`reportOrderId` 补报。同机三 daemon 测试覆盖在线收件、远端任务完成、原 Host 回连后查询和打开子会话。浏览器用隔离 daemon 实测 Web 发单、澄清答复、收件确认和前门补报。
+- **发布阻塞。** daemon/peer 握手仍以共享 token 和自报 Host 为基础，Web 管理凭据没有与 Host 身份分开。已实现的所有权证明约束原发单 Host 上的答复入口。跨 Host 的转发和事件仍依赖现有信任边界。建议单独设计 Host 准入，区分 daemon 与 Web/CLI 凭据，将 Root 握手和直连绑定到经批准的 Host 身份，并在接收答复、收件确认和补报时核验原 Order 与发送 Host。现有叶证书面向服务端，且签发接口接受共享 token，迁移时须一起处理准入。这个分支尚未合入或推送。当前生产 Root 未重启。
+- 验收新增了三条恢复路径。已受理答复在重启后复用原 Order，前门补报在发报端和请求端重连后可读，原 Host 漏收澄清发布后仍能打开并答复。还需真实第二物理 Host 与混合版本验证。Root 查询按固定上限补回子任务和近期报告。外部 issue 台账未改，npm 发布仍由 operator 执行。
+- 全量 128 文件、724 项测试通过。TypeScript、Web check/build 与 routing 67/67 通过，隔离打包冒烟 17/17，Claude 插件 6/6。独立设计与代码审查已跑。外部台账结构检查为 0 错误，保留 6 条既有警告。
+
 ### 2026-11-26 — Team 派单与反馈收口
 
 - **接手入口**。设计见 [team delivery](../superpowers/specs/2026-11-26-team-delivery-design.md)，实施与剩余范围见 [plan](../superpowers/plans/2026-11-26-team-delivery.md)。设计经独立审查，已实现批次也做了两轮独立代码审查。用 `git status --short --branch` 和 `git log --oneline -5` 核对现场。

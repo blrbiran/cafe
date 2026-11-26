@@ -282,6 +282,117 @@ describe("team sessions (v4-13)", () => {
     expect(saved.some((t) => t.team === "shop" && !t.removed)).toBe(false);
   });
 
+  it("records a late front-door report on the original human Order exactly once", async () => {
+    const d = await startDaemon("report", { mode: "root" });
+    cleanup.push(d.stop);
+    const lead = await barista(d.addr, identity("lead"));
+    cleanup.push(() => lead.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const first = await c.ask({ body: "review release", to: "lead" });
+    await untilClosed(c, first.threadId, first.orderId);
+    const report = { orderId: first.orderId, threadId: first.threadId, text: "all regressions covered" };
+    await lead.client.report(report);
+    await lead.client.report(report);
+    await waitFor(() => c.recentEvents(first.threadId).some((e) => e.event.type === "order.reported"));
+    const result = d.daemon.thread(first.threadId)!;
+    expect(result.meta).toMatchObject({ status: "done", turns: 1 });
+    expect(result.events.filter((e) => e.event.type === "order.reported")).toEqual([
+      expect.objectContaining({ orderId: first.orderId, event: { type: "order.reported", agentId: lead.rec.agentId, text: report.text } }),
+    ]);
+  });
+
+  it("recovers a late result report after the reporting and requester Hosts reconnect", async () => {
+    const root = await startDaemon("report-root", { mode: "root" });
+    cleanup.push(root.stop);
+    const origin = await startDaemon("report-origin", { config: { root: root.addr } });
+    cleanup.push(origin.stop);
+    const remote = await startDaemon("report-remote", { config: { root: root.addr } });
+    cleanup.push(remote.stop);
+    const agent = await barista(remote.addr, identity("lead"));
+    cleanup.push(() => agent.client.close());
+    const c = await customer(origin.addr);
+    cleanup.push(() => c.close());
+    await waitFor(() => !!origin.daemon.registry.get(agent.rec.agentId));
+    const parent = await c.ask({ body: "review the release", to: "lead" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    await waitFor(() => remote.daemon.thread(parent.threadId)?.meta.status === "done");
+    origin.daemon.setRoot("127.0.0.1:1");
+    remote.daemon.setRoot("127.0.0.1:1");
+    await waitFor(() => !origin.daemon.rootOnline && !remote.daemon.rootOnline);
+    const report = { threadId: parent.threadId, orderId: parent.orderId, text: "final release review" };
+    await expect(agent.client.report(report)).rejects.toMatchObject({ code: "report_pending" });
+    remote.daemon.setRoot(root.addr);
+    const hasReport = (events: import("@cafe/protocol").ThreadEnvelope[]) => events.filter((env) => env.event.type === "order.reported");
+    await waitFor(() => hasReport(root.daemon.thread(parent.threadId)?.events ?? []).length === 1);
+    origin.daemon.setRoot(root.addr);
+    await waitFor(() => origin.daemon.rootOnline);
+    const detail = await (await fetch(`http://${origin.addr}/api/threads/${parent.threadId}`)).json();
+    expect(hasReport(detail.events)).toEqual([expect.objectContaining({ orderId: parent.orderId, event: { type: "order.reported", agentId: agent.rec.agentId, text: report.text } })]);
+    expect(detail.meta.status).toBe("done");
+  });
+
+  it.each([false, true])("projects child work to the customer Host (disconnect before closure: %s)", async (disconnect) => {
+    const root = await startDaemon("project-root", { mode: "root" });
+    cleanup.push(root.stop);
+    const origin = await startDaemon("project-origin", { config: { root: root.addr } });
+    cleanup.push(origin.stop);
+    const leadHost = await startDaemon("project-lead", { config: { root: root.addr } });
+    cleanup.push(leadHost.stop);
+    root.daemon.publishRoster(root.home, team("reporting", [{ name: "lead", duty: "orchestrator" }]));
+    let finish!: () => void;
+    const barrier = new Promise<void>((resolve) => { finish = resolve; });
+    cleanup.push(finish);
+    const dev = await barista(root.addr, identity("dev"), async (h) => {
+      await h.ack();
+      await barrier;
+      await h.reply("parser regression covered");
+    });
+    cleanup.push(() => dev.client.close());
+    const lead = await barista(leadHost.addr, identity("lead"), async (h) => {
+      await h.ack();
+      await lead.client.ask({ body: "check parsing", channel: "reporting", to: "dev", parentThreadId: h.order.threadId, parentOrderId: h.order.orderId });
+      await h.reply("tester is working on parsing", false);
+      await h.reply("delegated");
+    });
+    cleanup.push(() => lead.client.close());
+    await waitFor(() => origin.daemon.registry.get(lead.rec.agentId) !== undefined && leadHost.daemon.registry.get(dev.rec.agentId) !== undefined);
+    const c = await customer(origin.addr);
+    cleanup.push(() => c.close());
+    const parent = await c.ask({ body: "verify the release", to: "lead" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    const childUrl = `http://${origin.addr}/api/threads?parent=${parent.threadId}`;
+    const children = async () => (await fetch(childUrl)).json() as Promise<import("@cafe/protocol").ThreadMeta[]>;
+    await waitFor(async () => (await children())[0]?.status === "working", 1500);
+    const [child] = await children();
+    expect(child).toMatchObject({ parentOrderId: parent.orderId });
+    expect(origin.daemon.thread(parent.threadId)?.meta.status).toBe("done");
+    const parentDetail = await (await fetch(`http://${origin.addr}/api/threads/${parent.threadId}`)).json();
+    expect(parentDetail.meta).toMatchObject({ status: "done", pendingChildren: 1 });
+    const teams = await (await fetch(`http://${root.addr}/api/teams`)).json() as Array<{ channel: string; openThreads: number }>;
+    expect(teams.find((t) => t.channel === "reporting")?.openThreads).toBeGreaterThanOrEqual(1);
+    if (disconnect) {
+      origin.daemon.setRoot("127.0.0.1:1");
+      await waitFor(() => !origin.daemon.rootOnline);
+    }
+    finish();
+    await waitFor(() => root.daemon.thread(child!.threadId)?.meta.status === "done");
+    if (disconnect) {
+      expect(origin.daemon.thread(child!.threadId)?.meta.status).toBe("working");
+      origin.daemon.setRoot(root.addr);
+      await waitFor(() => origin.daemon.rootOnline);
+    } else {
+      await waitFor(() => c.recentEvents(child!.threadId).some((e) => e.event.type === "order.closed"), 1500);
+    }
+    await waitFor(async () => (await children())[0]?.replies[0]?.text === "parser regression covered", 1500);
+    const detailUrl = `http://${origin.addr}/api/threads/${child!.threadId}`;
+    await waitFor(async () => {
+      const detail = await (await fetch(detailUrl)).json() as { meta?: { status: string; parentOrderId?: string }; events?: import("@cafe/protocol").ThreadEnvelope[] };
+      return detail.meta?.status === "done" && detail.meta.parentOrderId === parent.orderId &&
+        detail.events?.some((env) => env.event.type === "order.closed" && env.event.status === "done") === true;
+    });
+  });
+
   it("carries parent context when the dispatched member delegates from another Host", async () => {
     const root = await startDaemon("ctx-root", { mode: "root" });
     cleanup.push(root.stop);

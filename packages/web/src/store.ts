@@ -31,6 +31,8 @@ export interface State {
   legacy: boolean;
   /** The open Thread detail, kept live while open. */
   detail?: ThreadDetail & { loading?: boolean; loadingOlder?: boolean };
+  /** Latest update of a linked task while its parent is open, including across channels. */
+  linkedActivity?: string;
   /** Per-thread facts about the latest turn that ThreadMeta does not carry. */
   live: Record<string, LiveTurn>;
   /** Newest first, capped: the global "Live" page. */
@@ -328,6 +330,9 @@ function onNotification(method: string, params: any): void {
     case "thread/event": {
       const { env, meta } = params as { env: ThreadEnvelope; meta?: ThreadMeta };
       if (meta) upsertThread(meta);
+      if (meta?.parentThreadId && meta.parentThreadId === state.detail?.meta.threadId && env.event.type !== "order.heartbeat") {
+        set({ linkedActivity: env.eventId });
+      }
       appendEvent(env);
       break;
     }

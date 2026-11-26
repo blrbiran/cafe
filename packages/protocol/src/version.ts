@@ -6,7 +6,7 @@ export const DEFAULT_PORT = 4777;
  * Feature flags a Daemon advertises (v4-11 §7 named the idea; v4-12 adds the wire fields and the
  * mixed-release behaviour). An old peer omits the list; absent means none.
  */
-export const FEATURES = ["teams", "channels", "escalate", "collect", "digests", "team-sessions"] as const;
+export const FEATURES = ["teams", "channels", "escalate", "collect", "digests", "team-sessions", "team-child-view", "human-clarifications"] as const;
 export type Feature = (typeof FEATURES)[number];
 export const CURRENT_FEATURES: readonly Feature[] = FEATURES;
 

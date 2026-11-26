@@ -68,8 +68,10 @@ export class CafeClient {
   private peer?: Peer;
   private ws?: WebSocket;
   private identity?: AgentIdentity;
+  private readonly resumeProof = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
   private closedByUser = false;
   private retry = 0;
+  private readonly clarificationDeliveries = new Map<string, boolean>();
   private orderListeners = new Set<Listener<OrderHandle>>();
   private cancelListeners = new Set<Listener<{ orderId: string; threadId: string; by: string }>>();
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
@@ -236,6 +238,15 @@ export class CafeClient {
       });
       peer.on(Methods.orderDeliver, ({ order, attachmentPaths }: { order: Order; attachmentPaths?: Record<string, string> }) => {
         const h = this.handle(order, attachmentPaths);
+        if (order.clarificationRecipient) {
+          const prior = this.clarificationDeliveries.get(order.orderId);
+          if (prior !== undefined) {
+            if (prior) void h.ack().catch(() => {});
+            return;
+          }
+          this.clarificationDeliveries.set(order.orderId, false);
+          if (this.clarificationDeliveries.size > 512) this.clarificationDeliveries.delete(this.clarificationDeliveries.keys().next().value!);
+        }
         for (const fn of this.orderListeners) fn(h);
       });
       peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
@@ -316,7 +327,7 @@ export class CafeClient {
               }
               throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support team-sessions; team registration was refused`));
             }
-            const registered = await peer.request<AgentRecord & { teamContext?: TeamContext }>(Methods.agentRegister, identity);
+            const registered = await peer.request<AgentRecord & { teamContext?: TeamContext }>(Methods.agentRegister, { ...identity, resumeProof: this.resumeProof });
             this.record = registered;
             this.setTeamContext(registered.teamContext);
             // With no advertisement, the echo still proves support: an old Daemon strips these.
@@ -387,11 +398,48 @@ export class CafeClient {
       ...(order.attachments?.length
         ? { attachments: order.attachments.map((a) => ({ ...a, ...(attachmentPaths?.[a.id] ? { path: attachmentPaths[a.id] } : {}) })) }
         : {}),
-      ack: () => this.req(Methods.orderAck, base),
+      ack: async () => {
+        if (!order.clarificationRecipient) return this.req(Methods.orderAck, base);
+        await this.ackClarification(order);
+        this.clarificationDeliveries.set(order.orderId, true);
+      },
       heartbeat: (note) => this.req(Methods.orderHeartbeat, { ...base, note }),
       reply: (text, final = true, attachments) => this.req(Methods.orderReply, { ...base, text, final, ...(attachments?.length ? { attachments } : {}) }),
       decline: (reason, opts) => this.req(Methods.orderDecline, { ...base, reason, ...(opts?.unavailable ? { unavailable: true } : {}) }),
     };
+  }
+
+  /** Keep the original handler waiting across a transient disconnect. */
+  private async ackClarification(order: Order): Promise<void> {
+    const params = { orderId: order.orderId, threadId: order.threadId };
+    const until = order.createdAt + (order.deadlineMs ?? 300_000);
+    for (;;) {
+      const peer = this.peer;
+      if (peer && this.connected) {
+        try {
+          await peer.request(Methods.orderAck, params);
+          return;
+        } catch (err) {
+          if (!peer.isClosed && this.peer === peer) throw err;
+        }
+      }
+      const remaining = until - Date.now();
+      if (!this.opts.reconnect || this.closedByUser || remaining <= 0) throw new Error("could not confirm receipt of the clarification answer");
+      if (this.peer && this.peer !== peer && this.connected) continue;
+      await new Promise<void>((resolve, reject) => {
+        const off = this.onConnect(() => {
+          clearTimeout(timeout);
+          off();
+          resolve();
+        });
+        const timeout = setTimeout(() => {
+          off();
+          reject(new Error("clarification answer acknowledgment timed out"));
+        }, remaining);
+        // An outstanding network acknowledgment should not keep a closed CLI process alive.
+        if (typeof timeout === "object") timeout.unref?.();
+      });
+    }
   }
 
   private async req(method: string, params: unknown): Promise<void> {
@@ -444,6 +492,10 @@ export class CafeClient {
       if (!reachedParent) this.warnIgnored("escalate", "the question became a normal routed ask instead of a sub-Thread to the parent");
     }
     return res;
+  }
+
+  async report(params: { threadId: string; orderId: string; text: string }): Promise<void> {
+    await this.req("order/report", params);
   }
 
   async resumeOrderResults(threadId: string, orderId: string): Promise<ThreadEnvelope[]> {

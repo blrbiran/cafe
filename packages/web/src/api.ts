@@ -88,11 +88,24 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+function orderOwnerKey(): string | undefined {
+  try {
+    const storageKey = "cafe-order-owner";
+    const saved = localStorage.getItem(storageKey);
+    if (saved && /^[0-9a-f]{64}$/.test(saved)) return saved;
+    const key = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+    localStorage.setItem(storageKey, key);
+    return key;
+  } catch {
+    return undefined;
+  }
+}
+
+async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, ownerKey?: string): Promise<T> {
   const res = await fetch(path, {
     method,
     signal,
-    headers: { ...authHeaders(token), ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    headers: { ...authHeaders(token), ...(body === undefined ? {} : { "content-type": "application/json" }), ...(ownerKey ? { "x-cafe-order-owner": ownerKey } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -189,10 +202,15 @@ export const api = {
     return call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}${q ? `?${q}` : ""}`);
   },
   /** Clarification/assignment sub-Threads of one Thread (v4-13, #112). */
-  children: (parentThreadId: string) => call<ThreadMeta[]>("GET", `/api/threads?parent=${encodeURIComponent(parentThreadId)}&limit=200`),
+  children: async (parentThreadId: string) => {
+    const result = await call<ThreadMeta[] | { children: ThreadMeta[]; partial: boolean }>("GET", `/api/threads?parent=${encodeURIComponent(parentThreadId)}&limit=200&view=1`);
+    return Array.isArray(result) ? { children: result, partial: false } : result;
+  },
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
   createOrder: (p: { body: string; to?: string; broadcast?: boolean; kind?: "order" | "notice"; threadId?: string; channel?: string; attachments?: Attachment[] }) =>
-    call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),
+    call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }, undefined, orderOwnerKey()),
+  answerClarification: (parent: string, child: string, clarificationOrderId: string, text: string) =>
+    call<{ orderId: string }>("POST", `/api/threads/${encodeURIComponent(parent)}/clarifications/${encodeURIComponent(child)}/answer`, { clarificationOrderId, text }, undefined, orderOwnerKey()),
   cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),
   agentStats: (since: number) => call<Record<string, AgentStats>>("GET", `/api/agents/stats?since=${since}`),

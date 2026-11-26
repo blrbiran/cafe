@@ -773,8 +773,9 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const parent = url.searchParams.get("parent");
     // v4-13 (#112): the clarification/assignment sub-Threads of one Thread.
     if (parent) {
-      const rows = daemon.store.listThreadsByParent(parent, limit).filter((r) => (!status || r.status === status) && (!channel || (r.channel ?? "default") === channel));
-      return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
+      const view = await daemon.childView(parent, limit);
+      const children = view.children.filter((r) => (!status || r.status === status) && (!channel || (r.channel ?? "default") === channel));
+      return send(res, 200, url.searchParams.get("view") === "1" ? { children, partial: view.partial } : children);
     }
     const rows = channel ? daemon.store.listThreadsIn(channel, limit, status, before) : daemon.store.listThreads(limit, status, before);
     return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
@@ -815,13 +816,25 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const rawLimit = url.searchParams.get("limit");
     const limit = rawLimit === null ? undefined : parseLimit(rawLimit, 200);
     const before = url.searchParams.get("before") ?? undefined;
-    const t = daemon.thread(match[1]!, { ...(limit !== undefined ? { limit } : {}), ...(before ? { before } : {}) });
-    return t ? send(res, 200, t) : send(res, 404, { error: "not_found" });
+    const t = await daemon.linkedThreadDetail(match[1]!, { ...(limit !== undefined ? { limit } : {}), ...(before ? { before } : {}) });
+    if (!t) return send(res, 404, { error: "not_found" });
+    if (before || !t.meta.from.id?.startsWith("cli:") || t.meta.parentThreadId) return send(res, 200, t);
+    const view = await daemon.childView(t.meta.threadId, 200);
+    const pendingChildren = view.children.filter((child) => child.parentOrderId === t.meta.orderId &&
+      (child.clarification ? child.turns === 1 || !child.closedAt : !child.closedAt)).length;
+    return send(res, 200, { ...t, meta: { ...t.meta, pendingChildren, childrenPartial: view.partial } });
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
   if (m === "POST" && path === "/api/orders") {
     const p = CreateOrderParams.parse(await readJson(req));
-    return send(res, 200, await daemon.createOrder(p));
+    const ownerKey = req.headers["x-cafe-order-owner"];
+    return send(res, 200, await daemon.createOrder(p, undefined, typeof ownerKey === "string" ? ownerKey : undefined));
+  }
+  if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/clarifications\/([^/]+)\/answer$/.exec(path))) {
+    const input = await readJson(req);
+    const ownerKey = req.headers["x-cafe-order-owner"];
+    await daemon.catchUpClarification(match[1]!, match[2]!);
+    return send(res, 200, daemon.answerClarification(match[1]!, match[2]!, input, typeof ownerKey === "string" ? ownerKey : undefined));
   }
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/cancel$/.exec(path))) {
     return send(res, 200, daemon.cancel(match[1]!, "cli"));

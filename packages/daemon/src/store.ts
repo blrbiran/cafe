@@ -393,6 +393,14 @@ export class Store {
 
 
 
+  /** Published clarifications whose metadata has not yet recorded an answer. */
+  unansweredClarifications(): ThreadMeta[] {
+    const rows = this.db.prepare(`SELECT meta FROM threads
+      WHERE json_extract(meta, '$.clarification.orderId') IS NOT NULL
+      AND json_extract(meta, '$.turns') = 1`).all() as { meta: string }[];
+    return rows.map((r) => threadMeta(r.meta));
+  }
+
   /** Unfinished threads (recovery after a restart). Finished ones are never read back. */
   openThreads(limit = 1000): ThreadMeta[] {
     const rows = this.db.prepare("SELECT meta FROM threads WHERE status NOT IN ('done','failed','cancelled') ORDER BY created_at DESC LIMIT ?").all(limit) as { meta: string }[];

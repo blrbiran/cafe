@@ -65,6 +65,51 @@ describe("team setup guidance", () => {
 });
 
 describe("thread child results", () => {
+  it("shows pending child work in ask output when the front door replies early", async () => {
+    const d = await startDaemon("ask-pending", { mode: "root" });
+    cleanup.push(d.stop);
+    let release!: () => void;
+    const finished = new Promise<void>((resolve) => { release = resolve; });
+    cleanup.push(release);
+    const worker = await barista(d.addr, identity("worker"), async (h) => {
+      await h.ack();
+      await finished;
+      await h.reply("checks passed");
+    });
+    cleanup.push(() => worker.client.close());
+    const lead = await barista(d.addr, identity("lead"), async (h) => {
+      const task = await lead.client.ask({ body: "test parser", to: "worker", parentThreadId: h.order.threadId, parentOrderId: h.order.orderId });
+      await waitFor(() => d.daemon.thread(task.threadId)?.meta.status === "working");
+      await h.reply("assigned");
+    });
+    cleanup.push(() => lead.client.close());
+    const result = await cafeAsync(d.home, d.addr, "--json", "ask", "--to", "lead", "verify release");
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ status: "working", orderStatus: "done", pending: [{ summary: "test parser" }] });
+  });
+  it("answers an owner-bound clarification from the issuing CLI home", async () => {
+    const d = await startDaemon("cli-clarification", { mode: "root" });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("tester"), async (h) => {
+      await h.ack();
+      if (h.order.turn === 1) {
+        await worker.client.ask({ body: "Cover old syntax too?", escalate: true, parentOrderId: h.order.orderId, parentThreadId: h.order.threadId });
+        await h.reply("waiting for confirmation");
+      } else await h.reply(`confirmed: ${h.order.body}`);
+    });
+    cleanup.push(() => worker.client.close());
+    const cliHome = join(home(), "new-client");
+    const ask = await cafeAsync(cliHome, d.addr, "--json", "ask", "--to", "tester", "verify parsing");
+    expect(ask.status, ask.stderr).toBe(0);
+    const { threadId, pending } = JSON.parse(ask.stdout);
+    expect(pending[0]?.clarification?.question).toBe("Cover old syntax too?");
+    const child = pending[0].threadId as string;
+    const answer = await cafeAsync(cliHome, d.addr, "answer", threadId, child, "yes");
+    expect(answer.status, answer.stderr).toBe(0);
+    expect(answer.stdout).toContain("Answer accepted");
+    await waitFor(() => d.daemon.thread(child)?.meta.replies[0]?.text === "confirmed: yes");
+  });
+
   it("ignores unrelated Threads from daemons without a parent filter", async () => {
     const http = await import("node:http");
     const server = http.createServer((req, res) => {
