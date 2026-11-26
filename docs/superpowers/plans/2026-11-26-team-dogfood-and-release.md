@@ -55,7 +55,7 @@
 - Exercise Root → child roster propagation using real daemon links and deterministic in-process Baristas.
 
 - [x] Add a Root plus team-host child scenario. Publish the authoritative roster from the child, then update it and connect a remote Customer through the Root.
-- [x] Assert the Root converges on the child's new roster revision and the child member receives exactly one `team/roster` update.
+- [x] Assert the Root converges on the child's new roster revision and the child member receives exactly one `team/roster` update; republishing identical content leaves the revision and update count unchanged.
 - [x] Assert the remote Customer's `to: <team>` Order is routed through the Root to the child orchestrator; the roster note creates no Order/Thread event and starts no extra turn.
 - [x] Run the new test alone, then run `node_modules/.bin/vitest run tests/team-sessions.test.ts tests/team-roster.test.ts` (15 passed).
 
@@ -79,7 +79,7 @@
 - [x] Start isolated Root/child Daemons with non-default ports and plaintext scratch configs; do not connect synthetic agents to the user's real `~/.cafe` (scratch Root plus Root/child integration test).
 - [x] Run the scenario table in `docs/specs/v4-14-team-dogfood.md` with deterministic Baristas; capture targets, turn counts, response timing, and roster/digest observations (front-door, assignment, broadcast/collect-all run in scratch; follow-up and roster paths covered by integration tests).
 - [x] Start the Web UI against the scratch scenario and inspect the Feed channel, team front-door target, parent/child navigation, per-target status, and skipped wording in a real browser.
-- [x] Exercise Root-online and Root-offline digest handover with local Root/child daemons; no second physical Host was available, so physical-host validation remains a follow-up.
+- [x] Exercise Root-online and Root-offline digest handover with local Root/child daemons; assert no duplicate digests while Root is quiet and that the child takeover digest excludes pre-takeover Threads. No second physical Host was available, so physical-host validation remains a follow-up.
 - [x] Stop the scratch daemon after browser inspection; the in-process Baristas exited after seeding.
 
 ### Task 5: Local install, daemon restart, and handoff

@@ -111,7 +111,7 @@ describe("observer digests and channel history (v4-11)", () => {
     expect(digests[0]!.partial).toBe(true);
   });
 
-  it("publishes from the Root while online and hands over to the child when it goes offline (#109)", async () => {
+  it("publishes once from the Root while online and excludes pre-takeover activity from the child digest (#109)", async () => {
     const root = await startDaemon("obR", { mode: "root", timing: { ...FAST, graceMs: 60, digestIntervalMs: 120 } });
     const child = await startDaemon("obC", { config: { root: root.addr }, timing: { ...FAST, graceMs: 60, digestIntervalMs: 120 } });
     cleanup.push(child.stop);
@@ -124,21 +124,36 @@ describe("observer digests and channel history (v4-11)", () => {
     cleanup.push(() => watch.client.close());
     const worker = await barista(child.addr, identity("worker", { channels: ["team"] }));
     cleanup.push(() => worker.client.close());
-    const c = await customer(root.addr);
-    cleanup.push(() => c.close());
+    const throughRoot = await customer(root.addr);
+    cleanup.push(() => throughRoot.close());
 
-    // The Thread lives on the Root; the observer is registered on the child. Only the Root has the
-    // complete view, so the Root publishes it (no `partial`) and the child stays quiet.
-    await c.ask({ body: "root view", to: "worker", channel: "team" });
-    await waitFor(() => digests.some((x) => x.partial !== true), 5000);
-    expect(digests.filter((x) => x.partial !== true).every((x) => String(x.digestId).startsWith("obR:"))).toBe(true);
-    const beforeStop = digests.length;
+    // The Root publishes the complete view for an observer on a child; the child stays quiet.
+    const rootOrder = await throughRoot.ask({ body: "root view", to: "worker", channel: "team" });
+    await waitFor(() => digests.some((x) => x.partial !== true && x.threads.some((t) => t.threadId === rootOrder.threadId)), 5000);
+    const beforeTakeoverCustomer = await customer(child.addr);
+    cleanup.push(() => beforeTakeoverCustomer.close());
+    const beforeTakeoverOrder = await beforeTakeoverCustomer.ask({ body: "child activity before takeover", to: "worker", channel: "team" });
+    await waitFor(() => digests.some((x) => x.partial !== true && x.threads.some((t) => t.threadId === beforeTakeoverOrder.threadId)), 5000);
+
+    const full = digests.filter((x) => x.partial !== true);
+    expect(full.every((x) => String(x.digestId).startsWith("obR:"))).toBe(true);
+    expect(full.some((x) => x.threads.some((t) => t.threadId === rootOrder.threadId))).toBe(true);
+    expect(full.some((x) => x.threads.some((t) => t.threadId === beforeTakeoverOrder.threadId))).toBe(true);
+    expect(digests.some((x) => x.partial === true)).toBe(false);
+    const fullCount = full.length;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(digests.filter((x) => x.partial !== true)).toHaveLength(fullCount);
 
     await root.stop();
     await waitFor(() => !child.daemon.rootOnline, 8000);
-    const local = await customer(child.addr);
-    cleanup.push(() => local.close());
-    await local.ask({ body: "child view", channel: "team" });
-    await waitFor(() => digests.length > beforeStop && digests.some((x) => x.partial === true && String(x.digestId).startsWith("obC:")), 8000);
+    const afterTakeoverCustomer = await customer(child.addr);
+    cleanup.push(() => afterTakeoverCustomer.close());
+    const afterTakeoverOrder = await afterTakeoverCustomer.ask({ body: "child view after takeover", to: "worker", channel: "team" });
+    await waitFor(() => digests.some((x) => x.partial === true && String(x.digestId).startsWith("obC:") && x.threads.some((t) => t.threadId === afterTakeoverOrder.threadId)), 8000);
+    const takeover = digests.find((x) => x.partial === true && x.threads.some((t) => t.threadId === afterTakeoverOrder.threadId))!;
+    const takeoverThreadIds = takeover.threads.map((t) => t.threadId);
+    expect(takeoverThreadIds).toContain(afterTakeoverOrder.threadId);
+    expect(takeoverThreadIds).not.toContain(beforeTakeoverOrder.threadId);
+    expect(takeoverThreadIds).not.toContain(rootOrder.threadId);
   }, 30_000);
 });

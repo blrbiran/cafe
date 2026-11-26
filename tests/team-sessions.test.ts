@@ -249,6 +249,12 @@ describe("team sessions (v4-13)", () => {
     expect(updates[0]).toMatchObject({ team: "shop", channel: "shop", revision: synced.revision, change: { added: ["dev2"] } });
     expect(orch.client.recentEvents()).toHaveLength(eventsBefore);
 
+    // Re-publishing identical content leaves the revision and roster-note count unchanged.
+    child.daemon.publishRoster("/tmp/shop", expanded);
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(root.daemon.teams().find((t) => t.host === child.daemon.host && t.team === "shop")?.revision).toBe(synced.revision);
+    expect(updates).toHaveLength(1);
+
     const remote = await customer(root.addr);
     cleanup.push(() => remote.close());
     const order = await remote.ask({ body: "route through the Root", to: "shop" });
