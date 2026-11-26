@@ -50,6 +50,43 @@ function cafeAsync(h: string, addr: string, ...args: string[]): Promise<{ status
   });
 }
 
+describe("thread show skipped targets (#111)", () => {
+  it.each([
+    ["deadline", "did not respond before the deadline"],
+    ["skipped: another Barista answered first", "was skipped: another Barista answered first"],
+  ])("formats skipped reason %s without calling it a decline", async (reason, expected) => {
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/api/threads/t1") {
+        return res.end(JSON.stringify({
+          meta: {
+            threadId: "t1", orderId: "o1", kind: "order", from: { address: "asker" }, targets: ["a1"],
+            targetStates: [{ agentId: "a1", state: "skipped" }], status: "done", summary: "task",
+            summaryTurn: 1, createdAt: 1, turns: 1, channel: "default",
+          },
+          events: [{
+            eventId: "e1", threadId: "t1", orderId: "o1", host: "stub", at: 2,
+            event: { type: "order.declined", agentId: "a1", reason, unavailable: true, skipped: true },
+          }],
+        }));
+      }
+      if (req.url === "/api/agents") return res.end("[]");
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not_found", message: "missing" }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const r = await cafeAsync(home(), addr, "thread", "t1");
+
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain(expected);
+    expect(r.stdout).not.toContain("declined:");
+  });
+});
+
 describe("daemon API errors", () => {
   it("does not repeat an error code already present in the message", () => {
     expect(formatApiError({ error: "EISDIR", message: "EISDIR: illegal operation on a directory, read" }, 500)).toBe("EISDIR: illegal operation on a directory, read");

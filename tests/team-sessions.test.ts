@@ -215,4 +215,45 @@ describe("team sessions (v4-13)", () => {
     const all = await c.ask({ body: "everyone", threadId: first.threadId, broadcast: true });
     expect(new Set(all.decision.targets)).toEqual(new Set([orch.rec.agentId, dev1.rec.agentId, dev2.rec.agentId]));
   });
+
+  it("propagates a child-owned roster to Root and routes a remote request to its orchestrator", async () => {
+    const root = await startDaemon("ts11-root", { mode: "root", timing: { ...FAST, graceMs: 60 } });
+    cleanup.push(root.stop);
+    const child = await startDaemon("ts11-child", { config: { root: root.addr }, timing: { ...FAST, graceMs: 60 } });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline, 5000);
+
+    const initial = team("shop", [{ name: "orch", duty: "orchestrator" }, { name: "dev1", duty: "developer" }]);
+    child.daemon.publishRoster("/tmp/shop", initial);
+    const orch = await connect(child.addr, "orch", "orchestrator", "shop");
+    await waitFor(() => child.daemon.registry.get(orch.rec.agentId) !== undefined, 5000);
+    await waitFor(() => root.daemon.teams().some((t) => t.host === child.daemon.host && t.team === "shop" && t.total === 2), 5000);
+    const initialRevision = root.daemon.teams().find((t) => t.host === child.daemon.host && t.team === "shop")!.revision ?? 0;
+    expect(initialRevision).toBeGreaterThan(0);
+
+    const updates: Array<{ team: string; channel: string; revision: number; change: { added: string[] } }> = [];
+    orch.client.onRoster((u) => updates.push(u as unknown as (typeof updates)[number]));
+    const eventsBefore = orch.client.recentEvents().length;
+    const expanded = team("shop", [
+      { name: "orch", duty: "orchestrator" },
+      { name: "dev1", duty: "developer" },
+      { name: "dev2", duty: "tester" },
+    ]);
+    child.daemon.publishRoster("/tmp/shop", expanded);
+
+    await waitFor(() => updates.length > 0, 5000);
+    await waitFor(() => root.daemon.teams().some((t) => t.host === child.daemon.host && t.team === "shop" && t.total === 3), 5000);
+    const synced = root.daemon.teams().find((t) => t.host === child.daemon.host && t.team === "shop")!;
+    expect(synced.revision).toBeGreaterThan(initialRevision);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toMatchObject({ team: "shop", channel: "shop", revision: synced.revision, change: { added: ["dev2"] } });
+    expect(orch.client.recentEvents()).toHaveLength(eventsBefore);
+
+    const remote = await customer(root.addr);
+    cleanup.push(() => remote.close());
+    const order = await remote.ask({ body: "route through the Root", to: "shop" });
+    expect(order.decision).toMatchObject({ mode: "unicast", targets: [orch.rec.agentId] });
+    await untilClosed(remote, order.threadId, order.orderId);
+    expect(updates).toHaveLength(1);
+  });
 });

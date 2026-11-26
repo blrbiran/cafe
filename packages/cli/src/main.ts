@@ -346,7 +346,10 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
     case "order.replied":
       return `\n## ${who(e.agentId)}${e.final ? "" : " (interim)"}\n${e.text}\n`;
     case "order.declined":
-      return `✗ ${who(e.agentId)} declined: ${e.reason}`;
+      if (!e.skipped) return `✗ ${who(e.agentId)} declined: ${e.reason}`;
+      return e.reason === "deadline"
+        ? `… ${who(e.agentId)} did not respond before the deadline`
+        : `… ${who(e.agentId)} was skipped: ${e.reason.replace(/^skipped:\s*/, "")}`;
     case "order.failed":
       return `! ${e.agentId ? who(e.agentId) : "order"} failed: ${e.reason}`;
     case "order.cancelled":
