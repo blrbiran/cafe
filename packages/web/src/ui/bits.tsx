@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
 import type { AgentRecord } from "@cafe/protocol";
 import { useT } from "../i18n.ts";
+import type { Tone } from "./tone.ts";
+export type { Tone } from "./tone.ts";
 
-export type Tone = "info" | "ok" | "warn" | "danger" | undefined;
 
 export function Dot({ tone }: { tone?: Tone }) {
   return <span className="dot" data-dot={tone} aria-hidden="true" />;

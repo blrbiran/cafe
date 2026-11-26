@@ -237,8 +237,10 @@ export const AgentRecord = AgentIdentity.extend({
   aliases: z.array(z.string()).default([]),
   /** Names kept for routing only (automatic on rename); never used as the display label. */
   legacyAliases: z.array(z.string()).default([]),
-  /** Thread this Agent is currently handling (v4-11); set by its own daemon, cleared on reply/decline. */
+  /** Thread this Agent is currently handling (v4-11); set by its own daemon. */
   activeThreadId: z.string().optional(),
+  /** Exact Order being handled; late events must not clear a newer Order in the same Thread. */
+  activeOrderId: z.string().optional(),
 });
 export type AgentRecord = z.infer<typeof AgentRecord>;
 
@@ -339,6 +341,8 @@ export const Order = z.object({
   parentThreadId: z.string().optional(),
   /** Short excerpt of the parent task, derived by the sending daemon for a known participant. */
   parentContext: z.string().max(640).optional(),
+  /** The issuing daemon verified the original human parent's owner credential for this link. */
+  parentOwnerVerified: z.literal(true).optional(),
   /** The issuing daemon has a private ownership credential for this human Order. */
   humanClarifications: z.literal(true).optional(),
   /** The first turn publishes a question for the owner of its human parent. */
@@ -433,7 +437,7 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.delivered"), agentId: z.string(), protectedIdentity: z.literal(true).optional() }),
   z.object({ type: z.literal("order.acked"), agentId: z.string() }),
   z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), note: z.string().optional() }),
-  z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), attachments: z.array(Attachment).optional() }),
+  z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), source: z.enum(["agent", "operator"]).optional(), attachments: z.array(Attachment).optional() }),
   /** A result added by an original recipient after the human Order closed. */
   z.object({ type: z.literal("order.reported"), agentId: z.string(), text: z.string() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
@@ -456,6 +460,9 @@ export const ThreadEnvelope = z.object({
 });
 export type ThreadEnvelope = z.infer<typeof ThreadEnvelope>;
 
+export const TaskStatus = z.enum(["working", "awaiting_report", "done", "failed", "cancelled", "unknown"]);
+export type TaskStatus = z.infer<typeof TaskStatus>;
+
 export const ThreadMeta = z.object({
   threadId: z.string(),
   orderId: z.string(),
@@ -465,6 +472,8 @@ export const ThreadMeta = z.object({
   /** Set when this Thread is a clarification/escalation of another Thread (v4-11). */
   parentThreadId: z.string().optional(),
   parentOrderId: z.string().optional(),
+  /** Set only after the parent Human Order owner credential was verified. */
+  parentOwnerVerified: z.literal(true).optional(),
   clarification: z.object({ orderId: z.string(), question: z.string(), acknowledged: z.boolean().optional() }).optional(),
   from: Party,
   /** Provenance of the first question; absent on older Threads. */
@@ -491,17 +500,35 @@ export const ThreadMeta = z.object({
   router: z.enum(["explicit", "followup", "llm", "rules"]).optional(),
   lastActivityAt: z.number().optional(),
   /** Final replies of the latest Order (text truncated), for list views. */
-  replies: z.array(z.object({ agentId: z.string(), address: z.string().optional(), text: z.string(), at: z.number() })).default([]),
+  replies: z.array(z.object({ agentId: z.string(), address: z.string().optional(), text: z.string(), at: z.number(), source: z.enum(["agent", "operator"]).optional() })).default([]),
   /** Declines of the latest Order. */
   declines: z.array(z.object({ agentId: z.string(), address: z.string().optional(), reason: z.string(), at: z.number() })).default([]),
   /** Derived in Thread detail: visible child Orders of this turn that still need work. */
   pendingChildren: z.number().int().nonnegative().optional(),
+  /** Latest parent Order with a persisted result report; used to project task state. */
+  reportedOrderId: z.string().optional(),
+  /** Derived task lifecycle, kept separate from this Thread's Order status. */
+  taskStatus: TaskStatus.optional(),
   /** True when the parent projection could not query all relevant Hosts. */
   childrenPartial: z.boolean().optional(),
   /** Per-target state of the latest Order (v4-11); absent on old rows. */
   targetStates: z.array(z.object({ agentId: z.string(), state: z.enum(["pending", "acked", "replied", "declined", "failed", "skipped"]) })).optional(),
 });
 export type ThreadMeta = z.infer<typeof ThreadMeta>;
+
+/** Derive whole-task status from one parent Order and its authenticated linked children. */
+export function projectTaskStatus(parent: ThreadMeta, children: ThreadMeta[], partial = false): TaskStatus | undefined {
+  const linked = children.filter((child) => child.parentThreadId === parent.threadId && child.parentOrderId === parent.orderId && !child.clarification);
+  if (!linked.length) return undefined;
+  if (linked.some((child) => child.status === "routing" || child.status === "delivering" || child.status === "working")) return "working";
+  if (partial) return "unknown";
+  if (parent.status === "failed" || parent.status === "cancelled") return parent.status;
+  if (parent.status !== "done") return "working";
+  if (parent.reportedOrderId === parent.orderId) return "done";
+  const humanParent = parent.origin !== "agent" && parent.from.id.startsWith("cli:");
+  const agentCreatedWork = linked.some((child) => child.origin === "agent" || !child.from.id.startsWith("cli:"));
+  return humanParent && agentCreatedWork ? "awaiting_report" : "done";
+}
 
 /** A channel digest for an observer (v4-11): one summary, not an Order. */
 export const ChannelDigest = z.object({
@@ -580,7 +607,7 @@ export const CreateOrderParams = z.object({
   escalate: z.boolean().optional(),
   /** Follow-up: continue this Thread (default targets: Baristas that replied in it). */
   threadId: z.string().optional(),
-  deadlineMs: z.number().int().optional(),
+  deadlineMs: z.number().int().min(1).max(2_147_483_647).optional(),
   /** Customer identity for callers that are not registered Agents (CLI, web). */
   as: z.string().optional(),
   /** `agent` when an Agent relays the person's request; defaults to `human`. */
@@ -647,6 +674,8 @@ export const Methods = {
   orderCancel: "order/cancel",
   orderRelay: "order/relay",
   threadEvent: "thread/event",
+  /** Child → Root: batch task-state projection for one visible list page. */
+  threadTaskStatuses: "thread/task-statuses",
   registrySnapshot: "registry/snapshot",
   registryDelta: "registry/delta",
   registryUpsert: "registry/upsert",

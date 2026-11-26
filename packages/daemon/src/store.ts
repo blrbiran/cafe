@@ -40,9 +40,11 @@ export class Store {
         created_at INTEGER NOT NULL,
         status TEXT NOT NULL,
         channel TEXT,
+        parent_order_id TEXT,
         meta TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS threads_created ON threads(created_at DESC);
+      CREATE INDEX IF NOT EXISTS threads_status_created_id ON threads(status, created_at, thread_id);
       CREATE TABLE IF NOT EXISTS registry (
         agent_id TEXT PRIMARY KEY,
         record TEXT NOT NULL
@@ -104,9 +106,14 @@ export class Store {
       this.db.exec("ALTER TABLE threads ADD COLUMN parent_thread_id TEXT");
       this.db.exec("UPDATE threads SET parent_thread_id = json_extract(meta, '$.parentThreadId')");
     }
+    if (!threadCols.has("parent_order_id")) {
+      this.db.exec("ALTER TABLE threads ADD COLUMN parent_order_id TEXT");
+      this.db.exec("UPDATE threads SET parent_order_id = json_extract(meta, '$.parentOrderId')");
+    }
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_created ON threads(channel, created_at DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_activity ON threads(channel, last_activity DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_parent ON threads(parent_thread_id, created_at DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS threads_parent_order ON threads(parent_thread_id, parent_order_id, created_at DESC)");
     this.upsertIndexRows = this.prepareIndexRows();
   }
 
@@ -407,12 +414,24 @@ export class Store {
     return rows.map((r) => threadMeta(r.meta));
   }
 
+  /** Unfinished threads, in stable creation/id order for keyset recovery pages. */
+  openThreadsPage(limit: number, after?: { createdAt: number; threadId: string }): ThreadMeta[] {
+    const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 1000;
+    if (n === 0) return [];
+    const openStatuses = ["routing", "delivering", "working"];
+    const statusParams = openStatuses.map(() => "?").join(", ");
+    const rows = (after
+      ? this.db.prepare(`SELECT meta FROM threads WHERE status IN (${statusParams}) AND (created_at > ? OR (created_at = ? AND thread_id > ?)) ORDER BY created_at ASC, thread_id ASC LIMIT ?`).all(...openStatuses, after.createdAt, after.createdAt, after.threadId, n)
+      : this.db.prepare(`SELECT meta FROM threads WHERE status IN (${statusParams}) ORDER BY created_at ASC, thread_id ASC LIMIT ?`).all(...openStatuses, n)) as { meta: string }[];
+    return rows.map((r) => threadMeta(r.meta));
+  }
+
   /** Upsert one Thread's metadata; returns the serialized bytes (for /api/health counters). */
   putThread(meta: ThreadMeta): number {
     const json = JSON.stringify(meta);
     this.db
-      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, last_activity, parent_thread_id, meta) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, last_activity=excluded.last_activity, parent_thread_id=excluded.parent_thread_id, meta=excluded.meta")
-      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", meta.lastActivityAt ?? meta.createdAt, meta.parentThreadId ?? null, json);
+      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, last_activity, parent_thread_id, parent_order_id, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, last_activity=excluded.last_activity, parent_thread_id=excluded.parent_thread_id, parent_order_id=excluded.parent_order_id, meta=excluded.meta")
+      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", meta.lastActivityAt ?? meta.createdAt, meta.parentThreadId ?? null, meta.parentOrderId ?? null, json);
     return Buffer.byteLength(json);
   }
 
@@ -441,6 +460,13 @@ export class Store {
   listThreadsByParent(parentThreadId: string, limit = 200): ThreadMeta[] {
     const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 200;
     const rows = this.db.prepare("SELECT meta FROM threads WHERE parent_thread_id = ? ORDER BY created_at DESC LIMIT ?").all(parentThreadId, n) as { meta: string }[];
+    return rows.map((r) => threadMeta(r.meta));
+  }
+
+  /** Children of one exact parent Order, newest first; limit+1 lets callers detect truncation. */
+  listThreadsByParentOrder(parentThreadId: string, parentOrderId: string, limit = 10_001): ThreadMeta[] {
+    const n = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 10_001) : 10_001;
+    const rows = this.db.prepare("SELECT meta FROM threads WHERE parent_thread_id = ? AND parent_order_id = ? ORDER BY created_at DESC LIMIT ?").all(parentThreadId, parentOrderId, n) as { meta: string }[];
     return rows.map((r) => threadMeta(r.meta));
   }
 

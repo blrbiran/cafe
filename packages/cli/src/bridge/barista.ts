@@ -145,8 +145,8 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
   }
   const rec = await client.connect(
     opts.tui
-      ? { ...identity, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }
-      : { ...identity, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid },
+      ? { ...identity, concurrency: 1, mode: "tui", agent: opts.agent, cwd: dir, pid: process.pid }
+      : { ...identity, concurrency: 1, mode: "headless", agent: opts.agent, access: access === "read-only" ? "read-only" : "write", cwd: dir, pid: process.pid },
   );
   // Name the session, not only "the running Codex session": with several open, the person must be
   // able to check which one was attached (#100).

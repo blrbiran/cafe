@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import { CafeClient, keepAlive } from "@cafe/protocol/client";
+import type { Order, ThreadMeta } from "@cafe/protocol";
+import { Store } from "../packages/daemon/src/store.ts";
 import { runDaemon } from "@cafe/daemon";
 import { barista, customer, FAST, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
@@ -185,5 +187,49 @@ describe("restart & reconnect", () => {
     d = await runDaemon(opts);
     cleanup.push(() => d.stop());
     await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "failed", 5000);
+  });
+
+  it("recovers an open Order older than the first 1,000 Threads", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-recover-many-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    writeFileSync(join(home, "config.yml"), stringify({ host: "solo", token: "t", port: 0, mode: "root", advertise: "127.0.0.1", security: { mode: "plaintext" } }));
+    const d = await runDaemon({ home, timing: { ...FAST, ackTimeoutMs: 60_000, heartbeatIntervalMs: 10_000, unicastDeadlineMs: 120_000 }, log: () => {}, noLock: true, noSupervisor: true, webDist: join(home, "none") });
+    cleanup.push(() => d.stop());
+    const b = new CafeClient({ daemon: `127.0.0.1:${d.server.port}` });
+    const registered = await b.connect(identity("worker"));
+    cleanup.push(() => b.close());
+
+    const store = d.daemon.store;
+    const from = { id: "cli:seed", address: "cli@solo", host: "solo" };
+    const baseAt = Date.now() - 2000;
+    for (let i = 0; i < 1005; i++) {
+      const suffix = String(i).padStart(4, "0");
+      const threadId = `thread-${suffix}`;
+      const orderId = `order-${suffix}`;
+      const createdAt = baseAt + i;
+      const file = store.threadFile(threadId, createdAt);
+      const order: Order = {
+        orderId, threadId, kind: "order", channel: "default", from,
+        body: `recover ${suffix}`, chain: [], depth: 0, createdAt, turn: 1, history: [],
+      };
+      const meta: ThreadMeta = {
+        threadId, orderId, kind: "order", channel: "default", from,
+        targets: [registered!.agentId], mode: "unicast", status: "working", summary: order.body,
+        summaryTurn: 1, createdAt, file, turns: 1, replies: [], declines: [],
+        targetStates: [{ agentId: registered!.agentId, state: "pending" }],
+      };
+      store.putThread(meta);
+      store.appendEvent(file, { eventId: `created-${suffix}`, threadId, orderId, host: "solo", at: createdAt, event: { type: "order.created", order } });
+      store.appendEvent(file, {
+        eventId: `routed-${suffix}`, threadId, orderId, host: "solo", at: createdAt + 1,
+        event: { type: "order.routed", decision: { targets: [registered!.agentId], mode: "unicast", reason: "explicit", router: "explicit", candidates: [] } },
+      });
+    }
+
+    expect(d.daemon.recover()).toBe(1005);
+    d.daemon.replyAs("thread-0000", { orderId: "order-0000", agent: registered!.address, text: "recovered oldest Order" });
+    const result = d.daemon.thread("thread-0000")!;
+    expect(result.meta.status).toBe("done");
+    expect(result.events.find((env) => env.event.type === "order.replied")?.orderId).toBe("order-0000");
   });
 });

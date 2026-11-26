@@ -16,7 +16,7 @@ afterEach(async () => {
   while (cleanup.length) await cleanup.pop()!();
 });
 
-async function setup(agent: AgentKind, access?: Access) {
+async function setup(agent: AgentKind, access?: Access, concurrency = 1) {
   const root = await startDaemon("root", { mode: "root" });
   cleanup.push(root.stop);
   const tmp = mkdtempSync(join(tmpdir(), `cafe-bridge-${agent}-`));
@@ -25,7 +25,7 @@ async function setup(agent: AgentKind, access?: Access) {
   const state = join(tmp, "state");
   mkdirSync(dir);
   mkdirSync(state);
-  writeFileSync(join(dir, ".cafe"), "name: coder\ndescription: answers questions about the code\n");
+  writeFileSync(join(dir, ".cafe"), `name: coder\ndescription: answers questions about the code\nconcurrency: ${concurrency}\n`);
   const logFile = join(tmp, "agent.log");
   const KEY = agent === "codex" ? "FAKE_CODEX" : "FAKE_CLAUDE";
   process.env[`${KEY}_STATE`] = state;
@@ -55,6 +55,11 @@ async function setup(agent: AgentKind, access?: Access) {
 const replyOf = (events: { event: { type: string } }[]) => (events.find((e) => e.event.type === "order.replied")?.event as { text: string } | undefined)?.text;
 
 describe.each(["codex", "claude"] as const)("native %s barista", (agent) => {
+  it("registers one serial slot when .cafe requests greater concurrency", async () => {
+    const { root } = await setup(agent, undefined, 3);
+    expect(root.daemon.registry.all().find((record) => record.name === "coder")).toMatchObject({ concurrency: 1 });
+  });
+
   it("answers, continues the same session for a follow-up, and is read-only by default", async () => {
     const { ask, logged, root } = await setup(agent);
     // The Registry says which agent runs it and that it is read-only (shown on the Agents page).

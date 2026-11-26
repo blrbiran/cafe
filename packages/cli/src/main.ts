@@ -356,8 +356,10 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
       return `→ routed (${e.decision.router}, ${e.decision.mode}) to ${e.decision.targets.map(who).join(", ") || "nobody"}: ${e.decision.reason}`;
     case "order.acked":
       return `… ${who(e.agentId)} is working on it`;
-    case "order.replied":
-      return `\n## ${who(e.agentId)}${e.final ? "" : " (interim)"}\n${e.text}\n`;
+    case "order.replied": {
+      const speaker = e.source === "operator" ? `operator override for ${who(e.agentId)}` : who(e.agentId);
+      return `\n## ${speaker}${e.final ? "" : " (interim)"}\n${e.text}\n`;
+    }
     case "order.reported":
       return `\n## ${who(e.agentId)} (result report)\n${e.text}\n`;
     case "order.declined":
@@ -379,27 +381,35 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
 }
 
 /** Follow a Thread over SSE until it closes. Returns the final status. */
-async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string; timeoutMs?: number; warnings?: string[] } = {}): Promise<string> {
+async function follow(threadId: string, opts: { quiet?: boolean; orderId?: string; timeoutMs?: number; waitTimeoutMs?: number; warnings?: string[] } = {}): Promise<string> {
   const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
   // Abort the local stream on timeout or Ctrl-C. Cancelling the Order too is the caller's job: a
   // follow-up should not kill an answer that is just slow, but leaving `thread_busy` behind is worse (#60).
   const abort = new AbortController();
-  let reason: "timeout" | "intr" | undefined;
+  let reason: "timeout" | "wait_timeout" | "intr" | undefined;
   const onInt = () => {
     reason = "intr";
     abort.abort();
   };
   process.once("SIGINT", onInt);
-  const timer = opts.timeoutMs
+  const timeoutMs = opts.timeoutMs ?? opts.waitTimeoutMs;
+  const timeoutReason = opts.timeoutMs !== undefined ? "timeout" : "wait_timeout";
+  const timer = timeoutMs
     ? setTimeout(() => {
-        reason = "timeout";
+        reason = timeoutReason;
         abort.abort();
-      }, opts.timeoutMs)
+      }, timeoutMs)
     : undefined;
   try {
     return await followStream(threadId, opts, agents, abort.signal);
   } catch (err) {
     if (!reason) throw err;
+    if (reason === "wait_timeout") {
+      const waitedSeconds = ((opts.waitTimeoutMs ?? 0) / 1000).toFixed(1).replace(/\.0$/, "");
+      if (JSON_OUT) console.log(JSON.stringify({ threadId, status: "working", orderStatus: "open" }, null, 2));
+      else console.log(`stopped waiting after ${waitedSeconds}s; thread ${threadId} is still running — check \`cafe thread ${threadId}\``);
+      return "working";
+    }
     // The daemon already closed the Order on its own deadline, so this is often just the local
     // stream ending late; say what happened and never leave the person without the thread id. A
     // cancel that fails must be reported as such: claiming "cancelled" hides a question still open.
@@ -444,7 +454,7 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
       const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
       // Earlier turns are replayed; only report on the Order being followed.
       if (opts.orderId && env.orderId !== opts.orderId) continue;
-      if (env.event.type === "order.replied") replies.push({ from: agents.get(env.event.agentId)?.address ?? env.event.agentId, text: env.event.text, final: env.event.final });
+      if (env.event.type === "order.replied") replies.push({ from: agents.get(env.event.agentId)?.address ?? env.event.agentId, text: env.event.text, final: env.event.final, ...(env.event.source ? { source: env.event.source } : {}) });
       if (env.event.type === "order.closed") {
         status = env.event.status;
         closedOrder = env.orderId;
@@ -456,14 +466,25 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
     }
   }
   const selectedOrder = opts.orderId ?? closedOrder;
-  const children = status === "done" && selectedOrder
+  const closed = status === "done" || status === "failed" || status === "cancelled";
+  const children = closed && selectedOrder
     ? await api<ThreadMeta[]>(`/api/threads?parent=${encodeURIComponent(threadId)}`).catch(() => [])
     : [];
   const pending = children.filter((c) => c.parentThreadId === threadId && c.parentOrderId === selectedOrder &&
     ((c.clarification && c.turns === 1) || ["routing", "delivering", "working"].includes(c.status)));
-  if (JSON_OUT) console.log(JSON.stringify({ threadId, status: pending.length ? "working" : status, replies, ...(pending.length ? { orderStatus: status, pending } : {}), ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
+  const taskDetail = selectedOrder
+    ? await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`).catch(() => undefined)
+    : undefined;
+  // The detail can move to a newer turn while this stream was closing: only use the followed Order's projection.
+  const taskStatus = taskDetail && taskDetail.meta.orderId === selectedOrder ? taskDetail.meta.taskStatus : undefined;
+  const displayedStatus = taskStatus === "working" || taskStatus === "awaiting_report" || taskStatus === "unknown"
+    ? taskStatus
+    : pending.length ? "working" : status;
+  if (JSON_OUT) console.log(JSON.stringify({ threadId, status: displayedStatus, ...(displayedStatus !== status ? { orderStatus: status } : {}), replies, ...(pending.length ? { pending } : {}), ...(taskStatus ? { taskStatus } : {}), ...(opts.warnings?.length ? { warnings: opts.warnings } : {}) }, null, 2));
   else if (!opts.quiet) {
-    if (!pending.length && status !== "unknown") console.log(`— ${status}`);
+    if (taskStatus === "awaiting_report") console.log(`… delegated work finished; waiting for the front-door report`);
+    else if (taskStatus === "unknown") console.log(`? linked task status is unknown while a Host is unavailable`);
+    else if (!pending.length && status !== "unknown") console.log(`— ${status}`);
     for (const child of pending) {
       if (child.clarification && child.turns === 1) {
         console.log(`? ${child.from.address} needs your answer: ${child.clarification.question}\n  cafe answer ${threadId} ${child.threadId} '<answer>'`);
@@ -842,11 +863,16 @@ program
   .option("--notice", "send a Notice (no reply expected)")
   .option("--deadline <ms>", "broadcast collection deadline", Number)
   .option("--timeout <s>", "stop waiting after this many seconds and cancel the question (0 = no limit)", Number, 0)
+  .option("--wait-timeout <s>", "stop waiting after this many seconds but leave the question running", Number)
   .option("--as <name>", "customer name shown to others", "cli")
   .option("--origin <kind>", "human (default) or agent: who actually asked", "human")
   .option("--via <address>", "with --origin agent: the Agent relaying the request")
   .option("--attach <file>", "attach a file (repeatable; uploaded before the Order)", (v: string, acc: string[]) => [...acc, v], [] as string[])
   .action(async (words: string[], o) => {
+    if (o.timeout > 0 && o.waitTimeout !== undefined) throw new Error("choose either --timeout (cancel on timeout) or --wait-timeout (leave the Order running)");
+    if (o.waitTimeout !== undefined && (!Number.isFinite(o.waitTimeout) || o.waitTimeout <= 0 || o.waitTimeout * 1000 > 2_147_483_647)) {
+      throw new Error("--wait-timeout must be a positive number of seconds no greater than 2147483");
+    }
     if (o.origin !== "human" && o.origin !== "agent") throw new Error("--origin must be human or agent");
     await ensureDaemon();
     // v4-13: refuse before the Order exists. A silent downgrade (a team message broadcast, an
@@ -899,8 +925,13 @@ program
     const warnings: string[] = [];
     if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision?.mode ?? "?"}: ${res.decision?.reason ?? ""}`, warnings.length ? { ...res, warnings } : res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
-    const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}), ...(warnings.length ? { warnings } : {}) });
-    process.exitCode = status === "done" ? 0 : 1;
+    const status = await follow(res.threadId, {
+      orderId: res.orderId,
+      ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}),
+      ...(o.waitTimeout !== undefined ? { waitTimeoutMs: o.waitTimeout * 1000 } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    });
+    process.exitCode = status === "done" || status === "working" ? 0 : 1;
   });
 
 program
@@ -932,7 +963,7 @@ program
 
 program
   .command("reply")
-  .description("reply to an open Order as one of its target Baristas (for scripts and external processes)")
+  .description("submit an operator override on an open Order, attributed to one of its target Baristas")
   .argument("<threadId>")
   .argument("<text...>", "the reply text")
   .requiredOption("--agent <address>", "the target Barista's address (name@host)")
@@ -953,7 +984,7 @@ program
         ...(attachments.length ? { attachments } : {}),
       }),
     });
-    out(`replied to ${id}${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}`, res);
+    out(`operator override recorded for ${id}${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}`, res);
   });
 
 program
@@ -1627,7 +1658,8 @@ barista
       throw new Error(`the ${o.agent ?? "pi"} Barista in ${dir} could not start:\n${outcome.failed.lastError ?? "it exited at once"}\nlog: ${outcome.failed.log}`);
     }
     const ready = outcome.agent ? `; registered as ${outcome.agent}` : "; not registered yet (check `cafe barista list` and `cafe agents`)";
-    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${dir}${how}${ready}`, ws);
+    const warnings = Array.isArray(ws) ? ws.map((worker: { warning?: string }) => worker.warning).filter(Boolean) as string[] : [];
+    out(`started ${ws.length} ${o.agent ?? "pi"} worker(s) in ${dir}${how}${ready}${warnings.length ? `\nwarning: ${warnings.join("; ")}` : ""}`, ws);
   });
 barista
   .command("stop")

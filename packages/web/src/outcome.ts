@@ -1,12 +1,12 @@
 import type { AgentRecord, ThreadMeta } from "@cafe/protocol";
 import type { Dict } from "./i18n.ts";
 import { isActive, nameOf, type LiveTurn } from "./store.ts";
-import type { Tone } from "./ui/bits.tsx";
+import type { Tone } from "./ui/tone.ts";
 
 export type Bucket = "active" | "answered" | "unanswered" | "cancelled";
 
 export function bucketOf(t: ThreadMeta): Bucket {
-  if (isActive(t.status) || (t.clarification && t.turns === 1)) return "active";
+  if (t.taskStatus === "working" || t.taskStatus === "awaiting_report" || t.taskStatus === "unknown" || isActive(t.status) || (t.clarification && t.turns === 1)) return "active";
   if (t.status === "cancelled") return "cancelled";
   if (t.replies.length > 0) return "answered";
   return "unanswered";
@@ -44,6 +44,9 @@ export function askerOf(
  */
 export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentRecord>, live: LiveTurn | undefined, now: number): { tone: Tone; text: string } {
   if (meta.clarification && meta.turns === 1) return { tone: "warn", text: t.needsHuman };
+  if (meta.taskStatus === "working") return { tone: "info", text: t.taskWorking };
+  if (meta.taskStatus === "awaiting_report") return { tone: "warn", text: t.taskAwaitingReport };
+  if (meta.taskStatus === "unknown") return { tone: "warn", text: t.taskStatusUnknown };
   const startedAt = live?.startedAt ?? meta.turnStartedAt ?? (meta.turns <= 1 ? meta.createdAt : undefined);
   const names = (ids: string[]) => t.list([...new Set(ids.map((id) => whoName(id, agents, meta)))]);
   switch (bucketOf(meta)) {
@@ -57,6 +60,8 @@ export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentR
       const who = names(meta.replies.map((r) => r.agentId));
       const end = meta.replies[0]?.at ?? meta.closedAt;
       const took = startedAt && end ? t.dur(end - startedAt) : undefined;
+      const operatorReplyers = meta.replies.filter((reply) => reply.source === "operator").map((reply) => reply.agentId);
+      if (operatorReplyers.length) return { tone: "warn", text: t.operatorOverride(names(operatorReplyers)) };
       return { tone: "ok", text: t.answeredBy(who, took) };
     }
     case "cancelled":

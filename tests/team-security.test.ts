@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { WebSocket } from "ws";
 import { Peer } from "@cafe/protocol/peer";
 import { CafeClient } from "@cafe/protocol/client";
+import type { Router } from "../packages/daemon/src/router.ts";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
 // The v4-11 review found four authorization gaps. Each test here fails on the batch as shipped.
@@ -249,5 +250,261 @@ describe("observer membership", () => {
     // v4-13: a team with no orchestrator has no front door; the observer is never a fallback.
     expect(res.decision.failure).toBe("no_orchestrator");
     expect(seen).toBe(0);
+  });
+});
+
+describe("protocol Order event authorization", () => {
+  it("rejects a registered non-target reply without changing the target Order", async () => {
+    const d = await startDaemon("event-auth", { mode: "root" });
+    cleanup.push(d.stop);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const target = await barista(d.addr, identity("target"), async (h) => {
+      await h.ack();
+      await held;
+      await h.reply("real target answer");
+    });
+    cleanup.push(() => { release(); target.client.close(); });
+    const attacker = await barista(d.addr, identity("attacker"));
+    cleanup.push(() => attacker.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const order = await c.ask({ body: "original question", to: "target" });
+    await waitFor(() => d.daemon.thread(order.threadId)?.meta.status === "working");
+    const targetPeer = (target.client as any).peer as Peer;
+    const wrongThread = await targetPeer.request("order/reply", { orderId: order.orderId, threadId: "wrong-thread", text: "wrong association", final: true }).catch((e: { code?: string }) => e);
+    expect((wrongThread as { code?: string }).code).toBe("not_found");
+    const peer = (attacker.client as any).peer as Peer;
+    const forgedEvents: Array<[string, Record<string, unknown>]> = [
+      ["order/ack", { orderId: order.orderId, threadId: order.threadId }],
+      ["order/heartbeat", { orderId: order.orderId, threadId: order.threadId }],
+      ["order/decline", { orderId: order.orderId, threadId: order.threadId, reason: "forged" }],
+      ["order/reply", { orderId: order.orderId, threadId: order.threadId, text: "forged answer", final: true }],
+    ];
+    for (const [method, params] of forgedEvents) {
+      const error = await peer.request(method, params).catch((e: { code?: string }) => e);
+      expect((error as { code?: string }).code).toBe("not_a_target");
+    }
+
+    expect(d.daemon.thread(order.threadId)?.meta).toMatchObject({ status: "working", replies: [], declines: [] });
+    release();
+    await untilClosed(c, order.threadId, order.orderId);
+    expect(d.daemon.thread(order.threadId)?.meta.replies[0]?.text).toBe("real target answer");
+  });
+});
+
+describe("late delivered replies", () => {
+  it("does not let a failed remote target's late decline dispatch another fallback", async () => {
+    const alpha = identity("alpha");
+    const beta = identity("beta");
+    const charlie = identity("charlie");
+    const router: Router = {
+      name: "rules",
+      decide: async ({ candidates }) => {
+        const byName = new Map(candidates.map((candidate) => [candidate.name, candidate.agentId]));
+        return { targets: [byName.get("alpha")!], mode: "unicast" as const, reason: "primary with fallbacks", router: "rules" as const, candidates: [byName.get("beta")!, byName.get("charlie")!] };
+      },
+    };
+    const d = await startDaemon("late-decline", { mode: "root", router, timing: { ...(await import("./helpers.ts")).FAST, unicastDeadlineMs: 5000 } });
+    cleanup.push(d.stop);
+    const a = new CafeClient({ daemon: d.addr });
+    const alphaRecord = await a.connect(alpha);
+    cleanup.push(() => a.close());
+    let releaseBeta!: () => void;
+    const betaHeld = new Promise<void>((resolve) => { releaseBeta = resolve; });
+    const b = await barista(d.addr, beta, async (handle) => { await handle.ack(); await betaHeld; await handle.reply("beta answered"); });
+    cleanup.push(() => { releaseBeta(); b.client.close(); });
+    let charlieSeen = 0;
+    const cAgent = await barista(d.addr, charlie, async (handle) => { charlieSeen++; await handle.reply("unexpected third attempt"); });
+    cleanup.push(() => cAgent.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const order = await c.ask({ body: "fallback question" });
+    expect(order.decision.targets).toEqual([alphaRecord!.agentId]);
+    await waitFor(() => Boolean(d.daemon.thread(order.threadId)?.meta.targetStates?.some((state) => state.agentId === alphaRecord!.agentId && state.state === "failed")));
+    await waitFor(() => Boolean(d.daemon.thread(order.threadId)?.meta.targetStates?.some((state) => state.agentId === b.rec.agentId && state.state === "acked")));
+    d.daemon.recordEvent({ eventId: "late-remote-decline", threadId: order.threadId, orderId: order.orderId, host: "alpha-remote", at: Date.now(), event: { type: "order.declined", agentId: alphaRecord!.agentId, reason: "late decline" } } as import("@cafe/protocol").ThreadEnvelope);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(charlieSeen).toBe(0);
+    expect(d.daemon.thread(order.threadId)?.meta.targetStates?.find((state) => state.agentId === alphaRecord!.agentId)?.state).toBe("failed");
+    releaseBeta();
+    await untilClosed(c, order.threadId, order.orderId);
+    expect(d.daemon.thread(order.threadId)?.meta.replies[0]?.text).toBe("beta answered");
+  });
+
+  it("recovers a failed target while another collect-all target keeps the Order open", async () => {
+    const d = await startDaemon("late-reply", { mode: "root", timing: { ...(await import("./helpers.ts")).FAST, broadcastDeadlineMs: 5000 } });
+    cleanup.push(d.stop);
+    const late = new CafeClient({ daemon: d.addr });
+    let lateHandle: any;
+    late.onOrder((handle) => {
+      lateHandle = handle;
+      void handle.ack();
+    });
+    const lateAgent = await late.connect(identity("late"));
+    cleanup.push(() => late.close());
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const slow = await barista(d.addr, identity("slow"), async (handle) => {
+      await handle.ack();
+      await held;
+      await handle.reply("slow target result");
+    });
+    cleanup.push(() => { release(); slow.client.close(); });
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const order = await c.ask({ body: "collect both", broadcast: true, collect: "all", deadlineMs: 5000 });
+    await waitFor(() => Boolean(lateHandle && d.daemon.thread(order.threadId)?.meta.targetStates?.some((state) => state.agentId === lateAgent!.agentId && state.state === "failed")));
+    expect(d.daemon.thread(order.threadId)?.meta.status).toBe("working");
+    await lateHandle.reply("late target result");
+    expect(d.daemon.thread(order.threadId)?.meta.status).toBe("working");
+    release();
+    await untilClosed(c, order.threadId, order.orderId);
+    expect(d.daemon.thread(order.threadId)?.meta.replies.map((reply) => reply.text).sort()).toEqual(["late target result", "slow target result"]);
+  });
+});
+
+describe("active Order identity", () => {
+  it("keeps a late reply from clearing the same Thread's newer Order", async () => {
+    const d = await startDaemon("active-order", { mode: "root", timing: { ...(await import("./helpers.ts")).FAST, ackTimeoutMs: 1000, heartbeatIntervalMs: 1000 } });
+    cleanup.push(d.stop);
+    const handles = new Map<string, any>();
+    const worker = new CafeClient({ daemon: d.addr });
+    worker.onOrder((handle) => {
+      handles.set(handle.order.orderId, handle);
+      void handle.ack().catch(() => {});
+    });
+    const record = await worker.connect(identity("worker"));
+    cleanup.push(() => worker.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const first = await c.ask({ body: "first turn", to: "worker" });
+    await waitFor(() => handles.has(first.orderId));
+    await c.cancel(first.threadId);
+    await waitFor(() => d.daemon.thread(first.threadId)?.meta.status === "cancelled");
+    const beforeLateNoise = d.daemon.thread(first.threadId)!.events.length;
+    d.daemon.recordEvent({ eventId: "late-relayed-heartbeat", threadId: first.threadId, orderId: first.orderId, host: "remote", at: Date.now() + 1, event: { type: "order.heartbeat", agentId: record!.agentId } } as any);
+    expect(d.daemon.thread(first.threadId)!.events).toHaveLength(beforeLateNoise);
+    await handles.get(first.orderId).ack();
+    await handles.get(first.orderId).heartbeat();
+    await handles.get(first.orderId).decline("late decline");
+    expect(d.daemon.thread(first.threadId)!.events.slice(beforeLateNoise)).toEqual([]);
+    const second = await c.ask({ body: "second turn", to: "worker", threadId: first.threadId, replace: true });
+    await waitFor(() => handles.has(second.orderId));
+    expect((d.daemon.registry.get(record!.agentId) as any)?.activeOrderId).toBe(second.orderId);
+
+    await handles.get(first.orderId).reply("late first result");
+    expect(d.daemon.thread(first.threadId)?.meta.status).toBe("working");
+    expect((d.daemon.registry.get(record!.agentId) as any)?.activeOrderId).toBe(second.orderId);
+    const firstTurnEvents = d.daemon.thread(first.threadId)!.events.filter((env) => env.orderId === first.orderId);
+    expect(firstTurnEvents.find((env) => env.event.type === "order.closed")?.event).toMatchObject({ status: "cancelled" });
+    expect(firstTurnEvents.some((env) => env.event.type === "order.replied" && env.event.text === "late first result")).toBe(true);
+    await handles.get(second.orderId).reply("second result");
+    await untilClosed(c, first.threadId, second.orderId);
+    expect((d.daemon.registry.get(record!.agentId) as any)?.activeOrderId).toBeUndefined();
+  });
+});
+describe("linked parent authorization", () => {
+  it("validates parent IDs for linked work but preserves a valid order-only provenance field", async () => {
+    const d = await startDaemon("linked-ids", { mode: "root" });
+    cleanup.push(d.stop);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const lead = await barista(d.addr, identity("lead"), async (h) => {
+      await h.ack();
+      await held;
+      await h.reply("parent complete");
+    });
+    cleanup.push(() => { release(); lead.client.close(); });
+    const worker = await barista(d.addr, identity("worker"));
+    cleanup.push(() => worker.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const parent = await c.ask({ body: "root task", to: "lead" });
+    await waitFor(() => d.daemon.thread(parent.threadId)?.meta.status === "working");
+
+    const missing = await lead.client.ask({ body: "missing", to: "worker", parentOrderId: "not-an-order", parentThreadId: parent.threadId }).catch((e: { code?: string }) => e);
+    expect((missing as { code?: string }).code).toBe("unknown_parent");
+    const mismatch = await lead.client.ask({ body: "mismatch", to: "worker", parentOrderId: parent.orderId, parentThreadId: "other-thread" }).catch((e: { code?: string }) => e);
+    expect((mismatch as { code?: string }).code).toBe("unknown_parent");
+    const threadOnly = await lead.client.ask({ body: "thread only", to: "worker", parentThreadId: parent.threadId }).catch((e: { code?: string }) => e);
+    expect((threadOnly as { code?: string }).code).toBe("bad_request");
+
+    const provenance = await lead.client.ask({ body: "legacy provenance", to: "worker", parentOrderId: parent.orderId });
+    expect(d.daemon.thread(provenance.threadId)?.meta).toMatchObject({ parentOrderId: parent.orderId });
+    expect(d.daemon.thread(provenance.threadId)?.meta.parentThreadId).toBeUndefined();
+    release();
+  });
+
+  it("does not cancel an open linked child before rejecting an unauthorized replacement", async () => {
+    const d = await startDaemon("linked-replace", { mode: "root" });
+    cleanup.push(d.stop);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const worker = await barista(d.addr, identity("worker"), async (h) => {
+      await h.ack();
+      await held;
+      await h.reply("worker finished");
+    });
+    cleanup.push(() => { release(); worker.client.close(); });
+    let childThreadId: string | undefined;
+    const lead = await barista(d.addr, identity("lead"), async (h) => {
+      const child = await lead.client.ask({ body: "run tests", to: "worker", parentOrderId: h.order.orderId, parentThreadId: h.order.threadId });
+      childThreadId = child.threadId;
+      await waitFor(() => d.daemon.thread(child.threadId)?.meta.status === "working");
+      await h.reply("tests delegated");
+    });
+    cleanup.push(() => lead.client.close());
+    const attacker = await barista(d.addr, identity("attacker"));
+    cleanup.push(() => attacker.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const parent = await c.ask({ body: "check release", to: "lead" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    await waitFor(() => !!childThreadId && d.daemon.thread(childThreadId)?.meta.status === "working");
+    const rejected = await attacker.client.ask({ body: "replace work", threadId: childThreadId!, replace: true }).catch((e: { code?: string }) => e);
+    expect((rejected as { code?: string }).code).toBe("not_a_target");
+    expect(d.daemon.thread(childThreadId!)?.meta.status).toBe("working");
+    release();
+    await waitFor(() => d.daemon.thread(childThreadId!)?.meta.status === "done");
+  });
+
+  it("allows a delivered parent recipient to create linked work but rejects an unrelated agent", async () => {
+    const d = await startDaemon("linked-auth", { mode: "root" });
+    cleanup.push(d.stop);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const lead = await barista(d.addr, identity("lead"), async (h) => {
+      await h.ack();
+      await held;
+      await h.reply("front door replied");
+    });
+    cleanup.push(() => { release(); lead.client.close(); });
+    const worker = await barista(d.addr, identity("worker"));
+    cleanup.push(() => worker.client.close());
+    const attacker = await barista(d.addr, identity("attacker"));
+    cleanup.push(() => attacker.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const parent = await c.ask({ body: "check the release", to: "lead" });
+    await waitFor(() => d.daemon.thread(parent.threadId)?.meta.status === "working");
+    const forged = await attacker.client.ask({ body: "unrelated work", to: "worker", parentOrderId: parent.orderId, parentThreadId: parent.threadId }).catch((e: { code?: string }) => e);
+    expect((forged as { code?: string }).code).toBe("not_a_target");
+
+    const linked = await lead.client.ask({ body: "check parser tests", to: "worker", parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    expect(d.daemon.thread(linked.threadId)?.meta).toMatchObject({ parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    await waitFor(() => d.daemon.thread(linked.threadId)?.meta.status === "done");
+    const unauthorizedFollow = await attacker.client.ask({ body: "reopen someone else's task", threadId: linked.threadId }).catch((e: { code?: string }) => e);
+    expect((unauthorizedFollow as { code?: string }).code).toBe("not_a_target");
+    const authorizedFollow = await lead.client.ask({ body: "verify one more case", threadId: linked.threadId });
+    expect(d.daemon.thread(authorizedFollow.threadId)?.meta).toMatchObject({ parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    release();
+    await untilClosed(c, parent.threadId, parent.orderId);
   });
 });

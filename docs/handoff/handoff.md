@@ -141,6 +141,20 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
+### 2026-11-27 — 任务生命周期与事件授权（已并入 main，未发版）
+
+- **接手入口。** 设计 [task lifecycle and event auth](../superpowers/specs/2026-11-26-task-lifecycle-and-event-auth-design.md)（经独立 builder check 两轮，“nothing important left”），计划 [implementation plan](../superpowers/plans/2026-11-26-task-lifecycle-and-event-auth.md)，逐任务记录在 `.superpowers/sdd/2026-11-26-task-lifecycle-and-event-auth/progress.md`（该目录被 git 忽略，仅本地）。用 `git status --short --branch`、`git log --oneline -5` 核对现场；`.vitest/` 是既有未跟踪目录，本轮未触碰，测试统一用隔离的 `--attachmentsDir`。
+- **任务时限（#181/#156/#154）。** unicast 默认硬上限从 10 分钟改为 2 小时；ack/heartbeat 仍按 lease 判“没进展”；`deadlineMs` 必须是 1–2147483647 的整数，否则 `bad_request`；硬期限按 `createdAt + deadlineMs` 绝对时刻执行，路由耗时会消耗同一期限，到期前不再投递；恢复沿用同一绝对时刻。`recover()` 改为 `(createdAt, threadId)` keyset 分页直到空页，不再只恢复最近 1000 个 open Thread。
+- **串行容量。** 单个 Cafe 会话固定只启动一个 worker，`.cafe` 配 `concurrency > 1` 时 `barista start` 打印一条 warning；pi/omp 扩展与 codex/claude bridge 注册时一律报 `concurrency: 1`。真正的并行需要不同的成员身份和目录（#144 的共享目录问题仍单列）。
+- **父任务状态。** `ThreadMeta` 新增可选 `reportedOrderId`（由 `order.reported` 事件写入的唯一索引值）与派生的 `taskStatus`（`working` / `awaiting_report` / `done` / `failed` / `cancelled` / `unknown`）。父 Order 自己的 `status` 与直接回复数不变。判定只使用与该 `parentOrderId` 精确匹配、且经投递或人类所有者证明的子 Thread；澄清子 Thread 不计入。Root 用本地全量子项索引；非 Root 列表用一条批量 `thread/task-statuses` 请求取 Root 结果，Root 不可用时只对本地已知的关联工作标 `unknown`（普通会话不因此变成 unknown）。详情页可单独向 Root 取完整视图。子 Thread 也可以是父（嵌套委派），详情对任何发单在本机的 Thread 都投影。
+- **授权边界。** 协议的 ack/heartbeat/reply/decline 先核对 `AgentRecord` 对端身份，再按精确 `(orderId, threadId, agentId, host)` 的持久化 `order.delivered` 记录放行；非 target 返回 `not_a_target`。Order 结束后只保留“已投递 target 的最终回复（审计）”和 `order.reported`，其余迟到 ack/heartbeat/decline 丢弃；仍 open 时，已失败 target 的迟到最终回复可恢复该 target，迟到 decline 不再触发下一个 fallback。`AgentRecord.activeOrderId` 与 `activeThreadId` 成对，旧 Order 的迟到答复不能清掉同一 Thread 的新任务。`parentThreadId` 必须对应真实 parent Order；父子链接需要已注册 peer 的实际投递证明，或原人类 Order 的所有权凭据（CLI）；链接一经建立不可在后续 turn 改挂，未链接的 Thread 不能事后补挂；越权 follow-up（含 `replace`）在取消任何 Order 之前就被拒绝；escalate 同样要求已注册 peer 的真实投递证明。agentId 续用需要匹配的 resume proof（本机从未记录 proof 时要求本次提供 proof，裸声明不再继承投递权限）。
+- **操作员代答。** HTTP `replyAs`（`cafe reply`/MCP `cafe_reply`）标记为 `source: "operator"`，CLI、MCP wait、Web 详情/Feed/Live 与 pi 事件流都显示为“operator override”，且不计入 Barista 路由统计；daemon 传给后续 agent 的历史里也显式标注。它仍不是经过认证的 Barista 身份。
+- **验证。** 最终全量 `vitest run` **129 文件 / 770 项**（修复后最后一轮见下方“仍待你本人”的前提）；`tsc`、Web check/build（56 modules / 388 kB）、`routing:eval` 67/67、隔离打包冒烟 17/17 通过。Claude 插件 validate 通过，但 `claude plugin test` 被本进程的 rollout 开关挡住（提示需另启带网络的 claude 刷新），未执行；这是环境限制，不是代码失败。
+- **独立复核已处理。** 三类 reviewer（整枝、安全、React）发现并已修复：`order.reported` 被 closed-guard 丢弃的 Critical；子项展示分页把完整视图说成完成；Leaf 在 Root 断线/未同步时的状态优先；搜索结果的 taskStatus；嵌套委派被跳过；Feed 用分页行覆盖权威状态并丢失 operator 归属；operator 来源在 MCP/CLI JSON/Pi/历史中丢失；未授权 `replace` 先取消再拒绝；escalate 绕过投递证明；跨 Host 迟到 decline 触发 fallback；远端迟到最终回复进入 follow-up 路由候选；拉取附件期间对端断开仍写 `order.delivered`；`--wait-timeout` 超 Node 上限。React 专项 reviewer 的独立派遣被自动审查拒绝一次，后由整枝复核覆盖 UI。
+- **Deferred minor（未修，记录在案）：** 会话页 header/rail 仍显示最近 Order 结果，与正文“Task status: …”并存（已加前缀和常驻 live region）；`restoredTaskStatuses` 只在内存，重启后 Leaf 脱离 Root 时可能退回本地视角；结束后到达的迟到最终回复仍会进 agent 回答统计（只做了路由候选过滤）；`localTaskChildren` 上限 10,001 行，超过即按 partial 处理；`cafe ask --timeout` 超过 Node 上限的旧行为未改。
+- **发布阻塞（未变）。** 共享 token + 自报 Host 的跨 Host 身份仍未迁移；HTTP `replyAs` 调用者认证、cancel 归属、幂等键作用域、普通 HTTP 订单的 `origin`/`via` 自报、JSON 请求体上限未在本批处理。真实第二物理 Host、混合版本实网、生产 Root 重启、npm 发布仍由 operator 决定。外部 issue 台账本轮未改。
+- **仍需你本人：** 审核上面的行为变化；决定是否在本机 `cafe daemon stop/start` 让新代码生效（本 session 已按既有偏好重启并跑 `cafe doctor`，见本轮结束语）；发版；真实第二 Host dogfood；在带网络的 claude 进程里重跑 `npm run test:claude-plugin`。
+
 ### 2026-11-26 — 人工澄清与父会话汇报（本地功能分支）
 
 - 接手 `feat/team-clarification-live-reporting`，从 `git status --short --branch`、`git log --oneline origin/main..HEAD` 核对现场。设计和验收清单见 [team delivery](../superpowers/specs/2026-11-26-team-delivery-design.md) 与 [parent loop plan](../superpowers/plans/2026-11-26-team-parent-loop.md)。上一批已推送的名册工作见下节。

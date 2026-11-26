@@ -239,13 +239,21 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
         ? t.dur(end - started)
         : undefined;
   const status =
-    bucket === "active"
-      ? { tone: "info" as Tone, text: t.statusWorking }
-      : bucket === "answered"
-        ? { tone: "ok" as Tone, text: t.statusAnswered }
-        : bucket === "cancelled"
-          ? { tone: undefined, text: t.statusCancelled }
-          : { tone: (meta.declines.length ? "warn" : "danger") as Tone, text: t.statusUnanswered };
+    meta.taskStatus === "working"
+      ? { tone: "info" as Tone, text: t.taskWorking }
+      : meta.taskStatus === "awaiting_report"
+        ? { tone: "warn" as Tone, text: t.taskAwaitingReport }
+        : meta.taskStatus === "unknown"
+          ? { tone: "warn" as Tone, text: t.taskStatusUnknown }
+          : bucket === "active"
+            ? { tone: "info" as Tone, text: t.statusWorking }
+            : bucket === "answered" && meta.replies.some((reply) => reply.source === "operator")
+              ? { tone: "warn" as Tone, text: t.operatorOverride(t.list(meta.replies.filter((reply) => reply.source === "operator").map((reply) => whoAddress(reply.agentId, agents, meta)))) }
+              : bucket === "answered"
+                ? { tone: "ok" as Tone, text: t.statusAnswered }
+                : bucket === "cancelled"
+                  ? { tone: undefined, text: t.statusCancelled }
+                  : { tone: (meta.declines.length ? "warn" : "danger") as Tone, text: t.statusUnanswered };
   const preview = first
     ? plain(first.text)
     : bucket === "unanswered" && meta.declines.length
@@ -284,7 +292,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
       <div className="clamp2 text-[15px] font-semibold leading-snug text-fg-strong">{meta.summary || "—"}</div>
       {bucket === "answered" && first && (
         <div className="truncate text-xs text-muted">
-          <span className="mono text-ok">{whoAddress(first.agentId, agents, meta)}</span>：{preview}
+          <span className={`mono ${first.source === "operator" ? "text-warn" : "text-ok"}`}>{first.source === "operator" ? t.operatorOverride(whoAddress(first.agentId, agents, meta)) : whoAddress(first.agentId, agents, meta)}</span>：{preview}
           {meta.replies.length > 1 && <span> · {t.moreReplies(meta.replies.length - 1)}</span>}
         </div>
       )}

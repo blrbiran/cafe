@@ -85,6 +85,23 @@ describe("cafe mcp", () => {
     expect(follow.text).toContain("echo says: again");
   });
 
+  it("does not let an HTTP MCP client claim Barista parent-link authority", async () => {
+    const { base } = await network();
+    const m = mcpClient(base);
+    await m.request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "claude-code", version: "2" }, capabilities: {} });
+    const parent = await m.call("cafe_ask", { question: "parent work", to: "echo" });
+    expect(parent.isError).toBe(false);
+    const threadId = /threadId: (\S+)/.exec(parent.text)![1]!;
+    const orderId = /orderId: (\S+)/.exec(parent.text)![1]!;
+
+    const forged = await m.call("cafe_ask", { question: "unverified linked child", to: "echo", parent_order_id: orderId, parent_thread_id: threadId });
+    expect(forged.isError).toBe(true);
+    expect(forged.text).toContain("not_a_target");
+    const forgedEscalation = await m.call("cafe_ask", { question: "unverified escalation", to: "echo", parent_order_id: orderId, parent_thread_id: threadId, escalate: true });
+    expect(forgedEscalation.isError).toBe(true);
+    expect(forgedEscalation.text).toContain("not_a_target");
+  });
+
   it("returns early with the threadId when the answer is slow; cafe_wait picks it up", async () => {
     const { base } = await network();
     const m = mcpClient(base);

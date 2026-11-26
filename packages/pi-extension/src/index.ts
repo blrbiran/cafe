@@ -150,8 +150,10 @@ export function orderPrompt(order: Order, self?: AgentRecord, attachments?: Arra
 function describeEvent(env: ThreadEnvelope, addr: (id: string) => string): string | undefined {
   const ev = env.event;
   switch (ev.type) {
-    case "order.replied":
-      return `☕ ${ev.final ? "Reply" : "Interim reply"} from ${addr(ev.agentId)} (threadId ${env.threadId}):\n\n${ev.text}`;
+    case "order.replied": {
+      const speaker = ev.source === "operator" ? `an operator override for ${addr(ev.agentId)}` : addr(ev.agentId);
+      return `☕ ${ev.final ? "Reply" : "Interim reply"} from ${speaker} (threadId ${env.threadId}):\n\n${ev.text}`;
+    }
     case "order.declined":
       return `☕ ${addr(ev.agentId)} declined (threadId ${env.threadId}): ${ev.reason}`;
     case "order.closed":
@@ -439,7 +441,7 @@ export default function cafe(pi: ExtensionAPI) {
         }
       });
       try {
-        await c.connect({ ...identity, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
+        await c.connect({ ...identity, concurrency: 1, mode: ctx.hasUI && ctx.mode === "tui" ? "tui" : "headless", agent: isOmp() ? "omp" : "pi", cwd: ctx.cwd, pid: process.pid });
         client = c;
         // A capability downgrade at registration (team/channel/observer) must be visible, not logged.
         for (const w of c.drainWarnings()) {

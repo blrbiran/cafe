@@ -60,29 +60,42 @@ function setup(concurrency = 1) {
   return { root, home, dir, pidfile };
 }
 
-function supervisor(home: string, extra: { backoffBaseMs?: number } = {}) {
+function supervisor(home: string, extra: { backoffBaseMs?: number; log?: (message: string) => void } = {}) {
   const sup = new Supervisor({ home, daemonAddr: "127.0.0.1:1", token: "t", piBin: FAKE_PI, extension: "/dev/null", graceMs: 500, ...extra });
   cleanup.push(() => sup.shutdown());
   return sup;
 }
 
 describe("supervisor", () => {
-  it("starts one worker per concurrency slot, lists and stops them", async () => {
-    const { home, dir, pidfile } = setup(2);
-    const sup = supervisor(home);
+  it("does not attach a concurrency warning to a one-slot worker", () => {
+    const { home, dir } = setup(1);
+    const messages: string[] = [];
+    const sup = supervisor(home, { log: (message) => messages.push(message) });
     const started = sup.start({ dir });
-    expect(started).toHaveLength(2);
-    await waitFor(() => pidsIn(pidfile).length === 2, 5000);
+    expect(started).toHaveLength(1);
+    expect(started[0]?.warning).toBeUndefined();
+    expect(messages).toEqual([]);
+  });
+
+  it("starts one serial worker and warns when .cafe requests unsupported parallel slots", async () => {
+    const { home, dir, pidfile } = setup(3);
+    const messages: string[] = [];
+    const sup = supervisor(home, { log: (message) => messages.push(message) });
+    const started = sup.start({ dir });
+    expect(started).toHaveLength(1);
+    expect(started[0]?.warning).toContain("concurrency 3");
+    await waitFor(() => pidsIn(pidfile).length === 1, 5000);
     expect(sup.list().every((w) => w.running)).toBe(true);
     expect(JSON.parse(readFileSync(join(home, "baristas.json"), "utf8"))).toEqual([{ dir }]);
-    await waitFor(() => JSON.parse(readFileSync(join(home, "baristas.runtime.json"), "utf8")).length === 2, 5000);
+    await waitFor(() => JSON.parse(readFileSync(join(home, "baristas.runtime.json"), "utf8")).length === 1, 5000);
 
     // Worker output reaches the per-worker log.
     const log = sup.list()[0]!.log;
     await waitFor(() => readFileSync(log, "utf8").includes("fake pi"), 5000);
-    expect(sup.stop(dir)).toBe(2);
+    expect(sup.stop(dir)).toBe(1);
     await waitFor(() => pidsIn(pidfile).every((p) => !alive(p)), 5000);
     expect(sup.list()).toEqual([]);
+    expect(messages.join("\n")).toContain("concurrency 3");
   });
 
   it("restarts a crashed worker with backoff", async () => {

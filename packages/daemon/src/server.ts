@@ -562,6 +562,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && path === "/api/events") return eventStream(daemon, url, req, res, recentEvents.get(daemon) ?? []);
   if (m === "GET" && path === "/api/snapshot") {
     const snap = daemon.snapshot(url.searchParams.get("channel") ?? undefined);
+    snap.threads = await daemon.projectTaskMetas(snap.threads);
     return send(res, 200, webStale() ? { ...snap, webStale: true } : snap);
   }
   if (m === "POST" && path === "/api/tls/renew") {
@@ -778,7 +779,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       return send(res, 200, url.searchParams.get("view") === "1" ? { children, partial: view.partial } : children);
     }
     const rows = channel ? daemon.store.listThreadsIn(channel, limit, status, before) : daemon.store.listThreads(limit, status, before);
-    return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
+    return send(res, 200, await daemon.projectTaskMetas(rows));
   }
   if (m === "GET" && path === "/api/search") {
     const q = url.searchParams.get("q") ?? "";
@@ -789,9 +790,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     if (url.searchParams.get("stats") === "1") {
       const stats = { scanned: 0, elapsedMs: 0, truncated: false };
       const results = daemon.search(q, limit, { stats, channel });
-      return send(res, 200, { results, ...stats });
+      const metas = await daemon.projectTaskMetas(results.map((result) => result.meta));
+      const byId = new Map(metas.map((meta) => [meta.threadId, meta]));
+      return send(res, 200, { results: results.map((result) => ({ ...result, meta: byId.get(result.meta.threadId) ?? result.meta })), ...stats });
     }
-    return send(res, 200, daemon.search(q, limit, { channel }));
+    const results = daemon.search(q, limit, { channel });
+    const metas = await daemon.projectTaskMetas(results.map((result) => result.meta));
+    const byId = new Map(metas.map((meta) => [meta.threadId, meta]));
+    return send(res, 200, results.map((result) => ({ ...result, meta: byId.get(result.meta.threadId) ?? result.meta })));
   }
   if (m === "POST" && path === "/api/prune") {
     const { olderThanDays, dryRun } = await readJson(req);
@@ -802,15 +808,13 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "GET" && (match = /^\/api\/channels\/([^/]+)\/threads$/.exec(path))) {
     const afterRaw = Number(url.searchParams.get("after"));
     const beforeRaw = Number(url.searchParams.get("before"));
-    return send(
-      res,
-      200,
-      daemon.channelThreads(decodeURIComponent(match[1]!), {
-        ...(Number.isFinite(afterRaw) && afterRaw > 0 ? { after: afterRaw } : {}),
-        ...(Number.isFinite(beforeRaw) && beforeRaw > 0 ? { before: beforeRaw } : {}),
-        limit: parseLimit(url.searchParams.get("limit"), 50),
-      }),
-    );
+    const page = daemon.channelThreads(decodeURIComponent(match[1]!), {
+      ...(Number.isFinite(afterRaw) && afterRaw > 0 ? { after: afterRaw } : {}),
+      ...(Number.isFinite(beforeRaw) && beforeRaw > 0 ? { before: beforeRaw } : {}),
+      limit: parseLimit(url.searchParams.get("limit"), 50),
+    });
+    page.threads = await daemon.projectTaskMetas(page.threads);
+    return send(res, 200, page);
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)$/.exec(path))) {
     const rawLimit = url.searchParams.get("limit");
@@ -818,17 +822,14 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const before = url.searchParams.get("before") ?? undefined;
     const t = await daemon.linkedThreadDetail(match[1]!, { ...(limit !== undefined ? { limit } : {}), ...(before ? { before } : {}) });
     if (!t) return send(res, 404, { error: "not_found" });
-    if (before || !t.meta.from.id?.startsWith("cli:") || t.meta.parentThreadId) return send(res, 200, t);
-    const view = await daemon.childView(t.meta.threadId, 200);
-    const pendingChildren = view.children.filter((child) => child.parentOrderId === t.meta.orderId &&
-      (child.clarification ? child.turns === 1 || !child.closedAt : !child.closedAt)).length;
-    return send(res, 200, { ...t, meta: { ...t.meta, pendingChildren, childrenPartial: view.partial } });
+    return send(res, 200, { ...t, meta: await daemon.projectTaskMeta(t.meta) });
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
   if (m === "POST" && path === "/api/orders") {
-    const p = CreateOrderParams.parse(await readJson(req));
+    const parsed = CreateOrderParams.safeParse(await readJson(req));
+    if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
     const ownerKey = req.headers["x-cafe-order-owner"];
-    return send(res, 200, await daemon.createOrder(p, undefined, typeof ownerKey === "string" ? ownerKey : undefined));
+    return send(res, 200, await daemon.createOrder(parsed.data, undefined, typeof ownerKey === "string" ? ownerKey : undefined));
   }
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/clarifications\/([^/]+)\/answer$/.exec(path))) {
     const input = await readJson(req);

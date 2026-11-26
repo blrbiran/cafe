@@ -14,7 +14,7 @@ interface Turn {
   order?: Order;
   startedAt: number;
   decision?: RoutingDecision;
-  replies: { agentId: string; text: string; final: boolean; at: number; attachments?: Attachment[]; report?: boolean }[];
+  replies: { agentId: string; text: string; final: boolean; at: number; source?: "agent" | "operator"; attachments?: Attachment[]; report?: boolean }[];
   declines: { agentId: string; reason: string; at: number }[];
   /** `collect: all` deadline silences: recorded, but not a refusal (v4-11). */
   skips: { agentId: string; reason: string; at: number }[];
@@ -50,7 +50,7 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
         turn.replies.push({ agentId: ev.agentId, text: ev.text, final: false, at: env.at, report: true });
         break;
       case "order.replied":
-        turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at, ...(ev.attachments?.length ? { attachments: ev.attachments } : {}) });
+        turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at, source: ev.source, ...(ev.attachments?.length ? { attachments: ev.attachments } : {}) });
         break;
       case "order.declined":
         if (ev.skipped) turn.skips.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
@@ -79,6 +79,7 @@ function turnOutcome(t: Dict, turn: Turn, active: boolean, agents: Record<string
     return { tone: "info", text: t.working(names(pending.length ? pending : targets), t.dur(now - turn.startedAt)) };
   }
   if (turn.closed?.status === "cancelled") return { tone: undefined, text: t.cancelled };
+  if (finals.some((reply) => reply.source === "operator")) return { tone: "warn", text: t.operatorOverride(names(finals.map((reply) => reply.agentId))) };
   if (finals.length > 0) return { tone: "ok", text: t.answeredBy(names(finals.map((r) => r.agentId)), t.dur(finals[0]!.at - turn.startedAt)) };
   if (turn.declines.length > 0) return { tone: "warn", text: t.nobody(turn.declines.length) };
   if (finals.length === 0 && turn.skips.length > 0) return { tone: "info", text: t.skipped(turn.skips.length) };
@@ -181,6 +182,12 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   }
 
   const { meta } = detail;
+  const taskStatus = meta.taskStatus;
+  const taskLabel = taskStatus === "working" ? t.taskWorking
+    : taskStatus === "awaiting_report" ? t.taskAwaitingReport
+    : taskStatus === "unknown" ? t.taskStatusUnknown
+    : undefined;
+  const taskStatusText = taskLabel ? `${t.taskStatusPrefix}${taskLabel}` : undefined;
   const first = turns[0];
   const last = turns.at(-1);
   // The tone does not depend on the clock; the text ticks on its own in <OutcomeText>.
@@ -208,6 +215,7 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
           <div>
             <div className="cap">{t.ctxStatus}</div>
             <div className="text-fg-strong">{lastOutcome ?? t.loading}</div>
+            {taskStatusText && <div className="mt-1 text-warn">{taskStatusText}</div>}
           </div>
           <div>
             <div className="cap">{t.ctxPeople}</div>
@@ -232,7 +240,8 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
         </div>
       )}
 
-      {childView?.threadId === threadId && childView.partial && <p className="hint" role="status">{t.linkedTasksPartial}</p>}
+      {childView?.threadId === threadId && childView.partial && (taskStatus === "unknown" || linkedTasks.length > 0) && <p className="hint" role="status">{t.linkedTasksPartial}</p>}
+      <p className={taskStatusText ? "well text-sm" : "sr-only"} role="status" aria-live="polite" aria-atomic="true">{taskStatusText ?? ""}</p>
       {clarificationThreads.map((child) => <Clarification key={child.threadId} parent={meta.threadId} child={child} />)}
       {turns.map((turn, i) => {
         const active = threadActive && turn === last;
@@ -444,7 +453,7 @@ function LinkedTasks({ children, meta, agents }: { children: ThreadMeta[]; meta:
           </a>
           {child.replies.map((reply) => (
             <p key={`${reply.agentId}-${reply.at}`} className="text-sm text-muted">
-              {reply.address ?? whoAddress(reply.agentId, agents, child)} · {reply.text}
+              {reply.source === "operator" ? t.operatorOverride(reply.address ?? whoAddress(reply.agentId, agents, child)) : reply.address ?? whoAddress(reply.agentId, agents, child)} · {reply.text}
             </p>
           ))}
         </div>
@@ -495,7 +504,7 @@ function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: Th
   const t = useT();
   const agents = useStore((s) => s.agents);
   const items = [
-    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.final ? "ok" : "info") as Tone, kind: r.report ? t.resultReport : r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
+    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.source === "operator" ? "warn" : r.final ? "ok" : "info") as Tone, kind: r.report ? t.resultReport : r.source === "operator" ? t.operatorOverrideLabel : r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
     ...turn.declines.map((d) => ({ key: `d-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "warn" as Tone, kind: t.kDecline, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
     ...turn.skips.map((d) => ({ key: `s-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "info" as Tone, kind: t.kSkipped, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
   ].sort((a, b) => a.at - b.at);

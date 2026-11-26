@@ -120,6 +120,12 @@ async function runTurn(pi: ReturnType<typeof fakePi>, answer: string) {
 }
 
 describe("pi extension", () => {
+  it("registers one serial slot when .cafe requests greater concurrency", async () => {
+    writeFileSync(join(dir, ".cafe"), "name: widgets\ndescription: owns the widget service\ntags: [widgets]\nconcurrency: 3\n");
+    const { root } = await setup();
+    expect(root.daemon.registry.all().find((record) => record.name === "widgets")).toMatchObject({ concurrency: 1 });
+  });
+
   it("extracts the last assistant text", () => {
     expect(lastAssistantText([assistant("a"), { role: "user", content: "x" }, assistant("b")])).toBe("b");
     expect(lastAssistantText([{ role: "user", content: "x" }])).toBeUndefined();

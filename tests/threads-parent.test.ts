@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ThreadMeta } from "@cafe/protocol";
-import { FAST, barista, customer, identity, startDaemon, untilClosed } from "./helpers.ts";
+import { FAST, barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
 // #112: clarification/assignment sub-Threads are queryable by parent; #114: a Thread written
 // before channels existed reads back as `channel: "default"` on every API that returns meta.
@@ -14,24 +14,32 @@ describe("sub-Thread links and legacy channel reads (v4-13)", () => {
   it("lists the sub-Threads of a parent Thread", async () => {
     const d = await startDaemon("parent1", { mode: "root", timing: { ...FAST, graceMs: 60 } });
     cleanup.push(d.stop);
-    const w = await barista(d.addr, identity("worker"));
+    let childThreadId: string | undefined;
+    const tester = await barista(d.addr, identity("tester"));
+    cleanup.push(() => tester.client.close());
+    const w = await barista(d.addr, identity("worker"), async (h) => {
+      if (h.order.body === "parent task") {
+        const child = await w.client.ask({ body: "child task", to: "tester", parentOrderId: h.order.orderId, parentThreadId: h.order.threadId });
+        childThreadId = child.threadId;
+      }
+      await h.reply(h.order.body === "parent task" ? "assigned" : "finished");
+    });
     cleanup.push(() => w.client.close());
     const c = await customer(d.addr);
     cleanup.push(() => c.close());
 
     const parent = await c.ask({ body: "parent task", to: "worker" });
     await untilClosed(c, parent.threadId);
-    const child = await c.ask({ body: "child task", to: "worker", parentOrderId: parent.orderId, parentThreadId: parent.threadId });
-    await untilClosed(c, child.threadId);
+    await waitFor(() => !!childThreadId && d.daemon.thread(childThreadId)?.meta.status === "done");
 
     const rows = (await (await fetch(`http://${d.addr}/api/threads?parent=${parent.threadId}`)).json()) as ThreadMeta[];
-    expect(rows.map((r) => r.threadId)).toEqual([child.threadId]);
+    expect(rows.map((r) => r.threadId)).toEqual([childThreadId]);
     expect(rows[0]!.parentThreadId).toBe(parent.threadId);
 
-    const detail = (await (await fetch(`http://${d.addr}/api/threads/${child.threadId}`)).json()) as { meta: ThreadMeta };
+    const detail = (await (await fetch(`http://${d.addr}/api/threads/${childThreadId}`)).json()) as { meta: ThreadMeta };
     expect(detail.meta.parentThreadId).toBe(parent.threadId);
     // The parent page sees no children of its own parent.
-    expect(d.daemon.store.listThreadsByParent(child.threadId)).toEqual([]);
+    expect(d.daemon.store.listThreadsByParent(childThreadId!)).toEqual([]);
   });
 
   it("reads a pre-channel Thread as default on /api/threads, /api/snapshot and /api/threads/:id", async () => {

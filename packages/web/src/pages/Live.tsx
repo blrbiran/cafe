@@ -27,7 +27,7 @@ function eventText(t: Dict, agents: Record<string, { address: string }>, env: Th
     case "order.reported":
       return `${name(ev.agentId)} · ${t.resultReport}`;
     case "order.replied":
-      return t.eventReplied(name(ev.agentId), ev.final);
+      return ev.source === "operator" ? t.operatorOverride(name(ev.agentId)) : t.eventReplied(name(ev.agentId), ev.final);
     case "order.declined":
       return t.eventDeclined(name(ev.agentId));
     case "order.failed":

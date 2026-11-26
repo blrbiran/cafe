@@ -75,7 +75,7 @@ const TOOLS = [
   {
     name: "cafe_reply",
     description:
-      "Reply to an open cafe Order as one of its target Baristas (by address). For a process working on an Order that is not connected as a Barista peer; attachments are local paths this server uploads.",
+      "Submit an operator override on an open cafe Order, attributed to a named target Barista; this is not an authenticated Barista peer reply. Attachments are local paths this server uploads.",
     inputSchema: {
       type: "object",
       properties: {
@@ -142,7 +142,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
   const waitOrder = async (threadId: string, orderId: string, seconds: number) => {
     const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a.address]));
     const who = (id?: string) => (id ? (agents.get(id) ?? id) : "?");
-    const replies: { from: string; text: string; final: boolean }[] = [];
+    const replies: { from: string; text: string; final: boolean; source?: "agent" | "operator" }[] = [];
     const notes: string[] = [];
     let status: string | undefined;
     const ctrl = new AbortController();
@@ -162,7 +162,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
           const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
           if (env.orderId !== orderId) continue;
           const e = env.event;
-          if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final });
+          if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final, ...(e.source ? { source: e.source } : {}) });
           else if (e.type === "order.declined") notes.push(e.skipped ? `${who(e.agentId)} did not answer before the deadline` : `${who(e.agentId)} declined: ${e.reason}`);
           else if (e.type === "order.failed") notes.push(`${e.agentId ? who(e.agentId) : "the question"} failed: ${e.reason}`);
           else if (e.type === "order.cancelled") notes.push(`cancelled by ${e.by}`);
@@ -177,7 +177,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
       ctrl.abort();
     }
     const lines = [`threadId: ${threadId}`, `orderId: ${orderId}`, `status: ${status ?? "still working"}`];
-    for (const r of replies) lines.push("", `## ${r.from}${r.final ? "" : " (progress)"}`, r.text);
+    for (const r of replies) lines.push("", `## ${r.source === "operator" ? `operator override for ${r.from}` : r.from}${r.final ? "" : " (progress)"}`, r.text);
     if (notes.length) lines.push("", ...notes);
     if (!status) lines.push("", `Not answered yet. Call cafe_wait with threadId "${threadId}" to keep waiting, or cafe_cancel to give up.`);
     else if (status === "done") lines.push("", `Ask a follow-up with cafe_ask and threadId "${threadId}".`);
@@ -277,7 +277,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
           method: "POST",
           body: JSON.stringify({ agent, text, final: args.final !== false, ...(attachments.length ? { attachments } : {}) }),
         });
-        return { text: `replied to ${threadId}${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}` };
+        return { text: `operator override recorded for ${threadId}${attachments.length ? ` with ${attachments.length} attachment(s)` : ""}` };
       }
       default:
         throw new ToolError(`unknown tool ${name}`);

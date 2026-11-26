@@ -50,8 +50,9 @@ describe("reply attachments (v4-1 phase 2)", () => {
     expect(reply.status).toBe(200);
 
     const events = await untilClosed(c, res.threadId, res.orderId);
-    const ev = events.find((e) => e.event.type === "order.replied")!.event as { text: string; attachments?: Array<{ name: string }> };
+    const ev = events.find((e) => e.event.type === "order.replied")!.event as { text: string; source?: string; attachments?: Array<{ name: string }> };
     expect(ev.text).toBe("here it is");
+    expect(ev.source).toBe("operator");
     expect(ev.attachments).toMatchObject([{ name: "note.txt" }]);
   });
 

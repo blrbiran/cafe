@@ -48,6 +48,8 @@ interface Worker {
   quickFailures: number;
   /** Gave up restarting (#82); `start()` again replaces it. */
   failed: boolean;
+  /** A user-facing diagnostic attached to this worker's start result. */
+  warning?: string;
   /** The worker's own explanation of its last failure (its last stderr lines). */
   lastError?: string;
   /** Recent output lines, to explain a failure. */
@@ -71,6 +73,7 @@ export interface WorkerInfo {
   running: boolean;
   /** running, waiting (between restarts) or failed (gave up; see lastError). */
   state: "running" | "waiting" | "failed";
+  warning?: string;
   /** Why the worker last exited, in its own words (e.g. "cafe: … / next: …"). */
   lastError?: string;
   /** The per-worker log with the full output. */
@@ -211,9 +214,13 @@ export class Supervisor {
     // The leaf name alone collided for /a/work and /b/work (#102): keep it for readability and add a
     // short hash of the full path so two workers never interleave in one log.
     const tag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
-    // A running session answers one question at a time: one worker per TUI Barista.
-    for (let slot = 1; slot <= (spec.tui ? 1 : cafe.concurrency); slot++) {
-      const w: Worker = { spec: { ...spec, dir }, slot, restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${tag}-${slot}.log`) };
+    const warning = cafe.concurrency > 1
+      ? `configured concurrency ${cafe.concurrency}; Cafe sessions are serial, so only one worker is running`
+      : undefined;
+    if (warning) this.log(warning);
+    // One process owns one Cafe identity and one serial session. Distinct workers need distinct identities and directories.
+    for (let slot = 1; slot <= 1; slot++) {
+      const w: Worker = { spec: { ...spec, dir }, slot, ...(warning ? { warning } : {}), restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${tag}-${slot}.log`) };
       this.workers.push(w);
       this.launch(w);
     }
@@ -317,6 +324,7 @@ export class Supervisor {
       startedAt: w.launchedAt,
       running: !!w.child && w.child.exitCode === null && w.child.signalCode === null,
       state: w.failed ? ("failed" as const) : w.child && w.child.exitCode === null && w.child.signalCode === null ? ("running" as const) : ("waiting" as const),
+      ...(w.warning ? { warning: w.warning } : {}),
       ...(w.lastError ? { lastError: w.lastError } : {}),
       log: w.logPath,
     }));

@@ -87,6 +87,29 @@ describe("thread child results", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ status: "working", orderStatus: "done", pending: [{ summary: "test parser" }] });
   });
+  it("labels an HTTP reply as an operator override in Thread output", async () => {
+    const d = await startDaemon("operator-reply", { mode: "root" });
+    cleanup.push(d.stop);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const helper = await barista(d.addr, identity("helper"), async (h) => { await h.ack(); await held; });
+    cleanup.push(() => { release(); helper.client.close(); });
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const order = await c.ask({ body: "review the release", to: "helper" });
+    await waitFor(() => d.daemon.thread(order.threadId)?.meta.status === "working");
+
+    const reply = await fetch(`http://${d.addr}/api/threads/${order.threadId}/reply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent: helper.rec.address, text: "reviewed" }),
+    });
+    expect(reply.status).toBe(200);
+    await untilClosed(c, order.threadId, order.orderId);
+    const shown = await cafeAsync(d.home, d.addr, "thread", order.threadId);
+    expect(shown.stdout).toContain("operator override");
+  });
+
   it("answers an owner-bound clarification from the issuing CLI home", async () => {
     const d = await startDaemon("cli-clarification", { mode: "root" });
     cleanup.push(d.stop);
@@ -108,6 +131,30 @@ describe("thread child results", () => {
     expect(answer.status, answer.stderr).toBe(0);
     expect(answer.stdout).toContain("Answer accepted");
     await waitFor(() => d.daemon.thread(child)?.meta.replies[0]?.text === "confirmed: yes");
+  });
+
+  it("links human-owned child work only when the original CLI owner key matches", async () => {
+    const d = await startDaemon("owner-linked-child", { mode: "root" });
+    cleanup.push(d.stop);
+    const lead = await barista(d.addr, identity("lead"));
+    cleanup.push(() => lead.client.close());
+    const worker = await barista(d.addr, identity("worker"));
+    cleanup.push(() => worker.client.close());
+    const ownerHome = home();
+    const parentResult = await cafeAsync(ownerHome, d.addr, "--json", "ask", "--to", "lead", "verify release");
+    expect(parentResult.status, parentResult.stderr).toBe(0);
+    const parent = JSON.parse(parentResult.stdout) as { threadId: string };
+    const parentOrderId = d.daemon.thread(parent.threadId)!.meta.orderId;
+
+    const intruder = await cafeAsync(home(), d.addr, "--json", "ask", "--to", "worker", "--parent", parentOrderId, "--parent-thread", parent.threadId, "forge child");
+    expect(intruder.status).toBe(1);
+    expect(intruder.stdout).toContain("not_owner");
+
+    const child = await cafeAsync(ownerHome, d.addr, "--json", "ask", "--to", "worker", "--parent", parentOrderId, "--parent-thread", parent.threadId, "check parser tests");
+    expect(child.status, child.stderr).toBe(0);
+    const childResult = JSON.parse(child.stdout) as { threadId: string };
+    expect(d.daemon.thread(childResult.threadId)?.meta).toMatchObject({ origin: "human", parentOrderId, parentThreadId: parent.threadId, parentOwnerVerified: true });
+    expect((await (await fetch(`http://${d.addr}/api/threads/${parent.threadId}`)).json() as any).meta.taskStatus).toBe("done");
   });
 
   it("ignores unrelated Threads from daemons without a parent filter", async () => {
@@ -132,17 +179,32 @@ describe("thread child results", () => {
   it("shows a child result after the parent has closed", async () => {
     const d = await startDaemon("thread-children", { mode: "root" });
     cleanup.push(d.stop);
-    const worker = await barista(d.addr, identity("worker"), async (h) => h.reply(h.order.body === "parent" ? "assigned" : "checks passed"));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    cleanup.push(release);
+    const worker = await barista(d.addr, identity("worker"), async (h) => {
+      await h.ack();
+      await held;
+      await h.reply("checks passed");
+    });
     cleanup.push(() => worker.client.close());
+    let childId: string | undefined;
+    const lead = await barista(d.addr, identity("lead"), async (h) => {
+      const child = await lead.client.ask({ body: "tests", to: "worker", parentOrderId: h.order.orderId, parentThreadId: h.order.threadId });
+      childId = child.threadId;
+      await h.reply("assigned");
+    });
+    cleanup.push(() => lead.client.close());
     const c = await customer(d.addr);
     cleanup.push(() => c.close());
-    const parent = await c.ask({ body: "parent", to: "worker" });
-    await untilClosed(c, parent.threadId);
-    const child = await c.ask({ body: "tests", to: "worker", parentOrderId: parent.orderId, parentThreadId: parent.threadId });
-    await untilClosed(c, child.threadId);
+    const parent = await c.ask({ body: "parent", to: "lead" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    await waitFor(() => !!childId && d.daemon.thread(childId)?.meta.status === "working");
+    release();
+    await waitFor(() => d.daemon.thread(childId!)?.meta.status === "done");
     const result = await cafeAsync(d.home, d.addr, "thread", parent.threadId, "--children");
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain(child.threadId);
+    expect(result.stdout).toContain(childId!);
     expect(result.stdout).toContain("checks passed");
   });
 });
@@ -199,8 +261,10 @@ describe("cafe wait cancellation is honest (#60)", () => {
   /** A daemon stub: health answers, the stream hangs once, the cancel call fails its way. */
   async function stubDaemon(cancelFails: boolean) {
     const http = await import("node:http");
+    const calls: string[] = [];
     const server = http.createServer((req, res) => {
       const url = req.url ?? "/";
+      calls.push(`${req.method} ${url}`);
       if (url.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "stub", pid: 1, isRoot: true, version: "0.1.4" }));
       if (url.startsWith("/api/agents")) return res.end("[]");
       if (url === "/api/orders") return res.end(JSON.stringify({ threadId: "t1", orderId: "o1", decision: { mode: "unicast", reason: "stub" } }));
@@ -219,11 +283,11 @@ describe("cafe wait cancellation is honest (#60)", () => {
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
     const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
-    return addr;
+    return { addr, calls };
   }
 
   it("does not claim the question was cancelled when the cancel request failed", async () => {
-    const addr = await stubDaemon(true);
+    const { addr } = await stubDaemon(true);
     const r = await cafeAsync(home(), addr, "ask", "--timeout", "1", "hi");
     expect(r.status).toBe(1);
     expect(r.stderr).not.toContain("cancelled");
@@ -231,10 +295,44 @@ describe("cafe wait cancellation is honest (#60)", () => {
   });
 
   it("still reports a real cancellation", async () => {
-    const addr = await stubDaemon(false);
+    const { addr } = await stubDaemon(false);
     const r = await cafeAsync(home(), addr, "ask", "--timeout", "1", "hi");
     expect(r.stderr).toContain("cancelled");
     expect(r.stderr).not.toContain("could not cancel");
+  });
+
+  it("reports awaiting_report after the parent Order closes without a final report", async () => {
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => {
+      const url = req.url ?? "/";
+      res.setHeader("content-type", "application/json");
+      if (url.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "stub", pid: 1, isRoot: true, version: "0.2.0" }));
+      if (url.startsWith("/api/agents")) return res.end("[]");
+      if (url === "/api/threads?parent=t1") return res.end("[]");
+      if (url === "/api/threads/t1") return res.end(JSON.stringify({ meta: { threadId: "t1", orderId: "o1", taskStatus: "awaiting_report", status: "done" }, events: [] }));
+      if (url.startsWith("/api/threads/t1/stream")) {
+        res.setHeader("content-type", "text/event-stream");
+        return res.end(`data: ${JSON.stringify({ eventId: "e1", threadId: "t1", orderId: "o1", host: "stub", at: 1, event: { type: "order.closed", status: "done" } })}\n\n`);
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not_found", message: url }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const result = await cafeAsync(home(), addr, "--json", "wait", "t1");
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ status: "awaiting_report", orderStatus: "done", taskStatus: "awaiting_report" });
+  });
+
+  it("stops waiting without cancelling an Order when --wait-timeout expires", async () => {
+    const { addr, calls } = await stubDaemon(false);
+    const r = await cafeAsync(home(), addr, "ask", "--wait-timeout", "0.1", "hi");
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("stopped waiting after 0.1s");
+    expect(r.stdout).toContain("still running");
+    expect(calls.some((call) => call.endsWith("/cancel"))).toBe(false);
   });
 });
 
@@ -280,6 +378,29 @@ describe("mixed-release preflights (v4-12)", () => {
 });
 
 describe("cafe commands", () => {
+  it("shows the serial-capacity warning when a worker configuration is clamped", async () => {
+    const http = await import("node:http");
+    const dir = home();
+    writeFileSync(join(dir, ".cafe"), "name: worker\nconcurrency: 3\n");
+    const warning = "configured concurrency 3; Cafe sessions are serial, so only one worker is running";
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url?.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "stub", pid: 1, isRoot: true, version: "0.2.0" }));
+      if (req.url === "/api/baristas" && req.method === "POST") return res.end(JSON.stringify([{ dir, warning }]));
+      if (req.url === "/api/baristas") return res.end(JSON.stringify([{ dir, running: true, state: "running" }]));
+      if (req.url === "/api/agents") return res.end(JSON.stringify([{ cwd: dir, status: "idle", address: "worker@stub" }]));
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not_found", message: req.url }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const result = await cafeAsync(home(), addr, "barista", "start", "--dir", dir);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(warning);
+  });
+
   it("status lists the entry point for each host", () => {
     const r = cafeEnv(home(), home(), "commands", "status");
     expect(r.status, r.stderr).toBe(0);

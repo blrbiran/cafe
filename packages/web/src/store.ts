@@ -228,10 +228,21 @@ export function setSearch(q: string): void {
   }, 250);
 }
 
+export function mergeProjectedMeta(previous: ThreadMeta | undefined, raw: ThreadMeta): ThreadMeta {
+  const sameOrder = previous?.orderId === raw.orderId;
+  return norm({
+    ...raw,
+    ...(sameOrder && raw.taskStatus === undefined && previous?.taskStatus !== undefined ? { taskStatus: previous.taskStatus } : {}),
+    ...(sameOrder && raw.pendingChildren === undefined && previous?.pendingChildren !== undefined ? { pendingChildren: previous.pendingChildren } : {}),
+    ...(sameOrder && raw.childrenPartial === undefined && previous?.childrenPartial !== undefined ? { childrenPartial: previous.childrenPartial } : {}),
+  });
+}
+
 function upsertThread(raw: ThreadMeta): void {
-  const meta = norm(raw);
   set((s) => {
     // Live events from other channels must not leak into the visible Feed (v4-11).
+    const previous = s.threads.find((t) => t.threadId === raw.threadId) ?? (s.detail?.meta.threadId === raw.threadId ? s.detail.meta : undefined);
+    const meta = mergeProjectedMeta(previous, raw);
     const detail = s.detail && s.detail.meta.threadId === meta.threadId ? { ...s.detail, meta } : s.detail;
     if ((meta.channel ?? "default") !== s.channel) return { detail };
     const i = s.threads.findIndex((t) => t.threadId === meta.threadId);
@@ -239,6 +250,28 @@ function upsertThread(raw: ThreadMeta): void {
     return { threads, detail };
   });
 }
+
+function scheduleTaskStatusRefresh(threadId: string): void {
+  if (!state.threads.some((meta) => meta.threadId === threadId) && state.detail?.meta.threadId !== threadId) return;
+  taskStatusRefreshes.add(threadId);
+  if (taskStatusRefreshTimer) return;
+  taskStatusRefreshTimer = setTimeout(() => {
+    taskStatusRefreshTimer = undefined;
+    const ids = [...taskStatusRefreshes];
+    taskStatusRefreshes.clear();
+    void Promise.all(ids.map(async (id) => {
+      try {
+        const detail = await api.thread(id, { limit: 1 });
+        upsertThread(detail.meta);
+      } catch {
+        // The last projection remains visible; opening detail reports a partial view if Root is down.
+      }
+    }));
+  }, 80);
+}
+
+let taskStatusRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+const taskStatusRefreshes = new Set<string>();
 
 /** Fold one event into the per-thread latest-turn facts. */
 function foldLive(live: Record<string, LiveTurn>, env: ThreadEnvelope): Record<string, LiveTurn> {
@@ -333,6 +366,10 @@ function onNotification(method: string, params: any): void {
       if (meta?.parentThreadId && meta.parentThreadId === state.detail?.meta.threadId && env.event.type !== "order.heartbeat") {
         set({ linkedActivity: env.eventId });
       }
+      if (meta?.parentThreadId && env.event.type !== "order.heartbeat") scheduleTaskStatusRefresh(meta.parentThreadId); else if (env.event.type === "order.reported" || (env.event.type === "order.closed" && state.threads.some((thread) => thread.parentThreadId === env.threadId))) {
+        scheduleTaskStatusRefresh(env.threadId);
+      }
+      if (state.search.q.trim() && (env.event.type === "order.reported" || (meta?.parentThreadId && env.event.type !== "order.heartbeat"))) setSearch(state.search.q);
       appendEvent(env);
       break;
     }

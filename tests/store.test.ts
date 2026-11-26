@@ -122,6 +122,58 @@ describe("Store", () => {
     expect(bad).toBe(0);
   });
 
+  it("pages open Threads in stable creation-time and id order", () => {
+    const store = new Store(temp());
+    const meta = (threadId: string, createdAt: number): ThreadMeta => ({
+      threadId,
+      orderId: `O-${threadId}`,
+      kind: "order",
+      from: { id: "customer", address: "customer@h", host: "h" },
+      targets: [],
+      status: "working",
+      summary: threadId,
+      summaryTurn: 1,
+      createdAt,
+      file: `/nonexistent/${threadId}.jsonl`,
+      turns: 1,
+      replies: [],
+      declines: [],
+    });
+    for (const item of [meta("b", 10), meta("a", 10), meta("d", 20), meta("c", 20)]) store.putThread(item);
+
+    const first = store.openThreadsPage(2);
+    const second = store.openThreadsPage(2, { createdAt: first[1]!.createdAt, threadId: first[1]!.threadId });
+    const end = store.openThreadsPage(2, { createdAt: second[1]!.createdAt, threadId: second[1]!.threadId });
+
+    expect(first.map((item) => item.threadId)).toEqual(["a", "b"]);
+    expect(second.map((item) => item.threadId)).toEqual(["c", "d"]);
+    expect(end).toEqual([]);
+  });
+
+  it("queries child Threads for one exact parent Order", () => {
+    const store = new Store(temp());
+    const child = (threadId: string, parentOrderId: string, createdAt: number): ThreadMeta => ({
+      threadId,
+      orderId: `O-${threadId}`,
+      kind: "order",
+      parentThreadId: "parent",
+      parentOrderId,
+      from: { id: "agent", address: "agent@h", host: "h" },
+      targets: [],
+      status: "done",
+      summary: threadId,
+      summaryTurn: 1,
+      createdAt,
+      file: `/nonexistent/${threadId}.jsonl`,
+      turns: 1,
+      replies: [],
+      declines: [],
+    });
+    for (const meta of [child("old-turn", "old-order", 1), child("current-a", "current-order", 2), child("current-b", "current-order", 3)]) store.putThread(meta);
+
+    expect(store.listThreadsByParentOrder("parent", "current-order").map((meta) => meta.threadId)).toEqual(["current-b", "current-a"]);
+  });
+
   it("returns only unfinished threads for recovery", () => {
     const store = new Store(temp());
     const meta = (id: string, status: ThreadMeta["status"]): ThreadMeta => ({

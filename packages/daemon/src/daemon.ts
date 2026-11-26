@@ -31,6 +31,7 @@ import {
   channelsOf,
   formatAddress,
   parseAddress,
+  projectTaskStatus,
   type AgentRecord,
   type AgentStatus,
   type Attachment,
@@ -347,7 +348,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       ackTimeoutMs: ACK_TIMEOUT_MS,
       heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
       broadcastDeadlineMs: BROADCAST_DEADLINE_MS,
-      unicastDeadlineMs: 10 * 60_000,
+      unicastDeadlineMs: 2 * 60 * 60_000,
       graceMs: 2_000,
       reconnectMinMs: 500,
       reconnectMaxMs: 30_000,
@@ -845,8 +846,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const proof = resumeProof ? ownershipDigest(resumeProof) : undefined;
       const priorProof = resumeAgentId ? this.store.getKv<string>(`agent-proof:${resumeAgentId}`) : undefined;
       if (priorProof && priorProof !== proof) throw new RpcError("bad_identity", "agent resume proof does not match");
-      // Resume only an ID not held by a live connection. Retain compatibility with legacy, unprotected IDs.
-      const availableId = resumeAgentId && !this.agents.has(resumeAgentId) ? resumeAgentId : undefined;
+      // An agentId is resumable only with a matching stored proof, or — when this Host has never
+      // recorded one (legacy or freshly restarted store) — with a proof the client presents. A bare
+      // claim of an unprotected ID is not enough to inherit its delivery authority.
+      const resumableProof = !!priorProof === true ? priorProof === proof : !!proof;
+      const availableId = resumeAgentId && resumableProof && !this.agents.has(resumeAgentId) ? resumeAgentId : undefined;
       const prev = availableId ? (this.local.get(availableId) ?? this.registry.get(availableId)) : undefined;
       const resumable = prev && prev.host === this.host && prev.name === identity.name ? prev : undefined;
       const now = Date.now();
@@ -892,17 +896,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (x.removeAlias) return this.removeAgentAlias(x.agentId, x.removeAlias);
       throw new RpcError("bad_request", "displayName, alias or removeAlias is required");
     });
-    peer.on(Methods.orderCreate, (raw) => this.createOrder(CreateOrderParams.parse(raw), peer));
+    peer.on(Methods.orderCreate, (raw) => {
+      const parsed = CreateOrderParams.safeParse(raw);
+      if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
+      return this.createOrder(parsed.data, peer);
+    });
     peer.on(Methods.orderAck, (p: { orderId: string; threadId: string }) => this.agentEvent(peer, p, { type: "order.acked", agentId: peer.meta.agentId }));
     peer.on(Methods.orderHeartbeat, (p: { orderId: string; threadId: string; note?: string }) =>
       this.agentEvent(peer, p, { type: "order.heartbeat", agentId: peer.meta.agentId, note: p.note }),
     );
-    peer.on(Methods.orderReply, (p: { orderId: string; threadId: string; text: string; final?: boolean; attachments?: Attachment[] }) => {
-      // Reply blobs were uploaded to this daemon first; move them into the Thread
-      // so the Customer's daemon can proxy the download (v4-1 phase 2).
-      const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, p.threadId) : undefined;
-      return this.agentEvent(peer, p, { type: "order.replied", agentId: peer.meta.agentId, text: p.text, final: p.final ?? true, ...(attachments?.length ? { attachments } : {}) });
-    });
+    peer.on(Methods.orderReply, (p: { orderId: string; threadId: string; text: string; final?: boolean; attachments?: Attachment[] }) =>
+      this.agentEvent(peer, p, { type: "order.replied", agentId: peer.meta.agentId, text: p.text, final: p.final ?? true, ...(p.attachments?.length ? { attachments: p.attachments } : {}) }),
+    );
     peer.on(Methods.orderDecline, (p: { orderId: string; threadId: string; reason: string; unavailable?: boolean }) =>
       this.agentEvent(peer, p, { type: "order.declined", agentId: peer.meta.agentId, reason: p.reason, ...(p.unavailable ? { unavailable: true } : {}) }),
     );
@@ -973,15 +978,33 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private agentEvent(peer: Peer, p: { orderId: string; threadId: string }, event: ThreadEventBody): {} {
-    if (!peer.meta.agentId) throw new RpcError("not_registered", "agent/register first");
-    const rec = this.local.get(peer.meta.agentId);
-    if (rec?.activeThreadId === p.threadId && ((event.type === "order.replied" && event.final) || event.type === "order.declined")) {
-      const next = { ...rec };
-      delete next.activeThreadId;
-      this.local.set(rec.agentId, next);
-      this.publishAgents([next]);
+    const agentId = peer.meta.agentId as string | undefined;
+    if (!agentId || this.agents.get(agentId) !== peer) throw new RpcError("not_registered", "agent/register first");
+    if (typeof p?.orderId !== "string" || !p.orderId || typeof p.threadId !== "string" || !p.threadId) {
+      throw new RpcError("bad_request", "orderId and threadId are required");
     }
-    this.recordEvent({ eventId: ulid(), threadId: p.threadId, orderId: p.orderId, host: this.host, at: Date.now(), event });
+    const meta = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
+    const order = meta ? this.findParentOrder(p.orderId, p.threadId) : undefined;
+    if (!order || order.threadId !== p.threadId) throw new RpcError("not_found", "no matching Order on this Thread");
+    if (!this.wasDelivered(order, agentId, this.host)) throw new RpcError("not_a_target", "this Agent was not delivered the Order");
+
+    const tracking = this.tracking.get(order.orderId);
+    const closed = tracking ? tracking.status !== "open" : !!this.closingEvent(p.threadId, p.orderId);
+    if (closed && !(event.type === "order.replied" && event.final)) return {};
+    if (tracking?.targets.get(agentId) === "failed" && !(event.type === "order.replied" && event.final)) return {};
+    if (tracking && !tracking.targets.has(agentId)) tracking.targets.set(agentId, "pending");
+
+    let accepted = event;
+    if (event.type === "order.replied" && event.attachments?.length) {
+      accepted = { ...event, attachments: this.commitAttachments(event.attachments, p.threadId) };
+    }
+    if (!closed && ((accepted.type === "order.replied" && accepted.final) || accepted.type === "order.declined")) {
+      this.clearActiveOrder(agentId, p.threadId, p.orderId);
+    }
+    this.recordEvent(
+      { eventId: ulid(), threadId: p.threadId, orderId: p.orderId, host: this.host, at: Date.now(), event: accepted },
+      closed ? { skipTrack: true } : {},
+    );
     return {};
   }
 
@@ -1924,19 +1947,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.draining) throw new RpcError("daemon_draining", "the daemon is draining for an update; retry after it restarts");
     const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
     if (p.escalate && !p.parentOrderId) throw new RpcError("unknown_parent", "escalate: true requires parentOrderId");
+    if (p.parentThreadId && !p.parentOrderId) throw new RpcError("bad_request", "parentThreadId requires parentOrderId");
     const parent = p.parentOrderId ? this.findParentOrder(p.parentOrderId, p.parentThreadId) : undefined;
-    if (p.escalate && !parent) throw new RpcError("unknown_parent", `cannot find parent order ${p.parentOrderId}`);
-    if (p.escalate && p.parentThreadId && parent!.threadId !== p.parentThreadId) {
+    // Provenance-only parentOrderId keeps its legacy meaning: it may be an ID this Host no longer
+    // indexes. A linked child or an escalation must resolve to a real parent.
+    if ((p.escalate || p.parentThreadId) && p.parentOrderId && !parent) throw new RpcError("unknown_parent", `cannot find parent order ${p.parentOrderId}`);
+    if (p.parentThreadId && parent!.threadId !== p.parentThreadId) {
       throw new RpcError("unknown_parent", `parent order ${p.parentOrderId} is not in thread ${p.parentThreadId}`);
     }
-    // Only a Barista that actually received the parent Order may escalate it: an Order id alone
-    // must not be a routing bypass for any caller (v4-11 review). Ask the parent Order's own target
-    // map, not the Thread's: ThreadMeta.targets accumulates across turns, so an agent targeted on a
-    // later turn would otherwise be accepted as the recipient of an earlier one.
-    if (p.escalate && peer?.meta.agentId) {
-      const delivery = this.tracking.get(parent!.orderId)?.targets.get(peer.meta.agentId);
-      if ((!delivery || delivery === "failed") && !this.wasDelivered(parent!, from.id, this.host)) {
-        throw new RpcError("not_a_target", "escalate: only a Barista that received the parent Order may escalate it");
+    if (p.escalate) {
+      const agentId = peer?.meta.agentId as string | undefined;
+      if (!agentId || this.agents.get(agentId) !== peer || !this.wasDelivered(parent!, agentId, this.host)) {
+        throw new RpcError("not_a_target", "escalate: only a registered Barista that received the parent Order may create a sub-Thread");
       }
     }
     const needsHuman = Boolean(p.escalate && !p.to && !p.broadcast && parent?.humanClarifications &&
@@ -1947,14 +1969,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       !this.daemons().some((d) => d.host === parent!.from.host && d.online && d.features?.includes("human-clarifications")))) {
       throw new RpcError("parent_unavailable", "the original requester’s Host is offline or does not support human clarifications");
     }
-    const depth = parent ? parent.depth + 1 : 0;
-    const parentContext = parent && parent.threadId === p.parentThreadId
-      ? parent.from.id === from.id
-        ? summarize(parent.body, 639)
-        : this.deliveredParentBodies.get(`${parent.orderId}:${from.id}`)
-      : undefined;
-    if (depth > MAX_ORDER_DEPTH) throw new RpcError("too_deep", `order depth ${depth} exceeds ${MAX_ORDER_DEPTH}`);
-
     // Follow-up: continue an existing Thread. An escalation is always a NEW sub-Thread: one open
     // Order per Thread is the invariant that keeps replies/history/cancel unambiguous (v4-11).
     let prior: ThreadMeta | undefined;
@@ -1964,19 +1978,61 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (prior.clarification) throw new RpcError("clarification_required", "answer the clarification from the original conversation");
       const tc = prior.channel ?? DEFAULT_CHANNEL;
       if (p.channel && p.channel !== tc) throw new RpcError("channel_mismatch", `thread ${prior.threadId} is in channel ${tc}`);
-      const open = [...this.tracking.values()].find((x) => x.order.threadId === p.threadId && x.status === "open");
-      if (open) {
-        if (!p.replace) {
-          throw new RpcError(
-            "thread_busy",
-            `the previous question in this thread is still open; wait, run \`cafe cancel ${p.threadId}\`, or pass replace: true to ask anyway`,
-          );
-        }
-        // The person gave up on the stuck Order; record that instead of leaving it open forever (#60).
+    }
+    let effectiveParentOrderId = p.parentOrderId ?? prior?.parentOrderId;
+    let effectiveParentThreadId = p.parentThreadId ?? prior?.parentThreadId;
+    if (prior?.parentThreadId && prior.parentOrderId) {
+      if ((p.parentOrderId && p.parentOrderId !== prior.parentOrderId) || (p.parentThreadId && p.parentThreadId !== prior.parentThreadId)) {
+        throw new RpcError("conflict", "a linked Thread cannot change its parent Order");
+      }
+      effectiveParentOrderId = prior.parentOrderId;
+      effectiveParentThreadId = prior.parentThreadId;
+    } else if (prior && p.parentThreadId) {
+      throw new RpcError("conflict", "an existing Thread cannot be linked to a parent retroactively");
+    }
+    const linkedParent = effectiveParentOrderId
+      ? parent?.orderId === effectiveParentOrderId ? parent : this.findParentOrder(effectiveParentOrderId, effectiveParentThreadId)
+      : undefined;
+    const linkedFollowup = !!(prior?.parentOrderId && prior.parentThreadId);
+    const needsResolvedParent = !!effectiveParentThreadId || !!p.escalate || linkedFollowup;
+    if (needsResolvedParent && effectiveParentOrderId && !linkedParent) throw new RpcError("unknown_parent", `cannot find parent order ${effectiveParentOrderId}`);
+    if (effectiveParentThreadId && !effectiveParentOrderId) throw new RpcError("bad_request", "parentThreadId requires parentOrderId");
+    if (effectiveParentThreadId && linkedParent?.threadId !== effectiveParentThreadId) {
+      throw new RpcError("unknown_parent", `parent order ${effectiveParentOrderId} is not in thread ${effectiveParentThreadId}`);
+    }
+    const linkedTask = !!effectiveParentThreadId && !p.escalate;
+    const agentId = peer?.meta.agentId as string | undefined;
+    const parentAgentDelivery = !!(!linkedFollowup && peer && agentId && this.agents.get(agentId) === peer && linkedParent && this.wasDelivered(linkedParent, agentId, this.host));
+    const parentCreator = !!(linkedFollowup && peer && agentId === prior!.from.id && prior!.from.host === this.host && linkedParent && this.wasDelivered(linkedParent, agentId, this.host));
+    const priorChildOrder = linkedFollowup ? this.findParentOrder(prior!.orderId, prior!.threadId) : undefined;
+    const priorChildDelivery = !!(peer && agentId && this.agents.get(agentId) === peer && priorChildOrder && this.wasDelivered(priorChildOrder, agentId, this.host));
+    const ownerLinkedParent = !!(!peer && p.origin !== "agent" && linkedParent && this.ownsHumanOrder(linkedParent, ownerKey));
+    if (linkedTask && !parentAgentDelivery && !parentCreator && !priorChildDelivery && !ownerLinkedParent) {
+      throw new RpcError(p.origin === "agent" || peer ? "not_a_target" : "not_owner", "linked work requires the parent recipient or its human owner");
+    }
+    if (prior) {
+      const open = [...this.tracking.values()].find((x) => x.order.threadId === prior!.threadId && x.status === "open");
+      if (open && !p.replace) {
+        throw new RpcError("thread_busy", `the previous question in this thread is still open; wait, run \`cafe cancel ${prior.threadId}\`, or pass replace: true to ask anyway`);
+      }
+      if (open && p.replace) {
         this.emitEvent(open.order, { type: "order.cancelled", by: "replaced" });
         this.close(open, "cancelled");
+      } else if ((prior.status === "routing" || prior.status === "delivering" || prior.status === "working") && !this.closingEvent(prior.threadId, prior.orderId)) {
+        throw new RpcError("thread_busy", `the previous Order may still be open on its originating Host; verify or cancel it there before following up`);
       }
     }
+    const parentOwnerVerified = ownerLinkedParent || prior?.parentOwnerVerified === true;
+    const effectiveParent = linkedParent ?? parent;
+    const contextParentThreadId = effectiveParentThreadId ?? (p.escalate ? parent?.threadId : undefined);
+    const depth = effectiveParent ? effectiveParent.depth + 1 : 0;
+    const parentContext = effectiveParent && effectiveParent.threadId === contextParentThreadId
+      ? effectiveParent.from.id === from.id
+        ? summarize(effectiveParent.body, 639)
+        : this.deliveredParentBodies.get(`${effectiveParent.orderId}:${from.id}`)
+      : undefined;
+    if (depth > MAX_ORDER_DEPTH) throw new RpcError("too_deep", `order depth ${depth} exceeds ${MAX_ORDER_DEPTH}`);
+
     const threadId = p.escalate ? ulid() : prior?.threadId ?? ulid();
     // Channel (v4-11). A follow-up and a sub-Thread inherit; an explicit channel on a fresh Order
     // wins; a registered Agent defaults to its home channel (the first one it listed).
@@ -2007,16 +2063,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       from,
       ...(owner?.success ? { humanClarifications: true as const } : {}),
       ...(needsHuman ? { needsHuman: true as const } : {}),
-      // A registered Agent asking through the protocol is relaying on someone's behalf.
-      origin: p.origin ?? (peer?.meta.party ? "agent" : "human"),
-      via: p.via ?? (peer?.meta.party ? { id: peer.meta.party.id, address: peer.meta.party.address } : undefined),
+      // Agent RPC identity is authoritative; HTTP owner-linked children are attributed to their human owner.
+      origin: ownerLinkedParent ? "human" : peer?.meta.party ? "agent" : p.origin ?? "human",
+      via: ownerLinkedParent ? undefined : peer?.meta.party ? { id: peer.meta.party.id, address: peer.meta.party.address } : p.via,
       to: p.to,
       body: p.body,
       ...(attachments?.length ? { attachments } : {}),
-      parentOrderId: p.parentOrderId,
+      parentOrderId: effectiveParentOrderId,
       ...(parentContext ? { parentContext } : {}),
-      ...(p.escalate ? { parentThreadId: p.parentThreadId ?? parent?.threadId, escalate: true } : p.parentThreadId ? { parentThreadId: p.parentThreadId } : {}),
-      chain: [...(parent?.chain ?? []), ...(parent ? [parent.from.id] : [])],
+      ...(parentOwnerVerified ? { parentOwnerVerified: true as const } : {}),
+      ...(p.escalate ? { parentThreadId: effectiveParentThreadId ?? parent?.threadId, escalate: true } : effectiveParentThreadId ? { parentThreadId: effectiveParentThreadId } : {}),
+      chain: [...(effectiveParent?.chain ?? []), ...(effectiveParent ? [effectiveParent.from.id] : [])],
       depth,
       deadlineMs: p.deadlineMs,
       createdAt: Date.now(),
@@ -2035,7 +2092,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Capture who answered before the new turn resets the Thread's reply list. `targetStates` is
 // also per-turn (reset at every `order.created`), so it is the previous Order's target set;
 // `meta.targets` is cumulative and only a fallback for old Threads.
-    const answeredBefore = prior ? [...new Set(prior.replies.map((r) => r.agentId))] : [];
+    const answeredBefore = prior ? [...new Set(prior.replies.filter((reply) => reply.at < (prior!.closedAt ?? Number.POSITIVE_INFINITY)).map((r) => r.agentId))] : [];
     const priorTargets = prior ? (prior.targetStates?.length ? prior.targetStates.map((s) => s.agentId) : prior.targets) : [];
     const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
     this.tracking.set(order.orderId, t);
@@ -2056,15 +2113,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.close(t, "failed");
       return { orderId: order.orderId, threadId: order.threadId, decision };
     }
-    for (const id of decision.targets) this.dispatch(t, id);
-    // Every Order gets an upper bound (#60). Heartbeats prove the Barista is alive, not that it will
-    // answer: without a deadline a queued unicast Order left `cafe ask` hanging indefinitely.
-    // A notice is fire-and-forget and only needs to be collected, not answered.
-    if (order.kind === "notice" || decision.mode !== "unicast") {
-      t.deadline = setTimeout(() => this.finishOnDeadline(t), order.deadlineMs ?? this.timing.broadcastDeadlineMs);
-    } else {
-      t.deadline = setTimeout(() => this.finishOnDeadline(t), order.deadlineMs ?? this.timing.unicastDeadlineMs);
+    const defaultMs = order.kind === "notice" || decision.mode !== "unicast" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
+    const deadlineAt = order.createdAt + (order.deadlineMs ?? defaultMs);
+    if (Date.now() >= deadlineAt) {
+      for (const id of decision.targets) t.targets.set(id, "pending");
+      this.finishOnDeadline(t);
+      return { orderId: order.orderId, threadId: order.threadId, decision };
     }
+    // Route time consumes the same absolute hard lifetime as execution and recovery.
+    t.deadline = setTimeout(() => this.finishOnDeadline(t), deadlineAt - Date.now());
+    for (const id of decision.targets) this.dispatch(t, id);
     return { orderId: order.orderId, threadId: order.threadId, decision };
   }
 
@@ -2163,7 +2221,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const env of this.store.readEventsTail(meta.file, 200)) {
       const ev = env.event;
       if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: ev.order.body.slice(0, 4000) });
-      else if (ev.type === "order.replied" && ev.final) out.push({ agentId: ev.agentId, from: this.registry.get(ev.agentId)?.address ?? ev.agentId, role: "barista", text: ev.text.slice(0, 4000) });
+      else if (ev.type === "order.replied" && ev.final) {
+        const speaker = this.registry.get(ev.agentId)?.address ?? ev.agentId;
+        out.push({ agentId: ev.agentId, from: speaker, role: "barista", text: ev.source === "operator" ? `[operator override for ${speaker} — not the Barista's own words] ${ev.text.slice(0, 3900)}` : ev.text.slice(0, 4000) });
+      }
     }
     return out.slice(-12);
   }
@@ -2585,8 +2646,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return this.relayFailure(order, agentId, "agent not connected");
     }
     const rec = this.local.get(agentId);
-    if (rec && rec.activeThreadId !== order.threadId) {
-      const next = { ...rec, activeThreadId: order.threadId };
+    if (rec && (rec.activeThreadId !== order.threadId || rec.activeOrderId !== order.orderId)) {
+      const next = { ...rec, activeThreadId: order.threadId, activeOrderId: order.orderId };
       this.local.set(agentId, next);
       this.publishAgents([next]);
     }
@@ -2606,8 +2667,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.relayFailure(order, agentId, `attachment_unavailable: ${(err as Error).message}`);
       return;
     }
-    this.notifyLocal(order, agentId, peer);
+    // The pull is async: the peer may have disconnected or the Order closed meanwhile. Recording
+    // `order.delivered` for a peer that never received it would grant a later connection its authority.
+    if (peer.isClosed || this.agents.get(agentId) !== peer) return;
     const t = this.tracking.get(order.orderId);
+    if (t && t.status !== "open") return;
+    this.notifyLocal(order, agentId, peer);
     if (t && order.kind === "order") this.armAck(t, agentId);
   }
 
@@ -2665,13 +2730,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Apply an event to origin tracking. */
   private track(env: ThreadEnvelope): void {
     const t = this.tracking.get(env.orderId);
-    if (!t) return;
+    if (!t || t.status !== "open") return;
     const ev = env.event;
     if (t.order.clarificationRecipient && "agentId" in ev &&
       (ev.agentId !== t.order.clarificationRecipient.id || env.host !== t.order.clarificationRecipient.host)) return;
     switch (ev.type) {
       case "order.acked":
-        if (t.targets.get(ev.agentId) === "pending") t.targets.set(ev.agentId, "acked");
+        if (t.targets.get(ev.agentId) !== "pending") break;
+        t.targets.set(ev.agentId, "acked");
         this.armHeartbeat(t, ev.agentId);
         break;
       case "order.heartbeat":
@@ -2692,6 +2758,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         } else this.armHeartbeat(t, ev.agentId);
         break;
       case "order.declined":
+        if (t.targets.get(ev.agentId) !== "pending" && t.targets.get(ev.agentId) !== "acked") break;
         this.clearTimer(t, ev.agentId);
         t.targets.set(ev.agentId, "done");
         if (t.decision?.mode === "unicast" && !this.hasReply(t)) {
@@ -2798,11 +2865,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return this.draining;
   }
 
-  /**
-   * Reply on behalf of a target Barista over HTTP (v4-1 phase 2: `cafe reply`).
-   * The caller must name an agent that is actually a target of the open Order;
-   * the daemon commits any staged blobs before recording the reply.
-   */
+  /** Record an operator override on an open Order, clearly distinguished from an authenticated Barista reply. */
   replyAs(threadId: string, p: { orderId?: string; agent: string; text: string; final?: boolean; attachments?: Attachment[] }): {} {
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) throw new RpcError("not_found", `unknown thread ${threadId}`);
@@ -2817,6 +2880,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       agentId: ids[0]!,
       text: p.text,
       final: p.final ?? true,
+      source: "operator",
       ...(attachments?.length ? { attachments } : {}),
     });
     return {};
@@ -3040,6 +3104,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
     if (this.stopped || this.seen.has(env.eventId)) return;
+    const event = env.event;
+    const closed = this.closingEvent(env.threadId, env.orderId);
+    if (closed && !(event.type === "order.replied" && event.final) && event.type !== "order.reported") return;
+    const tracking = this.tracking.get(env.orderId);
+    if (!opts.skipTrack && tracking?.status === "open" && "agentId" in event && typeof event.agentId === "string" && tracking.targets.get(event.agentId) === "failed" &&
+      (event.type === "order.acked" || event.type === "order.heartbeat" || event.type === "order.declined" || event.type === "order.failed")) return;
     this.seen.add(env.eventId);
     if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
 
@@ -3090,7 +3160,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     this.emit("thread", env, meta);
     if (env.event.type === "order.cancelled") this.notifyCancelled(env);
-    if (env.event.type === "order.replied" && env.event.final) this.recordOutcome(env, env.event.agentId, "answered");
+    if (env.event.type === "order.failed" && env.event.agentId) this.clearActiveOrder(env.event.agentId, env.threadId, env.orderId);
+    if (env.event.type === "order.closed") for (const id of meta?.targets ?? []) this.clearActiveOrder(id, env.threadId, env.orderId);
+    if (env.event.type === "order.replied" && env.event.final && env.event.source !== "operator") this.recordOutcome(env, env.event.agentId, "answered");
     else if (env.event.type === "order.declined" && !env.event.skipped) this.recordOutcome(env, env.event.agentId, "declined", env.event.unavailable);
     else if (env.event.type === "order.failed" && env.event.agentId) this.recordOutcome(env, env.event.agentId, "failed");
     if (!opts.skipTrack) this.track(env);
@@ -3161,11 +3233,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const child of this.children.values()) child.notify(Methods.hintsUpdate, { hints });
   }
 
+  private clearActiveOrder(agentId: string, threadId: string, orderId: string): void {
+    const rec = this.local.get(agentId);
+    if (!rec || rec.activeThreadId !== threadId || rec.activeOrderId !== orderId) return;
+    const next = { ...rec };
+    delete next.activeThreadId;
+    delete next.activeOrderId;
+    this.local.set(agentId, next);
+    this.publishAgents([next]);
+  }
+
   /** Tell local Agents that were sent this Order that it was cancelled. Every Host in the Thread sees the event. */
   private notifyCancelled(env: ThreadEnvelope): void {
     if (env.event.type !== "order.cancelled") return;
     const meta = this.metas.get(env.threadId);
     for (const id of meta?.targets ?? []) {
+      this.clearActiveOrder(id, env.threadId, env.orderId);
       this.agents.get(id)?.notify(Methods.orderCancelled, { orderId: env.orderId, threadId: env.threadId, by: env.event.by });
     }
   }
@@ -3178,14 +3261,23 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       (!protectedIdentity || env.event.protectedIdentity === true));
   }
 
+  private ownsHumanOrder(order: Order, ownerKey?: string): boolean {
+    if (!order.from.id.startsWith("cli:") || order.origin === "agent") return false;
+    const digest = this.store.getKv<string>(`human-owner:${order.orderId}`);
+    const parsed = OwnershipKey.safeParse(ownerKey);
+    return !!digest && parsed.success && ownershipDigest(parsed.data) === digest;
+  }
+
   private parentLinks = new Map<string, Order>();
+  private restoredTaskStatuses = new Map<string, { orderId: string; status: ThreadMeta["taskStatus"] }>();
 
   private linkedParent(meta: ThreadMeta): Order | undefined {
     if (!meta.parentOrderId || !meta.parentThreadId) return undefined;
     const cached = this.parentLinks.get(meta.threadId);
     if (cached) return cached;
     const parent = this.findParentOrder(meta.parentOrderId, meta.parentThreadId);
-    if (parent?.threadId !== meta.parentThreadId || !this.wasDelivered(parent, meta.from.id, meta.from.host)) return undefined;
+    const humanOwnerLink = meta.parentOwnerVerified === true && meta.origin === "human" && meta.from.id.startsWith("cli:") && parent?.from.id.startsWith("cli:");
+    if (parent?.threadId !== meta.parentThreadId || (!humanOwnerLink && !this.wasDelivered(parent, meta.from.id, meta.from.host))) return undefined;
     if (this.parentLinks.size >= 2048) this.parentLinks.delete(this.parentLinks.keys().next().value!);
     this.parentLinks.set(meta.threadId, parent);
     return parent;
@@ -3237,6 +3329,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         ...(ev.order.channel ? { channel: ev.order.channel } : {}),
         ...(ev.order.parentThreadId ? { parentThreadId: ev.order.parentThreadId } : {}),
         ...(ev.order.parentOrderId ? { parentOrderId: ev.order.parentOrderId } : {}),
+        ...(ev.order.parentOwnerVerified ? { parentOwnerVerified: true as const } : {}),
         ...(ev.order.needsHuman ? { clarification: { orderId: ev.order.orderId, question: ev.order.body } } : {}),
         from: ev.order.from,
         ...(ev.order.origin ? { origin: ev.order.origin } : {}),
@@ -3314,8 +3407,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       case "order.replied":
         meta.firstReplyAt ??= env.at;
         if (ev.final) {
-          pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at }, MAX_META_REPLIES);
-          setTargetState(ev.agentId, "replied");
+          pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at, ...(ev.source ? { source: ev.source } : {}) }, MAX_META_REPLIES);
+          if (meta.closedAt === undefined) setTargetState(ev.agentId, "replied");
         }
         break;
       case "order.declined":
@@ -3329,6 +3422,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       case "order.closed":
         meta.status = ev.status;
         meta.closedAt = env.at;
+        break;
+      case "order.reported":
+        meta.reportedOrderId = env.orderId;
         break;
     }
     return meta;
@@ -3357,8 +3453,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (restored) this.writeMeta(restored);
     }
     let n = 0;
-    for (const meta of this.store.openThreads(1000)) {
-      if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
+    let cursor: { createdAt: number; threadId: string } | undefined;
+    while (true) {
+      const page = this.store.openThreadsPage(1000, cursor);
+      if (!page.length) break;
+      for (const meta of page) {
+        if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
       // The latest Order only, read from the end of the Thread (#31).
       const events = this.store.readOrderEvents(meta.file, meta.orderId);
       const created = events.find((e) => e.event.type === "order.created")?.event;
@@ -3406,6 +3506,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const remaining = order.createdAt + (order.deadlineMs ?? defaultMs) - Date.now();
       t.deadline = setTimeout(() => this.finishOnDeadline(t), Math.max(0, remaining));
       this.maybeClose(t);
+      }
+      const last = page.at(-1)!;
+      cursor = { createdAt: last.createdAt, threadId: last.threadId };
     }
     if (n) this.log(`recovered ${n} open order(s)`);
     return n;
@@ -3484,8 +3587,30 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on("agent/kick", (x: { agentId: string }) => this.kick(x.agentId));
     peer.on("thread/children", (p: { threadId: string; limit: number }) => {
       if (typeof p.threadId !== "string") throw new RpcError("bad_request", "threadId is required");
-      return this.localChildren(p.threadId, Math.max(1, Math.min(200, Number(p.limit) || 200)))
+      return this.localChildren(p.threadId, Math.max(1, Math.min(201, Number(p.limit) || 200)))
         .filter((child) => this.linkedParent(child)?.from.host === host);
+    });
+    peer.on(Methods.threadTaskStatuses, async (p: { parents?: unknown }) => {
+      if (!Array.isArray(p.parents) || p.parents.length > 200) throw new RpcError("bad_request", "parents must be an array of at most 200 parent references");
+      return Promise.all(p.parents.map(async (raw) => {
+        if (!raw || typeof raw !== "object" || typeof (raw as any).threadId !== "string" || typeof (raw as any).orderId !== "string") {
+          throw new RpcError("bad_request", "each parent reference requires threadId and orderId");
+        }
+        const { threadId, orderId } = raw as { threadId: string; orderId: string };
+        const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+        if (!meta || meta.from.host !== host || meta.orderId !== orderId) {
+          return { threadId, orderId, taskStatus: "unknown" as const, childrenPartial: true };
+        }
+        const projected = await this.projectTaskMeta(meta, false);
+        return {
+          threadId,
+          orderId,
+          ...(projected.taskStatus ? { taskStatus: projected.taskStatus } : {}),
+          pendingChildren: projected.pendingChildren ?? 0,
+          childrenPartial: projected.childrenPartial ?? false,
+          ...(projected.reportedOrderId ? { reportedOrderId: projected.reportedOrderId } : {}),
+        };
+      }));
     });
     peer.on("thread/reports", (p: { threadId: string }) => {
       const meta = typeof p.threadId === "string" && (this.metas.get(p.threadId) ?? this.store.getThread(p.threadId));
@@ -4421,21 +4546,86 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return this.store.listThreadsByParent(threadId, limit).map((meta) => this.summaryMeta(this.metas.get(meta.threadId) ?? meta));
   }
 
+  private localTaskChildren(threadId: string, orderId: string, limit = 10_001): ThreadMeta[] {
+    // `order.created`/`order.closed` are written to SQLite synchronously, so the row carries the
+    // durable lifecycle status; an in-memory meta may still hold an earlier snapshot of it.
+    return this.store.listThreadsByParentOrder(threadId, orderId, limit).map((meta) => {
+      const live = this.metas.get(meta.threadId);
+      return this.summaryMeta(live
+        ? { ...meta, lastActivityAt: Math.max(meta.lastActivityAt ?? 0, live.lastActivityAt ?? 0) }
+        : meta);
+    });
+  }
+
   async childView(threadId: string, limit: number): Promise<{ children: ThreadMeta[]; partial: boolean }> {
-    const local = this.localChildren(threadId, limit);
-    if (this.isRoot) return { children: local, partial: false };
+    const pageLimit = Math.max(1, Math.min(limit, 200));
+    const localPage = this.localChildren(threadId, pageLimit + 1);
+    const localPartial = localPage.length > pageLimit;
+    const local = localPage.slice(0, pageLimit);
+    if (this.isRoot) return { children: local, partial: localPartial };
     const parent = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (parent?.from.host !== this.host || !this.rootOnline || !this.rootSupports("team-child-view")) {
       return { children: local, partial: true };
     }
     try {
-      const remote = await this.uplink!.request<ThreadMeta[]>("thread/children", { threadId, limit }, 2000);
-      const byId = new Map(local.map((child) => [child.threadId, child]));
+      const remote = await this.uplink!.request<ThreadMeta[]>("thread/children", { threadId, limit: pageLimit + 1 }, 2000);
+      const byId = new Map(localPage.map((child) => [child.threadId, child]));
       for (const child of remote) if (child.from.host !== this.host || !byId.has(child.threadId)) byId.set(child.threadId, child);
-      return { children: [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, limit), partial: false };
+      const all = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+      return { children: all.slice(0, pageLimit), partial: localPartial || all.length > pageLimit };
     } catch {
       return { children: local, partial: true };
     }
+  }
+
+  async projectTaskMeta(meta: ThreadMeta, includeRemote = true): Promise<ThreadMeta> {
+    const [projected] = await this.projectTaskMetas([meta]);
+    if (!includeRemote) return projected;
+    const display = await this.childView(meta.threadId, 200);
+    return display.partial ? { ...projected, childrenPartial: true } : projected;
+  }
+
+  private rememberTaskStatus(meta: ThreadMeta, status: NonNullable<ThreadMeta["taskStatus"]>): void {
+    if (meta.parentThreadId) return;
+    this.restoredTaskStatuses.set(meta.threadId, { orderId: meta.orderId, status });
+    if (this.restoredTaskStatuses.size > 2000) this.restoredTaskStatuses.delete(this.restoredTaskStatuses.keys().next().value!);
+  }
+
+  async projectTaskMetas(metas: ThreadMeta[]): Promise<ThreadMeta[]> {
+    const parents = this.isRoot ? [] : metas.filter((meta) => meta.from.host === this.host);
+    let remote = new Map<string, { taskStatus?: ThreadMeta["taskStatus"]; pendingChildren?: number; childrenPartial: boolean; reportedOrderId?: string }>();
+    if (!this.isRoot && this.rootOnline && this.rootSupports("team-child-view") && parents.length) {
+      try {
+        const rows = await this.uplink!.request<Array<{ threadId: string; orderId: string; taskStatus?: ThreadMeta["taskStatus"]; pendingChildren?: number; childrenPartial: boolean; reportedOrderId?: string }>>(
+          Methods.threadTaskStatuses,
+          { parents: parents.map(({ threadId, orderId }) => ({ threadId, orderId })) },
+          3000,
+        );
+        remote = new Map(rows.map((row) => [`${row.threadId}:${row.orderId}`, row]));
+      } catch {
+        // A list must remain bounded when the Root cannot answer. Fall back to local evidence below.
+      }
+    }
+    return Promise.all(metas.map(async (meta) => {
+      const localChildren = this.localTaskChildren(meta.threadId, meta.orderId);
+      const localStatus = projectTaskStatus(meta, localChildren, false);
+      const projected = remote.get(`${meta.threadId}:${meta.orderId}`);
+      const restored = this.restoredTaskStatuses.get(meta.threadId);
+      if (projected) {
+        // The Root sees every Host's children, so its answer wins when it has one. Local evidence only
+        // fills a status Root omitted (work created here that has not synced yet) or a view Root
+        // called incomplete.
+        let taskStatus = projected.taskStatus;
+        if (taskStatus === undefined || (projected.childrenPartial === true && localStatus)) taskStatus = localStatus ?? taskStatus;
+        if ((meta.reportedOrderId === meta.orderId || projected.reportedOrderId === meta.orderId) && taskStatus !== "working" && taskStatus !== "unknown") taskStatus = "done";
+        return { ...this.summaryMeta(meta), ...projected, ...(taskStatus ? { taskStatus } : {}) };
+      }
+      if (localStatus && localStatus !== "unknown") return { ...this.summaryMeta(meta), taskStatus: localStatus };
+      const canUseRestored = restored?.orderId === meta.orderId && meta.reportedOrderId !== meta.orderId;
+      if (canUseRestored) return { ...this.summaryMeta(meta), taskStatus: restored!.status };
+      if (localStatus) return { ...this.summaryMeta(meta), taskStatus: localStatus };
+      return this.summaryMeta(meta);
+    }));
   }
 
   /** List views need the latest outcome, not the whole reply text. */

@@ -368,12 +368,22 @@ describe("team sessions (v4-13)", () => {
     expect(child).toMatchObject({ parentOrderId: parent.orderId });
     expect(origin.daemon.thread(parent.threadId)?.meta.status).toBe("done");
     const parentDetail = await (await fetch(`http://${origin.addr}/api/threads/${parent.threadId}`)).json();
-    expect(parentDetail.meta).toMatchObject({ status: "done", pendingChildren: 1 });
+    expect(parentDetail.meta).toMatchObject({ status: "done", taskStatus: "working" });
+    const threadList = await (await fetch(`http://${origin.addr}/api/threads`)).json() as import("@cafe/protocol").ThreadMeta[];
+    expect(threadList.find((meta) => meta.threadId === parent.threadId)?.taskStatus).toBe("working");
+    const rootThreadList = await (await fetch(`http://${root.addr}/api/threads`)).json() as import("@cafe/protocol").ThreadMeta[];
+    expect(rootThreadList.find((meta) => meta.threadId === parent.threadId)?.taskStatus).toBe("working");
+    const snapshot = await (await fetch(`http://${origin.addr}/api/snapshot`)).json() as { threads: import("@cafe/protocol").ThreadMeta[] };
+    expect(snapshot.threads.find((meta) => meta.threadId === parent.threadId)?.taskStatus).toBe("working");
+    const search = await (await fetch(`http://${origin.addr}/api/search?q=verify`)).json() as Array<{ meta: import("@cafe/protocol").ThreadMeta }>;
+    expect(search.find((result) => result.meta.threadId === parent.threadId)?.meta.taskStatus).toBe("working");
     const teams = await (await fetch(`http://${root.addr}/api/teams`)).json() as Array<{ channel: string; openThreads: number }>;
     expect(teams.find((t) => t.channel === "reporting")?.openThreads).toBeGreaterThanOrEqual(1);
     if (disconnect) {
       origin.daemon.setRoot("127.0.0.1:1");
       await waitFor(() => !origin.daemon.rootOnline);
+      const partial = await (await fetch(`http://${origin.addr}/api/threads/${parent.threadId}`)).json();
+      expect(partial.meta).toMatchObject({ taskStatus: "working" });
     }
     finish();
     await waitFor(() => root.daemon.thread(child!.threadId)?.meta.status === "done");
@@ -391,6 +401,141 @@ describe("team sessions (v4-13)", () => {
       return detail.meta?.status === "done" && detail.meta.parentOrderId === parent.orderId &&
         detail.events?.some((env) => env.event.type === "order.closed" && env.event.status === "done") === true;
     });
+    const parentStatus = async () => (await (await fetch(`http://${origin.addr}/api/threads/${parent.threadId}`)).json() as { meta: { taskStatus?: string } }).meta.taskStatus;
+    // Both Hosts index the child under the exact parent Order, independent of display paging.
+    expect(origin.daemon.store.listThreadsByParentOrder(parent.threadId, parent.orderId).map((row) => row.threadId)).toEqual([child!.threadId]);
+    expect(root.daemon.store.listThreadsByParentOrder(parent.threadId, parent.orderId).map((row) => row.threadId)).toEqual([child!.threadId]);
+    await waitFor(async () => await parentStatus() === "awaiting_report");
+    await lead.client.report({ threadId: parent.threadId, orderId: parent.orderId, text: "parser regression reviewed" });
+    await waitFor(async () => await parentStatus() === "done");
+    const snapshotTaskStatus = async () => {
+      const snapshot = await (await fetch(`http://${origin.addr}/api/snapshot`)).json() as { threads: import("@cafe/protocol").ThreadMeta[] };
+      return snapshot.threads.find((meta) => meta.threadId === parent.threadId)?.taskStatus;
+    };
+    await waitFor(async () => await snapshotTaskStatus() === "done");
+  });
+
+  it("keeps taskStatus unknown when the display child page omits an older open child", async () => {
+    const d = await startDaemon("child-cap", { mode: "root" });
+    cleanup.push(d.stop);
+    const lead = await barista(d.addr, identity("lead"));
+    cleanup.push(() => lead.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const parent = await c.ask({ body: "large task", to: "lead" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    const parentMeta = d.daemon.thread(parent.threadId)!.meta;
+    const baseAt = Date.now() - 1000;
+    for (let i = 0; i < 201; i++) {
+      const id = String(i).padStart(3, "0");
+      const threadId = `child-cap-${id}`;
+      const createdAt = baseAt + i;
+      d.daemon.store.putThread({
+        threadId,
+        orderId: `child-order-${id}`,
+        kind: "order",
+        channel: parentMeta.channel ?? "default",
+        parentThreadId: parent.threadId,
+        parentOrderId: parent.orderId,
+        parentOwnerVerified: true,
+        from: { id: `cli:child-${id}`, address: `cli@child-cap`, host: "child-cap" },
+        origin: "human",
+        targets: [],
+        status: i === 0 ? "working" : "done",
+        summary: `child ${id}`,
+        summaryTurn: 1,
+        createdAt,
+        file: d.daemon.store.threadFile(threadId, createdAt),
+        turns: 1,
+        replies: [],
+        declines: [],
+      });
+    }
+
+    const detail = await (await fetch(`http://${d.addr}/api/threads/${parent.threadId}`)).json();
+    // Status uses every child of the exact parent Order; the display page being capped only marks the list partial.
+    expect(detail.meta).toMatchObject({ taskStatus: "working", childrenPartial: true });
+  });
+
+  it("keeps locally known linked work active when Root has not indexed the child yet", async () => {
+    const root = await startDaemon("unsynced-root", { mode: "root" });
+    cleanup.push(root.stop);
+    const origin = await startDaemon("unsynced-origin", { config: { root: root.addr } });
+    cleanup.push(origin.stop);
+    const lead = await barista(root.addr, identity("lead"));
+    cleanup.push(() => lead.client.close());
+    const c = await customer(origin.addr);
+    cleanup.push(() => c.close());
+    await waitFor(() => !!origin.daemon.registry.get(lead.rec.agentId));
+    const parent = await c.ask({ body: "review on origin", to: "lead@unsynced-root" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    await waitFor(() => root.daemon.thread(parent.threadId)?.meta.status === "done");
+
+    origin.daemon.setRoot("127.0.0.1:1");
+    await waitFor(() => !origin.daemon.rootOnline);
+    const parentMeta = origin.daemon.thread(parent.threadId)!.meta;
+    const childThreadId = "unsynced-child";
+    const createdAt = Date.now();
+    const file = origin.daemon.store.threadFile(childThreadId, createdAt);
+    origin.daemon.store.putThread({
+      threadId: childThreadId,
+      orderId: "unsynced-child-order",
+      kind: "order",
+      channel: parentMeta.channel ?? "default",
+      parentThreadId: parent.threadId,
+      parentOrderId: parent.orderId,
+      parentOwnerVerified: true,
+      from: { id: "cli:linked-owner", address: "cli@unsynced-origin", host: "unsynced-origin" },
+      origin: "human",
+      targets: ["local-worker"],
+      status: "working",
+      summary: "work created during disconnect",
+      summaryTurn: 1,
+      createdAt,
+      file,
+      turns: 1,
+      replies: [],
+      declines: [],
+    });
+
+    origin.daemon.setRoot(root.addr);
+    await waitFor(() => origin.daemon.rootOnline);
+    const list = await (await fetch(`http://${origin.addr}/api/threads`)).json() as import("@cafe/protocol").ThreadMeta[];
+    expect(list.find((meta) => meta.threadId === parent.threadId)?.taskStatus).toBe("working");
+  });
+
+  it("projects nested delegated work on a child Thread that is itself linked", async () => {
+    const root = await startDaemon("nested-task", { mode: "root" });
+    cleanup.push(root.stop);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    cleanup.push(release);
+    const tester = await barista(root.addr, identity("tester"), async (h) => { await h.ack(); await held; await h.reply("nested work done"); });
+    cleanup.push(() => tester.client.close());
+    let nestedThreadId: string | undefined;
+    const dev = await barista(root.addr, identity("dev"), async (h) => {
+      const nested = await dev.client.ask({ body: "review parser tests", to: "tester", parentOrderId: h.order.orderId, parentThreadId: h.order.threadId });
+      nestedThreadId = nested.threadId;
+      await h.reply("review delegated");
+    });
+    cleanup.push(() => dev.client.close());
+    let childThreadId: string | undefined;
+    const lead = await barista(root.addr, identity("lead"), async (h) => {
+      const child = await lead.client.ask({ body: "implement parser", to: "dev", parentOrderId: h.order.orderId, parentThreadId: h.order.threadId });
+      childThreadId = child.threadId;
+      await h.reply("implementation delegated");
+    });
+    cleanup.push(() => lead.client.close());
+    const c = await customer(root.addr);
+    cleanup.push(() => c.close());
+
+    const parent = await c.ask({ body: "improve parser", to: "lead" });
+    await untilClosed(c, parent.threadId, parent.orderId);
+    await waitFor(() => !!childThreadId && !!nestedThreadId && root.daemon.thread(nestedThreadId)?.meta.status === "working");
+    const nestedParent = await (await fetch(`http://${root.addr}/api/threads/${childThreadId}`)).json();
+    expect(nestedParent.meta).toMatchObject({ parentThreadId: parent.threadId, taskStatus: "working" });
+    release();
+    await waitFor(() => root.daemon.thread(nestedThreadId!)?.meta.status === "done");
   });
 
   it("carries parent context when the dispatched member delegates from another Host", async () => {
