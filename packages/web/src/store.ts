@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 import type { AgentRecord, DaemonRecord, RegistryDelta, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { authState } from "./auth.ts";
-import { api, token, wsUrl, type ChannelInfo, type SearchHit, type Snapshot, type ThreadDetail } from "./api.ts";
+import { api, token, wsUrl, type ChannelInfo, type SearchHit, type Snapshot, type TeamView, type ThreadDetail } from "./api.ts";
 
 export interface State {
   loaded: boolean;
@@ -21,6 +21,8 @@ export interface State {
   threads: ThreadMeta[];
   /** Channel index for the Feed chips and Teams page (v4-11). */
   channels: ChannelInfo[];
+  /** Teams for the composer's front-door default and the Teams page (v4-13). */
+  teams: TeamView[];
   /** The running daemon still serves an older web build than the one on disk. */
   webStale?: boolean;
   /** Features the serving Daemon advertises (v4-12). */
@@ -78,6 +80,7 @@ let state: State = {
   daemons: [],
   threads: [],
   channels: [],
+  teams: [],
   live: {},
   events: [],
   older: { loading: false, loaded: false, done: false },
@@ -344,13 +347,14 @@ async function refresh(): Promise<void> {
   const channel = state.channel;
   const seq = ++snapshotSeq;
   try {
-    const [snap, channelProbe] = await Promise.all([
+    const [snap, channelProbe, teamProbe] = await Promise.all([
       api.snapshot(channel),
       api.channels().then((list) => ({ ok: true, list })).catch(() => ({ ok: false, list: [] as ChannelInfo[] })),
+      api.teams().then((list) => ({ ok: true, list })).catch(() => ({ ok: false, list: [] as TeamView[] })),
     ]);
     if (seq !== snapshotSeq) return; // a channel switch happened while this request was in flight
     applySnapshot(snap, channelProbe.ok);
-    set({ channels: channelProbe.list });
+    set({ channels: channelProbe.list, teams: teamProbe.list });
     const open = state.detail?.meta.threadId;
     if (open) await openThread(open);
     await backfillEvents();

@@ -203,6 +203,32 @@ export function runMcp(opts: McpOptions): Promise<void> {
       }
       case "cafe_ask": {
         const body = str(args.question, "question", true)!;
+        const to = str(args.to, "to");
+        const channel = str(args.channel, "channel");
+        // v4-13: MCP is HTTP-only, so it checks /api/health itself and refuses BEFORE creating an
+        // Order. A silent downgrade (a team broadcast, an escalation routed like a normal ask) is
+        // worse than an error (#110).
+        const h = await api<{ host: string; version?: string; features?: string[] }>("/api/health").catch(() => undefined);
+        const need = (feature: string, used: boolean, effect: string): void => {
+          if (!used) return;
+          if (Array.isArray(h?.features) && h.features.includes(feature)) return;
+          throw new ToolError(`${h?.host ?? "this daemon"} (cafe ${h?.version ?? "unknown"}) does not support ${feature}; ${effect}. If that Host already runs a newer cafe, restart it there (cafe daemon restart); otherwise upgrade cafe on it first.`);
+        };
+        need("channels", !!channel, `channel #${channel} would be ignored`);
+        need("collect", args.collect === "all", "the first answer may close the thread instead of waiting for every target");
+        need("escalate", args.escalate === true, "the question would become a normal routed ask, not a sub-Thread to the parent");
+        if (to) {
+          const name = to.replace(/[#@].*$/, "");
+          const host = /@([a-zA-Z0-9_.-]+)$/.exec(to)?.[1];
+          const [teams, agents] = await Promise.all([
+            api<{ team: string; host: string }[]>("/api/teams").catch(() => []),
+            api<{ name: string; address: string; displayName?: string }[]>("/api/agents").catch(() => []),
+          ]);
+          // An agent name wins over a team name (the daemon's own resolution order).
+          const agentHit = agents.some((a) => a.address === to || a.name === name || a.displayName === name);
+          const teamHit = !agentHit && teams.some((t) => t.team === name && (!host || t.host === host));
+          need("team-sessions", teamHit, `to: ${to} would reach every member instead of the orchestrator`);
+        }
         const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
         const attachments: Attachment[] = [];
         for (const file of files) attachments.push(await upload(file));
@@ -210,13 +236,13 @@ export function runMcp(opts: McpOptions): Promise<void> {
           method: "POST",
           body: JSON.stringify({
             body,
-            to: str(args.to, "to"),
+            to,
             broadcast: args.broadcast === true || undefined,
             threadId: str(args.threadId, "threadId"),
             ...(str(args.parent_order_id, "parent_order_id") ? { parentOrderId: str(args.parent_order_id, "parent_order_id") } : {}),
             ...(str(args.parent_thread_id, "parent_thread_id") ? { parentThreadId: str(args.parent_thread_id, "parent_thread_id") } : {}),
             ...(args.escalate === true ? { escalate: true } : {}),
-            ...(str(args.channel, "channel") ? { channel: str(args.channel, "channel") } : {}),
+            ...(channel ? { channel } : {}),
             ...(args.collect === "all" ? { collect: "all" as const } : {}),
             as: customer ?? "mcp",
             origin: "agent",
@@ -224,28 +250,11 @@ export function runMcp(opts: McpOptions): Promise<void> {
             ...(attachments.length ? { attachments } : {}),
           }),
         });
-        // v4-12: MCP is HTTP-only, so it checks /api/health itself and prepends the notes.
-        const warnings: string[] = [];
-        {
-          const h = await api<{ host: string; version?: string; features?: string[] }>("/api/health").catch(() => undefined);
-          const add = (feature: string, used: boolean, effect: string) => {
-            if (!used || !h) return;
-            if (Array.isArray(h.features) && h.features.includes(feature)) return;
-            const claim = Array.isArray(h.features) ? "does not support" : "does not advertise";
-            warnings.push(`${h.host} (cafe ${h.version ?? "unknown"}) ${claim} ${feature}; ${effect}. If that Host already runs a newer cafe, restart it there (cafe daemon restart); otherwise upgrade cafe on it first.`);
-          };
-          add("channels", !!str(args.channel, "channel"), `the channel #${str(args.channel, "channel")} may have been ignored`);
-          add("collect", args.collect === "all", "the first answer may close the thread instead of waiting for every target");
-          const reachedParent = res.decision.router === "explicit" && /escalate/i.test(res.decision.reason);
-          add("escalate", args.escalate === true && !reachedParent, "the question may have been routed as a normal ask, not to the parent");
-        }
-        const withWarnings = (text: string) => (warnings.length ? `${warnings.map((w) => `warning: ${w}`).join("\n")}\n\n${text}` : text);
         if (res.decision?.targets?.length === 0) {
           // An immediate routing failure (offline parent, empty channel) is not "sent, replies will come".
-          return { text: withWarnings(`Not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`), isError: true };
+          return { text: `Not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`, isError: true };
         }
-        const followed = await waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
-        return { ...followed, text: withWarnings(followed.text) };
+        return waitOrder(res.threadId, res.orderId, seconds(args.wait_seconds));
       }
       case "cafe_wait": {
         const threadId = str(args.threadId, "threadId", true)!;

@@ -45,10 +45,19 @@ describe(".cafe team roster (v4-11)", () => {
   });
 
   it("sanitizes a team name into a channel and rejects the reserved default", () => {
-    const dir = scratch({ ".cafe": "name: my.proj\nteam:\n  members:\n    - name: dev1\n" });
+    const dir = scratch({ ".cafe": "name: my.proj\nteam:\n  members:\n    - name: orch\n      duty: orchestrator\n    - name: dev1\n" });
     expect(readCafeFile(join(dir, ".cafe")).team!.channel).toBe("my-proj");
-    const bad = scratch({ ".cafe": "name: myproj\nteam:\n  channel: default\n  members:\n    - name: dev1\n" });
+    const bad = scratch({ ".cafe": "name: myproj\nteam:\n  channel: default\n  members:\n    - name: orch\n      duty: orchestrator\n" });
     expect(() => readCafeFile(join(bad, ".cafe"))).toThrow(/invalid or reserved/);
+  });
+
+  it("requires exactly one orchestrator and a member name different from the team name (v4-13)", () => {
+    const none = scratch({ ".cafe": "name: myproj\nteam:\n  members:\n    - name: dev1\n" });
+    expect(() => readCafeFile(join(none, ".cafe"))).toThrow(/exactly one member with duty: orchestrator \(found 0\)/);
+    const two = scratch({ ".cafe": "name: myproj\nteam:\n  members:\n    - name: o1\n      duty: orchestrator\n    - name: o2\n      duty: Orchestrator\n" });
+    expect(() => readCafeFile(join(two, ".cafe"))).toThrow(/exactly one member with duty: orchestrator \(found 2\)/);
+    const same = scratch({ ".cafe": "name: myproj\nteam:\n  members:\n    - name: myproj\n      duty: orchestrator\n" });
+    expect(() => readCafeFile(join(same, ".cafe"))).toThrow(/same name as the team/);
   });
 
   it("rejects duplicate members, a non-member channel and a bad observer", () => {

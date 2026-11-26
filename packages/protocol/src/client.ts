@@ -14,7 +14,10 @@ import {
   type CreateOrderParams,
   type Order,
   type RoutingDecision,
+  type TeamContext,
+  type TeamRosterUpdate,
   type ThreadEnvelope,
+  renderTeamPlaybook,
 } from "./index.ts";
 import { Peer, RpcError } from "./peer.ts";
 
@@ -72,7 +75,13 @@ export class CafeClient {
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
   private digestListeners = new Set<Listener<ChannelDigest>>();
   /** Digest ids already dispatched on this connection (reconnect/replay protection). */
-  private seenDigests = new Set<number>();
+  private seenDigests = new Set<string | number>();
+  /** `(publisher, channel, since)` already dispatched; catches a replayed window with a new id. */
+  private seenSince = new Set<string>();
+  /** The playbook/roster from `agent/register` (v4-13); absent on an older daemon. */
+  private _teamContext?: TeamContext;
+  private teamContextListeners = new Set<Listener<TeamContext>>();
+  private rosterListeners = new Set<Listener<TeamRosterUpdate>>();
   /** What the connected Daemon advertises (v4-12); undefined = it did not say. */
   private daemonFeatures?: string[];
   private daemonVersion?: string;
@@ -159,6 +168,29 @@ export class CafeClient {
     return () => this.digestListeners.delete(fn);
   }
 
+  /** The team playbook/roster delivered with registration (v4-13); undefined for a loose team. */
+  get teamContext(): TeamContext | undefined {
+    return this._teamContext;
+  }
+
+  /** Fires once per registration that carried a team context (and again after a reconnect). */
+  onTeamContext(fn: Listener<TeamContext>): () => void {
+    this.teamContextListeners.add(fn);
+    if (this._teamContext) fn(this._teamContext);
+    return () => this.teamContextListeners.delete(fn);
+  }
+
+  /** A roster change pushed by the daemon; never an Order and never a turn by itself. */
+  onRoster(fn: Listener<TeamRosterUpdate>): () => void {
+    this.rosterListeners.add(fn);
+    return () => this.rosterListeners.delete(fn);
+  }
+
+  private setTeamContext(ctx: TeamContext | undefined): void {
+    this._teamContext = ctx;
+    if (ctx) for (const fn of this.teamContextListeners) fn(ctx);
+  }
+
   /** Thread events already seen by this client (newest last), for late subscribers. */
   recentEvents(threadId?: string): ThreadEnvelope[] {
     return (threadId ? this.recent.filter((e) => e.threadId === threadId) : this.recent).slice();
@@ -191,6 +223,8 @@ export class CafeClient {
   private open(): Promise<AgentRecord | undefined> {
     return new Promise((resolve, reject) => {
       this.seenDigests.clear();
+      this.seenSince.clear();
+      this._teamContext = undefined;
       this.echoed.clear();
       this.daemonFeatures = undefined;
       const ws = this.connectSocket();
@@ -210,15 +244,42 @@ export class CafeClient {
         for (const fn of this.eventListeners) fn(env);
       });
       peer.on(Methods.channelDigest, ({ digest }: { digest: ChannelDigest }) => {
-        // A reconnect may replay a digest; the id is a publisher-local sequence, so the set is
-        // cleared on every open (a restarted daemon starts again at 1) (v4-11 review).
-        if (this.seenDigests.has(digest.digestId)) return;
+        // A reconnect may replay a digest. The id is a publisher-local sequence (`host:seq` since
+        // v4-13), so the sets are cleared on every open. `(publisher, channel, since)` also
+        // catches the same window re-sent under a new id.
+        const publisher = String(digest.digestId).split(":")[0] ?? "";
+        const sinceKey = `${publisher}|${digest.channel}|${digest.since}`;
+        if (this.seenDigests.has(digest.digestId) || this.seenSince.has(sinceKey)) return;
         this.seenDigests.add(digest.digestId);
+        this.seenSince.add(sinceKey);
         if (this.seenDigests.size > 1000) {
           const oldest = this.seenDigests.values().next().value;
           if (oldest !== undefined) this.seenDigests.delete(oldest);
         }
+        if (this.seenSince.size > 1000) {
+          const oldest = this.seenSince.values().next().value;
+          if (oldest !== undefined) this.seenSince.delete(oldest);
+        }
         for (const fn of this.digestListeners) fn(digest);
+      });
+      peer.on(Methods.teamRoster, ({ update }: { update: TeamRosterUpdate }) => {
+        if (update.removedTeam) this.setTeamContext(undefined);
+        else if (this._teamContext) {
+          // Re-render the playbook so it names the new roster; the static rules do not change.
+          this.setTeamContext({
+            ...this._teamContext,
+            revision: update.revision,
+            roster: update.members,
+            playbook: renderTeamPlaybook({
+              team: this._teamContext.team,
+              channel: this._teamContext.channel,
+              self: { name: this._teamContext.self.name, ...(this._teamContext.self.duty ? { duty: this._teamContext.self.duty } : {}), online: true },
+              orchestrator: this._teamContext.orchestrator,
+              roster: update.members,
+            }),
+          });
+        }
+        for (const fn of this.rosterListeners) fn(update);
       });
       ws.addEventListener("message", (e) => void peer.receive(String(e.data)));
       ws.addEventListener("open", async () => {
@@ -242,7 +303,22 @@ export class CafeClient {
             if (identity.observer && this.supports("digests") === false) {
               throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support digests; observer registration was refused`));
             }
-            this.record = await peer.request<AgentRecord>(Methods.agentRegister, identity);
+            // v4-13: a team member against a daemon that would treat `to: <team>` as a multicast
+            // or strip the team front-door semantics must not connect as a member.
+            if (identity.team && this.supports("team-sessions") !== true) {
+              // Same cleanup as the observer refusal: never look connected after a refused identity.
+              this.peer = undefined;
+              peer.closed();
+              try {
+                ws.close();
+              } catch {
+                // already closing
+              }
+              throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support team-sessions; team registration was refused`));
+            }
+            const registered = await peer.request<AgentRecord & { teamContext?: TeamContext }>(Methods.agentRegister, identity);
+            this.record = registered;
+            this.setTeamContext(registered.teamContext);
             // With no advertisement, the echo still proves support: an old Daemon strips these.
             const lost: string[] = [];
             if (identity.observer && this.record.observer) this.echoed.add("digests");
@@ -349,12 +425,21 @@ export class CafeClient {
   /** Create an Order as a Customer; Thread events arrive via onThreadEvent. */
   async ask(params: Partial<CreateOrderParams> & { body: string }): Promise<{ orderId: string; threadId: string; decision: RoutingDecision }> {
     if (!this.peer) throw new Error("not connected to cafe daemon");
+    // v4-13: a field the daemon cannot honour is refused BEFORE an Order exists. A silent
+    // downgrade (an escalation that becomes a normal ask, a team message that broadcasts) is
+    // worse than an error because the sender believes the wrong semantics succeeded.
+    const need = (feature: string, used: boolean, effect: string): void => {
+      if (!used || this.supports(feature) === true) return;
+      throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support ${feature}; ${effect}`));
+    };
+    need("escalate", params.escalate === true, "the clarification would become a normal routed ask");
+    need("collect", params.collect === "all", "the thread may close on the first answer instead of waiting for every target");
+    need("channels", !!params.channel && params.channel !== "default", `channel #${params.channel} would be ignored`);
+    const ownTeam = !!params.to && (params.to === this.identity?.team || params.to === this.record?.team);
+    need("team-sessions", ownTeam, `to: ${params.to} would reach every member instead of the orchestrator`);
     const res = await this.peer.request<{ orderId: string; threadId: string; decision: RoutingDecision }>(Methods.orderCreate, { kind: "order", ...params }, 120_000);
-    // v4-12: say what the old side may have done with a field it cannot understand.
-    if (params.channel) this.warnIgnored("channels", `the order was routed ${res.decision.mode} in the daemon's old scope, not necessarily channel #${params.channel}`);
-    if (params.collect === "all") this.warnIgnored("collect", "the daemon may close on the first answer instead of waiting for every target");
     if (params.escalate) {
-      // The decision reveals whether the sub-Thread actually reached the parent.
+      // The daemon advertised escalate; if the decision still did not reach the parent, say so.
       const reachedParent = res.decision.router === "explicit" && /escalate/i.test(res.decision.reason);
       if (!reachedParent) this.warnIgnored("escalate", "the question became a normal routed ask instead of a sub-Thread to the parent");
     }

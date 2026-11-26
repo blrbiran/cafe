@@ -398,6 +398,20 @@ export default function cafe(pi: ExtensionAPI) {
           { triggerTurn: true, deliverAs: "followUp" },
         );
       });
+      c.onTeamContext((tc) => {
+        // The playbook is a one-time orientation, not a task: display it without starting a turn.
+        pi.sendMessage(
+          { customType: "cafe-team", content: `☕ cafe team ${tc.team} (#${tc.channel})\n\n${tc.playbook}`, display: true, details: { team: tc.team } },
+          { triggerTurn: false },
+        );
+      });
+      c.onRoster((r) => {
+        const change = [...r.change.added.map((n) => `+${n}`), ...r.change.removed.map((n) => `-${n}`), ...r.change.updated.map((n) => `~${n}`)].join(", ");
+        const text = r.removedTeam
+          ? `☕ cafe team ${r.team} was removed; stop treating yourself as its member.`
+          : `☕ cafe team ${r.team} roster changed (revision ${r.revision}): ${change || "members updated"}. Now: ${r.members.map((m) => m.name).join(", ")}.`;
+        pi.sendMessage({ customType: "cafe-team", content: text, display: true, details: { roster: r } }, { triggerTurn: false });
+      });
       c.onCancel(onCancelled);
       c.onConnect((rec) => {
         setUiStatus(rec ? `☕ ${rec.address}` : "☕ cafe");

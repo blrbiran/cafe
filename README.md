@@ -143,12 +143,13 @@ cafe serve --exec "<any command>" --dir ~/code/billing    # or --preset claude|c
 
 One command run per question: prompt on stdin, answer on stdout; print `CAFE_DECLINE: reason` to decline. Follow-ups have no session and rely only on the history in the prompt.
 
-## Teams and channels (v4-11)
+## Teams and channels (v4-11; one front door since v4-13)
 
-A `.cafe` may declare one team. Each member is one process with its own duty,
-directory and channel; `cafe team start` fills in the missing headless members
-while leaving sessions you started yourself alone. cafe never creates worktrees
-or merges branches — point a member at a directory you prepared.
+A `.cafe` may declare one team. **It must list exactly one orchestrator**: the
+team's front door. Each member is one process with its own duty, directory and
+channel; `cafe team start` fills in the missing headless members while leaving
+sessions you started yourself alone. cafe never creates worktrees or merges
+branches — point a member at a directory you prepared.
 
 ```yaml
 name: myproj
@@ -165,9 +166,12 @@ team:
 
 ```bash
 cafe team start            # start missing headless members (headless pi by default)
-cafe team start dev1       # only one member
-cafe team status           # roster, online members, current Thread, warnings
+cafe team start dev1       # only one member (the full roster is still published)
+cafe team sync             # publish .cafe membership without starting anything
+cafe team status           # roster, online members, current Thread, revision, warnings
+cafe team context <member> # print the playbook that member receives at registration
 cafe team stop             # stop supervised members; TUI sessions are untouched
+cafe team remove <team>    # remove the roster (refuses while a member is online)
 ```
 
 A TUI member registers by starting the session with
@@ -180,8 +184,20 @@ Codex TUIs use `cafe barista run --agent codex --tui --dir <dir> --member <name>
 **Channels are message scopes, not permissions.** The Feed has channel chips
 and the composer shows `→ #channel`; `cafe ask --channel <name>` posts
 elsewhere. A member's fresh question defaults to its home channel (the first
-one it lists). `to: <team>` reaches the team's orchestrator (or its online
-members when there is no orchestrator).
+one it lists).
+
+**A team has one front door.** `to: <team>` reaches the orchestrator, not
+everyone; a fresh message in the team channel with no `to:` does the same.
+`to: <member>` assigns one member, `to: <duty>` asks the unique member with
+that duty (`ambiguous_duty` names the candidates). Reaching every member
+requires an explicit `broadcast: true`. A follow-up goes to the previous
+turn's final responders (then that turn's targets); if none are online it
+fails as `responders_offline` instead of falling back to the router.
+
+A registering member receives a **team playbook** (its duty, the roster, how
+to assign/report/escalate) in the registration result. When `.cafe` membership
+changes, online members get one short `team/roster` note — not an Order and
+not a turn. `cafe team stop` only stops workers; the roster stays.
 
 - `escalate`: a Barista can ask the sender of the Order it is handling a
   clarifying question. It creates a linked sub-Thread in the same channel and
@@ -195,15 +211,17 @@ members when there is no orchestrator).
   Orders. Run an observer on the Root or on the team's own Host; a child's
   digest is marked `partial` while the Root is down.
 
-**Mixed releases.** Every Daemon advertises its feature set on `initialize`,
-`/api/health` and `/api/snapshot`. A newer client talking to an older Daemon
-warns (naming the Host and version) when a channel, escalation, `collect: all`
-or team identity may have been ignored; registering as an observer is refused
-when the Daemon demonstrably cannot honour it, and `cafe team` preflights before
-touching a worker. During a mixed rollout an old Host is not given observer or
-channel-only records, so it cannot route to them. After upgrading cafe, restart
-the daemon (`cafe daemon restart`) and the pi/Claude session; `cafe doctor`
-reports a daemon that does not advertise the current features.
+**Mixed releases fail honestly.** Every Daemon advertises its feature set on
+`initialize`, `/api/health` and `/api/snapshot`. A newer client talking to an
+older Daemon **refuses before creating an Order** when it asks for a channel,
+`escalate`, `collect: all`, a team target or team identity; a warning is not
+enough when the old side would silently change who receives the message.
+Registering as an observer is refused on the same rule, and `cafe team`
+preflights before touching a worker. During a mixed rollout an old Host is not
+given observer or channel-only records, so it cannot route to them. After
+upgrading cafe, restart the daemon (`cafe daemon restart`) and the pi/Claude
+session; `cafe doctor` reports a daemon that does not advertise the current
+features.
 
 ## Chat connectors (experimental)
 

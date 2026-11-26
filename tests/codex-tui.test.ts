@@ -194,6 +194,19 @@ describe("Codex TUI Barista (barista run --agent codex --tui)", () => {
     ).rejects.toThrow(/several Codex sessions[\s\S]*live[\s\S]*old[\s\S]*--thread/);
   });
 
+  it("de-duplicates repeated thread/list rows before listing candidates (#107)", async () => {
+    await expect(
+      setup({
+        threads: (dir) => [
+          { id: "live", cwd: dir, updatedAt: 300, ephemeral: false },
+          { id: "live", cwd: dir, updatedAt: 300, ephemeral: false },
+          { id: "old", cwd: dir, updatedAt: 200, ephemeral: false },
+          { id: "old", cwd: dir, updatedAt: 200, ephemeral: false },
+        ],
+      }),
+    ).rejects.toThrow(/several Codex sessions in .*: live, old; pass --thread/);
+  });
+
   it("skips a session that is already running a turn", async () => {
     const { tui, c, ask, logs } = await setup({
       threads: (dir) => [

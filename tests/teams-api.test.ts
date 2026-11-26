@@ -35,7 +35,7 @@ describe("team records and team addressing (v4-11)", () => {
     expect(qualified.decision.targets).toEqual([orch.rec.agentId]);
   });
 
-  it("falls back to online members when the orchestrator is offline", async () => {
+  it("fails honestly when the orchestrator is offline (never multicasts the team)", async () => {
     const d = await startDaemon("tm2", { mode: "root", timing: { ...FAST, graceMs: 60 } });
     cleanup.push(d.stop);
     const orch = await barista(d.addr, member("orch", "orchestrator"));
@@ -48,7 +48,7 @@ describe("team records and team addressing (v4-11)", () => {
     await waitFor(() => d.daemon.registry.get(orch.rec.agentId) === undefined, 5000);
 
     const routed = await c.ask({ body: "who is left?", to: "myteam" });
-    expect(routed.decision.targets).toEqual([dev.rec.agentId]);
+    expect(routed.decision).toMatchObject({ targets: [], failure: "team_offline" });
   });
 
   it("names an unknown team instead of a generic no-barista failure", async () => {

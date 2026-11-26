@@ -141,11 +141,12 @@ cafe serve --exec "<任意命令>" --dir ~/code/billing    # 或 --preset claude
 
 每个问题跑一次命令，prompt 走 stdin，stdout 即回答；输出 `CAFE_DECLINE: 原因` 表示婉拒。追问没有会话，只靠 prompt 里的历史。
 
-## 团队与 channel（v4-11）
+## 团队与 channel（v4-11；v4-13 起只有一个前台）
 
-一份 `.cafe` 可以声明一个 team。每个成员是一个独立进程，有自己的职责、目录和
-channel；`cafe team start` 只补齐缺的 headless 成员，不碰你自己开的会话。cafe
-不创建 worktree、不碰分支合入——把成员指向你准备好的目录即可。
+一份 `.cafe` 可以声明一个 team。**必须有且只有一个 orchestrator**：它是团队
+唯一的前台。每个成员是一个独立进程，有自己的职责、目录和 channel；
+`cafe team start` 只补齐缺的 headless 成员，不碰你自己开的会话。cafe 不创建
+worktree、不碰分支合入——把成员指向你准备好的目录即可。
 
 ```yaml
 name: myproj
@@ -162,9 +163,12 @@ team:
 
 ```bash
 cafe team start            # 补齐缺的 headless 成员（默认是 headless pi）
-cafe team start dev1       # 只补一个
-cafe team status           # 名册、在线成员、当前 Thread、警告
+cafe team start dev1       # 只补一个（仍然发布完整名册）
+cafe team sync             # 只发布 .cafe 名册，不启动任何进程
+cafe team status           # 名册、在线成员、当前 Thread、revision、警告
+cafe team context <成员>   # 打印成员注册时收到的 playbook
 cafe team stop             # 停掉被托管的成员；你的 TUI 会话不受影响
+cafe team remove <team>    # 删除名册（有成员在线时拒绝）
 ```
 
 TUI 成员用 `CAFE_TEAM_MEMBER=<名字> CAFE_TEAM_DIR=<名册目录>` 启动会话来注册；
@@ -174,8 +178,17 @@ context，所以重启会话才真正生效）。Codex TUI 用 `cafe barista run
 
 **channel 是消息范围，不是权限边界。** Feed 顶部有 channel 切换，composer 会
 显示 `→ #channel`；`cafe ask --channel <名字>` 可以发到别处。成员自己发起的新
-问题默认落在它的 home channel（它列出的第一个）。`to: <team>` 会找该 team 的
-orchestrator（没有就投给在线的非 observer 成员）。
+问题默认落在它的 home channel（它列出的第一个）。
+
+**团队只有一个前台。** `to: <team>` 只发给 orchestrator，不再组播；在 team
+channel 里不带 `to:` 的新消息也一样。`to: <成员>` 指派一个人，`to: <duty>`
+找该职责唯一的在线成员（多人时 `ambiguous_duty` 并列出名字）。要叫醒全队必须
+显式 `broadcast: true`。追问只发给上一轮最终回复的人（没有则发给上一轮的
+targets）；都不在线时报 `responders_offline`，不再退回 rules/LLM 路由。
+
+成员注册时会在返回值里收到一份 **team playbook**（自己的职责、名册、怎么派单/
+汇报/追问）。`.cafe` 名册变化时，在线成员会收到一条简短的 `team/roster` 注记
+——不是 Order，也不会触发一个 turn。`cafe team stop` 只停 worker，名册保留。
 
 - `escalate`：Barista 可以就“正在处理的那张单”向它的上级追问。这会创建同一
   channel 下、带 `parentThreadId` 的子 Thread，绝不退回路由或隐式广播。
@@ -186,14 +199,14 @@ orchestrator（没有就投给在线的非 observer 成员）。
   channel 摘要（不是每条消息），也可以主动发新单。observer 请放在 Root 或
   team 所在的机器；Root 离线时子机的摘要有 `partial` 标记。
 
-**混合版本。** 每个 daemon 在 `initialize`、`/api/health` 和 `/api/snapshot`
-里声明自己的能力。新客户端连到旧 daemon 时，如果 channel、escalate、
-`collect: all` 或 team 身份可能被忽略，会给出带主机名和版本号的警告；确认
-不支持 observer 时拒绝注册，避免它变成可被投单的普通 Barista；`cafe team`
-在动 worker 之前先做检查。混合升级期间，旧主机收不到 observer 和只在非
-default channel 的 agent 记录，因此不会把它们选为投递目标。升级 cafe 后记得
-重启 daemon（`cafe daemon restart`）和 pi/Claude 会话；`cafe doctor` 会指出
-没有声明当前能力的 daemon。
+**混合版本会诚实失败。** 每个 daemon 在 `initialize`、`/api/health` 和
+`/api/snapshot` 里声明自己的能力。新客户端连到旧 daemon 时，如果它要用
+channel、escalate、`collect: all`、team 目标或 team 身份，**在创建 Order 之前
+就拒绝**：旧 daemon 可能静默改变收件人，一条警告不足以让人发现。observer 同
+样按这个规则拒绝注册；`cafe team` 在动 worker 之前先做检查。混合升级期间，旧
+主机收不到 observer 和只在非 default channel 的 agent 记录，因此不会把它们选
+为投递目标。升级 cafe 后记得重启 daemon（`cafe daemon restart`）和 pi/Claude
+会话；`cafe doctor` 会指出没有声明当前能力的 daemon。
 
 ## 聊天 connector（实验）
 

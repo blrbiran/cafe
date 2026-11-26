@@ -14,7 +14,7 @@ afterEach(async () => {
 });
 
 const roster = (members: string[]) =>
-  ["name: repo", "team:", "  channel: repo-dev", "  members:"]
+  ["name: repo", "team:", "  channel: repo-dev", "  members:", "    - name: orch", "      duty: orchestrator", "      dir: ."]
     .concat(members.flatMap((name) => [`    - name: ${name}`, "      dir: ."]))
     .join("\n") + "\n";
 
@@ -33,7 +33,7 @@ describe("team roster updates", () => {
     const c = new CafeClient({ daemon: d.addr });
     cleanup.push(() => c.close());
     await c.connect(member("dev1", dir));
-    await waitFor(() => d.daemon.teams()[0]?.roster.length === 2, 5000);
+    await waitFor(() => d.daemon.teams()[0]?.roster.length === 3, 5000);
 
     // dev2 is removed from the file; a fresh registration re-reads it.
     writeFileSync(join(dir, ".cafe"), roster(["dev1"]));
@@ -41,8 +41,8 @@ describe("team roster updates", () => {
     const again = new CafeClient({ daemon: d.addr });
     cleanup.push(() => again.close());
     await again.connect(member("dev1", dir));
-    await waitFor(() => d.daemon.teams()[0]?.roster.length === 1, 5000);
-    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["dev1"]);
+    await waitFor(() => d.daemon.teams()[0]?.roster.length === 2, 5000);
+    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["orch", "dev1"]);
   });
 
   it("removes a forgotten Host's teams from memory and teams.json", async () => {

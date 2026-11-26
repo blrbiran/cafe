@@ -71,12 +71,24 @@ function validateTeam(doc: CafeDocument, path: string): void {
   team.name = teamName;
   team.channel = channel;
   const seen = new Set<string>();
+  let orchestrators = 0;
   for (const m of team.members) {
     if (seen.has(m.name)) fail(`team member '${m.name}' is listed twice`);
     seen.add(m.name);
+    if (m.name === teamName) fail(`team member '${m.name}' may not have the same name as the team; \`to: ${m.name}\` would be ambiguous`);
     m.channels = m.channels?.length ? m.channels : [channel];
     if (!m.channels.includes(channel)) fail(`team member '${m.name}' must include the team channel '${channel}' in channels`);
     if (m.observer && !m.channels.includes(channel)) fail(`observer '${m.name}' must include the team channel '${channel}'`);
+    // v4-13: the orchestrator is structural. Normalise the spelling once so every consumer
+    // (`teams()`, the playbook, `to: <team>`) sees the same value.
+    if (m.duty && m.duty.trim().toLowerCase() === "orchestrator") {
+      m.duty = "orchestrator";
+      orchestrators++;
+      if (m.observer) fail(`'${m.name}' cannot be both the orchestrator and an observer`);
+    }
+  }
+  if (orchestrators !== 1) {
+    fail(`team '${teamName}' must list exactly one member with duty: orchestrator (found ${orchestrators}); the orchestrator is the team's front door (v4-13)`);
   }
 }
 

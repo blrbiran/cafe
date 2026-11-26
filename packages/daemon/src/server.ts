@@ -400,7 +400,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       res.end(useGzip ? file.gz! : file.body);
     } catch (err) {
       const e = err as RpcError;
-      send(res, e.code === "not_found" ? 404 : e.code === "host_online" ? 409 : 400, { error: e.code ?? "error", message: e.message });
+      send(res, e.code === "not_found" ? 404 : e.code === "host_online" || e.code === "conflict" ? 409 : 400, { error: e.code ?? "error", message: e.message });
     }
   };
 
@@ -770,6 +770,12 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const status = parseStatus(url.searchParams.get("status"));
     const before = parseBefore(url.searchParams.get("before"));
     const channel = url.searchParams.get("channel");
+    const parent = url.searchParams.get("parent");
+    // v4-13 (#112): the clarification/assignment sub-Threads of one Thread.
+    if (parent) {
+      const rows = daemon.store.listThreadsByParent(parent, limit).filter((r) => (!status || r.status === status) && (!channel || (r.channel ?? "default") === channel));
+      return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
+    }
     const rows = channel ? daemon.store.listThreadsIn(channel, limit, status, before) : daemon.store.listThreads(limit, status, before);
     return send(res, 200, rows.map((r) => daemon.summaryMeta(r)));
   }
@@ -830,6 +836,19 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, { ok: true });
   }
   if (m === "GET" && path === "/api/teams") return send(res, 200, daemon.teams());
+  if (m === "DELETE" && path === "/api/teams") {
+    // v4-13 (#113): remove a roster, not just its workers. Refuse while a member is online so a
+    // person cannot tombstone a team that is still working.
+    const team = url.searchParams.get("team") ?? "";
+    if (!team) throw new RpcError("bad_request", "team is required");
+    const host = url.searchParams.get("host") || daemon.host;
+    const found = daemon.teams().find((t) => t.team === team && t.host === host);
+    if (!found) throw new RpcError("not_found", `no team '${team}' on ${host}`);
+    const online = found.roster.filter((m) => m.status && m.status !== "offline").map((m) => m.name);
+    if (online.length) throw new RpcError("conflict", `team ${team} on ${host} still has online member(s): ${online.join(", ")}; run \`cafe team stop\` first`);
+    const removed = daemon.removeTeam(team, host);
+    return send(res, 200, { ok: true, removed });
+  }
   if (path === "/api/baristas") {
     const sup = daemon.supervisor;
     if (m !== "POST" && !sup) throw new RpcError("unavailable", "barista supervisor disabled");
@@ -838,7 +857,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       const body = await readJson(req);
       // Unknown fields are refused, not ignored: `bin`/`args` used to start any local executable,
       // and silently ignoring them would start the default pi instead (#65).
-      const allowed = new Set(["dir", "agent", "access", "model", "tui", "thread", "member", "teamDir", "team"]);
+      const allowed = new Set(["dir", "agent", "access", "model", "tui", "thread", "member", "teamDir", "team", "sync"]);
       const extra = Object.keys(body).filter((k) => !allowed.has(k));
       if (extra.length) throw new RpcError("bad_request", `unknown field(s): ${extra.join(", ")}; cafe only starts its own agents (pi, omp, codex, claude)`);
       const { dir, agent, access, model, tui, thread, member, teamDir, team } = body;
@@ -863,6 +882,8 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
         const unknown = names.filter((n) => !known.includes(n));
         if (unknown.length) throw new RpcError("bad_request", `unknown member(s): ${unknown.join(", ")}; roster: ${known.join(", ")}`);
         daemon.publishRoster(rosterDir, doc.team);
+        // v4-13: `team sync` only publishes the roster; it must not start a process.
+        if (body.sync === true) return send(res, 200, { published: true, team: doc.team.name });
         return send(res, 200, sup.startTeam(rosterDir, { ...doc.team, members: doc.team.members.filter((m) => names.includes(m.name)) }));
       }
       if (member !== undefined) {

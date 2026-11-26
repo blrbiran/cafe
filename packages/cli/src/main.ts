@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, CommanderError } from "commander";
-import { onlineVersions, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+import { onlineVersions, renderTeamPlaybook, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configKeyPath, isConfigKey, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { fingerprintOf, issueLeaf, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
@@ -85,6 +85,24 @@ async function requireTeams(): Promise<DaemonHealth> {
     throw new Error(featureWarning(h, "teams", "team commands are unavailable on this daemon") + ` (${(err as Error).message})`);
   }
   return h;
+}
+
+/**
+ * v4-13: a v4-11/v4-12 daemon has `teams` but not the front-door semantics (`to: <team>` is a
+ * multicast there). Team commands must not write against it.
+ */
+async function requireTeamSessions(): Promise<DaemonHealth> {
+  const h = await requireTeams();
+  if (Array.isArray(h.features) && h.features.includes("team-sessions")) return h;
+  throw new Error(featureWarning(h, "team-sessions", "team start/stop/sync/remove need the v4-13 front-door semantics"));
+}
+
+/** v4-13: refuse a field the daemon cannot honour before creating an Order (never a silent downgrade). */
+async function requireFeature(feature: string, used: boolean, effect: string): Promise<void> {
+  if (!used) return;
+  const h = await api<DaemonHealth>("/api/health");
+  if (Array.isArray(h.features) && h.features.includes(feature)) return;
+  throw new Error(featureWarning(h, feature, effect));
 }
 
 async function healthy(): Promise<boolean> {
@@ -794,6 +812,24 @@ program
   .action(async (words: string[], o) => {
     if (o.origin !== "human" && o.origin !== "agent") throw new Error("--origin must be human or agent");
     await ensureDaemon();
+    // v4-13: refuse before the Order exists. A silent downgrade (a team message broadcast, an
+    // escalation routed like a normal ask) is worse than an error (#110, #72).
+    await requireFeature("channels", !!o.channel, `channel #${o.channel} would be ignored`);
+    await requireFeature("collect", o.collect !== "any", "the first answer may close the thread instead of waiting for every target");
+    await requireFeature("escalate", !!o.escalate, "the question would become a normal routed ask instead of a sub-Thread");
+    if (o.to) {
+      const name = String(o.to).replace(/[#@].*$/, "");
+      const host = /@([a-zA-Z0-9_.-]+)$/.exec(String(o.to))?.[1];
+      const [teams, agents] = await Promise.all([
+        api<{ team: string; host: string }[]>("/api/teams").catch(() => []),
+        api<{ name: string; address: string; displayName?: string }[]>("/api/agents").catch(() => []),
+      ]);
+      // An agent name wins over a team name (the daemon's own resolution order), so a v4-12
+      // daemon with a team whose name matches an agent must not reject a valid agent target.
+      const agentHit = agents.some((a) => a.address === o.to || a.name === name || a.displayName === name);
+      const teamHit = !agentHit && teams.some((t) => t.team === name && (!host || t.host === host));
+      await requireFeature("team-sessions", teamHit, `to: ${o.to} would reach every member instead of the orchestrator`);
+    }
     const attachments = [];
     for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
     const res = await api("/api/orders", {
@@ -821,26 +857,8 @@ program
       // An immediate routing failure is not "thread created"; say so and exit non-zero (#39 review).
       throw new Error(`not delivered${res.decision.failure ? ` (${res.decision.failure})` : ""}: ${res.decision.reason}`);
     }
-    // v4-12: name a mixed-release downgrade before following, so the person sees it even in JSON.
+    // The capability check above already refused a daemon that cannot honour these fields.
     const warnings: string[] = [];
-    if (o.channel || o.collect !== "any" || o.escalate) {
-      const h = await api<DaemonHealth>("/api/health").catch(() => undefined);
-      if (h) {
-        if (o.channel) {
-          const w = featureWarning(h, "channels", `the channel #${o.channel} may have been ignored`);
-          if (w) warnings.push(w);
-        }
-        if (o.collect !== "any") {
-          const w = featureWarning(h, "collect", "the first answer may close the thread instead of waiting for every target");
-          if (w) warnings.push(w);
-        }
-        if (o.escalate && !(res.decision?.router === "explicit" && /escalate/i.test(res.decision.reason ?? ""))) {
-          const w = featureWarning(h, "escalate", "the question may have been routed as a normal ask, not to the parent");
-          if (w) warnings.push(w);
-        }
-      }
-    }
-    for (const w of warnings) console.error(`warning: ${w}`);
     if (o.async || o.notice) return out(`thread ${res.threadId} (order ${res.orderId}) → ${res.decision?.mode ?? "?"}: ${res.decision?.reason ?? ""}`, warnings.length ? { ...res, warnings } : res);
     if (!JSON_OUT) console.log(`thread ${res.threadId}`);
     const status = await follow(res.threadId, { orderId: res.orderId, ...(o.timeout > 0 ? { timeoutMs: o.timeout * 1000 } : {}), ...(warnings.length ? { warnings } : {}) });
@@ -995,9 +1013,14 @@ program
       .description("list channels with Thread counts and teams")
       .action(async () => {
         await ensureDaemon();
-        const list = await api<{ name: string; threads: number; teams: { team: string; host: string }[] }[]>("/api/channels");
+        const list = await api<{ name: string; threads: number; teams: { team: string; host: string }[]; conflict?: boolean }[]>("/api/channels");
         out(
-          list.map((c) => `#${c.name.padEnd(24)} ${String(c.threads).padStart(4)} thread(s)${c.teams.length ? `  teams: ${c.teams.map((t) => `${t.team}@${t.host}`).join(", ")}` : ""}`).join("\n") || "(no channels)",
+          list
+            .map(
+              (c) =>
+                `#${c.name.padEnd(24)} ${String(c.threads).padStart(4)} thread(s)${c.teams.length ? `  teams: ${c.teams.map((t) => `${t.team}@${t.host}`).join(", ")}` : ""}${c.conflict ? "  ⚠ more than one team uses this channel; a message without to: is ambiguous" : ""}`,
+            )
+            .join("\n") || "(no channels)",
           list,
         );
       }),
@@ -1119,7 +1142,17 @@ program
     const t = await api<{ meta: ThreadMeta; events: ThreadEnvelope[] }>(`/api/threads/${id}`);
     const agents = new Map((await api<AgentRecord[]>("/api/agents")).map((a) => [a.agentId, a]));
     const att = t.meta.attachments?.map((a) => `📎 ${a.name} (${a.size} bytes, id ${a.id})`) ?? [];
-    const lines = [`${t.meta.from.address}: ${t.meta.summary}`, ...((t.meta.channel ?? "default") !== "default" ? [`channel: #${t.meta.channel}`] : []), ...att, ...t.events.map((e) => describe(e, agents)).filter(Boolean)];
+    // v4-13 (#111): `collect: all` is only useful when the silent member is visible.
+    const targets = t.meta.targetStates?.length
+      ? `targets: ${t.meta.targetStates.map((s) => `${agents.get(s.agentId)?.address ?? s.agentId} ${s.state}`).join(", ")}`
+      : undefined;
+    const lines = [
+      `${t.meta.from.address}: ${t.meta.summary}`,
+      ...((t.meta.channel ?? "default") !== "default" ? [`channel: #${t.meta.channel}`] : []),
+      ...(targets ? [targets] : []),
+      ...att,
+      ...t.events.map((e) => describe(e, agents)).filter(Boolean),
+    ];
     out(lines.join("\n"), t);
   });
 
@@ -1511,7 +1544,7 @@ barista
       ...(o.member ? { member: o.member } : {}),
       ...(o.teamDir ? { teamDir: resolve(o.teamDir) } : {}),
     };
-    if (o.member) await requireTeams();
+    if (o.member) await requireTeamSessions();
     const ws = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir, ...spec }) });
     const how = o.tui ? " (answers in the running Codex session)" : native ? (o.write ? " (may edit files)" : " (read-only)") : "";
     // A member's cwd is the roster entry's dir, not --dir; that check belongs to `cafe team status`.
@@ -1571,7 +1604,7 @@ team
   .option("--force", "start a headless member even if an unowned same-name agent is online")
   .action(async (names: string[], o) => {
     await ensureDaemon();
-    await requireTeams();
+    await requireTeamSessions();
     const { rosterDir, team: spec } = rosterAt(o.dir, o.teamDir);
     const unknown = names.filter((n) => !spec.members.some((m) => m.name === n));
     if (unknown.length) throw new Error(`unknown member(s): ${unknown.join(", ")}; roster: ${spec.members.map((m) => m.name).join(", ")}`);
@@ -1622,7 +1655,7 @@ team
   .option("--team-dir <dir>", "same as --dir (explicit roster)")
   .action(async (o) => {
     await ensureDaemon();
-    await requireTeams();
+    await requireTeamSessions();
     const { team: spec } = rosterAt(o.dir, o.teamDir);
     const all = await api<any[]>("/api/teams");
     const local = (await api<{ host: string }>("/api/health")).host;
@@ -1639,7 +1672,13 @@ team
       ...(m.currentThread ? { currentThread: m.currentThread } : {}),
     }));
     const lines = rows.map((r: any) => `${r.status.padEnd(8)} ${r.member.padEnd(16)} ${r.duty.padEnd(14)} ${r.mode.padEnd(8)} ${r.address}${r.observer ? " (observer)" : ""}${r.currentThread ? `  thread ${r.currentThread}` : ""}`);
-    out([`team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: this Host's view)" : ""}`, ...lines].join("\n"), t);
+    out(
+      [
+        `team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: this Host's view)" : ""}${t.authoritative ? " · authoritative .cafe roster" : ""}${t.revision ? ` · revision ${t.revision}` : ""}`,
+        ...lines,
+      ].join("\n"),
+      t,
+    );
   });
 team
   .command("stop")
@@ -1648,7 +1687,7 @@ team
   .option("--team-dir <dir>", "same as --dir (explicit roster)")
   .action(async (names: string[], o) => {
     await ensureDaemon();
-    await requireTeams();
+    await requireTeamSessions();
     const { rosterDir } = rosterAt(o.dir, o.teamDir);
     let stopped = 0;
     if (names.length) {
@@ -1660,6 +1699,64 @@ team
       stopped = ((await api(`/api/baristas?dir=${encodeURIComponent(rosterDir)}&team=1`, { method: "DELETE" })) as { stopped: number }).stopped;
     }
     out(`stopped ${stopped} supervised member worker(s); TUI sessions are untouched`, { stopped });
+  });
+team
+  .command("sync")
+  .description("publish the roster from .cafe (full membership) without starting any process")
+  .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
+  .option("--team-dir <dir>", "same as --dir (explicit roster)")
+  .action(async (o) => {
+    await ensureDaemon();
+    await requireTeamSessions();
+    const { rosterDir, team: spec } = rosterAt(o.dir, o.teamDir);
+    const r = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: spec, sync: true }) });
+    out(`roster ${spec.name} (#${spec.channel}) synced from ${rosterDir}`, r);
+  });
+team
+  .command("context")
+  .argument("[member]", "roster member (default: CAFE_TEAM_MEMBER)")
+  .description("print the playbook a team member receives at registration")
+  .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
+  .option("--team-dir <dir>", "same as --dir (explicit roster)")
+  .action(async (memberArg: string | undefined, o) => {
+    await ensureDaemon();
+    await requireTeamSessions();
+    const { team: spec } = rosterAt(o.dir, o.teamDir);
+    const name = memberArg ?? process.env.CAFE_TEAM_MEMBER;
+    const self = name ? spec.members.find((m) => m.name === name) : undefined;
+    if (!self) {
+      throw new Error(`${name ? `unknown member '${name}'` : "member is required (or set CAFE_TEAM_MEMBER)"}; roster: ${spec.members.map((m) => m.name).join(", ")}`);
+    }
+    const all = await api<any[]>("/api/teams");
+    const local = (await api<{ host: string }>("/api/health")).host;
+    const t = all.find((x) => x.team === spec.name && x.host === local) ?? all.find((x) => x.team === spec.name);
+    const roster = (t?.roster ?? spec.members).map((m: any) => ({
+      name: m.name,
+      ...(m.duty ? { duty: m.duty } : {}),
+      online: m.status ? m.status !== "offline" : false,
+    }));
+    const orch = roster.find((m: any) => m.duty === "orchestrator");
+    if (!orch) throw new Error(`team ${spec.name} has no orchestrator`);
+    const text = renderTeamPlaybook({
+      team: spec.name!,
+      channel: spec.channel!,
+      self: { name: self.name, ...(self.duty ? { duty: self.duty } : {}), online: true },
+      orchestrator: orch.name,
+      roster,
+    });
+    out(text, { team: spec.name, channel: spec.channel, member: self.name, roster });
+  });
+team
+  .command("remove")
+  .argument("<team>", "team name")
+  .description("remove a roster from the network (stop its workers first)")
+  .option("--host <host>", "Host whose roster to remove (default: this Host)")
+  .action(async (name: string, o) => {
+    await ensureDaemon();
+    await requireTeamSessions();
+    const host = o.host ?? (await api<{ host: string }>("/api/health")).host;
+    const r = await api(`/api/teams?team=${encodeURIComponent(name)}&host=${encodeURIComponent(host)}`, { method: "DELETE" });
+    out(`removed team ${name} on ${host}`, r);
   });
 barista
   .command("run")

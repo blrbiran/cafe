@@ -71,7 +71,15 @@ export class CodexTuiEngine implements Engine {
     const res = await server.request<Json>("thread/list", { limit: 50 });
     const rows = ((res.data ?? []) as Json[]).filter((t) => !t.ephemeral && typeof t.cwd === "string" && (t.cwd === this.opts.dir || real(t.cwd) === want));
     rows.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-    return rows;
+    // codex app-server can repeat a thread in thread/list; the newest row for an id wins. Without
+    // this the candidate list repeats one id and slice(0,10) can push a real session out (#107).
+    const seen = new Set<string>();
+    return rows.filter((t) => {
+      const id = String(t.id ?? "");
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
   }
 
   /**

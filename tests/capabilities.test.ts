@@ -18,9 +18,9 @@ interface FakeOptions {
   decision?: Record<string, unknown>;
 }
 
-async function fakeDaemon(opts: FakeOptions = {}): Promise<{ addr: string; registers: () => number }> {
+async function fakeDaemon(opts: FakeOptions = {}): Promise<{ addr: string; registers: () => number; orders: () => number }> {
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-  const state = { registers: 0 };
+  const state = { registers: 0, orders: 0 };
   wss.on("connection", (ws: WebSocket) => {
     const peer = new Peer(ws);
     ws.on("message", (data) => void peer.receive(data.toString()));
@@ -32,37 +32,41 @@ async function fakeDaemon(opts: FakeOptions = {}): Promise<{ addr: string; regis
       const kept = opts.keepIdentity ? identity : { name: identity.name, description: "", tags: [], scope: [], role: "barista", concurrency: 1, mode: "headless", cwd: "/tmp" };
       return { ...kept, agentId: "a1", address: `${String(identity.name)}#1@oldbox`, host: "oldbox", status: "idle", registeredAt: Date.now() };
     });
-    peer.on("order/create", () => ({ orderId: "o1", threadId: "t1", decision: opts.decision ?? { mode: "unicast", targets: ["a1"], reason: "asked the most available Barista", router: "rules", candidates: [] } }));
+    peer.on("order/create", () => {
+      state.orders++;
+      return { orderId: "o1", threadId: "t1", decision: opts.decision ?? { mode: "unicast", targets: ["a1"], reason: "asked the most available Barista", router: "rules", candidates: [] } };
+    });
   });
   cleanup.push(() => new Promise<void>((r) => wss.close(() => r())));
   await new Promise<void>((r) => wss.once("listening", () => r()));
-  return { addr: `127.0.0.1:${(wss.address() as { port: number }).port}`, registers: () => state.registers };
+  return { addr: `127.0.0.1:${(wss.address() as { port: number }).port}`, registers: () => state.registers, orders: () => state.orders };
 }
 
 describe("mixed-release client behaviour (v4-12)", () => {
-  it("warns for channel, collect and escalate when the daemon advertises nothing", async () => {
-    const { addr } = await fakeDaemon();
+  it("refuses channel, collect and escalate before creating an Order when the daemon advertises nothing", async () => {
+    const { addr, orders } = await fakeDaemon();
     const c = new CafeClient({ daemon: addr });
     cleanup.push(() => c.close());
     await c.connect();
+    const before = orders();
 
-    await c.ask({ body: "in dev", channel: "dev" });
-    expect(c.drainWarnings().join("\n")).toMatch(/does not advertise channels/);
-
-    await c.ask({ body: "ask all", collect: "all" });
-    expect(c.drainWarnings().join("\n")).toMatch(/does not advertise collect/);
-
-    await c.ask({ body: "clarify", escalate: true, parentOrderId: "o0", parentThreadId: "t0" });
-    expect(c.drainWarnings().join("\n")).toMatch(/does not advertise escalate/);
+    await expect(c.ask({ body: "in dev", channel: "dev" })).rejects.toMatchObject({ code: "unsupported_capability" });
+    await expect(c.ask({ body: "ask all", collect: "all" })).rejects.toMatchObject({ code: "unsupported_capability" });
+    await expect(c.ask({ body: "clarify", escalate: true, parentOrderId: "o0", parentThreadId: "t0" })).rejects.toMatchObject({ code: "unsupported_capability" });
+    // Nothing was sent: no Order exists for a field the old daemon would silently drop.
+    expect(orders()).toBe(before);
   });
 
-  it("does not warn for escalate when the decision proves it reached the parent", async () => {
-    const { addr } = await fakeDaemon({ decision: { mode: "unicast", targets: ["a9"], reason: "escalate to parent boss#1@oldbox", router: "explicit", candidates: [] } });
+  it("accepts escalate when the daemon advertises it and does not warn", async () => {
+    const { addr } = await fakeDaemon({
+      features: ["teams", "channels", "escalate", "collect", "digests", "team-sessions"],
+      decision: { mode: "unicast", targets: ["a9"], reason: "escalate to parent boss#1@oldbox", router: "explicit", candidates: [] },
+    });
     const c = new CafeClient({ daemon: addr });
     cleanup.push(() => c.close());
     await c.connect();
     await c.ask({ body: "clarify", escalate: true, parentOrderId: "o0", parentThreadId: "t0" });
-    expect(c.drainWarnings().join("\n")).not.toMatch(/escalate/);
+    expect(c.drainWarnings()).toEqual([]);
   });
 
   it("refuses an observer after the registration echo proves it was stripped", async () => {
@@ -89,8 +93,16 @@ describe("mixed-release client behaviour (v4-12)", () => {
     expect(c.drainWarnings()).toEqual([]);
   });
 
-  it("warns for a team identity the daemon dropped, but stays connected", async () => {
+  it("refuses a team identity when the daemon advertises no team-sessions", async () => {
     const { addr } = await fakeDaemon();
+    const c = new CafeClient({ daemon: addr });
+    cleanup.push(() => c.close());
+    await expect(c.connect(identity("dev1", { team: "repo", teamChannel: "repo-dev", member: "dev1", channels: ["repo-dev"] }))).rejects.toMatchObject({ code: "unsupported_capability" });
+    expect(c.connected).toBe(false);
+  });
+
+  it("warns when a team-sessions daemon still drops the team identity", async () => {
+    const { addr } = await fakeDaemon({ features: ["teams", "channels", "escalate", "collect", "digests", "team-sessions"] });
     const c = new CafeClient({ daemon: addr });
     cleanup.push(() => c.close());
     await c.connect(identity("dev1", { team: "repo", teamChannel: "repo-dev", member: "dev1", channels: ["repo-dev"] }));

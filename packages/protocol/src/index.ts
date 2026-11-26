@@ -58,7 +58,7 @@ export const TeamSpec = z.object({
 });
 export type TeamSpec = z.infer<typeof TeamSpec>;
 
-/** A roster replicated to the Root (v4-11). */
+/** A roster replicated to the Root (v4-11; v4-13 adds the authoritative flag and content hash). */
 export const TeamRecord = z.object({
   team: z.string(),
   host: z.string(),
@@ -66,8 +66,90 @@ export const TeamRecord = z.object({
   members: z.array(TeamMember),
   revision: z.number().int().optional(),
   hostOnline: z.boolean().optional(),
+  /** The roster came from a `.cafe` file: `teams()` must not grow it from live registrations. */
+  authoritative: z.boolean().optional(),
+  /** Hash of team/channel/members; an identical re-publish is a no-op (no revision bump, no push). */
+  contentHash: z.string().optional(),
+  /** Tombstone (v4-13): the roster was removed; keep it in teams.json so a stale upsert loses. */
+  removed: z.boolean().optional(),
 });
 export type TeamRecord = z.infer<typeof TeamRecord>;
+
+/** One entry of a team's live roster (v4-13). */
+export const TeamRosterEntry = z.object({
+  name: z.string(),
+  duty: z.string().optional(),
+  online: z.boolean().default(false),
+});
+export type TeamRosterEntry = z.infer<typeof TeamRosterEntry>;
+
+/**
+ * What a member needs to know about its team (v4-13). Delivered in the `agent/register` result,
+ * never stored in the replicated AgentRecord.
+ */
+export const TeamContext = z.object({
+  team: z.string(),
+  channel: ChannelName,
+  revision: z.number().int().optional(),
+  self: z.object({ name: z.string(), duty: z.string().optional(), mode: z.string() }),
+  orchestrator: z.string(),
+  roster: z.array(TeamRosterEntry),
+  playbook: z.string(),
+});
+export type TeamContext = z.infer<typeof TeamContext>;
+
+/** A roster change pushed to online members (v4-13). Not an Order and never a turn of its own. */
+export const TeamRosterUpdate = z.object({
+  team: z.string(),
+  channel: ChannelName,
+  revision: z.number().int(),
+  members: z.array(TeamRosterEntry),
+  change: z.object({ added: z.array(z.string()).default([]), removed: z.array(z.string()).default([]), updated: z.array(z.string()).default([]) }),
+  /** The team was removed; drop the playbook and stop addressing it. */
+  removedTeam: z.boolean().optional(),
+});
+export type TeamRosterUpdate = z.infer<typeof TeamRosterUpdate>;
+
+/**
+ * The team playbook (v4-13). One template for every client, so pi/Claude/CLI see the same words.
+ * It is deliberately short: it is injected once per process, and the roster is repeated only as
+ * a compact list.
+ */
+export function renderTeamPlaybook(input: { team: string; channel: string; self: TeamRosterEntry; orchestrator: string; roster: TeamRosterEntry[] }): string {
+  const { team, channel, self, orchestrator, roster } = input;
+  const who = `You are ${self.name}${self.duty ? ` (${self.duty})` : ""} in team "${team}", channel #${channel}. The team's orchestrator (front door) is ${orchestrator}.`;
+  const lines = [
+    who,
+    `Team roster: ${roster.map((m) => `${m.name}${m.duty ? `/${m.duty}` : ""}${m.online ? "" : " (offline)"}`).join(", ")}.`,
+    "",
+    "How the team talks:",
+    `- Sending to "${team}" (or sending in #${channel} without a target) reaches the ORCHESTRATOR, not everyone.`,
+    "- Assign one member with to: \"<member>\". Ask whoever owns a duty with to: \"<duty>\" (if that is ambiguous, use a name).",
+    "- broadcast: true is the only way to reach every member. Use it only when the person explicitly asked everyone.",
+    "- A question about an assignment goes back to the asker with escalate: true; never broadcast a clarification.",
+    "- Use collect: \"all\" only when you need every target's answer; otherwise the first final answer closes the turn.",
+    "- The roster can change while you work. `cafe team status` (or the team roster note) is authoritative before a big assignment.",
+    "- Channels are scopes, not privacy boundaries.",
+    "",
+  ];
+  if (self.duty === "orchestrator" || self.name === orchestrator) {
+    lines.push(
+      "Your job as orchestrator:",
+      "- Split the task. Assign each part to one member at a time with to: \"<member>\".",
+      "- When you assign inside the task you received, pass its parent_order_id and parent_thread_id so the work forms a sub-thread tree the person can follow.",
+      "- Do not do the work yourself unless it is small; keep your context for the task and the reports.",
+      "- Report to the person who asked you with a normal reply. Say what was done, where, and what is still open.",
+    );
+  } else {
+    lines.push(
+      "Your job as a member:",
+      "- Do the work in this Order, then reply to it. Keep the reply short: what changed, where, what is blocked.",
+      "- Need a decision or a clarification? Escalate to the asker with escalate: true; do not ask the whole team.",
+      "- Status reports go to the orchestrator with to: \"<orchestrator>\", not to everyone.",
+    );
+  }
+  return lines.join("\n");
+}
 
 /** Contents of a `.cafe` Cafe File. */
 export const CafeFile = z.object({
@@ -254,7 +336,7 @@ export const Order = z.object({
 });
 export type Order = z.infer<typeof Order>;
 
-/** Why a sub-Order could not be delivered (v4-11). Appears on RoutingDecision.failure and order.failed. */
+/** Why a sub-Order could not be delivered (v4-11; v4-13 adds the team-session failures). */
 export const SubOrderFailure = z.enum([
   "parent_offline",
   "unknown_team",
@@ -263,6 +345,16 @@ export const SubOrderFailure = z.enum([
   "ambiguous_address",
   "no_online_barista",
   "no_channel_members",
+  /** v4-13: a roster has no (or more than one) orchestrator. */
+  "no_orchestrator",
+  /** v4-13: `to: <duty>` matched more than one online member. */
+  "ambiguous_duty",
+  /** v4-13: no member has that duty. */
+  "unknown_duty",
+  /** v4-13: two teams own one channel, so its default recipient is not unique. */
+  "ambiguous_channel",
+  /** v4-13: a follow-up's responders and targets are all offline. */
+  "responders_offline",
 ]);
 export type SubOrderFailure = z.infer<typeof SubOrderFailure>;
 
@@ -379,7 +471,8 @@ export type ThreadMeta = z.infer<typeof ThreadMeta>;
 
 /** A channel digest for an observer (v4-11): one summary, not an Order. */
 export const ChannelDigest = z.object({
-  digestId: z.number().int(),
+  /** `<host>:<seq>` (v4-13); a number is accepted for an older publisher. */
+  digestId: z.union([z.string(), z.number().int()]),
   channel: ChannelName,
   since: z.number(),
   threads: z.array(
@@ -534,6 +627,8 @@ export const Methods = {
   /** v4-11: a daemon publishes a full team roster (revision-guarded) to the Root / children. */
   teamUpsert: "team/upsert",
   teamRemove: "team/remove",
+  /** v4-13: Daemon→Agent, a changed roster (not an Order; never triggers a turn). */
+  teamRoster: "team/roster",
   /** v4-11: a channel digest for an observer (not an Order). */
   channelDigest: "channel/digest",
   /** Root→children: a Host was forgotten (v4-8); drop its address, link and pins. */

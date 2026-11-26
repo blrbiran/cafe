@@ -60,7 +60,7 @@ describe("handshake gate", () => {
 describe("team start never learns an executable from the request body", () => {
   it("loads the roster from disk and only accepts member names", async () => {
     const roster = mkdtempSync(join(tmpdir(), "cafe-roster-"));
-    writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: dev1\n      dir: .\n");
+    writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: orch\n      duty: orchestrator\n      dir: .\n    - name: dev1\n      dir: .\n");
     cleanup.push(() => rmSync(roster, { recursive: true, force: true }));
 
     const d = await startDaemon("team1");
@@ -104,9 +104,38 @@ describe("team start never learns an executable from the request body", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("publishes the full roster on sync without starting a worker (v4-13)", async () => {
+    const roster = mkdtempSync(join(tmpdir(), "cafe-roster-sync-"));
+    writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: orch\n      duty: orchestrator\n      dir: .\n    - name: human\n      dir: .\n      mode: tui\n");
+    cleanup.push(() => rmSync(roster, { recursive: true, force: true }));
+
+    const d = await startDaemon("team-sync");
+    cleanup.push(d.stop);
+    let started = 0;
+    d.daemon.supervisor = {
+      list: () => [],
+      startTeam: () => {
+        started++;
+        return [];
+      },
+      stopTeam: () => 0,
+      start: () => [],
+      shutdown: async () => {},
+    } as unknown as typeof d.daemon.supervisor;
+
+    const res = await fetch(`http://${d.addr}/api/baristas`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dir: roster, team: { members: [{ name: "orch" }] }, sync: true }),
+    });
+    expect(res.status, await res.text()).toBe(200);
+    expect(started).toBe(0);
+    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["orch", "human"]);
+  });
+
   it("publishes a TUI-only roster even though no worker starts", async () => {
     const roster = mkdtempSync(join(tmpdir(), "cafe-roster-tui-"));
-    writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: human\n      dir: .\n      mode: tui\n");
+    writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: orch\n      duty: orchestrator\n      dir: .\n    - name: human\n      dir: .\n      mode: tui\n");
     cleanup.push(() => rmSync(roster, { recursive: true, force: true }));
 
     const d = await startDaemon("team2");
@@ -132,7 +161,7 @@ describe("team start never learns an executable from the request body", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.team.members[0]!.mode).toBe("tui");
     expect(d.daemon.teams().map((t) => t.team)).toEqual(["repo"]);
-    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["human"]);
+    expect(d.daemon.teams()[0]!.roster.map((m) => m.name)).toEqual(["orch", "human"]);
   });
 });
 
@@ -217,7 +246,8 @@ describe("observer membership", () => {
     const c = await customer(d.addr);
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "hello team", to: "t1" });
-    expect(res.decision.failure).toBe("team_offline");
+    // v4-13: a team with no orchestrator has no front door; the observer is never a fallback.
+    expect(res.decision.failure).toBe("no_orchestrator");
     expect(seen).toBe(0);
   });
 });

@@ -128,12 +128,12 @@ describe("mixed-release preflights (v4-12)", () => {
     return { addr: `127.0.0.1:${(server.address() as { port: number }).port}`, calls };
   }
 
-  it("warns about a channel on an old daemon and still creates the order", async () => {
+  it("refuses a channel on an old daemon before creating the order (v4-13 hard reject)", async () => {
     const { addr, calls } = await oldDaemon();
     const r = await cafeAsync(home(), addr, "ask", "--channel", "dev", "--async", "hello");
-    expect(r.status, r.stderr).toBe(0);
+    expect(r.status, r.stderr).not.toBe(0);
     expect(r.stderr).toContain("does not advertise channels");
-    expect(calls).toContain("POST /api/orders");
+    expect(calls).not.toContain("POST /api/orders");
   });
 
   it("refuses team stop before any barista write", async () => {

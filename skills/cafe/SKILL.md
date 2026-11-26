@@ -41,43 +41,56 @@ cafe ask --notice "deploy finished"          # one-way notice, no reply expected
 - Long tasks are fine, but not unbounded: heartbeats prove the Barista is alive, not that it will answer. A unicast Order closes after 10 minutes without a final reply, and `cafe ask --timeout <seconds>` (or Ctrl-C) cancels it earlier, so a stuck follow-up never leaves `thread_busy` behind. `cafe cancel <threadId>` stops waiting; `cafe ask --thread <id> --replace "..."` asks again immediately.
 - `cafe thread <id>` now returns the newest 200 events; older pages come with `?before=`.
 
-## Teams and channels (v4-11)
+## Teams and channels (v4-11; one front door since v4-13)
 
-A `.cafe` may declare one team; each member is one process with a duty, directory
-and channel. `cafe team start` fills in missing headless members and never
-touches a session you started yourself.
+A `.cafe` may declare one team with **exactly one orchestrator**; each member is
+one process with a duty, directory and channel. `cafe team start` fills in
+missing headless members and never touches a session you started yourself.
 
 ```bash
 cafe team start [member…] --dir <roster dir> --dry-run   # plan; --force starts an unowned same-name member
-cafe team status                                         # roster, online, current Thread, warnings
+cafe team sync                                           # publish .cafe membership; start nothing
+cafe team status                                         # roster, online, current Thread, revision, warnings
+cafe team context <member>                               # the playbook that member receives
 cafe team stop [member…]                                 # only supervised members; TUI sessions stay
+cafe team remove <team>                                  # remove the roster (refuses while a member is online)
 cafe ask --channel <name> "..."                          # post to a channel instead of your home channel
 cafe ask --collect all "..."                             # multicast: wait for every target or the deadline
 cafe ask --escalate --parent <orderId> --parent-thread <threadId> "..."  # ask the sender of the Order you are handling
-cafe channel list                                        # channels, Thread counts, teams
+cafe channel list                                        # channels, Thread counts, teams (and channel conflicts)
 cafe channel threads <name> [--after <ms>]               # one channel's Threads (observer catch-up)
 ```
 
-- `to: <team>` reaches the team's orchestrator (or its online non-observer
-  members). A bare member name resolves inside your own team first.
+- `to: <team>` reaches **only the orchestrator** (the team's front door). A
+  fresh message in the team channel with no `to:` does the same. `to: <member>`
+  assigns one member; `to: <duty>` asks the unique online member with that duty.
+  Reaching everyone requires an explicit `broadcast: true`.
+- A follow-up goes to the previous turn's final responders, then that turn's
+  targets; if none are online it fails as `responders_offline` instead of
+  falling back to rules/LLM routing.
+- A registering member receives a team playbook (its duty, the roster, how to
+  assign/report/escalate). A roster change pushes one short `team/roster` note
+  to online members; it is not an Order and does not trigger a turn.
 - A sub-Thread (`escalate`) is linked by `parentThreadId`; it never falls back
   to routing or an implicit broadcast. Use `to:` to delegate, `broadcast: true`
-  to address the whole channel.
+  to address the whole channel. The Web shows the parent/child links and the
+  latest turn's target states.
 - `collect: all` reports deadline silences as skipped (auditable), not declines;
   `ThreadMeta.targetStates` names who is still silent.
 - An `observer: true` member is never routed to. It receives one channel digest
   per interval (not one message per Order), can send fresh Orders, and should
-  run on the Root or the team's Host. A child digest is `partial` while the
-  Root is offline.
+  run on the Root or the team's Host. The Root publishes the complete digest
+  while online; a child publishes `partial` only while the Root is offline.
 - Channels are **not permissions**. The Web shows channel chips and a Teams page;
-  the composer always names its destination (`→ #channel`).
-- **Mixed releases:** a Daemon advertises features on `initialize`, `/api/health`
-  and `/api/snapshot`. A newer client talking to an older Daemon returns a
-  `warning:` line in the tool result (channel/escalate/collect/team identity may
-  have been ignored); observer registration is refused when it cannot be honoured,
-  and `cafe team` preflights before touching a worker. After upgrading, restart
-  the daemon (`cafe daemon restart`) and the session; `cafe doctor` reports a
-  daemon without the current features.
+  the composer always names its destination (`→ #channel`), defaulting to the
+  team's orchestrator in a team channel.
+- **Mixed releases fail honestly:** a Daemon advertises features on
+  `initialize`, `/api/health` and `/api/snapshot`. A newer client talking to an
+  older Daemon **refuses before creating an Order** when it asks for a channel,
+  `escalate`, `collect: all`, a team target or team identity; observer
+  registration is refused on the same rule, and `cafe team` preflights before
+  touching a worker. After upgrading, restart the daemon (`cafe daemon restart`)
+  and the session; `cafe doctor` reports a daemon without the current features.
 
 ## Inspect / debug
 

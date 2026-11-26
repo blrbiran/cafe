@@ -110,4 +110,35 @@ describe("observer digests and channel history (v4-11)", () => {
     await waitFor(() => digests.length > 0, 5000);
     expect(digests[0]!.partial).toBe(true);
   });
+
+  it("publishes from the Root while online and hands over to the child when it goes offline (#109)", async () => {
+    const root = await startDaemon("obR", { mode: "root", timing: { ...FAST, graceMs: 60, digestIntervalMs: 120 } });
+    const child = await startDaemon("obC", { config: { root: root.addr }, timing: { ...FAST, graceMs: 60, digestIntervalMs: 120 } });
+    cleanup.push(child.stop);
+    cleanup.push(root.stop);
+    await waitFor(() => child.daemon.rootOnline, 5000);
+
+    const digests: ChannelDigest[] = [];
+    const watch = await barista(child.addr, identity("watch", { observer: true, channels: ["team"] }));
+    watch.client.onDigest((x) => digests.push(x));
+    cleanup.push(() => watch.client.close());
+    const worker = await barista(child.addr, identity("worker", { channels: ["team"] }));
+    cleanup.push(() => worker.client.close());
+    const c = await customer(root.addr);
+    cleanup.push(() => c.close());
+
+    // The Thread lives on the Root; the observer is registered on the child. Only the Root has the
+    // complete view, so the Root publishes it (no `partial`) and the child stays quiet.
+    await c.ask({ body: "root view", to: "worker", channel: "team" });
+    await waitFor(() => digests.some((x) => x.partial !== true), 5000);
+    expect(digests.filter((x) => x.partial !== true).every((x) => String(x.digestId).startsWith("obR:"))).toBe(true);
+    const beforeStop = digests.length;
+
+    await root.stop();
+    await waitFor(() => !child.daemon.rootOnline, 8000);
+    const local = await customer(child.addr);
+    cleanup.push(() => local.close());
+    await local.ask({ body: "child view", channel: "team" });
+    await waitFor(() => digests.length > beforeStop && digests.some((x) => x.partial === true && String(x.digestId).startsWith("obC:")), 8000);
+  }, 30_000);
 });

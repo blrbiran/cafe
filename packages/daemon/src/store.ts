@@ -1,7 +1,13 @@
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentRecord, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { DEFAULT_CHANNEL, type AgentRecord, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+
+/** Decode a Thread's metadata; a Thread written before channels existed is a default-channel Thread. */
+function threadMeta(raw: string): ThreadMeta {
+  const meta = JSON.parse(raw) as ThreadMeta;
+  return meta.channel === undefined ? { ...meta, channel: DEFAULT_CHANNEL } : meta;
+}
 
 export interface StoredArtifact {
   id: string;
@@ -93,8 +99,14 @@ export class Store {
       this.db.exec("ALTER TABLE threads ADD COLUMN last_activity INTEGER");
       this.db.exec("UPDATE threads SET last_activity = COALESCE(json_extract(meta, '$.lastActivityAt'), created_at)");
     }
+    // v4-13: a sub-Thread's parent is queryable without scanning the metadata JSON (#112).
+    if (!threadCols.has("parent_thread_id")) {
+      this.db.exec("ALTER TABLE threads ADD COLUMN parent_thread_id TEXT");
+      this.db.exec("UPDATE threads SET parent_thread_id = json_extract(meta, '$.parentThreadId')");
+    }
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_created ON threads(channel, created_at DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_activity ON threads(channel, last_activity DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS threads_parent ON threads(parent_thread_id, created_at DESC)");
     this.upsertIndexRows = this.prepareIndexRows();
   }
 
@@ -197,7 +209,7 @@ export class Store {
     const rows = this.db
       .prepare("SELECT meta FROM threads WHERE thread_id NOT IN (SELECT DISTINCT thread_id FROM search_indexed) ORDER BY created_at DESC LIMIT ?")
       .all(limit) as { meta: string }[];
-    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+    return rows.map((r) => threadMeta(r.meta));
   }
 
   /**
@@ -375,21 +387,21 @@ export class Store {
   /** Unfinished threads (recovery after a restart). Finished ones are never read back. */
   openThreads(limit = 1000): ThreadMeta[] {
     const rows = this.db.prepare("SELECT meta FROM threads WHERE status NOT IN ('done','failed','cancelled') ORDER BY created_at DESC LIMIT ?").all(limit) as { meta: string }[];
-    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+    return rows.map((r) => threadMeta(r.meta));
   }
 
   /** Upsert one Thread's metadata; returns the serialized bytes (for /api/health counters). */
   putThread(meta: ThreadMeta): number {
     const json = JSON.stringify(meta);
     this.db
-      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, last_activity, meta) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, last_activity=excluded.last_activity, meta=excluded.meta")
-      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", meta.lastActivityAt ?? meta.createdAt, json);
+      .prepare("INSERT INTO threads(thread_id, created_at, status, channel, last_activity, parent_thread_id, meta) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET status=excluded.status, channel=excluded.channel, last_activity=excluded.last_activity, parent_thread_id=excluded.parent_thread_id, meta=excluded.meta")
+      .run(meta.threadId, meta.createdAt, meta.status, meta.channel ?? "default", meta.lastActivityAt ?? meta.createdAt, meta.parentThreadId ?? null, json);
     return Buffer.byteLength(json);
   }
 
   getThread(threadId: string): ThreadMeta | undefined {
     const row = this.db.prepare("SELECT meta FROM threads WHERE thread_id = ?").get(threadId) as { meta: string } | undefined;
-    return row ? (JSON.parse(row.meta) as ThreadMeta) : undefined;
+    return row ? (threadMeta(row.meta)) : undefined;
   }
 
   /** Cheap count for /api/health; never loads the metadata payloads. */
@@ -405,7 +417,14 @@ export class Store {
     const rows = (status
       ? this.db.prepare("SELECT meta FROM threads WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(status, at, n)
       : this.db.prepare("SELECT meta FROM threads WHERE created_at < ? ORDER BY created_at DESC LIMIT ?").all(at, n)) as { meta: string }[];
-    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+    return rows.map((r) => threadMeta(r.meta));
+  }
+
+  /** Clarification/assignment sub-Threads of one Thread, newest first (v4-13, #112). */
+  listThreadsByParent(parentThreadId: string, limit = 200): ThreadMeta[] {
+    const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 200;
+    const rows = this.db.prepare("SELECT meta FROM threads WHERE parent_thread_id = ? ORDER BY created_at DESC LIMIT ?").all(parentThreadId, n) as { meta: string }[];
+    return rows.map((r) => threadMeta(r.meta));
   }
 
   /** Newest first, restricted to one channel (v4-11). */
@@ -415,7 +434,7 @@ export class Store {
     const rows = (status
       ? this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, status, at, n)
       : this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, at, n)) as { meta: string }[];
-    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+    return rows.map((r) => threadMeta(r.meta));
   }
 
   /**
@@ -430,7 +449,7 @@ export class Store {
     const rows = this.db
       .prepare("SELECT meta FROM threads WHERE channel = ? AND last_activity > ? AND last_activity < ? ORDER BY last_activity DESC, thread_id DESC LIMIT ?")
       .all(channel, after, before, n) as { meta: string }[];
-    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta);
+    return rows.map((r) => threadMeta(r.meta));
   }
 
   /** Per-channel counts for /api/channels (v4-11). */
@@ -450,7 +469,7 @@ export class Store {
     const rows = this.db
       .prepare(`SELECT meta FROM threads WHERE created_at < ? AND status IN (${statuses.map(() => "?").join(", ")})`)
       .all(cutoff, ...statuses) as { meta: string }[];
-    return rows.map((r) => JSON.parse(r.meta) as ThreadMeta).filter((m) => (m.lastActivityAt ?? m.createdAt) < cutoff);
+    return rows.map((r) => threadMeta(r.meta)).filter((m) => (m.lastActivityAt ?? m.createdAt) < cutoff);
   }
 
   /** Delete thread rows and their JSONL files; empty day directories go too. Returns bytes freed. */
@@ -566,7 +585,7 @@ export class Store {
 
   /** Every thread, newest first (for full-text search over the JSONL files). */
   allThreads(): ThreadMeta[] {
-    return (this.db.prepare("SELECT meta FROM threads ORDER BY created_at DESC").all() as { meta: string }[]).map((r) => JSON.parse(r.meta) as ThreadMeta);
+    return (this.db.prepare("SELECT meta FROM threads ORDER BY created_at DESC").all() as { meta: string }[]).map((r) => threadMeta(r.meta));
   }
 
   /**

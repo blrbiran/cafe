@@ -299,7 +299,12 @@ function Composer({ initialTo, channel }: { initialTo?: string; channel: string 
   const t = useT();
   const agents = useStore((s) => s.agents);
   const daemons = useStore((s) => s.daemons);
+  const teams = useStore((s) => s.teams);
   const [body, setBody] = useState("");
+  // v4-13: in a team channel the default recipient is the team's front door (orchestrator).
+  const team = teams.find((x) => x.channel === channel);
+  const orch = team?.roster.find((m) => m.duty === "orchestrator");
+  const defaultTo = orch?.address ?? (team ? `${team.team}@${team.host}` : "");
   const [to, setTo] = useState(initialTo ?? "");
   const [broadcast, setBroadcast] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
@@ -311,7 +316,11 @@ function Composer({ initialTo, channel }: { initialTo?: string; channel: string 
   useEffect(() => {
     setTo(initialTo ?? "");
     ref.current?.focus();
-  }, [initialTo]);
+  }, [initialTo, channel]);
+  // Fill the front door once the team roster arrives; never override a person's own choice.
+  useEffect(() => {
+    setTo((prev) => prev || defaultTo);
+  }, [defaultTo]);
 
   const choices = Object.values(agents)
     .filter((a) => a.role === "barista" && a.status !== "offline")
@@ -440,6 +449,7 @@ function Composer({ initialTo, channel }: { initialTo?: string; channel: string 
         </div>
       </div>
       {!to && <div className="hint">{t.autoPickHint}</div>}
+      {team && to && to === defaultTo && <div className="hint">{t.teamFrontDoor(team.team)}</div>}
       {err && (
         <div role="alert" className="well text-sm" data-tone="danger">
           {err}

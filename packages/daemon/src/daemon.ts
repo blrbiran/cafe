@@ -45,6 +45,10 @@ import {
   type TeamRecord,
   type TeamSpec,
   type ChannelDigest,
+  type TeamContext,
+  type TeamRosterEntry,
+  type TeamRosterUpdate,
+  renderTeamPlaybook,
 } from "@cafe/protocol";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { Peer, RpcError } from "@cafe/protocol/peer";
@@ -55,6 +59,9 @@ import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
 import { Store } from "./store.ts";
 import { summarize } from "./summary.ts";
 import { describeFetchError } from "./net-errors.ts";
+
+/** A roster is unique per (host, team, channel): two same-named teams on one Host may differ by channel (v4-13, #108). */
+const rosterKey = (t: { host: string; team: string; channel: string }): string => `${t.host}/${t.team}/${t.channel}`;
 
 export interface DaemonOptions {
   config: CafeConfig;
@@ -247,6 +254,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private local = new Map<string, AgentRecord>();
   /** v4-11 team rosters by `<host>/<team>`; the Root is authoritative and children replicate. */
   private teamRecords = new Map<string, TeamRecord>();
+  /** Channels already reported as used by more than one team (one log line per channel). */
+  private teamConflicts = new Set<string>();
+  /** Tombstoned rosters already explained in the log (one line per roster, not per reconnect). */
+  private teamRemovedLogged = new Set<string>();
+  /** When a child takes over digests after losing the Root, new channels start from here (v4-13). */
+  private digestTakeoverAt?: number;
   /** Rosters survive a daemon restart; the Root replays them on reconnect. */
   private teamsFile: string;
 
@@ -314,7 +327,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.store = new Store(opts.home);
     this.teamsFile = join(opts.home, "teams.json");
     try {
-      for (const t of JSON.parse(readFileSync(this.teamsFile, "utf8")) as TeamRecord[]) this.teamRecords.set(`${t.host}/${t.team}`, t);
+      for (const t of JSON.parse(readFileSync(this.teamsFile, "utf8")) as TeamRecord[]) this.teamRecords.set(rosterKey(t), t);
     } catch {
       // no saved rosters yet
     }
@@ -845,7 +858,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.publishAgents([record]);
       this.learnTeam(record);
       this.log(`registered ${record.address} (${identity.mode}, ${identity.role})`);
-      return record;
+      // v4-13: a team member gets its playbook and roster in the registration result. Extra fields
+      // are ignored by an old client, and the replicated AgentRecord never carries them.
+      const teamContext = this.teamContextFor(record);
+      return teamContext ? { ...record, teamContext } : record;
     });
     peer.on(Methods.agentStatus, (raw: { status: AgentStatus }) => {
       const rec = peer.meta.agentId ? this.local.get(peer.meta.agentId) : undefined;
@@ -942,64 +958,74 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   teams() {
     const byKey = new Map(this.teamRecords);
     // A team started only by TUIs (no `team start`) still appears: derive from live registrations.
+    // An authoritative `.cafe` roster owns membership, and a tombstone must not be resurrected.
     for (const r of this.registry.all()) {
       if (!r.team || !r.teamChannel) continue;
-      const key = `${r.host}/${r.team}`;
-      const rec = byKey.get(key) ?? { team: r.team, host: r.host, channel: r.teamChannel, members: [], revision: 0 };
+      const key = rosterKey({ host: r.host, team: r.team, channel: r.teamChannel });
+      const rec = byKey.get(key);
+      if (rec?.authoritative || rec?.removed) continue;
+      const next = rec ?? { team: r.team, host: r.host, channel: r.teamChannel, members: [], revision: 0 };
       const name = r.member ?? r.name;
-      if (!rec.members.some((m) => m.name === name)) {
-        rec.members = [...rec.members, { name, duty: r.duty, description: r.description, tags: r.tags, scope: r.scope, mode: "headless" as const, dir: r.cwd, observer: r.observer }];
+      if (!next.members.some((m) => m.name === name)) {
+        next.members = [...next.members, { name, duty: r.duty, description: r.description, tags: r.tags, scope: r.scope, mode: "headless" as const, dir: r.cwd, observer: r.observer }];
       }
-      byKey.set(key, rec);
+      byKey.set(key, next);
     }
-    return [...byKey.values()].map((t) => {
-      const agents = this.registry.all().filter((r) => r.host === t.host && r.team === t.team);
-      const roster = t.members.map((m) => {
-        const a = agents.find((r) => (r.member ?? r.name) === m.name);
+    return [...byKey.values()]
+      .filter((t) => !t.removed)
+      .map((t) => {
+        const agents = this.registry.all().filter((r) => r.host === t.host && r.team === t.team && r.teamChannel === t.channel);
+        const roster = t.members.map((m) => {
+          const a = agents.find((r) => (r.member ?? r.name) === m.name);
+          return {
+            name: m.name,
+            ...(m.duty ? { duty: m.duty } : {}),
+            mode: m.mode,
+            dir: m.dir,
+            ...(m.observer ? { observer: true } : {}),
+            ...(a ? { address: a.address, status: a.status, ...(a.activeThreadId ? { currentThread: a.activeThreadId } : {}) } : {}),
+          };
+        });
+        const threads = [...this.metas.values()].filter((m) => (m.channel ?? DEFAULT_CHANNEL) === t.channel);
         return {
-          name: m.name,
-          ...(m.duty ? { duty: m.duty } : {}),
-          mode: m.mode,
-          dir: m.dir,
-          ...(m.observer ? { observer: true } : {}),
-          ...(a ? { address: a.address, status: a.status, ...(a.activeThreadId ? { currentThread: a.activeThreadId } : {}) } : {}),
+          ...t,
+          // A child sees the network registry (and therefore whether any member is online) but only
+          // its own Threads: mark the view local instead of letting zero counts read as "idle"
+          // (v4-11 review). Membership itself is replicated, so the roster is still complete.
+          hostOnline: t.host === this.host || this.registry.all().some((r) => r.host === t.host && r.status !== "offline"),
+          ...(this.isRoot ? {} : { partial: true }),
+          roster,
+          online: roster.filter((m) => "status" in m && m.status !== "offline").length,
+          total: t.members.length,
+          authoritative: t.authoritative === true,
+          revision: t.revision,
+          openThreads: threads.filter((m) => m.status === "routing" || m.status === "delivering" || m.status === "working").length,
+          ...(threads.length ? { lastActivityAt: Math.max(...threads.map((m) => m.lastActivityAt ?? m.createdAt)) } : {}),
+          // Whether this roster reaches the Root; `partial` is about Thread metrics only (v4-12 D8).
+          rosterShared: this.isRoot || this.rootSupports("teams"),
         };
       });
-      const threads = [...this.metas.values()].filter((m) => (m.channel ?? DEFAULT_CHANNEL) === t.channel);
-      return {
-        ...t,
-        // A child sees the network registry (and therefore whether any member is online) but only
-        // its own Threads: mark the view local instead of letting zero counts read as "idle"
-        // (v4-11 review). Membership itself is replicated, so the roster is still complete.
-        hostOnline: t.host === this.host || this.registry.all().some((r) => r.host === t.host && r.status !== "offline"),
-        ...(this.isRoot ? {} : { partial: true }),
-        roster,
-        online: roster.filter((m) => "status" in m && m.status !== "offline").length,
-        total: t.members.length,
-        openThreads: threads.filter((m) => m.status === "routing" || m.status === "delivering" || m.status === "working").length,
-        ...(threads.length ? { lastActivityAt: Math.max(...threads.map((m) => m.lastActivityAt ?? m.createdAt)) } : {}),
-        // Whether this roster reaches the Root; `partial` is about Thread metrics only (v4-12 D8).
-        rosterShared: this.isRoot || this.rootSupports("teams"),
-      };
-    });
   }
 
   /** Channel index for the Web (v4-11): DB counts plus the teams that use each channel. */
   channels() {
+    const all = this.teams();
     const stats = new Map(this.store.channelStats().map((s) => [s.channel, s]));
-    for (const t of this.teams()) {
+    for (const t of all) {
       const s = stats.get(t.channel) ?? { channel: t.channel, threads: 0, lastActivityAt: 0 };
       stats.set(t.channel, s);
     }
     return [...stats.values()]
-      .map((s) => ({
-        name: s.channel,
-        threads: s.threads,
-        lastActivityAt: s.lastActivityAt || undefined,
-        teams: this.teams()
-          .filter((t) => t.channel === s.channel)
-          .map((t) => ({ team: t.team, host: t.host })),
-      }))
+      .map((s) => {
+        const teams = all.filter((t) => t.channel === s.channel).map((t) => ({ team: t.team, host: t.host }));
+        return {
+          name: s.channel,
+          threads: s.threads,
+          lastActivityAt: s.lastActivityAt || undefined,
+          teams,
+          ...(teams.length > 1 ? { conflict: true } : {}),
+        };
+      })
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
@@ -1014,21 +1040,46 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       exists: all.length > 0 || this.store.listThreadsIn(channel, 1).length > 0 || this.teams().some((t) => t.channel === channel),
     };
   }
-  private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "ambiguous_address" } {
+  /**
+   * `to: <team>` has one meaning in v4-13: the team's front door, its orchestrator. Reaching every
+   * member requires an explicit `broadcast`.
+   */
+  private resolveTeamTarget(name: string, host: string | undefined, sender: Party): { ids: string[]; failure?: "unknown_team" | "team_offline" | "ambiguous_team" | "no_orchestrator" } {
     let teams = this.teams().filter((t) => t.team === name && (!host || t.host === host));
     if (!teams.length) return { ids: [], failure: "unknown_team" };
     if (teams.length > 1) {
-      // Prefer the sender's Host, then a team sharing the sender's channel.
+      // Prefer the sender's Host, then a team sharing the sender's own team channel.
       const sameHost = teams.filter((t) => t.host === sender.host);
-      if (sameHost.length === 1) teams = sameHost;
-      else return { ids: [], failure: "ambiguous_team" };
+      const pool = sameHost.length ? sameHost : teams;
+      if (pool.length === 1) teams = pool;
+      else {
+        const senderRec = sender.id ? this.registry.get(sender.id) : undefined;
+        const sameChannel = senderRec?.teamChannel ? pool.filter((t) => t.channel === senderRec.teamChannel) : [];
+        if (sameChannel.length === 1) teams = sameChannel;
+        else return { ids: [], failure: "ambiguous_team" };
+      }
     }
     const t = teams[0]!;
-    const online = t.roster.filter((m) => m.status && m.status !== "offline" && !m.observer);
-    if (!online.length) return { ids: [], failure: "team_offline" };
-    const orch = online.filter((m) => m.duty === "orchestrator");
-    const chosen = orch.length === 1 ? orch : online;
-    return { ids: chosen.map((m) => this.registry.all().find((r) => r.host === t.host && r.team === t.team && (r.member ?? r.name) === m.name)!.agentId) };
+    const orch = t.roster.find((m) => m.duty === "orchestrator");
+    if (!orch) return { ids: [], failure: "no_orchestrator" };
+    if (!orch.status || orch.status === "offline") return { ids: [], failure: "team_offline" };
+    const rec = this.registry.all().find((r) => r.host === t.host && r.team === t.team && r.teamChannel === t.channel && (r.member ?? r.name) === orch.name);
+    if (!rec) return { ids: [], failure: "team_offline" };
+    return { ids: [rec.agentId] };
+  }
+
+  /** `to: <duty>`: the unique eligible member with that duty (v4-13). */
+  private resolveDuty(order: Order, duty: string, host?: string): { ids: string[]; failure?: "ambiguous_duty" | "unknown_duty" | "no_online_barista" } {
+    const want = duty.trim().toLowerCase();
+    const matches = (r: { duty?: string }) => (r.duty ?? "").trim().toLowerCase() === want;
+    const candidates = this.eligible(order).filter((r) => matches(r) && (!host || r.host === host));
+    if (candidates.length > 1) return { ids: [], failure: "ambiguous_duty" };
+    if (candidates.length === 1) return { ids: [candidates[0]!.agentId] };
+    // Distinguish "nobody owns this duty in this scope" from "the owner is offline".
+    const known = this.registry
+      .all()
+      .some((r) => r.role === "barista" && !r.observer && matches(r) && (!host || r.host === host) && channelsOf(r).includes(order.channel ?? DEFAULT_CHANNEL));
+    return { ids: [], failure: known ? "no_online_barista" : "unknown_duty" };
   }
 
   /** Send a notification to an Agent wherever it is registered (v4-11 digests). */
@@ -1051,19 +1102,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   private emitDigests(): void {
     const now = Date.now();
-    // Only the daemon the observer REGISTERED on publishes. Every daemon can see the network
-    // registry, so without this a Root and a child both wake the same observer for one Thread
-    // (v4-11 review). A child's digest is partial by design.
-    const observers = this.registry.all().filter((r) => r.observer && r.host === this.host);
+    // v4-13: the Root publishes the complete network view while it is online; a child only takes
+    // over when the Root is offline (its digest is then `partial`). This is one publisher per
+    // observer, with the complete view whenever one exists (#109).
+    if (!this.isRoot && this.rootOnline) return;
+    // The Root sees every observer and the complete network, so it publishes for all of them; a
+    // child only publishes for observers registered on itself, and only while the Root is away.
+    const observers = this.registry.all().filter((r) => r.observer && (this.isRoot || r.host === this.host));
     if (!observers.length) return;
     const channels = [...new Set(observers.flatMap((r) => channelsOf(r)))];
     let moved = false;
     for (const channel of channels) {
-      const since = this.digestSince.get(channel) ?? 0;
+      // A child that just took over starts from the takeover moment instead of replaying what the
+      // Root already covered. Its existing cursors are moved forward in setRootOnline(false).
+      const since = this.digestSince.get(channel) ?? this.digestTakeoverAt ?? 0;
       const changed = this.store.listThreadsInByActivity(channel, { after: since, limit: 200 });
       if (!changed.length) continue;
       const digest: ChannelDigest = {
-        digestId: ++this.digestSeq,
+        digestId: `${this.host}:${++this.digestSeq}`,
         channel,
         since,
         threads: changed.slice(0, 20).map((m) => ({
@@ -1089,15 +1145,68 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (moved) this.store.setKv("digestSince", Object.fromEntries(this.digestSince));
   }
 
-  private storeTeam(rec: TeamRecord, from?: Peer): void {
-    const key = `${rec.host}/${rec.team}`;
+  /** Content identity of a roster; an identical re-publish changes nothing (v4-13). */
+  private teamHash(rec: Pick<TeamRecord, "team" | "channel" | "members" | "removed" | "authoritative">): string {
+    const members = [...rec.members].sort((a, b) => a.name.localeCompare(b.name)).map((m) => JSON.stringify(m));
+    return createHash("sha256").update([rec.team, rec.channel, rec.removed ? "removed" : "live", rec.authoritative ? "auth" : "derived", ...members].join("\n")).digest("hex").slice(0, 16);
+  }
+
+  /** The compact roster in a `team/roster` update / `teamContext`. */
+  private rosterEntries(rec: TeamRecord): TeamRosterEntry[] {
+    const agents = this.registry.all().filter((r) => r.host === rec.host && r.team === rec.team && r.teamChannel === rec.channel);
+    return rec.members.map((m) => {
+      const a = agents.find((r) => (r.member ?? r.name) === m.name);
+      return { name: m.name, ...(m.duty ? { duty: m.duty } : {}), online: !!a && a.status !== "offline" };
+    });
+  }
+
+  /** Tell local members that a roster changed. Remote members hear it from their own daemon. */
+  private notifyRosterChange(current: TeamRecord | undefined, next: TeamRecord, opts: { skipAgentId?: string } = {}): void {
+    const before = new Map((current?.members ?? []).map((m) => [m.name, m]));
+    const after = new Map(next.members.map((m) => [m.name, m]));
+    const added = [...after.keys()].filter((n) => !before.has(n));
+    const removed = [...before.keys()].filter((n) => !after.has(n));
+    const updated = [...after.keys()].filter((n) => before.has(n) && JSON.stringify(before.get(n)) !== JSON.stringify(after.get(n)));
+    if (!next.removed && !added.length && !removed.length && !updated.length) return;
+    const update: TeamRosterUpdate = {
+      team: next.team,
+      channel: next.channel,
+      revision: next.revision ?? 0,
+      members: this.rosterEntries(next),
+      change: { added, removed, updated },
+      ...(next.removed ? { removedTeam: true } : {}),
+    };
+    for (const r of this.registry.all()) {
+      if (r.host !== this.host || r.team !== next.team || r.teamChannel !== next.channel || r.agentId === opts.skipAgentId) continue;
+      this.notifyAgent(r.agentId, Methods.teamRoster, { update });
+    }
+  }
+
+  /** One warning per channel that more than one team claims (v4-13, #113). */
+  private noteChannelConflict(rec: TeamRecord): void {
+    if (rec.removed) return;
+    const others = [...this.teamRecords.values()].filter((t) => !t.removed && t.channel === rec.channel && (t.host !== rec.host || t.team !== rec.team));
+    if (!others.length || this.teamConflicts.has(rec.channel)) return;
+    this.teamConflicts.add(rec.channel);
+    this.log(`channel #${rec.channel} is used by ${[...others, rec].map((t) => `${t.team}@${t.host}`).join(", ")}; a message without a target is ambiguous`);
+  }
+
+  private storeTeam(rec: TeamRecord, from?: Peer, opts: { skipAgentId?: string } = {}): void {
+    const key = rosterKey(rec);
     const current = this.teamRecords.get(key);
+    const contentHash = this.teamHash(rec);
+    // Identical content is a no-op: no revision bump, no roster note, no broadcast. This is what
+    // makes `team start`/`team sync` idempotent and keeps a removed member from reappearing.
+    if (current?.contentHash === contentHash && !rec.removed) return;
     // A strictly newer revision wins. Equal means a replay/retry: applying it again would only
     // reopen a window for a stale clock to overwrite a genuine update (v4-11 review).
     if (current?.revision !== undefined && rec.revision !== undefined && current.revision >= rec.revision) return;
-    this.teamRecords.set(key, rec);
+    const next: TeamRecord = { ...rec, contentHash };
+    this.teamRecords.set(key, next);
     this.saveTeams();
-    if (this.isRoot) for (const child of this.children.values()) if (child !== from && (child.meta.features as string[] | undefined)?.includes("teams")) child.notify(Methods.teamUpsert, { team: rec });
+    this.noteChannelConflict(next);
+    this.notifyRosterChange(current, next, opts);
+    if (this.isRoot) for (const child of this.children.values()) if (child !== from && (child.meta.features as string[] | undefined)?.includes("teams")) child.notify(Methods.teamUpsert, { team: next });
   }
 
   private saveTeams(): void {
@@ -1113,10 +1222,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** A registering member teaches this daemon its roster (from teamDir when readable) and publishes it. */
   private learnTeam(rec: AgentRecord): void {
     if (!rec.team || !rec.teamChannel) return;
-    const key = `${rec.host}/${rec.team}`;
-    const previous = this.teamRecords.get(key)?.members ?? [];
-    let members: TeamRecord["members"] = previous;
-    let authoritative = false;
+    const key = rosterKey({ host: rec.host, team: rec.team, channel: rec.teamChannel });
+    const current = this.teamRecords.get(key);
+    if (current?.removed) {
+      if (!this.teamRemovedLogged.has(key)) {
+        this.teamRemovedLogged.add(key);
+        this.log(`team ${rec.team} was removed; ${rec.member ?? rec.name} stays registered but the roster is ignored (run cafe team start to restore it)`);
+      }
+      return;
+    }
+    let members: TeamRecord["members"] = current?.members ?? [];
+    let authoritative = current?.authoritative === true;
     if (rec.teamDir) {
       try {
         const doc = readCafeFile(join(rec.teamDir, ".cafe"));
@@ -1134,20 +1250,25 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     // Without a readable roster (a sibling-worktree TUI, or the Root hearing a child registration)
-    // keep members learned earlier and add this registration.
-    members = [...members];
+    // keep members learned earlier. An authoritative roster is never grown by a registration: a
+    // removed member that is still running must not reappear (v4-13).
     const name = rec.member ?? rec.name;
-    if (!authoritative && !members.some((m) => m.name === name)) {
-      members.push({ name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels, observer: rec.observer });
+    if (authoritative) {
+      if (!members.some((m) => m.name === name)) {
+        this.log(`member ${name} is not in the authoritative roster of ${rec.team}; ignoring its team registration`);
+        return;
+      }
+    } else if (!members.some((m) => m.name === name)) {
+      members = [...members, { name, duty: rec.duty, description: rec.description, tags: rec.tags, scope: rec.scope, mode: "headless", dir: rec.cwd, channels: rec.channels, observer: rec.observer }];
     }
-    const existing = this.teamRecords.get(key);
-    const revision = Math.max(Date.now(), (existing?.revision ?? 0) + 1);
-    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision };
-    this.storeTeam(team);
+    const revision = Math.max(Date.now(), (current?.revision ?? 0) + 1);
+    const team: TeamRecord = { team: rec.team, host: rec.host, channel: rec.teamChannel, members, revision, authoritative };
+    this.storeTeam(team, undefined, { skipAgentId: rec.agentId });
     if (!this.isRoot && this.rootOnline) {
       if (this.rootSupports("teams")) {
         this.teamLocalLogged = false;
-        this.uplink!.notify(Methods.teamUpsert, { team });
+        const saved = this.teamRecords.get(key);
+        if (saved) this.uplink!.notify(Methods.teamUpsert, { team: saved });
       } else if (!this.teamLocalLogged) {
         this.teamLocalLogged = true;
         this.log("root does not advertise teams; rosters stay local (cafe team status shows this)");
@@ -1157,19 +1278,57 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /**
    * Publish a roster read from disk even when no worker starts (a TUI-only team), so the Teams
-   * page and `to: <team>` do not have to wait for the first registration (v4-11 review).
+   * page and `to: <team>` do not have to wait for the first registration (v4-11 review). v4-13:
+   * this is the only operation that clears a tombstone, and it always publishes the full roster.
    */
   publishRoster(rosterDir: string, team: TeamSpec): void {
     if (!team.name || !team.channel) return;
-    const key = `${this.host}/${team.name}`;
+    const key = rosterKey({ host: this.host, team: team.name, channel: team.channel });
     const previous = this.teamRecords.get(key);
     const members = team.members.map((m) => ({ ...m, channels: m.channels?.length ? m.channels : [team.channel!] }));
-    this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1) });
+    this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1), authoritative: true, removed: false });
     if (!this.isRoot && this.rootOnline && this.rootSupports("teams")) {
-      const saved = this.teamRecords.get(`${this.host}/${team.name}`);
+      const saved = this.teamRecords.get(key);
       if (saved) this.uplink!.notify(Methods.teamUpsert, { team: saved });
     }
     this.log(`roster ${team.name} published from ${rosterDir}`);
+  }
+
+  /** Remove a roster everywhere the network remembers it (v4-13, #113). Returns how many records were tombstoned. */
+  removeTeam(teamName: string, host: string = this.host, from?: Peer): number {
+    let removed = 0;
+    for (const [key, t] of [...this.teamRecords]) {
+      if (t.host !== host || t.team !== teamName || t.removed) continue;
+      this.storeTeam({ ...t, members: [], removed: true, revision: Math.max(Date.now(), (t.revision ?? 0) + 1) }, from);
+      if (this.teamRecords.get(key)?.removed) removed++;
+      // A child cannot broadcast to the network; the Root stores the tombstone and re-broadcasts it.
+      if (!this.isRoot && this.rootOnline && this.rootSupports("teams")) {
+        const saved = this.teamRecords.get(key);
+        if (saved) this.uplink!.notify(Methods.teamUpsert, { team: saved });
+      }
+    }
+    return removed;
+  }
+
+  /** The playbook + roster a registering member receives (v4-13). */
+  private teamContextFor(rec: AgentRecord): TeamContext | undefined {
+    if (!rec.team || !rec.teamChannel) return undefined;
+    const team = this.teams().find((t) => t.host === rec.host && t.team === rec.team && t.channel === rec.teamChannel);
+    if (!team) return undefined;
+    const orch = team.roster.find((m) => m.duty === "orchestrator");
+    const self = team.roster.find((m) => m.name === (rec.member ?? rec.name));
+    if (!orch || !self) return undefined;
+    const roster = team.roster.map((m) => ({ name: m.name, ...(m.duty ? { duty: m.duty } : {}), online: !!m.status && m.status !== "offline" }));
+    const playbook = renderTeamPlaybook({ team: team.team, channel: team.channel, self: { name: self.name, ...(self.duty ? { duty: self.duty } : {}), online: true }, orchestrator: orch.name, roster });
+    return {
+      team: team.team,
+      channel: team.channel,
+      ...(team.revision !== undefined ? { revision: team.revision } : {}),
+      self: { name: self.name, ...(self.duty ? { duty: self.duty } : {}), mode: rec.mode },
+      orchestrator: orch.name,
+      roster,
+      playbook,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1783,13 +1942,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.knownOrders.set(order.orderId, order);
     if (peer) this.subscribe(order.threadId, peer);
 
-    // Capture who answered before the new turn resets the Thread's reply list.
+    // Capture who answered before the new turn resets the Thread's reply list. `targetStates` is
+// also per-turn (reset at every `order.created`), so it is the previous Order's target set;
+// `meta.targets` is cumulative and only a fallback for old Threads.
     const answeredBefore = prior ? [...new Set(prior.replies.map((r) => r.agentId))] : [];
+    const priorTargets = prior ? (prior.targetStates?.length ? prior.targetStates.map((s) => s.agentId) : prior.targets) : [];
     const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
     this.tracking.set(order.orderId, t);
     this.emitEvent(order, { type: "order.created", order });
 
-    const decision = await this.route(order, answeredBefore, p.broadcast ?? false);
+    const decision = await this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
     t.decision = decision;
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
@@ -1817,7 +1979,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       .all()
       .filter((r) => r.role === "barista" && r.status !== "offline" && !excluded.has(r.agentId))
       .filter((r) => !r.observer && channelsOf(r).includes(channel))
+      .filter((r) => this.inTeamRoster(r))
       .filter((r) => this.rootOnline || r.host === this.host || this.peerUrls.has(r.host));
+  }
+
+  /**
+   * An authoritative `.cafe` roster owns membership: an agent removed from it must not be a
+   * routing target even while its process is still registered (v4-13). A loose team has no roster
+   * to enforce, and a non-team agent always passes.
+   */
+  private inTeamRoster(r: AgentRecord): boolean {
+    if (!r.team || !r.teamChannel) return true;
+    const rec = this.teamRecords.get(rosterKey({ host: r.host, team: r.team, channel: r.teamChannel }));
+    if (!rec) return true;
+    if (rec.removed) return false;
+    if (!rec.authoritative) return true;
+    return rec.members.some((m) => m.name === (r.member ?? r.name));
   }
 
   /** Earlier turns of a Thread, oldest first, bounded for prompt size. */
@@ -1847,20 +2024,42 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return undefined;
   }
 
-  private async route(order: Order, answeredBefore: string[] = [], broadcast = false): Promise<RoutingDecision> {
+  private async route(order: Order, followUp: { isFollowUp?: boolean; responders?: string[]; priorTargets?: string[] } = {}, broadcast = false): Promise<RoutingDecision> {
     if (order.escalate) return this.routeEscalation(order, broadcast);
     const candidates = this.eligible(order);
-    if (answeredBefore.length && !order.to) {
-      const answered = answeredBefore.filter((id) => candidates.some((c) => c.agentId === id));
-      if (answered.length) {
+    const eligibleIds = new Set(candidates.map((c) => c.agentId));
+    if (followUp.isFollowUp && !order.to && !broadcast) {
+      // v4-13: a follow-up goes to the previous turn's final responders, then to that turn's
+      // targets, then fails honestly. It never falls through to rules/LLM: a clarification
+      // broadcast to an unrelated agent is worse than an error (#72).
+      const responders = (followUp.responders ?? []).filter((id) => eligibleIds.has(id));
+      if (responders.length) {
         return {
-          targets: answered,
-          mode: answered.length === 1 ? "unicast" : "multicast",
-          reason: `follow-up to ${answered.map((id) => this.registry.get(id)?.address ?? id).join(", ")}, who answered earlier in this thread`,
+          targets: responders,
+          mode: responders.length === 1 ? "unicast" : "multicast",
+          reason: `follow-up to ${responders.map((id) => this.registry.get(id)?.address ?? id).join(", ")}, who answered the previous turn`,
           router: "followup",
           candidates: [],
         };
       }
+      const prior = (followUp.priorTargets ?? []).filter((id) => eligibleIds.has(id));
+      if (prior.length) {
+        return {
+          targets: prior,
+          mode: prior.length === 1 ? "unicast" : "multicast",
+          reason: `follow-up to ${prior.map((id) => this.registry.get(id)?.address ?? id).join(", ")}, the previous turn's targets (no reply yet)`,
+          router: "followup",
+          candidates: [],
+        };
+      }
+      return {
+        targets: [],
+        mode: "unicast",
+        reason: `nobody who answered ${order.threadId} is online; address someone explicitly with to:, or start them`,
+        router: "followup",
+        candidates: [],
+        failure: "responders_offline",
+      };
     }
     if (order.to) return this.explicitDecision(order);
     if (broadcast) {
@@ -1871,6 +2070,36 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         router: "explicit",
         candidates: [],
       });
+    }
+    // v4-13: a fresh message in a team channel goes to the team's front door, not everyone.
+    const channel = order.channel ?? DEFAULT_CHANNEL;
+    if (channel !== DEFAULT_CHANNEL) {
+      const owners = this.teams().filter((t) => t.channel === channel);
+      if (owners.length > 1) {
+        return {
+          targets: [],
+          mode: "unicast",
+          reason: `channel #${channel} is used by ${owners.length} teams (${owners.map((t) => `${t.team}@${t.host}`).join(", ")}); address one with to:`,
+          router: "explicit",
+          candidates: [],
+          failure: "ambiguous_channel",
+        };
+      }
+      if (owners.length === 1) {
+        const t = owners[0]!;
+        const orch = t.roster.find((m) => m.duty === "orchestrator");
+        if (!orch) {
+          return { targets: [], mode: "unicast", reason: `team ${t.team} has no orchestrator`, router: "explicit", candidates: [], failure: "no_orchestrator" };
+        }
+        if (!orch.status || orch.status === "offline") {
+          return { targets: [], mode: "unicast", reason: `team ${t.team} front door (${orch.name}) is offline; start it`, router: "explicit", candidates: [], failure: "team_offline" };
+        }
+        const rec = this.registry.all().find((r) => r.host === t.host && r.team === t.team && r.teamChannel === t.channel && (r.member ?? r.name) === orch.name);
+        if (!rec) {
+          return { targets: [], mode: "unicast", reason: `team ${t.team} front door (${orch.name}) is offline; start it`, router: "explicit", candidates: [], failure: "team_offline" };
+        }
+        return { targets: [rec.agentId], mode: "unicast", reason: `team ${t.team} front door (orchestrator)`, router: "explicit", candidates: [] };
+      }
     }
     await this.routerReady();
     if (this.router.name === "rules" && this.config.router.fallback === "root" && !this.isRoot && this.rootOnline) {
@@ -1961,22 +2190,40 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         failure: "ambiguous_address",
       };
     }
-    // Not an Agent: `to: <team>` (optionally `team@host`) resolves to its orchestrator or members.
+    // Not an Agent: `to: <team>` (optionally `team@host`) is the team's front door.
     const parsed = order.to ? parseAddress(this.normalizeAddress(order.to)) : undefined;
     if (parsed) {
       const team = this.resolveTeamTarget(parsed.name, parsed.host, order.from);
       if (team.ids.length) {
         return {
           targets: team.ids,
-          mode: team.ids.length === 1 ? "unicast" : "multicast",
-          reason: `team ${parsed.name}${parsed.host ? `@${parsed.host}` : ""}`,
+          mode: "unicast",
+          reason: `team ${parsed.name}${parsed.host ? `@${parsed.host}` : ""} front door (orchestrator)`,
           router: "explicit",
           candidates: [],
         };
       }
-      if (team.failure) {
-        return { targets: [], mode: "multicast", reason: `team ${order.to}: ${team.failure}`, router: "explicit", candidates: [], failure: team.failure };
+      // An existing team's failure is the answer; only "no such team" falls through to a duty.
+      if (team.failure && team.failure !== "unknown_team") {
+        return { targets: [], mode: "unicast", reason: `team ${order.to}: ${team.failure}`, router: "explicit", candidates: [], failure: team.failure };
       }
+      const duty = this.resolveDuty(order, parsed.name, parsed.host);
+      if (duty.ids.length) {
+        return { targets: duty.ids, mode: "unicast", reason: `duty ${parsed.name}`, router: "explicit", candidates: [] };
+      }
+      if (duty.failure && duty.failure !== "unknown_duty") {
+        const names =
+          duty.failure === "ambiguous_duty"
+            ? `: ${this.registry
+                .all()
+                .filter((r) => (r.duty ?? "").trim().toLowerCase() === parsed.name.trim().toLowerCase())
+                .map((r) => r.address)
+                .join(", ")}`
+            : "";
+        return { targets: [], mode: "unicast", reason: `duty ${parsed.name}${names}`, router: "explicit", candidates: [], failure: duty.failure };
+      }
+      // Neither an agent, a team, nor a duty: keep the v4-11 diagnostic.
+      return { targets: [], mode: "unicast", reason: `unknown target ${order.to}`, router: "explicit", candidates: [], failure: "unknown_team" };
     }
     return { targets: [], mode: "unicast", reason: `no online barista at ${order.to}`, router: "explicit", candidates: [], failure: "no_online_barista" };
   }
@@ -2998,8 +3245,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.storeTeam({ ...x.team, host }, peer);
       return {};
     });
+    peer.on(Methods.teamRemove, (x: { team?: unknown; host?: unknown }) => {
+      if (typeof x?.team !== "string" || !x.team) throw new RpcError("bad_request", "team is required");
+      this.removeTeam(x.team, typeof x.host === "string" && x.host ? x.host : host, peer);
+      return {};
+    });
     peer.on(Methods.channelDigest, (x: { agentId?: string; digest: ChannelDigest }) => {
       if (x.agentId) this.notifyAgent(x.agentId, Methods.channelDigest, { digest: x.digest });
+      return {};
+    });
+    peer.on(Methods.teamRoster, (x: { agentId?: string; update: TeamRosterUpdate }) => {
+      if (x.agentId) this.notifyAgent(x.agentId, Methods.teamRoster, { update: x.update });
       return {};
     });
     peer.on(Methods.registryRemove, (x: { agentIds: string[] }) => {
@@ -3311,8 +3567,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.storeTeam(x.team, peer);
       return {};
     });
+    peer.on(Methods.teamRemove, (x: { team?: unknown; host?: unknown }) => {
+      if (typeof x?.team !== "string" || !x.team) throw new RpcError("bad_request", "team is required");
+      this.removeTeam(x.team, typeof x.host === "string" && x.host ? x.host : this.host, peer);
+      return {};
+    });
     peer.on(Methods.channelDigest, (x: { agentId?: string; digest: ChannelDigest }) => {
       if (x.agentId) this.agents.get(x.agentId)?.notify(Methods.channelDigest, { digest: x.digest });
+      return {};
+    });
+    peer.on(Methods.teamRoster, (x: { agentId?: string; update: TeamRosterUpdate }) => {
+      if (x.agentId) this.notifyAgent(x.agentId, Methods.teamRoster, { update: x.update });
       return {};
     });
     peer.on(Methods.daemonsChanged, (list: DaemonRecord[]) => this.learnPeers(list));
@@ -3391,6 +3656,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     rec.lastSeenAt = Date.now();
     if (online) rec.connectedAt = Date.now();
     else this.rootConnectedAddr = undefined;
+    // v4-13 digest handover: the Root publishes while connected. When a child takes over, start
+    // from now instead of replaying activity the Root already summarized (#109).
+    if (online) this.digestTakeoverAt = undefined;
+    else if (!this.isRoot && !this.stopped) {
+      this.digestTakeoverAt = Date.now();
+      for (const ch of this.digestSince.keys()) this.digestSince.set(ch, this.digestTakeoverAt);
+      this.store.setKv("digestSince", Object.fromEntries(this.digestSince));
+    }
     this.daemonRecords.set("__root__", rec);
     if (!online) {
       // Remote agents become unreachable unless their Daemon can be reached directly (ADR-0004).

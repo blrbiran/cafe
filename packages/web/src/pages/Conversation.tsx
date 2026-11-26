@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AgentRecord, Attachment, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, ThreadStatus } from "@cafe/protocol";
 import { api, ApiError, token } from "../api.ts";
 import { ago, useT, type Dict } from "../i18n.ts";
@@ -111,6 +111,26 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   const events = detail?.events ?? [];
   const turns = useMemo(() => buildTurns(events), [events]);
 
+  // v4-13 (#112): assignments and clarifications are separate Threads linked by parentThreadId.
+  // The store carries the live ones; the API page catches children outside the snapshot.
+  const storeThreads = useStore((s) => s.threads);
+  const [fetchedChildren, setFetchedChildren] = useState<ThreadMeta[]>([]);
+  useEffect(() => {
+    let alive = true;
+    api
+      .children(threadId)
+      .then((list) => alive && setFetchedChildren(list))
+      .catch(() => alive && setFetchedChildren([]));
+    return () => {
+      alive = false;
+    };
+  }, [threadId, detail?.meta.status, detail?.meta.lastActivityAt]);
+  const children = useMemo(() => {
+    const map = new Map<string, ThreadMeta>();
+    for (const t of [...fetchedChildren, ...storeThreads]) if (t.parentThreadId === threadId) map.set(t.threadId, t);
+    return [...map.values()].sort((a, b) => b.createdAt - a.createdAt);
+  }, [fetchedChildren, storeThreads, threadId]);
+
   const copy = () => {
     if (!detail) return;
     void navigator.clipboard?.writeText(detail.meta.threadId).then(() => {
@@ -120,10 +140,15 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   };
 
   const back = (
-    <div>
+    <div className="flex flex-wrap gap-3">
       <a className="linkbtn" href={hashFor({ page: "feed", filter: "all", channel: detail?.meta.channel ?? "default" })}>
         {t.back}
       </a>
+      {detail?.meta.parentThreadId && (
+        <a className="linkbtn" href={hashFor({ page: "thread", threadId: detail.meta.parentThreadId, channel: detail.meta.channel ?? "default" })}>
+          {t.backToParent}
+        </a>
+      )}
     </div>
   );
 
@@ -263,6 +288,36 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
           </div>
         );
       })}
+      {children.length > 0 && (
+        <div className="card flex flex-col gap-2 px-5 py-4">
+          <div className="cap">{t.clarifications(children.length)}</div>
+          {children.map((c) => (
+            <a
+              key={c.threadId}
+              className="linkbtn flex flex-wrap items-baseline justify-between gap-2"
+              href={hashFor({ page: "thread", threadId: c.threadId, channel: c.channel ?? meta.channel ?? "default" })}
+            >
+              <span className="truncate">{c.summary}</span>
+              <span className="mono text-xs text-muted">
+                {c.status}
+                {c.closedAt ? ` · ${t.closedLabel}` : ""}
+              </span>
+            </a>
+          ))}
+        </div>
+      )}
+      {meta.targetStates?.length ? (
+        <div className="card flex flex-col gap-2 px-5 py-4">
+          <div className="cap">{t.latestTargets}</div>
+          <div className="flex flex-wrap gap-2">
+            {meta.targetStates.map((s) => (
+              <Pill key={s.agentId} tone={s.state === "replied" ? "ok" : s.state === "declined" ? "warn" : s.state === "failed" ? "danger" : "info"}>
+                <span className="mono">{whoAddress(s.agentId, agents, meta)}</span> · {t.targetState[s.state] ?? s.state}
+              </Pill>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {first === undefined && <div className="hint">{t.loading}</div>}
       <Disclosure show={t.processShow} hide={t.processHide} open={showLog} onToggle={() => setShowLog((v) => !v)}>
         <DeliveryLog events={events} meta={meta} />

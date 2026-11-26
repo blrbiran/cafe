@@ -11,6 +11,7 @@ export function TeamsPage() {
   const registryVersion = useStore((s) => s.registryVersion);
   const connected = useStore((s) => s.connected);
   const threads = useStore((s) => s.threads);
+  const channels = useStore((s) => s.channels);
   const [teams, setTeams] = useState<TeamView[]>();
   const [unavailable, setUnavailable] = useState(false);
   const [selected, setSelected] = useState<string>();
@@ -63,13 +64,21 @@ export function TeamsPage() {
               onClick={() => setSelected(key)}
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="text-base font-semibold text-fg-strong">{x.team}</span>
+                <span className="flex items-center gap-2 text-base font-semibold text-fg-strong">
+                  {x.team}
+                  {x.roster.some((m) => m.duty === "orchestrator") && (
+                    <Pill tone="info" dot={false}>
+                      {t.orchestrator}
+                    </Pill>
+                  )}
+                </span>
                 <span className="text-xs text-muted">
                   <Dot tone={x.online > 0 ? "ok" : "warn"} /> {x.online}/{x.total} {t.onlineOf}
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
                 <span className="mono">#{x.channel}</span>
+                {channels.find((c) => c.name === x.channel)?.conflict && <span title={t.channelConflict}>⚠</span>}
                 <span>{x.openThreads} {t.openThreads}</span>
                 {x.partial && <span>{t.partialTeam}</span>}
               </div>
@@ -102,6 +111,8 @@ export function TeamsPage() {
                 <div className="text-sm text-muted">
                   <span className="mono">#{team.channel}</span> · {team.online}/{team.total} {t.onlineOf} · {team.openThreads} {t.openThreads}
                   {team.partial ? ` · ${t.partialTeam}` : ""}
+                  {team.revision ? ` · ${t.teamRevision} ${team.revision}` : ""}
+                  {team.authoritative ? ` · ${t.authoritativeRoster}` : ""}
                 </div>
               </div>
               <button type="button" className="linkbtn" onClick={() => setSelected(undefined)} aria-label={t.cancel}>

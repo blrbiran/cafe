@@ -106,6 +106,21 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
   let current: { h: OrderHandle; started: boolean; cancelled: boolean; timer?: NodeJS.Timeout; stopBeat: () => void } | undefined;
   let paused = false;
   let stopped = false;
+  // v4-13: deliver the team playbook once, and a roster change with the next Order. Neither
+  // starts a turn of its own (the session's context stays owned by the person).
+  let teamNote: string | undefined;
+  const rosterNotes: string[] = [];
+  client.onTeamContext((tc) => {
+    teamNote ??= tc.playbook;
+  });
+  client.onRoster((r) => {
+    rosterNotes.push(
+      r.removedTeam
+        ? `Team ${r.team} was removed; stop treating yourself as its member.`
+        : `Team ${r.team} roster changed (revision ${r.revision}): ${[...r.change.added.map((n) => `+${n}`), ...r.change.removed.map((n) => `-${n}`), ...r.change.updated.map((n) => `~${n}`)].join(", ") || "members updated"}. Now: ${r.members.map((m) => m.name).join(", ")}.`,
+    );
+    if (rosterNotes.length > 5) rosterNotes.splice(0, rosterNotes.length - 5);
+  });
 
   const finish = () => {
     if (!current) return;
@@ -127,7 +142,9 @@ export async function runSessionHost(opts: SessionHostOptions): Promise<{ client
     next.stopBeat(); // `current` takes over with its own heartbeat
     const h = next.h;
     const self = { address: client.record?.address ?? baseIdentity.name, description: baseIdentity.description };
-    const body = answered.has(h.order.threadId) ? buildFollowup(h.order, h.attachments) : buildPrompt(h.order, self, REPLY_NOTE, h.attachments);
+    const notes = [teamNote, ...rosterNotes.splice(0)].filter(Boolean) as string[];
+    teamNote = undefined;
+    const body = `${notes.length ? `${notes.join("\n\n")}\n\n` : ""}${answered.has(h.order.threadId) ? buildFollowup(h.order, h.attachments) : buildPrompt(h.order, self, REPLY_NOTE, h.attachments)}`;
     const marker = orderMarker(h.order.orderId);
     current = { h, started: false, cancelled: false, stopBeat: keepAlive(h) };
     current.timer = setTimeout(() => {

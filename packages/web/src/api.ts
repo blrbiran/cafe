@@ -31,6 +31,8 @@ export interface ChannelInfo {
   threads: number;
   lastActivityAt?: number;
   teams: { team: string; host: string }[];
+  /** More than one team uses this channel; a message without a target is ambiguous (v4-13). */
+  conflict?: boolean;
 }
 
 export interface TeamView {
@@ -43,6 +45,9 @@ export interface TeamView {
   openThreads: number;
   lastActivityAt?: number;
   partial?: boolean;
+  /** v4-13: the roster came from `.cafe`; its revision moves on every real change. */
+  authoritative?: boolean;
+  revision?: number;
   roster: {
     name: string;
     duty?: string;
@@ -183,6 +188,8 @@ export const api = {
     const q = qs.toString();
     return call<ThreadDetail>("GET", `/api/threads/${encodeURIComponent(id)}${q ? `?${q}` : ""}`);
   },
+  /** Clarification/assignment sub-Threads of one Thread (v4-13, #112). */
+  children: (parentThreadId: string) => call<ThreadMeta[]>("GET", `/api/threads?parent=${encodeURIComponent(parentThreadId)}&limit=200`),
   /** New question, or a follow-up when `threadId` is set (rejects with `thread_busy` while a turn is open). */
   createOrder: (p: { body: string; to?: string; broadcast?: boolean; kind?: "order" | "notice"; threadId?: string; channel?: string; attachments?: Attachment[] }) =>
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }),

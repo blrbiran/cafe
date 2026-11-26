@@ -111,12 +111,29 @@ export async function serve(opts: ServeOptions): Promise<{ client: CafeClient; s
   const queue: Array<{ h: OrderHandle; stopBeat: () => void }> = [];
   const running = new Map<string, () => void>(); // orderId → kill
   let active = 0;
+  // v4-13: the team playbook is delivered once per process, before the first Order; roster
+  // changes ride the next Order. Neither creates an extra turn.
+  let teamNote: string | undefined;
+  const rosterNotes: string[] = [];
+  client.onTeamContext((tc) => {
+    teamNote ??= tc.playbook;
+  });
+  client.onRoster((r) => {
+    rosterNotes.push(
+      r.removedTeam
+        ? `Team ${r.team} was removed; stop treating yourself as its member.`
+        : `Team ${r.team} roster changed (revision ${r.revision}): ${[...r.change.added.map((n) => `+${n}`), ...r.change.removed.map((n) => `-${n}`), ...r.change.updated.map((n) => `~${n}`)].join(", ") || "members updated"}. Now: ${r.members.map((m) => m.name).join(", ")}.`,
+    );
+    if (rosterNotes.length > 5) rosterNotes.splice(0, rosterNotes.length - 5);
+  });
 
   const run = async (h: OrderHandle) => {
     active++;
     void client.setStatus("busy").catch(() => {});
     const stopBeat = keepAlive(h);
-    const prompt = buildPrompt(h.order, { address: client.record?.address ?? identity.name, description: identity.description }, undefined, h.attachments);
+    const notes = [teamNote, ...rosterNotes.splice(0)].filter(Boolean) as string[];
+    teamNote = undefined;
+    const prompt = `${notes.length ? `${notes.join("\n\n")}\n\n` : ""}${buildPrompt(h.order, { address: client.record?.address ?? identity.name, description: identity.description }, undefined, h.attachments)}`;
     let tmp: string | undefined;
     let cmd = opts.exec;
     if (cmd.includes("{prompt_file}")) {
