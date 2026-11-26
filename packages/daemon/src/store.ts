@@ -347,6 +347,17 @@ export class Store {
     return found ? { events: newestFirst.reverse(), found } : { events: [], found };
   }
 
+  /** The latest matching events, in chronological order. Only matches count toward the limit. */
+  readMatchingEvents(file: string, limit: number, matches: (env: ThreadEnvelope) => boolean): ThreadEnvelope[] {
+    if (limit <= 0) return [];
+    const events: ThreadEnvelope[] = [];
+    this.scanBackward(file, (env) => {
+      if (matches(env)) events.push(env);
+      return events.length >= limit;
+    });
+    return events.reverse();
+  }
+
   /** The newest event matching `match`, read from the end; stops at the first hit (#31). */
   findLastEvent(file: string, match: (env: ThreadEnvelope) => boolean): ThreadEnvelope | undefined {
     let hit: ThreadEnvelope | undefined;

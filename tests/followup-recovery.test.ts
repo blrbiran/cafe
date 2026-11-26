@@ -31,6 +31,12 @@ describe("follow-ups", () => {
 
     const first = await c.ask({ body: "what is the vat rate?" });
     await untilClosed(c, first.threadId, first.orderId);
+    // Legacy logs may have hundreds of events between a question and its final answer.
+    const metaBefore = root.daemon.thread(first.threadId)!.meta;
+    for (let i = 0; i < 220; i++) root.daemon.store.appendEvent(metaBefore.file, {
+      eventId: `legacy-heartbeat-${i}`, threadId: first.threadId, orderId: first.orderId,
+      host: "root", at: Date.now(), event: { type: "order.heartbeat", agentId: billing.rec.agentId },
+    });
 
     // The follow-up mentions "rounding" but must still go to billing, who answered.
     const follow = await c.ask({ body: "and how is rounding done?", threadId: first.threadId });

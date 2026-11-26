@@ -2219,7 +2219,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Earlier turns of a Thread, oldest first, bounded for prompt size. */
   private history(meta: ThreadMeta): Order["history"] {
     const out: Order["history"] = [];
-    for (const env of this.store.readEventsTail(meta.file, 200)) {
+    const events = this.store.readMatchingEvents(meta.file, 12, ({ event }) =>
+      event.type === "order.created" || (event.type === "order.replied" && event.final),
+    );
+    for (const env of events) {
       const ev = env.event;
       if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: ev.order.body.slice(0, 4000) });
       else if (ev.type === "order.replied" && ev.final) {
@@ -2227,7 +2230,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         out.push({ agentId: ev.agentId, from: speaker, role: "barista", text: ev.source === "operator" ? `[operator override for ${speaker} — not the Barista's own words] ${ev.text.slice(0, 3900)}` : ev.text.slice(0, 4000) });
       }
     }
-    return out.slice(-12);
+    return out;
   }
 
   /**
