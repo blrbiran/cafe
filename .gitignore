@@ -5,6 +5,8 @@ dist/
 .codegraph/
 output/
 .playwright-cli/
+/.claude/worktrees/
+/.claude/settings.local.json
 
 *.log
 .cafe
