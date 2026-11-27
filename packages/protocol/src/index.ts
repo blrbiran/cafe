@@ -254,9 +254,20 @@ export const AgentRecord = AgentIdentity.extend({
 });
 export type AgentRecord = z.infer<typeof AgentRecord>;
 
+export const HostIdentity = z.object({
+  /** Immutable Root-assigned identity; separate from the mutable routing/display slug. */
+  hostId: z.string().min(1),
+  host: z.string().min(1),
+  /** SPKI fingerprint bound to the Host certificate by the Root. */
+  keyFingerprint: z.string().min(1),
+  state: z.enum(["enrolled", "revoked"]),
+  revision: z.number().int().nonnegative().optional(),
+});
+export type HostIdentity = z.infer<typeof HostIdentity>;
+
 export const DaemonRecord = z.object({
   host: z.string(),
-  /** Stable internal id; `host` is the original slug. Absent on older Daemons. */
+  /** Stable Root-assigned identity; absent on older Daemons. */
   hostId: z.string().optional(),
   /** User-visible name (defaults to `host`). Renaming it does not change routing keys. */
   displayName: z.string().optional(),
@@ -288,6 +299,13 @@ export type OrderKind = z.infer<typeof OrderKind>;
 
 export const DeliveryMode = z.enum(["unicast", "multicast", "broadcast"]);
 export type DeliveryMode = z.infer<typeof DeliveryMode>;
+
+export const EventActor = z.object({
+  kind: z.enum(["human", "connector", "agent", "operator"]),
+  /** Opaque stable principal ID; raw credentials and digests never appear in the event. */
+  principalId: z.string().min(1),
+});
+export type EventActor = z.infer<typeof EventActor>;
 
 export const Party = z.object({
   /** agentId for registered Agents; synthetic id for CLI/web Customers. */
@@ -353,6 +371,17 @@ export const Order = z.object({
   parentContext: z.string().max(640).optional(),
   /** The issuing daemon verified the original human parent's owner credential for this link. */
   parentOwnerVerified: z.literal(true).optional(),
+  /** One-use owner-authored attestation for a human answer in a clarification Thread. */
+  parentOwnerAttestation: z.object({
+    attestationId: z.string().min(1),
+    parentOrderId: z.string().min(1),
+    parentThreadId: z.string().min(1),
+    clarificationOrderId: z.string().min(1),
+    recipientAgentId: z.string().min(1),
+    recipientHostId: z.string().min(1),
+    answerRequestId: z.string().min(1),
+    answerHash: z.string().min(1),
+  }).optional(),
   /** The issuing daemon has a private ownership credential for this human Order. */
   humanClarifications: z.literal(true).optional(),
   /** The first turn publishes a question for the owner of its human parent. */
@@ -441,19 +470,34 @@ export const ThreadStatus = z.enum(["routing", "delivering", "working", "done", 
 export type ThreadStatus = z.infer<typeof ThreadStatus>;
 
 /** Everything that happens to a Thread is a ThreadEvent; Threads are append-only logs of these. */
+export const OrderAssignment = z.object({
+  assignmentId: z.string().min(1),
+  targetAgentId: z.string().min(1),
+  targetHostId: z.string().min(1),
+  /** Target-specific text/history copied from the canonical Order assignment. */
+  body: z.string(),
+  history: z.array(z.object({ from: z.string(), agentId: z.string().optional(), role: z.enum(["customer", "barista"]), text: z.string() })).default([]),
+  bodyHash: z.string().optional(),
+});
+export type OrderAssignment = z.infer<typeof OrderAssignment>;
+
 export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.created"), order: Order }),
   z.object({ type: z.literal("order.routed"), decision: RoutingDecision }),
-  z.object({ type: z.literal("order.delivered"), agentId: z.string(), protectedIdentity: z.literal(true).optional() }),
-  z.object({ type: z.literal("order.acked"), agentId: z.string() }),
-  z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), note: z.string().optional() }),
-  z.object({ type: z.literal("order.replied"), agentId: z.string(), text: z.string(), final: z.boolean(), source: z.enum(["agent", "operator"]).optional(), attachments: z.array(Attachment).optional() }),
+  z.object({ type: z.literal("order.assigned"), assignment: OrderAssignment }),
+  z.object({ type: z.literal("order.delivered"), agentId: z.string(), assignmentId: z.string().optional(), protectedIdentity: z.literal(true).optional() }),
+  z.object({ type: z.literal("order.acked"), agentId: z.string(), assignmentId: z.string().optional() }),
+  z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), assignmentId: z.string().optional(), note: z.string().optional() }),
+  z.object({ type: z.literal("order.replied"), agentId: z.string(), assignmentId: z.string().optional(), text: z.string(), final: z.boolean(), source: z.enum(["agent", "operator"]).optional(), attachments: z.array(Attachment).optional() }),
   /** A result added by an original recipient after the human Order closed. */
-  z.object({ type: z.literal("order.reported"), agentId: z.string(), text: z.string() }),
+  z.object({ type: z.literal("order.reported"), agentId: z.string(), assignmentId: z.string().optional(), text: z.string() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
-  z.object({ type: z.literal("order.declined"), agentId: z.string(), reason: z.string(), unavailable: z.boolean().optional(), /** The thread closed first; this target was never asked to do anything wrong (#101). */ skipped: z.boolean().optional() }),
-  z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), reason: z.string(), /** Operational failure (timeout), not "this topic is not mine". */ unavailable: z.boolean().optional() }),
+  z.object({ type: z.literal("order.declined"), agentId: z.string(), assignmentId: z.string().optional(), reason: z.string(), unavailable: z.boolean().optional(), /** The thread closed first; this target was never asked to do anything wrong (#101). */ skipped: z.boolean().optional() }),
+  z.object({ type: z.literal("order.dispatch-failed"), agentId: z.string(), assignmentId: z.string(), reason: z.string() }),
+  z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), assignmentId: z.string().optional(), reason: z.string(), /** Operational failure (timeout), not "this topic is not mine". */ unavailable: z.boolean().optional() }),
   z.object({ type: z.literal("order.cancelled"), by: z.string() }),
+  z.object({ type: z.literal("order.replaced"), previousOrderId: z.string(), order: Order, decision: RoutingDecision, assignments: z.array(OrderAssignment) }),
+  z.object({ type: z.literal("order.overridden"), targetAgentId: z.string(), text: z.string(), final: z.boolean() }),
   /** One Order finished. The Thread stays open for Follow-ups. */
   z.object({ type: z.literal("order.closed"), status: ThreadStatus }),
 ]);
@@ -463,8 +507,12 @@ export const ThreadEnvelope = z.object({
   eventId: z.string(),
   threadId: z.string(),
   orderId: z.string(),
-  /** Host whose Daemon emitted the event. */
+  /** Host whose Daemon emitted the event; absent on legacy entries. */
   host: z.string(),
+  /** Immutable authenticated source Host ID; absent only on legacy/unverified entries. */
+  eventHostId: z.string().min(1).optional(),
+  /** Authenticated caller principal; legacy entries may omit it. */
+  actor: EventActor.optional(),
   at: z.number(),
   event: ThreadEvent,
 });
@@ -472,6 +520,9 @@ export type ThreadEnvelope = z.infer<typeof ThreadEnvelope>;
 
 export const TaskStatus = z.enum(["working", "awaiting_report", "done", "failed", "cancelled", "unknown"]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
+
+export const TargetState = z.enum(["pending", "acked", "replied", "declined", "failed", "skipped", "overridden"]);
+export type TargetState = z.infer<typeof TargetState>;
 
 export const ThreadMeta = z.object({
   threadId: z.string(),
@@ -522,7 +573,7 @@ export const ThreadMeta = z.object({
   /** True when the parent projection could not query all relevant Hosts. */
   childrenPartial: z.boolean().optional(),
   /** Per-target state of the latest Order (v4-11); absent on old rows. */
-  targetStates: z.array(z.object({ agentId: z.string(), state: z.enum(["pending", "acked", "replied", "declined", "failed", "skipped"]) })).optional(),
+  targetStates: z.array(z.object({ agentId: z.string(), state: TargetState })).optional(),
 });
 export type ThreadMeta = z.infer<typeof ThreadMeta>;
 
@@ -586,6 +637,12 @@ export const InitializeParams = z.object({
   token: z.string().optional(),
   /** For kind=daemon: the connecting Daemon's host and reachable URL. */
   host: z.string().optional(),
+  /** Stable Root-assigned Host identity, authenticated by the TLS peer certificate. */
+  hostId: z.string().optional(),
+  /** Version of the Host certificate identity protocol; absent on older Daemons. */
+  hostAuthVersion: z.number().int().optional(),
+  /** The Root identity a child has pinned locally for this network. */
+  rootHostId: z.string().optional(),
   /** Display name and aliases of the connecting Daemon (rename does not change `host`). */
   displayName: z.string().optional(),
   aliases: z.array(z.string()).optional(),
@@ -627,10 +684,9 @@ export const CreateOrderParams = z.object({
   attachments: z.array(Attachment).optional(),
   /** Ask every eligible Barista, bypassing routing (only when the customer explicitly wants it). */
   broadcast: z.boolean().optional(),
-  /**
-   * Follow-up only: cancel the Thread's still-open question and ask this one instead, instead of
-   * failing with `thread_busy`. The abandoned Order is recorded as cancelled (#60).
-   */
+  /** Follow-up only: replace this exact still-open Order after owner authorization. */
+  replaceOrderId: z.string().min(1).optional(),
+  /** @deprecated transitional legacy request field; removed after all callers send replaceOrderId. */
   replace: z.boolean().optional(),
   /**
    * Customer-side dedupe key (a platform event id for connectors). A repeated

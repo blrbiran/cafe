@@ -56,12 +56,13 @@
 - Add `parentOwnerAttestationId`/`parentOwnerAttestation` to linked human follow-up Orders; keep `parentOwnerVerified` only as derived local metadata.
 - Add `order.replaced`, `order.overridden`, and durable `order.assigned` event variants.
 - Add `caller-auth-v1`, `host-auth-v1`, and `team-roster-ack-v1` feature names.
-- Store methods: `putHostIdentity`, `getHostIdentity`, `putInviteRedemption`, `getInviteRedemption`, `putCallerPrincipal`, `getCallerPrincipal`, `stagePendingEvent`, `commitPendingEvents`, and indexes for both Order IDs of `order.replaced`.
+- Store methods: `putHostIdentity`, `getHostIdentity`, `putInviteRedemption`, `getInviteRedemption`, `putCallerPrincipal`, `getCallerPrincipal`, `stagePendingEvent(env, missingAuthority)`, `listPendingEvents(threadId?)`, `commitPendingEvents(file, eventIds)`, and `readOrderEvents` support for indexing `order.replaced` under both old/new IDs.
 
 - [ ] Write failing protocol parsing tests for host/actor fields, assignment IDs, replacement/override events, attestation, and capability names.
 - [ ] Run `npx vitest run tests/protocol-auth.test.ts` and confirm each new contract fails before implementation.
 - [ ] Add Zod schemas and types in `packages/protocol/src/index.ts`; add the feature names without changing `PROTOCOL_VERSION` in this task.
 - [ ] Write failing Store tests in `tests/store-event-auth.test.ts` that append/recover an `order.replaced` envelope indexed by both old and new IDs, and stage/replay an event with a missing creation/assignment dependency.
+- [ ] Run `npx vitest run tests/store-event-auth.test.ts` and confirm it fails because the replacement index and pending-event persistence are absent.
 - [ ] Implement atomic pending-event and replacement indexes in `packages/daemon/src/store.ts`; preserve JSONL as the event source of truth.
 - [ ] Run `npx vitest run tests/protocol-auth.test.ts tests/store-event-auth.test.ts` and confirm pass.
 - [ ] Review `git diff --check`, stage only Task 1 files, and commit with the required attribution trailer; never stage `.vitest/`.

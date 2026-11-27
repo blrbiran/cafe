@@ -21,6 +21,13 @@ export interface StoredArtifact {
   createdAt: number;
 }
 
+export interface MissingEventAuthority {
+  kind: "order" | "assignment";
+  id: string;
+}
+
+const PENDING_EVENTS_MAX = 5000;
+
 /**
  * Thread content lives in append-only JSONL files; SQLite keeps only metadata
  * and the Registry cache (ADR-0003).
@@ -82,6 +89,15 @@ export class Store {
       CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(event_id UNINDEXED, thread_id UNINDEXED, order_id UNINDEXED, who UNINDEXED, at UNINDEXED, text, tokenize='trigram');
       CREATE TABLE IF NOT EXISTS search_indexed (event_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS search_backfilled_threads (thread_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS pending_events (
+        event_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        order_id TEXT NOT NULL,
+        missing_authority TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS pending_events_order_at ON pending_events(order_id, at, event_id);
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
@@ -153,6 +169,55 @@ export class Store {
           return [];
         }
       });
+  }
+
+  /** Persist an authenticated event that is waiting for its Order/assignment evidence. */
+  stagePendingEvent(env: ThreadEnvelope, missing: MissingEventAuthority): void {
+    if (!env.eventHostId) throw new Error("pending event must have an authenticated eventHostId");
+    if (!missing.id) throw new Error("pending event requires a missing authority id");
+    const eventJson = JSON.stringify(env);
+    const existing = this.db.prepare("SELECT event_json FROM pending_events WHERE event_id = ?").get(env.eventId) as { event_json: string } | undefined;
+    if (existing) {
+      if (existing.event_json !== eventJson) throw new Error(`pending event id conflict: ${env.eventId}`);
+      return;
+    }
+    const count = (this.db.prepare("SELECT COUNT(*) AS n FROM pending_events").get() as { n: number }).n;
+    if (count >= PENDING_EVENTS_MAX) throw new Error(`pending event journal is full (${PENDING_EVENTS_MAX})`);
+    this.db.prepare(
+      "INSERT INTO pending_events(event_id, thread_id, order_id, missing_authority, event_json, at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(env.eventId, env.threadId, env.orderId, JSON.stringify(missing), eventJson, env.at);
+  }
+
+  /** Pending events are returned oldest-first so dependencies can be applied in journal order. */
+  listPendingEvents(threadId?: string): ThreadEnvelope[] {
+    const rows = threadId
+      ? this.db.prepare("SELECT event_json FROM pending_events WHERE thread_id = ? ORDER BY at, event_id").all(threadId) as { event_json: string }[]
+      : this.db.prepare("SELECT event_json FROM pending_events ORDER BY at, event_id").all() as { event_json: string }[];
+    return rows.map((row) => JSON.parse(row.event_json) as ThreadEnvelope);
+  }
+
+  /**
+   * Append staged envelopes to their Thread journal and then delete their pending rows. If the process
+   * crashes between append and delete, replay is safe because eventId is checked before appending again.
+   */
+  commitPendingEvents(file: string, eventIds: string[]): ThreadEnvelope[] {
+    const unique = [...new Set(eventIds)];
+    const current = new Set(this.readEvents(file).map((env) => env.eventId));
+    const committed: ThreadEnvelope[] = [];
+    const remove = this.db.prepare("DELETE FROM pending_events WHERE event_id = ?");
+    for (const eventId of unique) {
+      const row = this.db.prepare("SELECT event_json, thread_id FROM pending_events WHERE event_id = ?").get(eventId) as { event_json: string; thread_id: string } | undefined;
+      if (!row) continue;
+      const env = JSON.parse(row.event_json) as ThreadEnvelope;
+      if (row.thread_id !== env.threadId) throw new Error(`pending event thread mismatch: ${eventId}`);
+      if (!current.has(eventId)) {
+        this.appendEvent(file, env);
+        current.add(eventId);
+      }
+      committed.push(env);
+      remove.run(eventId);
+    }
+    return committed;
   }
 
   /** The last `limit` events, read from the end so a long Thread is not parsed whole. */
@@ -305,13 +370,17 @@ export class Store {
    */
   readOrderEvents(file: string, orderId: string): ThreadEnvelope[] {
     const newestFirst: ThreadEnvelope[] = [];
-    let found = false;
+    let foundCreation = false;
     this.scanBackward(file, (env) => {
-      if (env.orderId !== orderId) return false;
+      const event = env.event;
+      const isCreatedHere = event.type === "order.created" && event.order.orderId === orderId;
+      const isReplacementOfOrder = event.type === "order.replaced" && event.previousOrderId === orderId;
+      const isReplacementCreation = event.type === "order.replaced" && event.order.orderId === orderId;
+      if (env.orderId !== orderId && !isReplacementOfOrder) return false;
       newestFirst.push(env);
-      return (found = env.event.type === "order.created");
+      return (foundCreation = isCreatedHere || isReplacementCreation);
     });
-    return found ? newestFirst.reverse() : [];
+    return foundCreation ? newestFirst.reverse() : [];
   }
 
   /**
