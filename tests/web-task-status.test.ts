@@ -69,6 +69,19 @@ describe("projectTaskStatus", () => {
     expect(projectTaskStatus(parent(), [child({ clarification: { orderId: "clarification", question: "need a choice?" } })])).toBeUndefined();
   });
 
+  it("tracks an accepted clarification continuation against its exact parent Order", () => {
+    const continuation = child({ turns: 2, clarification: { orderId: "clarification", question: "need a choice?", acknowledged: true } });
+    const finished = { ...continuation, status: "done" as const };
+    expect(projectTaskStatus(parent(), [continuation])).toBe("working");
+    expect(projectTaskStatus(parent(), [finished])).toBe("awaiting_report");
+    expect(projectTaskStatus(parent({ reportedOrderId: "previous-order" }), [finished])).toBe("awaiting_report");
+    expect(projectTaskStatus(parent({ reportedOrderId: "parent-order" }), [finished])).toBe("done");
+    expect(projectTaskStatus(parent(), [finished], true)).toBe("unknown");
+    expect(projectTaskStatus(parent({ status: "cancelled" }), [continuation])).toBe("cancelled");
+    expect(projectTaskStatus(parent({ status: "failed" }), [continuation])).toBe("failed");
+    expect(projectTaskStatus(parent(), [{ ...finished, parentOrderId: "previous-order" }])).toBeUndefined();
+  });
+
   it("waits for a report after agent work closes and marks the exact reported Order done", () => {
     const closedChild = child({ status: "done", closedAt: 10 });
     expect(projectTaskStatus(parent(), [closedChild])).toBe("awaiting_report");

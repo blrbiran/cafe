@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
@@ -38,6 +38,8 @@ export interface Worker {
   member?: string;
   /** The member's own working directory (may differ from spec.dir). */
   cwd?: string;
+  /** Canonical directory reserved at admission for a managed writer. */
+  writeScope?: WriteScope;
   rosterDir?: string;
   child?: ChildProcess;
   /** `ps lstart` of the guard (process-group leader), recorded for reaping after a crash. */
@@ -133,7 +135,26 @@ function hashFile(path: string): string { return createHash("sha256").update(rea
 
 function isPiRuntime(value: string): boolean { return /^pi[ @]/i.test(value.trim()); }
 function isOmpRuntime(value: string): boolean { return /^omp\//i.test(value.trim()); }
-/** The runtime kind a binary path refers to; a custom binary is neither and keeps the legacy launch. */
+type WriteScope = { path: string; ancestors: string[] };
+
+function captureWriteScope(path: string): WriteScope {
+  const ancestors: string[] = [];
+  for (let dir = path; ; dir = dirname(dir)) {
+    const { dev, ino } = statSync(dir, { bigint: true });
+    ancestors.push(`${dev}:${ino}`);
+    if (dirname(dir) === dir) break;
+  }
+  return { path, ancestors };
+}
+
+function writeScopesOverlap(a: WriteScope, b: WriteScope): boolean {
+  const contains = (parent: WriteScope, child: WriteScope) => {
+    const path = relative(parent.path, child.path);
+    return (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path)) || child.ancestors.includes(parent.ancestors[0]!);
+  };
+  return contains(a, b) || contains(b, a);
+}
+
 function agentKind(bin: string): "pi" | "omp" | undefined {
   const name = basename(bin).toLowerCase();
   return name === "pi" ? "pi" : name === "omp" ? "omp" : undefined;
@@ -269,14 +290,28 @@ export class Supervisor {
     return result;
   }
 
+  private readonly retiringWriters = new Map<number, WriteScope>();
+
+  private reservedWriter(scope: WriteScope): WriteScope | undefined {
+    for (const [pgid, retiring] of this.retiringWriters) {
+      if (probeGroup(pgid) === "gone") this.retiringWriters.delete(pgid);
+      else if (writeScopesOverlap(scope, retiring)) return retiring;
+    }
+  }
+
   start(spec: BaristaSpec, persist = true): WorkerInfo[] {
     const dir = resolve(spec.dir);
     if (spec.team) return this.startTeam(dir, spec.team.spec, persist);
     const existing = this.workers.filter((w) => w.spec.dir === dir && !w.rosterDir);
     // A Barista that gave up (#82) is replaced by a new start; a live one is not.
     if (existing.length && !existing.every((w) => w.failed)) throw new Error(`barista already running in ${dir}`);
+    const writeScope = !spec.tui && spec.access === "workspace-write" ? captureWriteScope(realpathSync(dir)) : undefined;
+    const retiring = writeScope && this.reservedWriter(writeScope);
+    if (retiring) throw new Error(`${dir} would overlap a write-enabled worker still stopping in ${retiring.path}`);
+    const active = writeScope ? this.workers.find((worker) => !existing.includes(worker) && worker.writeScope && writeScopesOverlap(writeScope, worker.writeScope)) : undefined;
+    if (active) throw new Error(`${dir} would overlap an existing write-enabled worker in ${active.writeScope!.path}`);
+    const { cafe } = loadIdentity(writeScope?.path ?? dir);
     if (existing.length) this.workers = this.workers.filter((w) => w.spec.dir !== dir || w.rosterDir);
-    const { cafe } = loadIdentity(dir);
     const name = dir.split(/[\\/]/).filter(Boolean).pop() ?? "barista";
     // The leaf name alone collided for /a/work and /b/work (#102): keep it for readability and add a
     // short hash of the full path so two workers never interleave in one log.
@@ -287,7 +322,7 @@ export class Supervisor {
     if (warning) this.log(warning);
     // One process owns one Cafe identity and one serial session. Distinct workers need distinct identities and directories.
     for (let slot = 1; slot <= 1; slot++) {
-      const w: Worker = { spec: { ...spec, dir }, slot, ...(warning ? { warning } : {}), restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${tag}-${slot}.log`) };
+      const w: Worker = { spec: { ...spec, dir }, writeScope, slot, ...(warning ? { warning } : {}), restarts: 0, stopping: false, quickFailures: 0, failed: false, tail: [], logPath: join(this.logDir, `barista-${name}-${tag}-${slot}.log`) };
       this.workers.push(w);
       this.launch(w);
     }
@@ -306,14 +341,16 @@ export class Supervisor {
     const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
     const validatedPaths = new Map(team.members.map((member) => [member.name, validateMemberPath(this.home, dir, member.name, member.dir).realPath]));
     const writes = team.members.filter((member) => effectiveMemberAccess(member) === "write");
+    const writeScopes = new Map(writes.map((member) => [member.name, captureWriteScope(validatedPaths.get(member.name)!)]));
     for (const [index, member] of writes.entries()) {
-      const target = validatedPaths.get(member.name)!;
-      const overlaps = (otherPath: string) => target === otherPath || target.startsWith(otherPath + sep) || otherPath.startsWith(target + sep);
-      const conflict = writes.slice(0, index).find((other) => overlaps(validatedPaths.get(other.name)!));
+      const target = writeScopes.get(member.name)!;
+      const conflict = writes.slice(0, index).find((other) => writeScopesOverlap(target, writeScopes.get(other.name)!));
       if (conflict) throw new Error(`${member.name} and ${conflict.name} would write to overlapping directories`);
+      const retiring = this.reservedWriter(target);
+      if (retiring) throw new Error(`${member.name} would overlap a write-enabled worker still stopping in ${retiring.path}`);
       const active = this.workers.find((other) => !(other.rosterDir === dir && other.member === member.name) &&
-        other.spec.access === "workspace-write" && overlaps(other.cwd ?? other.spec.dir));
-      if (active) throw new Error(`${member.name} would overlap an existing write-enabled worker in ${active.cwd ?? active.spec.dir}`);
+        other.writeScope && writeScopesOverlap(target, other.writeScope));
+      if (active) throw new Error(`${member.name} would overlap an existing write-enabled worker in ${active.writeScope!.path}`);
     }
     // Each worker keeps only its own member definition; save() unions them per roster. A partial
     // `team start` must never overwrite the set that a later restart restores (v4-11 review).
@@ -342,6 +379,7 @@ export class Supervisor {
         slot: 1,
         member: member.name,
         cwd: memberDir,
+        writeScope: writeScopes.get(member.name),
         rosterDir: dir,
         restarts: 0,
         stopping: false,
@@ -389,7 +427,7 @@ export class Supervisor {
   list(): WorkerInfo[] {
     return this.workers.map((w) => ({
       dir: w.spec.dir,
-      ...(w.cwd ? { cwd: w.cwd } : {}),
+      ...(w.cwd || w.writeScope ? { cwd: w.cwd ?? w.writeScope?.path } : {}),
       ...(w.member ? { member: w.member } : {}),
       ...(w.rosterDir ? { rosterDir: w.rosterDir } : {}),
       agent: w.spec.agent ?? (w.spec.bin ?? this.piBin).split(/[\\/]/).pop()!,
@@ -417,6 +455,25 @@ export class Supervisor {
   // ---------------------------------------------------------------------------
 
   private launch(w: Worker): void {
+    if (w.writeScope) {
+      const scope = w.writeScope;
+      const retiring = this.reservedWriter(scope);
+      if (retiring) {
+        w.timer = setTimeout(() => { if (!w.stopping) this.launch(w); }, EXIT_DRAIN_MS);
+        return;
+      }
+      try {
+        const current = captureWriteScope(realpathSync(scope.path));
+        if (current.path !== scope.path || current.ancestors[0] !== scope.ancestors[0] ||
+          this.workers.some((other) => other !== w && other.writeScope && writeScopesOverlap(current, other.writeScope))) {
+          throw new Error("the write-enabled worker's directory changed or overlaps another writer");
+        }
+      } catch (err) {
+        w.failed = true;
+        w.lastError = `${(err as Error).message}. Check ${scope.path} and start the worker again.`;
+        return;
+      }
+    }
     const kind = agentKind(w.spec.bin ?? this.piBin);
     if (!w.spec.agent && w.spec.access !== "workspace-write" && kind) {
       const agent = kind;
@@ -451,7 +508,7 @@ export class Supervisor {
         log = undefined;
       }
     };
-    const workDir = w.cwd ?? w.spec.dir;
+    const workDir = w.writeScope?.path ?? w.cwd ?? w.spec.dir;
     const bin = w.spec.agent ? process.execPath : (w.spec.bin ?? this.piBin);
     const args = w.spec.agent
       ? [
@@ -514,7 +571,10 @@ export class Supervisor {
       note(message ?? (code === EXIT_NOT_FOUND ? `agent executable not found: ${bin} (set CAFE_PI_BIN or --agent)` : `exited code=${code} signal=${signal}`));
       const pgid = child.pid;
       // Grandchildren may still hold the group's pipes: give them a moment, then SIGKILL the group.
-      if (pgid) setTimeout(() => signalGroup(pgid, "SIGKILL"), EXIT_DRAIN_MS).unref?.();
+      if (pgid) {
+        if (w.writeScope && probeGroup(pgid) !== "gone") this.retiringWriters.set(pgid, w.writeScope);
+        setTimeout(() => signalGroup(pgid, "SIGKILL"), EXIT_DRAIN_MS).unref?.();
+      }
       setTimeout(() => log?.close(), EXIT_DRAIN_MS + 100).unref?.();
       w.child = undefined;
       w.startedAt = undefined;
@@ -551,6 +611,7 @@ export class Supervisor {
     const child = w.child;
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
     const pgid = child.pid;
+    if (w.writeScope && probeGroup(pgid) !== "gone") this.retiringWriters.set(pgid, w.writeScope);
     signalGroup(pgid, "SIGTERM");
     setTimeout(() => {
       if (probeGroup(pgid) === "present") signalGroup(pgid, "SIGKILL");

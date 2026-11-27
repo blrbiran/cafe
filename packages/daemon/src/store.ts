@@ -34,6 +34,12 @@ export interface RecipientAssignmentReceipt {
   acceptedAt: number;
 }
 
+export interface FollowupProgress {
+  offset: number;
+  complete: boolean;
+  state: unknown;
+}
+
 export interface StoredOrderAssignment {
   orderId: string;
   threadId: string;
@@ -130,6 +136,12 @@ export class Store {
         record TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS followup_projection_progress (
+        thread_id TEXT PRIMARY KEY,
+        offset INTEGER NOT NULL,
+        complete INTEGER NOT NULL,
+        state_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS agent_events (
         agent_id TEXT NOT NULL,
         kind TEXT NOT NULL,
@@ -605,6 +617,50 @@ export class Store {
       });
   }
 
+  /** Current journal length; a not-yet-created Thread journal is empty. */
+  journalSize(file: string): number {
+    return existsSync(file) ? statSync(file).size : 0;
+  }
+
+  /** Read complete JSONL records from a byte cursor, yielding after a bounded batch. */
+  readEventsFromOffset(file: string, offset: number, maxBytes = 64 * 1024, maxEvents = 500): { events: ThreadEnvelope[]; offset: number; fileSize: number } {
+    if (!existsSync(file)) throw new Error(`journal is unavailable: ${file}`);
+    const fileSize = statSync(file).size;
+    let cursor = offset > fileSize ? 0 : Math.max(0, offset);
+    if (cursor === fileSize) return { events: [], offset: cursor, fileSize };
+    const fd = openSync(file, "r");
+    const events: ThreadEnvelope[] = [];
+    let line = Buffer.alloc(0);
+    let readOffset = cursor;
+    let completeOffset = cursor;
+    const chunk = Buffer.alloc(8192);
+    try {
+      while (readOffset < fileSize) {
+        const count = readSync(fd, chunk, 0, Math.min(chunk.length, fileSize - readOffset), readOffset);
+        if (!count) break;
+        const part = chunk.subarray(0, count);
+        let start = 0;
+        for (let i = 0; i < part.length; i++) {
+          if (part[i] !== 0x0a) continue;
+          const record = Buffer.concat([line, part.subarray(start, i)]).toString("utf8");
+          if (record) {
+            try { events.push(JSON.parse(record) as ThreadEnvelope); } catch { /* skip torn or malformed records */ }
+          }
+          completeOffset = readOffset + i + 1;
+          line = Buffer.alloc(0);
+          start = i + 1;
+          if (completeOffset - cursor >= maxBytes || events.length >= maxEvents) break;
+        }
+        if (start < part.length) line = Buffer.concat([line, part.subarray(start)]);
+        readOffset += count;
+        if (completeOffset - cursor >= maxBytes || events.length >= maxEvents) break;
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return { events, offset: completeOffset, fileSize };
+  }
+
   /** Persist an authenticated event that is waiting for its Order/assignment evidence. */
   stagePendingEvent(env: ThreadEnvelope, missing: MissingEventAuthority): void {
     if (!env.eventHostId) throw new Error("pending event must have an authenticated eventHostId");
@@ -967,6 +1023,40 @@ export class Store {
     return (this.db.prepare("SELECT COUNT(*) AS n FROM threads").get() as { n: number }).n;
   }
 
+  /** All Threads in stable pages for the bounded journal projection worker. */
+  threadsForFollowupProjection(after: { createdAt: number; threadId: string } | undefined, limit: number): ThreadMeta[] {
+    const n = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1000) : 100;
+    const rows = (after
+      ? this.db.prepare("SELECT meta FROM threads WHERE (created_at > ? OR (created_at = ? AND thread_id > ?)) ORDER BY created_at, thread_id LIMIT ?").all(after.createdAt, after.createdAt, after.threadId, n)
+      : this.db.prepare("SELECT meta FROM threads ORDER BY created_at, thread_id LIMIT ?").all(n)) as { meta: string }[];
+    return rows.map((row) => threadMeta(row.meta));
+  }
+
+  getFollowupProgress<T = unknown>(threadId: string): (Omit<FollowupProgress, "state"> & { state: T }) | undefined {
+    const row = this.db.prepare("SELECT offset, complete, state_json FROM followup_projection_progress WHERE thread_id = ?").get(threadId) as { offset: number; complete: number; state_json: string } | undefined;
+    return row ? { offset: row.offset, complete: row.complete === 1, state: JSON.parse(row.state_json) as T } : undefined;
+  }
+
+  /** Persist incremental reducer state when the public Thread projection did not change. */
+  saveFollowupProgress(threadId: string, progress: FollowupProgress): void {
+    this.db.prepare("INSERT INTO followup_projection_progress(thread_id, offset, complete, state_json) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET offset=excluded.offset, complete=excluded.complete, state_json=excluded.state_json")
+      .run(threadId, progress.offset, progress.complete ? 1 : 0, JSON.stringify(progress.state));
+  }
+
+  /** Commit the derived Thread fields and matching byte cursor as one SQLite transaction. */
+  saveFollowupProjection(meta: ThreadMeta, progress: FollowupProgress): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.putThread(meta);
+      this.db.prepare("INSERT INTO followup_projection_progress(thread_id, offset, complete, state_json) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET offset=excluded.offset, complete=excluded.complete, state_json=excluded.state_json")
+        .run(meta.threadId, progress.offset, progress.complete ? 1 : 0, JSON.stringify(progress.state));
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   /** Newest first. `before`: only threads created before this time (paging to older threads). */
   listThreads(limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER): ThreadMeta[] {
     // Defensive: SQLite reads LIMIT -1 as "all rows", and NaN binds as a datatype error.
@@ -1044,11 +1134,13 @@ export class Store {
     let bytes = 0;
     const dirs = new Set<string>();
     const del = this.db.prepare("DELETE FROM threads WHERE thread_id = ?");
+    const delFollowupProgress = this.db.prepare("DELETE FROM followup_projection_progress WHERE thread_id = ?");
     // One transaction for the row deletes (#34); the files go afterwards, outside the transaction.
     this.db.exec("BEGIN");
     try {
       for (const m of metas) {
         del.run(m.threadId);
+        delFollowupProgress.run(m.threadId);
         // Never touch files outside this home's sessions/ directory, whatever the metadata says.
         const sessions = resolve(this.home, "sessions") + sep;
         if (resolve(m.file).startsWith(sessions) && existsSync(m.file)) {

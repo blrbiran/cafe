@@ -63,6 +63,7 @@ import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints
 import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
 import { Store, type HostInviteRecord } from "./store.ts";
+import { projectFollowupEvent, recoverFollowupBatch } from "./followup-outcome.ts";
 import { summarize } from "./summary.ts";
 import { describeFetchError } from "./net-errors.ts";
 
@@ -361,6 +362,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private digestSeq = 0;
   /** channel → last digest timestamp. Persisted: a restarted daemon must not re-emit stored activity. */
   private digestSince = new Map<string, number>();
+  private followupProjectionTimer?: ReturnType<typeof setInterval>;
+  private followupProjectionCursor?: { createdAt: number; threadId: string };
 
   constructor(opts: DaemonOptions) {
     super();
@@ -440,6 +443,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }, this.timing.digestIntervalMs);
     this.digestTimer.unref?.();
+    this.followupProjectionTimer = setInterval(() => {
+      try {
+        const batch = recoverFollowupBatch(this.store, { limit: 16, after: this.followupProjectionCursor, addressOf: (agentId) => this.registry.get(agentId)?.address });
+        this.followupProjectionCursor = batch.next;
+        for (const meta of batch.updated) if (this.metas.has(meta.threadId)) this.metas.set(meta.threadId, meta);
+        if (batch.unavailable.length) this.log(`follow-up projection journals unavailable: ${batch.unavailable.join(", ")}`);
+      } catch (err) {
+        this.log(`follow-up projection failed: ${(err as Error).message}`);
+      }
+    }, 1000);
+    this.followupProjectionTimer.unref?.();
     if (this.isRoot) {
       this.hintsTimer = setInterval(() => this.pushHints(), this.timing.hintsIntervalMs);
       this.hintsTimer.unref?.();
@@ -3363,9 +3377,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** Append to the Thread's JSONL, keeping the byte counters for /api/health. */
-  private appendEvent(file: string, env: ThreadEnvelope): void {
-    this.stats.appendBytes += this.store.appendEvent(file, env);
+  private appendEvent(file: string, env: ThreadEnvelope): number {
+    const written = this.store.appendEvent(file, env);
+    this.stats.appendBytes += written;
     this.stats.events++;
+    return written;
   }
 
   /** Write Thread metadata, keeping the write counters for /api/health. */
@@ -3509,7 +3525,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.seen.add(env.eventId);
     if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
 
-    const meta = this.updateMeta(env);
+    let meta = this.updateMeta(env);
+    let projectionPersisted = false;
     // Keep `cafe search` current without rescanning JSONL (#34); the index is best-effort.
     try {
       this.store.indexEvent(env, (id) => this.registry.get(id)?.address ?? id);
@@ -3528,13 +3545,28 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (meta?.from.host === this.host) for (const a of carried ?? []) this.enqueuePull(a, env.threadId);
     if (meta) {
       // Heartbeats renew leases and remain visible live. Recovery only needs durable acks.
-      if (event.type !== "order.heartbeat") this.appendEvent(meta.file, env);
+      if (event.type !== "order.heartbeat") {
+        const bytesBefore = this.store.journalSize(meta.file);
+        const bytesWritten = this.appendEvent(meta.file, env);
+        try {
+          const projected = projectFollowupEvent(this.store, meta, env, bytesBefore, bytesWritten, (agentId) => this.registry.get(agentId)?.address);
+          if (projected) {
+            meta = projected;
+            this.metas.set(meta.threadId, meta);
+            this.stats.metaBytes += Buffer.byteLength(JSON.stringify(meta));
+            this.stats.metaWrites++;
+            projectionPersisted = true;
+          }
+        } catch (err) {
+          this.log(`follow-up projection update failed: ${(err as Error).message}`);
+        }
+      }
       // Thread creation and closure are durable immediately; activity updates can wait.
       if (env.event.type === "order.created" || env.event.type === "order.closed") {
         const pending = this.metaFlush.get(meta.threadId);
         if (pending) clearTimeout(pending);
         this.metaFlush.delete(meta.threadId);
-        this.writeMeta(meta);
+        if (!projectionPersisted) this.writeMeta(meta);
       } else {
         this.scheduleMeta(meta);
       }
@@ -5249,6 +5281,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     clearInterval(this.pullTimer);
     clearInterval(this.stagingTimer);
     clearInterval(this.digestTimer);
+    clearInterval(this.followupProjectionTimer);
     clearInterval(this.lagTimer);
     clearInterval(this.leafTimer);
     clearTimeout(this.enrolTimer);

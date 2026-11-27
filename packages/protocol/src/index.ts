@@ -578,14 +578,25 @@ export const ThreadMeta = z.object({
   childrenPartial: z.boolean().optional(),
   /** Per-target state of the latest Order (v4-11); absent on old rows. */
   targetStates: z.array(z.object({ agentId: z.string(), state: TargetState })).optional(),
+  /** Historical answer shown when this exact latest follow-up failed before delivery. */
+  followupOutcome: z.object({
+    orderId: z.string(),
+    answer: z.object({
+      orderId: z.string(), turn: z.number().int().positive(), agentId: z.string(),
+      address: z.string().optional(), source: z.enum(["agent", "operator"]).optional(), text: z.string(), truncated: z.boolean(),
+    }),
+  }).optional(),
 });
 export type ThreadMeta = z.infer<typeof ThreadMeta>;
 
 /** Derive whole-task status from one parent Order and its authenticated linked children. */
 export function projectTaskStatus(parent: ThreadMeta, children: ThreadMeta[], partial = false): TaskStatus | undefined {
-  const linked = children.filter((child) => child.parentThreadId === parent.threadId && child.parentOrderId === parent.orderId && !child.clarification);
+  const linked = children.filter((child) => child.parentThreadId === parent.threadId && child.parentOrderId === parent.orderId && (!child.clarification || child.turns > 1));
   if (!linked.length) return undefined;
-  if (linked.some((child) => child.status === "routing" || child.status === "delivering" || child.status === "working")) return "working";
+  const terminal = parent.status === "failed" || parent.status === "cancelled";
+  const openChild = linked.some((child) => (!terminal || !child.clarification) && (child.status === "routing" || child.status === "delivering" || child.status === "working"));
+  if (openChild) return "working";
+  if (terminal && linked.some((child) => child.clarification)) return parent.status === "failed" ? "failed" : "cancelled";
   if (partial) return "unknown";
   if (parent.status === "failed" || parent.status === "cancelled") return parent.status;
   if (parent.status !== "done") return "working";

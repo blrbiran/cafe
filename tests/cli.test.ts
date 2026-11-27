@@ -404,7 +404,11 @@ describe("cafe wait cancellation is honest (#60)", () => {
       if (url === "/api/threads/t1") return res.end(JSON.stringify({ meta: { threadId: "t1", orderId: "o1", taskStatus: "awaiting_report", status: "done" }, events: [] }));
       if (url.startsWith("/api/threads/t1/stream")) {
         res.setHeader("content-type", "text/event-stream");
-        return res.end(`data: ${JSON.stringify({ eventId: "e1", threadId: "t1", orderId: "o1", host: "stub", at: 1, event: { type: "order.closed", status: "done" } })}\n\n`);
+        const envelope = { threadId: "t1", orderId: "o1", host: "stub" };
+        return res.end([
+          { ...envelope, eventId: "e1", at: 1, event: { type: "order.acked", agentId: "lead" } },
+          { ...envelope, eventId: "e2", at: 2, event: { type: "order.closed", status: "done" } },
+        ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
       }
       res.statusCode = 404;
       res.end(JSON.stringify({ error: "not_found", message: url }));
@@ -416,6 +420,9 @@ describe("cafe wait cancellation is honest (#60)", () => {
     const result = await cafeAsync(home(), addr, "--json", "wait", "t1");
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ status: "awaiting_report", orderStatus: "done", taskStatus: "awaiting_report" });
+    const text = await cafeAsync(home(), addr, "wait", "t1");
+    expect(text.status, text.stderr).toBe(0);
+    expect(text.stdout).toContain("received the request");
   });
 
   it("stops waiting without cancelling an Order when --wait-timeout expires", async () => {
@@ -498,12 +505,16 @@ describe("cafe commands", () => {
     const dir = home();
     writeFileSync(join(dir, ".cafe"), "name: worker\nconcurrency: 3\n");
     const warning = "configured concurrency 3; Cafe sessions are serial, so only one worker is running";
+    const workerCwd = join(dir, "resolved-cwd");
     const server = http.createServer((req, res) => {
       res.setHeader("content-type", "application/json");
       if (req.url?.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "stub", pid: 1, isRoot: true, version: "0.2.0" }));
-      if (req.url === "/api/baristas" && req.method === "POST") return res.end(JSON.stringify([{ dir, warning }]));
-      if (req.url === "/api/baristas") return res.end(JSON.stringify([{ dir, running: true, state: "running" }]));
-      if (req.url === "/api/agents") return res.end(JSON.stringify([{ cwd: dir, status: "idle", address: "worker@stub" }]));
+      if (req.url === "/api/baristas" && req.method === "POST") return res.end(JSON.stringify([{ dir, cwd: workerCwd, warning }]));
+      if (req.url === "/api/baristas") return res.end(JSON.stringify([{ dir, cwd: workerCwd, running: true, state: "running" }]));
+      if (req.url === "/api/agents") return res.end(JSON.stringify([
+        { cwd: workerCwd, status: "idle", team: "workers", member: "dev", address: "dev@stub" },
+        { cwd: workerCwd, status: "idle", address: "worker@stub" },
+      ]));
       res.statusCode = 404;
       res.end(JSON.stringify({ error: "not_found", message: req.url }));
     });
@@ -514,6 +525,7 @@ describe("cafe commands", () => {
     const result = await cafeAsync(home(), addr, "barista", "start", "--dir", dir);
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain(warning);
+    expect(result.stdout).toContain("registered as worker@stub");
   });
 
   it("passes --write through for standalone Pi and OMP workers", async () => {

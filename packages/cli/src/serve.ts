@@ -47,7 +47,7 @@ export interface ServeOptions {
 }
 
 const STDOUT_REPLY =
-  "Answer directly and concisely; your entire stdout is sent back as the reply. To send a file, print a line `CAFE_ATTACH: /absolute/path` — it is uploaded and removed from the text.";
+  "Answer directly and concisely; your entire stdout is sent back as the reply. To send a file, print a line `CAFE_ATTACH: /absolute/path` — it is uploaded and removed from the text. The cafe serve process holds the registered Barista identity; this shell command does not. Do not use `cafe ask` or `cafe mcp` to act as this Barista. This command's only reply path is stdout.";
 
 /** The text handed to the command for one Order. `replyNote` says how the answer gets back (stdout by default). */
 export function buildPrompt(
@@ -80,7 +80,7 @@ export function buildPrompt(
     "",
     replyNote,
     `If this question is clearly outside your responsibility, print a single line \`${DECLINE_MARKER} <short reason>\` instead.`,
-    "If you need to ask the sender a clarifying question, call cafe_ask with escalate=true, parent_order_id and parent_thread_id above (or run `cafe ask --escalate --parent <orderId> --parent-thread <threadId> \"...\"`). Do not set a parent for an unrelated new question; to delegate, use an explicit target or broadcast.",
+    "If you need clarification or linked work, use Agent tools available to this same runtime and recipient; a separate CLI, MCP, Pi or OMP process does not inherit this Order's authority. If this runtime has no such tools, use the response mechanism above to answer or decline. Do not set a parent for an unrelated new question; to delegate, use an explicit target or broadcast.",
   );
   return lines.join("\n");
 }

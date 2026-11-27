@@ -3,7 +3,7 @@ import type { ThreadMeta } from "@cafe/protocol";
 import { api } from "../api.ts";
 import { ago, useT } from "../i18n.ts";
 import { cardTime, useNow } from "../format.ts";
-import { bucketOf, outcome, askerOf, whoAddress, whyText } from "../outcome.ts";
+import { bucketOf, outcome, askerOf, followupAnswer, followupPreviewText, followupSearchPreview, whoAddress, whyText } from "../outcome.ts";
 import { agentAddress, agentLabel } from "../display.ts";
 import { navigate, type Filter } from "../route.ts";
 import { closeComposer, ensureLive, loadOlder, openComposer, SEARCH_LIMIT, setChannel, setSearch, useStore, type SearchResult } from "../store.ts";
@@ -145,6 +145,8 @@ function SearchResults({ filter }: { filter: Filter }) {
       <h2 className="section-cap">{t.searchFound(rows.length)}</h2>
       {rows.map(({ meta, hits }) => {
         const o = outcome(t, meta, agents, undefined, now);
+        const historical = followupAnswer(meta);
+        const showHistorical = followupSearchPreview(meta, hits);
         const ask = askerOf(t, meta);
         const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter, channel });
         return (
@@ -160,7 +162,7 @@ function SearchResults({ filter }: { filter: Filter }) {
             <div>
               <Pill tone={o.tone}>{o.text}</Pill>
             </div>
-            {hits.filter((h) => !sameAsTitle(h.text, meta.summary)).map((h) => (
+            {hits.filter((h) => !sameAsTitle(h.text, meta.summary) && !(showHistorical && h.orderId === historical?.orderId)).map((h) => (
               <div key={`${h.orderId}-${h.at}-${h.who}`} className="well flex flex-col gap-1 px-3.5 py-2.5">
                 <div className="mono text-xs text-muted">{h.who}</div>
                 <div className="answer clamp3">
@@ -168,6 +170,12 @@ function SearchResults({ filter }: { filter: Filter }) {
                 </div>
               </div>
             ))}
+            {showHistorical && historical && (
+              <div className="well flex flex-col gap-1 px-3.5 py-2.5">
+                <div className="mono text-xs text-muted">{historical.source === "operator" ? t.operatorOverride(whoAddress(historical.agentId, agents, meta)) : whoAddress(historical.agentId, agents, meta)}</div>
+                <div className="answer clamp3">{plain(followupPreviewText(historical))}</div>
+              </div>
+            )}
             <div>
               <button type="button" className="linkbtn" onClick={open}>
                 {t.openConv}
@@ -217,6 +225,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
   const agents = useStore((s) => s.agents);
   const live = useStore((s) => s.live[meta.threadId]);
   const bucket = bucketOf(meta);
+  const historical = followupAnswer(meta);
   // "3 min ago" only; an in-progress card's elapsed time ticks in <ElapsedText>.
   const now = useNow(30_000);
   const open = () => navigate({ page: "thread", threadId: meta.threadId, from: filter, channel });
@@ -229,7 +238,7 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
   const first = meta.replies[0];
   const ask = askerOf(t, meta);
   const started = live?.startedAt ?? meta.turnStartedAt ?? (meta.turns <= 1 ? meta.createdAt : undefined);
-  const end = bucket === "answered" ? (first?.at ?? meta.closedAt) : undefined;
+  const end = bucket === "answered" && !historical ? (first?.at ?? meta.closedAt) : undefined;
   const timing =
     bucket === "active"
       ? started
@@ -247,18 +256,25 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
           ? { tone: "warn" as Tone, text: t.taskStatusUnknown }
           : bucket === "active"
             ? { tone: "info" as Tone, text: t.statusWorking }
-            : bucket === "answered" && meta.replies.some((reply) => reply.source === "operator")
-              ? { tone: "warn" as Tone, text: t.operatorOverride(t.list(meta.replies.filter((reply) => reply.source === "operator").map((reply) => whoAddress(reply.agentId, agents, meta)))) }
+            : bucket === "answered" && historical
+              ? { tone: "warn" as Tone, text: t.followupNotDelivered }
+              : bucket === "answered" && meta.replies.some((reply) => reply.source === "operator")
+                ? { tone: "warn" as Tone, text: t.operatorOverride(t.list(meta.replies.filter((reply) => reply.source === "operator").map((reply) => whoAddress(reply.agentId, agents, meta)))) }
               : bucket === "answered"
                 ? { tone: "ok" as Tone, text: t.statusAnswered }
                 : bucket === "cancelled"
                   ? { tone: undefined, text: t.statusCancelled }
                   : { tone: (meta.declines.length ? "warn" : "danger") as Tone, text: t.statusUnanswered };
-  const preview = first
-    ? plain(first.text)
-    : bucket === "unanswered" && meta.declines.length
-      ? meta.declines.map((d) => `${whoAddress(d.agentId, agents, meta)}：${d.reason}`).join(" · ")
-      : undefined;
+  const preview = historical
+    ? plain(followupPreviewText(historical))
+    : first
+      ? plain(first.text)
+      : bucket === "unanswered" && meta.declines.length
+        ? meta.declines.map((d) => `${whoAddress(d.agentId, agents, meta)}：${d.reason}`).join(" · ")
+        : undefined;
+  const previewAgentId = historical?.agentId ?? first?.agentId;
+  const previewAddress = historical?.address ?? (previewAgentId ? whoAddress(previewAgentId, agents, meta) : "");
+  const previewSource = historical?.source ?? first?.source;
 
   return (
     <article
@@ -290,10 +306,10 @@ function ThreadCardImpl({ meta, filter }: { meta: ThreadMeta; filter: Filter }) 
         </div>
       </div>
       <div className="clamp2 text-[15px] font-semibold leading-snug text-fg-strong">{meta.summary || "—"}</div>
-      {bucket === "answered" && first && (
+      {bucket === "answered" && (first || historical) && (
         <div className="truncate text-xs text-muted">
-          <span className={`mono ${first.source === "operator" ? "text-warn" : "text-ok"}`}>{first.source === "operator" ? t.operatorOverride(whoAddress(first.agentId, agents, meta)) : whoAddress(first.agentId, agents, meta)}</span>：{preview}
-          {meta.replies.length > 1 && <span> · {t.moreReplies(meta.replies.length - 1)}</span>}
+          <span className={`mono ${previewSource === "operator" ? "text-warn" : "text-ok"}`}>{previewSource === "operator" ? t.operatorOverride(previewAddress) : previewAddress}</span>：{preview}
+          {first && meta.replies.length > 1 && <span> · {t.moreReplies(meta.replies.length - 1)}</span>}
         </div>
       )}
       {bucket === "unanswered" && preview && <div className="truncate text-xs text-muted">{preview}</div>}

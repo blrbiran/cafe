@@ -36,6 +36,18 @@ describe("cafe serve --exec", () => {
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "GOT:echo ping" });
   });
 
+  it("tells shell Baristas to answer through stdout instead of impersonating their Agent via CLI or MCP", async () => {
+    const { c } = await setup("cat");
+    const res = await c.ask({ body: "inspect the prompt", to: "echo" });
+    const events = await untilClosed(c, res.threadId, res.orderId);
+    const prompt = events.find((e) => e.event.type === "order.replied")?.event as { text: string };
+    expect(prompt.text).toContain("entire stdout is sent back as the reply");
+    expect(prompt.text).toContain("this shell command does not");
+    expect(prompt.text).toContain("If this runtime has no such tools, use the response mechanism above");
+    expect(prompt.text).not.toContain("use the registered Agent tools available to Pi or OMP runtimes");
+    expect(prompt.text).not.toContain("cafe ask --escalate");
+  });
+
   it("CAFE_ATTACH lines on stdout become reply attachments", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cafe-attach-"));
     cleanup.push(() => rmSync(dir, { recursive: true, force: true }));

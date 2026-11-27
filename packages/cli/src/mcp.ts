@@ -47,9 +47,9 @@ const TOOLS = [
         to: { type: "string", description: "Explicit address (name, name@host, name#n@host); skips routing." },
         broadcast: { type: "boolean", description: "Ask every eligible agent. Only when the person explicitly wants everyone; normal questions use routing." },
         threadId: { type: "string", description: "Continue this conversation (follow-up)." },
-        parent_order_id: { type: "string", description: "The Order this question is a sub-Order of (for escalation)." },
+        parent_order_id: { type: "string", description: "The exact parent Order to link; the ID identifies work but grants no authority. Human-owned work requires the verified original owner." },
         parent_thread_id: { type: "string", description: "The Thread holding parent_order_id (needed when it is no longer in memory)." },
-        escalate: { type: "boolean", description: "With parent_order_id: ask the sender of that Order a clarifying question (creates a sub-thread)." },
+        escalate: { type: "boolean", description: "With parent_order_id: a registered Barista that received the parent Order can ask its sender a clarifying question. Standalone cafe mcp/cafe ask has no Barista identity." },
         channel: { type: "string", description: "Message scope (default: the agent's home channel, else default)." },
         collect: { type: "string", enum: ["any", "all"], description: "any: first answer wins; all: wait for every target or the deadline." },
         attachments: { type: "array", items: { type: "string" }, description: "Local file paths to attach; this MCP server reads and uploads them." },
@@ -133,7 +133,21 @@ export function runMcp(opts: McpOptions): Promise<void> {
     new Headers(init.headers).forEach((value, name) => allHeaders.set(name, value));
     const res = await fetch(`${opts.base}${path}`, { ...init, headers: allHeaders, ...(owner || operator ? { redirect: "error" } : {}) });
     const body = (await res.json().catch(() => ({}))) as any;
-    if (!res.ok) throw new ToolError(`${body.error ?? res.status}: ${body.message ?? ""}`.trim());
+    if (!res.ok) {
+      let message = `${body.error ?? res.status}: ${body.message ?? ""}`.trim();
+      if (path === "/api/orders" && typeof init.body === "string") {
+        let request: Record<string, unknown> = {};
+        try {
+          request = JSON.parse(init.body) as Record<string, unknown>;
+        } catch {}
+        if (message.startsWith("not_owner:")) {
+          message += ". This MCP process has no registered Barista identity. Linked work on an agent-origin parent requires its registered Barista runtime; for a human-origin parent, use its verified original owner client. The exact Order ID alone grants no authority.";
+        } else if (request.escalate === true && message.startsWith("not_a_target:")) {
+          message += ". This cafe MCP process has no registered Barista identity; use the registered Agent tools in its Pi or OMP runtime.";
+        }
+      }
+      throw new ToolError(message);
+    }
     return body as T;
   };
 
@@ -162,6 +176,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
     const replies: { from: string; text: string; final: boolean; source?: "agent" | "operator" }[] = [];
     const notes: string[] = [];
     let status: string | undefined;
+    let received = false;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), Math.max(0, seconds) * 1000);
     try {
@@ -179,7 +194,8 @@ export function runMcp(opts: McpOptions): Promise<void> {
           const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
           if (env.orderId !== orderId) continue;
           const e = env.event;
-          if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final, ...(e.source ? { source: e.source } : {}) });
+          if (e.type === "order.acked") received = true;
+          else if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final, ...(e.source ? { source: e.source } : {}) });
           else if (e.type === "order.declined") notes.push(e.skipped ? `${who(e.agentId)} did not answer before the deadline` : `${who(e.agentId)} declined: ${e.reason}`);
           else if (e.type === "order.failed") notes.push(`${e.agentId ? who(e.agentId) : "the question"} failed: ${e.reason}`);
           else if (e.type === "order.cancelled") notes.push(`cancelled by ${e.by}`);
@@ -199,7 +215,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
       ).catch(() => undefined) : Promise.resolve(undefined),
       api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`).catch(() => undefined),
     ]);
-    const lines = [`threadId: ${threadId}`, `orderId: ${orderId}`, `status: ${status ?? "still working"}`];
+    const lines = [`threadId: ${threadId}`, `orderId: ${orderId}`, `status: ${status ?? (received ? "received" : "still working")}`];
     if (thread?.meta.origin === "agent" && thread.meta.provenanceVerified !== true) {
       lines.push(`claimed relay (unverified): ${thread.meta.via?.address ?? thread.meta.from.address}`);
     }
@@ -339,8 +355,9 @@ export function runMcp(opts: McpOptions): Promise<void> {
           capabilities: { tools: {} },
           serverInfo: { name: "cafe", version: opts.version },
           instructions:
-            "cafe routes questions to other agents on the user's machines. Use cafe_agents to see who is there, cafe_ask to ask, " +
-            "cafe_wait when an answer takes longer than one call.",
+            "cafe routes questions to other agents on the user's machines. This MCP server acts as a Customer and has no registered Barista identity. " +
+            "Use cafe_agents to see who is there, cafe_ask to ask, and cafe_wait when an answer takes longer than one call. " +
+            "Exact parent Order IDs identify work but do not grant authority: link human-owned work only from its verified original owner, and use the registered Agent tools in Pi or OMP for Barista escalation.",
         });
       }
       case "ping":

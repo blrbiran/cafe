@@ -5,9 +5,26 @@ import type { Tone } from "./ui/tone.ts";
 
 export type Bucket = "active" | "answered" | "unanswered" | "cancelled";
 
+export function followupAnswer(meta: ThreadMeta): NonNullable<ThreadMeta["followupOutcome"]>["answer"] | undefined {
+  const projection = meta.followupOutcome;
+  if (meta.status !== "failed" || !projection || projection.orderId !== meta.orderId) return undefined;
+  if (projection.answer.orderId === meta.orderId || projection.answer.turn >= meta.turns) return undefined;
+  return projection.answer;
+}
+
+export function followupPreviewText(answer: NonNullable<ThreadMeta["followupOutcome"]>["answer"]): string {
+  return `${answer.text}${answer.truncated ? "…" : ""}`;
+}
+
+export function followupSearchPreview(meta: ThreadMeta, hits: readonly { orderId: string; text: string; at: number; who: string }[]): boolean {
+  const answer = followupAnswer(meta);
+  return !!answer && !hits.some((hit) => hit.orderId === answer.orderId);
+}
+
 export function bucketOf(t: ThreadMeta): Bucket {
   if (t.taskStatus === "working" || t.taskStatus === "awaiting_report" || t.taskStatus === "unknown" || isActive(t.status) || (t.clarification && t.turns === 1)) return "active";
   if (t.status === "cancelled") return "cancelled";
+  if (followupAnswer(t)) return "answered";
   if (t.replies.length > 0) return "answered";
   return "unanswered";
 }
@@ -16,12 +33,12 @@ export function bucketOf(t: ThreadMeta): Bucket {
 export function whoName(id: string, agents: Record<string, AgentRecord>, meta?: ThreadMeta): string {
   const a = agents[id];
   if (a) return a.displayName ?? a.name;
-  const fromMeta = meta?.replies.find((r) => r.agentId === id)?.address ?? meta?.declines.find((d) => d.agentId === id)?.address;
+  const fromMeta = meta?.replies.find((r) => r.agentId === id)?.address ?? (meta?.followupOutcome?.answer.agentId === id ? meta.followupOutcome.answer.address : undefined) ?? meta?.declines.find((d) => d.agentId === id)?.address;
   return fromMeta ? nameOf(fromMeta) : id.slice(-6);
 }
 
 export function whoAddress(id: string, agents: Record<string, AgentRecord>, meta?: ThreadMeta): string {
-  return agents[id]?.address ?? meta?.replies.find((r) => r.agentId === id)?.address ?? meta?.declines.find((d) => d.agentId === id)?.address ?? id.slice(-6);
+  return agents[id]?.address ?? meta?.replies.find((r) => r.agentId === id)?.address ?? (meta?.followupOutcome?.answer.agentId === id ? meta.followupOutcome.answer.address : undefined) ?? meta?.declines.find((d) => d.agentId === id)?.address ?? id.slice(-6);
 }
 
 /**
@@ -60,6 +77,7 @@ export function outcome(t: Dict, meta: ThreadMeta, agents: Record<string, AgentR
       return { tone: "info", text: t.working(names(targets), startedAt ? t.dur(now - startedAt) : "…") };
     }
     case "answered": {
+      if (followupAnswer(meta)) return { tone: "warn", text: t.followupNotDelivered };
       const who = names(meta.replies.map((r) => r.agentId));
       const end = meta.replies[0]?.at ?? meta.closedAt;
       const took = startedAt && end ? t.dur(end - startedAt) : undefined;

@@ -243,10 +243,10 @@ async function awaitBarista(dir: string, timeoutMs = Number(process.env.CAFE_BAR
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const ws = await api<any[]>("/api/baristas").catch(() => []);
-    const failed = ws.find((w) => w.dir === dir && !w.running && (w.state === "failed" || w.lastError));
-    if (failed) return { failed };
+    const worker = ws.find((w) => w.dir === dir && !w.member);
+    if (worker && !worker.running && (worker.state === "failed" || worker.lastError)) return { failed: worker };
     const agents = await api<any[]>("/api/agents").catch(() => []);
-    const mine = agents.find((a) => a.cwd === dir && a.status !== "offline");
+    const mine = agents.find((a) => !a.team && a.cwd === (worker?.cwd ?? dir) && a.status !== "offline");
     if (mine) return { agent: mine.address ?? mine.name };
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -416,7 +416,7 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
     case "order.routed":
       return `→ routed (${e.decision.router}, ${e.decision.mode}) to ${e.decision.targets.map(who).join(", ") || "nobody"}: ${e.decision.reason}`;
     case "order.acked":
-      return `… ${who(e.agentId)} is working on it`;
+      return `… ${who(e.agentId)} received the request`;
     case "order.replied": {
       const speaker = e.source === "operator" ? `operator override for ${who(e.agentId)}` : who(e.agentId);
       return `\n## ${speaker}${e.final ? "" : " (interim)"}\n${e.text}\n`;

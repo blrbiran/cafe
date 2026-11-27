@@ -205,6 +205,14 @@ describe("explicit escalation (v4-11)", () => {
     expect(answer.decision.targets).toEqual([worker.agentId]);
     await waitFor(() => handled.includes("yes"));
     await waitFor(() => restored.daemon.thread(clarification.threadId)?.meta.clarification?.acknowledged === true);
+    await waitFor(() => restored.daemon.thread(clarification.threadId)?.meta.status === "done");
+    expect(await restored.daemon.orderResult(parent.threadId, parent.orderId)).toMatchObject({ taskStatus: "awaiting_report" });
+    await expect(namesake.client.report({ threadId: parent.threadId, orderId: parent.orderId, text: "wrong reporter" })).rejects.toMatchObject({ code: "not_a_target" });
+    await client.report({ threadId: parent.threadId, orderId: parent.orderId, text: "Parser checked with old syntax." });
+    await client.report({ threadId: parent.threadId, orderId: parent.orderId, text: "Parser checked with old syntax." });
+    expect(await restored.daemon.orderResult(parent.threadId, parent.orderId)).toEqual({
+      taskStatus: "done", reports: [{ agentId: worker.agentId, text: "Parser checked with old syntax." }],
+    });
   });
 
   it("replays an accepted answer after restart using its original Order ID", async () => {

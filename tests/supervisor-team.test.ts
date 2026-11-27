@@ -137,6 +137,49 @@ describe("supervisor teams (v4-11)", () => {
     expect(sup.list()).toHaveLength(0);
   });
 
+  it.each(["team", "standalone"] as const)("rejects a second writer after %s starts", (first) => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    const nested = join(roster, "nested");
+    mkdirSync(nested);
+    writeFileSync(join(nested, ".cafe"), "name: standalone\n");
+    const alias = join(dirname(roster), "nested-alias");
+    symlinkSync(nested, alias, "junction");
+    const startTeam = () => sup.startTeam(roster, { ...team, members: [{ ...team.members[0]!, access: "write" }] });
+    const startStandalone = () => sup.start({ dir: alias, access: "workspace-write" });
+    if (first === "team") {
+      startTeam();
+      expect(startStandalone).toThrow(/overlap.*write/i);
+    } else {
+      startStandalone();
+      expect(startTeam).toThrow(/overlap.*write/i);
+    }
+    expect(sup.list()).toHaveLength(1);
+  });
+
+  it("rejects overlapping writers reached with different path casing on case-insensitive volumes", ({ skip }) => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    const nested = join(roster, "Nested");
+    mkdirSync(nested);
+    writeFileSync(join(nested, ".cafe"), "name: standalone\n");
+    const variant = join(dirname(roster), "REPO", "nested");
+    if (!existsSync(variant)) skip();
+    sup.startTeam(roster, { ...team, members: [{ ...team.members[0]!, access: "write" }] });
+    expect(() => sup.start({ dir: variant, access: "workspace-write" })).toThrow(/overlap.*write/i);
+    expect(sup.list()).toHaveLength(1);
+  });
+
+  it("holds the write directory while the stopped worker group is still exiting", async () => {
+    const { home, roster, pidfile } = setup();
+    const sup = supervisor(home);
+    const teamWriter = { ...team, members: [{ ...team.members[0]!, access: "write" as const }] };
+    sup.startTeam(roster, teamWriter);
+    await waitFor(() => existsSync(pidfile));
+    expect(sup.stopTeam(roster, "dev1")).toBe(1);
+    expect(() => sup.startTeam(roster, teamWriter)).toThrow(/still stopping/);
+  });
+
   it("refuses a member with a missing worktree before starting anything", () => {
     const { home, roster } = setup();
     const sup = supervisor(home);

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { keepAlive } from "@cafe/protocol/client";
 import { runMcp } from "../packages/cli/src/mcp.ts";
-import { barista, identity, startDaemon, waitFor } from "./helpers.ts";
+import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
 const CAFE = join(dirname(fileURLToPath(import.meta.url)), "..", "packages", "cli", "bin", "cafe.js");
 
@@ -104,9 +104,35 @@ describe("cafe mcp", () => {
     const forged = await attacker.call("cafe_ask", { question: "unverified linked child", to: "echo", parent_order_id: orderId, parent_thread_id: threadId });
     expect(forged.isError).toBe(true);
     expect(forged.text).toContain("not_owner");
+    expect(forged.text).toContain("agent-origin parent");
+    expect(forged.text).toContain("registered Barista runtime");
+    expect(forged.text).not.toContain("open the conversation on its original Host with the client that asked the question");
     const forgedEscalation = await attacker.call("cafe_ask", { question: "unverified escalation", to: "echo", parent_order_id: orderId, parent_thread_id: threadId, escalate: true });
     expect(forgedEscalation.isError).toBe(true);
     expect(forgedEscalation.text).toContain("not_a_target");
+    expect(forgedEscalation.text).toContain("registered Barista that received the parent Order");
+  });
+
+  it("guides an MCP follow-up that inherits linked parent authority requirements", async () => {
+    const { base, root } = await network();
+    let childThreadId: string | undefined;
+    const lead = await barista(root.addr, identity("lead"), async (h) => {
+      const child = await lead.client.ask({ body: "check the parser", to: "echo", parentThreadId: h.order.threadId, parentOrderId: h.order.orderId });
+      childThreadId = child.threadId;
+      await h.reply("assigned");
+    });
+    cleanup.push(() => lead.client.close());
+    const owner = await customer(root.addr);
+    cleanup.push(() => owner.close());
+    const parent = await owner.ask({ body: "review the release", to: "lead" });
+    await untilClosed(owner, parent.threadId, parent.orderId);
+    await waitFor(() => !!childThreadId);
+
+    const result = await mcpClient(base).call("cafe_ask", { question: "continue child work", threadId: childThreadId! });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("not_owner");
+    expect(result.text).toContain("human-origin parent");
+    expect(result.text).toContain("verified original owner client");
   });
 
   it("returns early with the threadId when the answer is slow; cafe_wait picks it up", async () => {
@@ -114,7 +140,7 @@ describe("cafe mcp", () => {
     const m = mcpClient(base);
     await m.request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "codex", version: "1" }, capabilities: {} });
     const ask = await m.call("cafe_ask", { question: "think", to: "slow", wait_seconds: 0.2 });
-    expect(ask.text).toContain("status: still working");
+    expect(ask.text).toContain("status: received");
     expect(ask.text).toContain("Call cafe_wait");
     const threadId = /threadId: (\S+)/.exec(ask.text)![1]!;
     const wait = await m.call("cafe_wait", { threadId });
@@ -148,7 +174,7 @@ describe("cafe mcp", () => {
     const started = Date.now();
     const capped = await m.call("cafe_ask", { question: "think", to: "slow", wait_seconds: 50 });
     expect(Date.now() - started).toBeLessThan(1150);
-    expect(capped.text).toContain("still working");
+    expect(capped.text).toContain("status: received");
     const threadId = /threadId: (\S+)/.exec(capped.text)![1]!;
     expect((await m.call("cafe_cancel", { threadId })).text).toBe(`cancelled ${threadId}`);
   });
