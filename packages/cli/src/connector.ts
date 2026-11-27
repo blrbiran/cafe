@@ -1,3 +1,4 @@
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import {
   closeSync,
@@ -17,7 +18,7 @@ import {
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
-import { cafeHome, loadConfig } from "@cafe/daemon";
+import { cafeHome, loadConfig, Store } from "@cafe/daemon";
 
 /** What `cafe connector` understands in `cafe-connector.json` (or package.json `cafe.connector`). */
 export interface ConnectorManifest {
@@ -109,6 +110,82 @@ export function installedDir(home: string, name: string): string {
 /** Config + connector state, kept outside the code directory so reinstall preserves it. */
 export function dataDir(home: string, name: string): string {
   return join(home, "connector-data", name);
+}
+
+const connectorKeyPath = (home: string, name: string) => join(dataDir(home, name), "connector.key");
+const connectorPrincipalPath = (home: string, name: string) => join(dataDir(home, name), "connector-principal.json");
+
+interface ConnectorPrincipalFile {
+  marker: "cafe-connector-principal";
+  name: string;
+  principalId: string;
+}
+
+function readConnectorPrincipal(home: string, name: string): { key: string; principalId: string } | undefined {
+  const keyFile = connectorKeyPath(home, name);
+  const principalFile = connectorPrincipalPath(home, name);
+  const hasKey = existsSync(keyFile);
+  const hasPrincipal = existsSync(principalFile);
+  if (!hasKey && !hasPrincipal) return undefined;
+  if (!hasKey || !hasPrincipal) throw new Error(`connector ${name} has incomplete credential state; restore its protected local data before retrying`);
+  const keyStat = statSync(keyFile);
+  const principalStat = statSync(principalFile);
+  if (!keyStat.isFile() || (keyStat.mode & 0o077) !== 0) throw new Error(`connector credential must be a mode-0600 file: ${keyFile}`);
+  if (!principalStat.isFile() || (principalStat.mode & 0o077) !== 0) throw new Error(`connector principal record must be a mode-0600 file: ${principalFile}`);
+  const key = readFileSync(keyFile, "utf8");
+  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error(`invalid connector credential at ${keyFile}`);
+  const principal = readJson<ConnectorPrincipalFile | undefined>(principalFile, undefined);
+  if (principal?.marker !== "cafe-connector-principal" || principal.name !== name || !principal.principalId.startsWith("connector:")) {
+    throw new Error(`invalid connector principal record at ${principalFile}`);
+  }
+  return { key, principalId: principal.principalId };
+}
+
+function ensureConnectorPrincipal(home: string, name: string): { key: string; principalId: string } {
+  const keyFile = connectorKeyPath(home, name);
+  const principalFile = connectorPrincipalPath(home, name);
+  if (existsSync(principalFile) && !existsSync(keyFile)) {
+    throw new Error(`connector ${name} has a principal record but no credential; restore its protected local data before reinstalling`);
+  }
+  mkdirSync(dataDir(home, name), { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(keyFile, randomBytes(32).toString("hex"), { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  if (!existsSync(principalFile)) {
+    try {
+      writeFileSync(principalFile, JSON.stringify({ marker: "cafe-connector-principal", name, principalId: `connector:${randomUUID()}` }), { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  return readConnectorPrincipal(home, name)!;
+}
+
+function registerConnectorPrincipal(home: string, name: string): void {
+  const { key, principalId } = ensureConnectorPrincipal(home, name);
+  const credentialDigest = createHash("sha256").update(key).digest("hex");
+  const store = new Store(home);
+  try {
+    const existing = store.getCallerPrincipal("connector", credentialDigest);
+    if (existing && existing !== principalId) throw new Error(`connector principal mismatch for ${name}; remove and reinstall this connector`);
+    store.putCallerPrincipal({ kind: "connector", credentialDigest, principalId });
+  } finally {
+    store.close();
+  }
+}
+
+function revokeConnectorPrincipal(home: string, name: string): void {
+  const identity = readConnectorPrincipal(home, name);
+  if (!identity) return;
+  const credentialDigest = createHash("sha256").update(identity.key).digest("hex");
+  const store = new Store(home);
+  try {
+    store.removeCallerPrincipal("connector", credentialDigest);
+  } finally {
+    store.close();
+  }
 }
 
 export function connectorConfigPath(home: string, name: string): string {
@@ -309,6 +386,7 @@ export function installConnector(home: string, source: string, opts: { force?: b
   writeMarker(dest, manifest, src);
   const config = ensureConfig(home, manifest);
   mkdirSync(connectorStateDir(home, manifest.name), { recursive: true });
+  registerConnectorPrincipal(home, manifest.name);
   const runtime = ensureDiscordRuntime(dest, manifest.name);
   // npm prunes undeclared symlinks, so link the SDK after installing the runtime.
   linkSdkPackages(dest);
@@ -461,10 +539,14 @@ function connectorEnv(home: string, name: string, manifest: ConnectorManifest, o
   const local = loadConfig(home);
   const daemon = opts.daemon || process.env.CAFE_DAEMON || `127.0.0.1:${local.port}`;
   const token = opts.token || process.env.CAFE_TOKEN || local.token;
+  const credential = readConnectorPrincipal(home, name);
+  const inherited = { ...process.env };
+  delete inherited.CAFE_CONNECTOR_KEY;
   return {
-    ...process.env,
+    ...inherited,
     CAFE_DAEMON: daemon,
     CAFE_TOKEN: token,
+    ...(credential ? { CAFE_CONNECTOR_KEY: credential.key } : {}),
     CAFE_CONNECTOR_NAME: name,
     CAFE_CONNECTOR_CONFIG: configPath,
     CAFE_CONNECTOR_STATE: statePath,
@@ -812,6 +894,7 @@ export async function removeConnector(home: string, name: string, opts: { force?
   const ours = (hasDir && isCafeInstalled(dir)) || (!hasDir && hasData);
   if (!ours && !opts.force) throw new Error(`${dir} was not installed by cafe; use --force to remove it`);
   const stopped = (await stopConnector(home, name)).stopped;
+  revokeConnectorPrincipal(home, name);
   if (hasDir) rmSync(dir, { recursive: true, force: true });
   if (hasData) rmSync(data, { recursive: true, force: true });
   return { removed: true, forced: !ours, stopped, dir };

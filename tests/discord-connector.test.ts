@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -225,7 +226,7 @@ describe("discord attachments end to end (fake platform)", () => {
     const reports: Array<Record<string, unknown>> = [];
     const main = createDiscordConnector({
       platform: async () => fake.platform,
-      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
+      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_KEY: d.connectorKey, CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
       heartbeatMs: 0,
       output: (report) => reports.push(report),
     });
@@ -265,7 +266,7 @@ describe("discord attachments end to end (fake platform)", () => {
     const stateDir = tempDir("cafe-discord-nonce-");
     const { readFileSync, writeFileSync } = await import("node:fs");
     writeFileSync(join(stateDir, "config.json"), JSON.stringify({ token: "x", allowChannels: ["c1"], allowUsers: ["u1"], requireMention: false }));
-    const env = { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") };
+    const env = { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_KEY: d.connectorKey, CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") };
     const connector = (p: typeof fake.platform) => createDiscordConnector({ platform: async () => p, env, heartbeatMs: 0 });
     const fake = fakePlatform();
     const main = connector(fake.platform);
@@ -331,12 +332,18 @@ function fakePlatform() {
 async function daemonWithBarista() {
   const d = await startDaemon("discord");
   cleanups.push(() => d.stop());
+  const connectorKey = randomBytes(32).toString("hex");
+  d.daemon.store.putCallerPrincipal({
+    kind: "connector",
+    credentialDigest: createHash("sha256").update(connectorKey).digest("hex"),
+    principalId: "connector:test-discord",
+  });
   const b = await barista(d.addr, identity("replier", { description: "answers questions" }), async (h) => {
     await h.ack();
     await h.reply(`answered: ${h.order.body}`);
   });
   cleanups.push(() => b.client.close());
-  return d;
+  return Object.assign(d, { connectorKey });
 }
 
 describe("discord connector end to end (fake platform)", () => {
@@ -348,7 +355,7 @@ describe("discord connector end to end (fake platform)", () => {
     const config = { token: "x", allowChannels: ["c1"], allowUsers: ["u1"] };
     const main = createDiscordConnector({
       platform: async () => platform,
-      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
+      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_KEY: d.connectorKey, CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
       heartbeatMs: 0,
     });
     // Provide the config file the SDK reads (token + allowlists).
@@ -372,7 +379,7 @@ describe("discord connector end to end (fake platform)", () => {
     writeFileSync(join(stateDir, "config.json"), JSON.stringify({ token: "x", allowChannels: ["other"] }));
     const main = createDiscordConnector({
       platform: async () => platform,
-      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
+      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_KEY: d.connectorKey, CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
       heartbeatMs: 0,
     });
     const runP = main.run();
@@ -396,7 +403,7 @@ describe("discord conversations: when a message starts a new Thread", () => {
     const fake = fakePlatform();
     const main = createDiscordConnector({
       platform: async () => fake.platform,
-      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
+      env: { CAFE_DAEMON: d.addr, CAFE_TOKEN: "t0k", CAFE_CONNECTOR_KEY: d.connectorKey, CAFE_CONNECTOR_STATE: stateDir, CAFE_CONNECTOR_NAME: "discord", CAFE_CONNECTOR_CONFIG: join(stateDir, "config.json") },
       heartbeatMs: 0,
     });
     const runP = main.run();
