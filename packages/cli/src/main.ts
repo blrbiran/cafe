@@ -631,7 +631,7 @@ program
   .option("--role <role>", "barista or customer", "barista")
   .option("--concurrency <n>", "headless worker processes", "1")
   .option("-y, --yes", "use the defaults without asking")
-  .option("--force", "overwrite an existing .cafe")
+  .option("--force", "replace a standalone identity (preserves team rosters)")
   .action(async (dir: string | undefined, o) => {
     const res = await runInit({ dir, name: o.name, description: o.description, tags: o.tags, scope: o.scope, role: o.role, concurrency: o.concurrency, yes: o.yes, force: o.force });
     out(`created ${res.file}\n\nnext:\n${res.next.map((s) => `  ${s}`).join("\n")}`, res);

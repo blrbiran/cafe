@@ -649,7 +649,7 @@ export default function cafe(pi: ExtensionAPI) {
       description: "list the team roster or select the member this session registers as",
       handler: async (args, ctx) => {
         const teamDir = process.env.CAFE_TEAM_DIR;
-        if (!teamDir) return ctx.ui.notify("CAFE_TEAM_DIR is not set; start this session with --team-dir <roster dir>", "warning");
+        if (!teamDir) return ctx.ui.notify('Restart this session from your shell with CAFE_TEAM_DIR="/path/to/roster" before your usual pi or omp command.', "warning");
         const name = args.trim();
         try {
           if (!name) {

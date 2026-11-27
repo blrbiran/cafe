@@ -100,6 +100,12 @@ describe("cafe init", () => {
 });
 
 describe("help", () => {
+  it("explains that init --force preserves team rosters", () => {
+    const result = cafe(temp(), "init", "--help");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/--force\s+replace a standalone identity.*preserves team rosters/);
+  });
+
   it("shows a quick start and the init command", () => {
     const dir = temp();
     const r = cafe(dir, "--help");

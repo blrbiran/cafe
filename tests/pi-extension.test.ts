@@ -90,6 +90,15 @@ afterEach(async () => {
   delete process.env.CAFE_TEAM_MEMBER;
 });
 
+it("shows a shell startup hint when the team roster directory is missing", async () => {
+  delete process.env.CAFE_TEAM_DIR;
+  const pi = fakePi();
+  cafe(pi.api as any);
+  await pi.runCommand("cafe-team", "", dir);
+  expect(pi.notices.at(-1)).toContain('CAFE_TEAM_DIR="/path/to/roster"');
+  expect(pi.notices.at(-1)).not.toContain("--team-dir");
+});
+
 async function setup(digestIntervalMs?: number) {
   const root = await startDaemon("root", { mode: "root", ...(digestIntervalMs ? { timing: { digestIntervalMs } } : {}) });
   cleanup.push(root.stop);
