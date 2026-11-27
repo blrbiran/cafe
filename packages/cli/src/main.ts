@@ -2024,7 +2024,7 @@ team
   .action(async (names: string[], o) => {
     await ensureDaemon();
     await requireTeamSessions();
-    const { rosterDir } = rosterAt(o.dir, o.teamDir);
+    const rosterDir = resolve(o.teamDir ?? o.dir);
     let stopped = 0;
     if (names.length) {
       for (const m of names) {

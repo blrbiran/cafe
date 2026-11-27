@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,7 +61,7 @@ describe("supervisor teams (v4-11)", () => {
     trustMemberPath(home, roster, "repo", "arch", "../repo-arch");
     const started = sup.startTeam(roster, team);
     expect(started.map((w) => w.member).sort()).toEqual(["arch", "dev1", "dev2"]);
-    expect(started.find((w) => w.member === "arch")!.cwd).toBe(join(dirname(roster), "repo-arch"));
+    expect(started.find((w) => w.member === "arch")!.cwd).toBe(realpathSync(join(dirname(roster), "repo-arch")));
     const logs = new Set(started.map((w) => w.log));
     expect(logs.size).toBe(3);
     await waitFor(() => readFileSync(pidfile, "utf8").split("\n").filter(Boolean).length === 3, 5000);
@@ -78,6 +78,17 @@ describe("supervisor teams (v4-11)", () => {
     expect(sup.stopTeam(roster, "dev1")).toBe(1);
     expect(sup.list().map((w) => w.member).sort()).toEqual(["arch", "dev2"]);
     expect(sup.stopTeam(roster)).toBe(2);
+    expect(sup.list()).toHaveLength(0);
+  });
+
+  it("stops a supervised member through a symlink to the roster directory", () => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    const alias = join(dirname(roster), "roster-alias");
+    symlinkSync(roster, alias, "junction");
+    sup.startTeam(roster, { ...team, members: [team.members[0]!] });
+
+    expect(sup.stopTeam(alias, "dev1")).toBe(1);
     expect(sup.list()).toHaveLength(0);
   });
 

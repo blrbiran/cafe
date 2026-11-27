@@ -460,6 +460,29 @@ describe("mixed-release preflights (v4-12)", () => {
     expect(calls).not.toContain("POST /api/orders");
   });
 
+  it("can stop a team by its recorded directory after its roster disappears", async () => {
+    const http = await import("node:http");
+    const rosterDir = join(home(), "removed-roster");
+    const requests: string[] = [];
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/api/health") return res.end(JSON.stringify({ ok: true, host: "stub", isRoot: true, features: ["teams", "team-sessions"] }));
+      if (req.method === "DELETE" && req.url?.startsWith("/api/baristas?")) {
+        requests.push(req.url);
+        return res.end(JSON.stringify({ stopped: 1 }));
+      }
+      res.writeHead(404).end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanup.push(() => new Promise<void>((r) => server.close(() => r())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const result = await cafeAsync(home(), addr, "team", "stop", "dev1", "--dir", rosterDir);
+    expect(result.status, result.stderr).toBe(0);
+    expect(requests).toEqual([`/api/baristas?dir=${encodeURIComponent(rosterDir)}&team=1&member=dev1`]);
+    expect(result.stdout).toContain("stopped 1");
+  });
+
   it("refuses team stop before any barista write", async () => {
     const { addr, calls } = await oldDaemon();
     const r = await cafeAsync(home(), addr, "team", "stop");

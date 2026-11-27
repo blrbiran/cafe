@@ -360,7 +360,17 @@ export class Supervisor {
   /** Stop supervised workers of one team, optionally one member. Never touches a TUI or plain Barista. */
   stopTeam(rosterDir: string, member?: string): number {
     const target = resolve(rosterDir);
-    const ws = this.workers.filter((w) => w.rosterDir === target && (!member || w.member === member));
+    const matching = (dir: string) => this.workers.filter((w) => w.rosterDir === dir && (!member || w.member === member));
+    let ws = matching(target);
+    // A recorded path still identifies the team if the directory is no longer accessible.
+    if (ws.length === 0) {
+      try {
+        ws = matching(realpathSync(target));
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      }
+    }
     for (const w of ws) this.kill(w);
     this.workers = this.workers.filter((w) => !ws.includes(w));
     this.save();
