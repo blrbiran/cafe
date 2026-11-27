@@ -493,6 +493,31 @@ describe("cafe commands", () => {
     expect(result.stdout).toContain(warning);
   });
 
+  it("passes --write through for standalone Pi and OMP workers", async () => {
+    const http = await import("node:http");
+    const dir = home();
+    let received: Record<string, unknown> | undefined;
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url?.startsWith("/api/health")) return res.end(JSON.stringify({ ok: true, host: "stub", pid: 1, isRoot: true, version: "0.2.0" }));
+      if (req.url === "/api/baristas" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk) => body += chunk);
+        req.on("end", () => { received = JSON.parse(body); res.end(JSON.stringify([{ dir, running: true, state: "running" }])); });
+        return;
+      }
+      if (req.url === "/api/agents") return res.end(JSON.stringify([{ cwd: dir, status: "idle", address: "worker@stub" }]));
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not_found", message: req.url }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const addr = `127.0.0.1:${(server.address() as { port: number }).port}`;
+    const result = await cafeAsync(home(), addr, "barista", "start", "--agent", "pi", "--write", "--dir", dir);
+    expect(result.status, result.stderr).toBe(0);
+    expect(received).toMatchObject({ agent: "pi", access: "workspace-write", dir });
+  });
+
   it("status lists the entry point for each host", () => {
     const r = cafeEnv(home(), home(), "commands", "status");
     expect(r.status, r.stderr).toBe(0);

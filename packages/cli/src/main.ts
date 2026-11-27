@@ -1847,7 +1847,7 @@ barista
     // free-form executable path.
     const spec = {
       ...(o.agent ? { agent: o.agent } : {}),
-      ...(native && o.write ? { access: "workspace-write" } : {}),
+      ...(o.write ? { access: "workspace-write" } : {}),
       ...(native && o.model ? { model: o.model } : {}),
       ...(native && o.tui ? { tui: true } : {}),
       ...(native && o.thread ? { thread: o.thread } : {}),
