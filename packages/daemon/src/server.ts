@@ -4,10 +4,10 @@ import { createSecureContext, TLSSocket, type SecureContext } from "node:tls";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { networkInterfaces } from "node:os";
-import { createReadStream, createWriteStream, existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { Readable } from "node:stream";
 import { finished, pipeline } from "node:stream/promises";
-import { dirname, extname, join, resolve } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ulid } from "ulid";
 import { WebSocketServer } from "ws";
@@ -19,6 +19,7 @@ import { homeId, loadConfig, saveConfig } from "./config.ts";
 import { eventMatches, parseEventFilter, replayAfter } from "./events.ts";
 import { listRouterModels } from "./router.ts";
 import { connectorStatuses } from "./connector-status.ts";
+import { readPathGrants, trustMemberPath } from "./team-paths.ts";
 
 /** pi's model catalogue is expensive to build; settings can ask for it repeatedly. */
 let modelCache: { at: number; models: string[] } | undefined;
@@ -939,6 +940,31 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   if (m === "DELETE" && (match = /^\/api\/agents\/([^/]+)$/.exec(path))) {
     daemon.kick(match[1]!);
     return send(res, 200, { ok: true });
+  }
+  if ((m === "GET" || m === "POST") && path === "/api/team-paths") {
+    const operatorKey = req.headers["x-cafe-operator-key"];
+    if (!isLoopback(req) || typeof operatorKey !== "string" || !daemon.verifyOperatorCredential(operatorKey)) {
+      throw new RpcError("operator_required", "team path grants require the local operator credential");
+    }
+    try {
+      if (m === "GET") {
+        const dir = url.searchParams.get("rosterDir");
+        const root = dir ? realpathSync(resolve(dir)) : undefined;
+        return send(res, 200, readPathGrants(daemon.store.home).filter((grant) => !root || grant.rosterRoot === root));
+      }
+      const input = await readJson(req);
+      if (typeof input?.rosterDir !== "string" || !input.rosterDir || typeof input.member !== "string" || !input.member || typeof input.path !== "string" || !input.path) {
+        throw new RpcError("bad_request", "rosterDir, member and path are required");
+      }
+      const root = realpathSync(resolve(input.rosterDir));
+      const roster = readCafeFile(join(root, ".cafe"));
+      if (!roster.team) throw new RpcError("bad_request", "the file does not declare a team");
+      const target = realpathSync(resolve(root, input.path));
+      return send(res, 200, trustMemberPath(daemon.store.home, root, roster.team.name ?? roster.name, input.member, relative(root, target)));
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError("bad_request", (err as Error).message);
+    }
   }
   if (m === "GET" && path === "/api/teams") return send(res, 200, daemon.teams());
   if (m === "DELETE" && path === "/api/teams") {

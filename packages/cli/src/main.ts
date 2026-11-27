@@ -1907,6 +1907,28 @@ const rosterAt = (dir: string, teamDir?: string) => {
 
 const team = program.command("team").description("agent teams declared in .cafe (v4-11)");
 team
+  .command("trust-path <rosterDir> <member> <path>")
+  .description("allow this team's member to use its declared external directory on this Host")
+  .action(async (rosterDir: string, member: string, path: string) => {
+    const key = localOperatorKey();
+    const grant = await api<{ grantId: string; realPath: string }>("/api/team-paths", {
+      method: "POST", headers: { "x-cafe-operator-key": key }, redirect: "error",
+      body: JSON.stringify({ rosterDir: resolve(rosterDir), member, path }),
+    });
+    out(`allowed ${member} to use ${grant.realPath} (grant ${grant.grantId})`, grant);
+  });
+team
+  .command("paths [rosterDir]")
+  .description("list this Host's external team directory grants")
+  .action(async (rosterDir?: string) => {
+    const key = localOperatorKey();
+    const query = rosterDir ? `?rosterDir=${encodeURIComponent(resolve(rosterDir))}` : "";
+    const grants = await api<Array<{ grantId: string; team: string; member: string; target: string; state: string }>>(`/api/team-paths${query}`, {
+      headers: { "x-cafe-operator-key": key }, redirect: "error",
+    });
+    out(grants.map((grant) => `${grant.team}/${grant.member}: ${grant.target} (${grant.state}, ${grant.grantId})`).join("\n") || "no external team directory grants", grants);
+  });
+team
   .command("start")
   .argument("[members...]", "only these roster members")
   .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
