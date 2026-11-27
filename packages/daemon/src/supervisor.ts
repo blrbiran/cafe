@@ -1,7 +1,8 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { TeamLaunchSpec, type TeamMember, type TeamSpec } from "@cafe/protocol";
@@ -29,7 +30,7 @@ export interface BaristaSpec {
   team?: { rosterDir: string; spec: TeamSpec };
 }
 
-interface Worker {
+export interface Worker {
   spec: BaristaSpec;
   slot: number;
   /** Roster member this worker runs (team specs only). */
@@ -43,6 +44,7 @@ interface Worker {
   restarts: number;
   launchedAt?: number;
   timer?: ReturnType<typeof setTimeout>;
+  pendingProbe?: Promise<void>;
   stopping: boolean;
   /** Consecutive exits soon after launch; resets after a healthy run. */
   quickFailures: number;
@@ -103,6 +105,8 @@ export interface SupervisorOptions {
   cliBin?: string;
   /** Lifecycle lines for the daemon log (a worker that keeps failing, or gives up). */
   log?: (msg: string) => void;
+  /** Override the isolated Pi/OMP no-model isolation probe (tests only). */
+  probeScript?: string;
   /** Give up after this many consecutive failed starts (default 3). */
   failAfter?: number;
   /** An exit this soon after launch counts as a failed start (default 30s). */
@@ -114,8 +118,111 @@ const GUARD = join(here, "proc", "guard.mjs");
 /** After a worker's leader exits, give the pipes this long, then SIGKILL the group (grandchildren). */
 const EXIT_DRAIN_MS = 1000;
 const EXIT_NOT_FOUND = 127;
+const PI_READONLY_TOOLS = "read,grep,find,ls,cafe_ask,cafe_agents,cafe_reply,cafe_decline";
+const OMP_READONLY_TOOLS = "read,grep,glob,cafe_ask,cafe_agents,cafe_reply,cafe_decline";
 
-/** The cafe pi extension: `CAFE_PI_EXTENSION`, else the installed `@cafe/pi-extension`, else the sibling workspace package. */
+export function readonlyToolArgs(agent: "pi" | "omp", cafeExtension: string): string[] {
+  const tools = agent === "pi" ? PI_READONLY_TOOLS : OMP_READONLY_TOOLS;
+  return ["--tools", tools, ...(agent === "pi" ? ["--no-mcp"] : []), "--no-extensions", "-e", cafeExtension];
+}
+
+export interface ProbeResult { supported: boolean; binaryHash: string; reason?: string; fromCache?: boolean; }
+
+function hashFile(path: string): string { return createHash("sha256").update(readFileSync(path)).digest("hex"); }
+
+const PI_VERSION = "1.6.0";
+const OMP_VERSION = "19.0.1";
+
+function isPiRuntime(value: string): boolean { return /^pi[ @]/i.test(value.trim()); }
+function isOmpRuntime(value: string): boolean { return /^omp\//i.test(value.trim()); }
+/** The runtime kind a binary path refers to; a custom binary is neither and keeps the legacy launch. */
+function agentKind(bin: string): "pi" | "omp" | undefined {
+  const name = basename(bin).toLowerCase();
+  return name === "pi" ? "pi" : name === "omp" ? "omp" : undefined;
+}
+function compatibleRuntime(binary: string, agent: "pi" | "omp"): boolean {
+  const version = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 5000 });
+  if (version.error || version.status !== 0) return false;
+  const reported = `${version.stdout}${version.stderr}`.trim();
+  return agent === "pi" ? isPiRuntime(reported) || (!isOmpRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported)) : isOmpRuntime(reported) || (!isPiRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported));
+}
+function compatibleVersion(reported: string, agent: "pi" | "omp"): boolean {
+  const clean = reported.trim();
+  const expected = agent === "pi" ? PI_VERSION : OMP_VERSION;
+  if (isOmpRuntime(clean)) return clean === `omp/${expected}`;
+  if (isPiRuntime(clean)) return clean === `pi ${expected}` || clean === `pi@${expected}`;
+  return clean === expected;
+}
+
+function localProbe(binary: string, agent: "pi" | "omp", _extension: string, flags: string[]): Promise<{ supported: boolean; reason?: string }> {
+  const required = agent === "pi" ? ["--tools", "--no-mcp", "--no-extensions", "-e"] : ["--tools", "--no-extensions", "-e"];
+  const help = spawnSync(binary, ["--help"], { encoding: "utf8", timeout: 5000 });
+  if (help.error || help.status !== 0 || !required.every((flag) => help.stdout.includes(flag))) return Promise.resolve({ supported: false, reason: "runtime does not advertise the required isolation flags" });
+  const version = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 5000 });
+  if (version.error || version.status !== 0) return Promise.resolve({ supported: false, reason: "runtime version is not in Cafe's tested read-only table" });
+  const reported = `${version.stdout}${version.stderr}`.trim();
+  const named = agent === "pi" ? isPiRuntime(reported) || (!isOmpRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported)) : isOmpRuntime(reported) || (!isPiRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported));
+  if (!named || !compatibleVersion(reported, agent)) return Promise.resolve({ supported: false, reason: "runtime version is not in Cafe's tested read-only table" });
+  const marker = join(tmpdir(), `cafe-probe-side-effect-${process.pid}-${Date.now()}`);
+  const child = spawn(binary, ["--mode", "rpc", "--no-session", "--profile", marker, ...flags], {
+    cwd: tmpdir(), env: { HOME: marker, XDG_CONFIG_HOME: join(marker, ".config"), CAFE_DAEMON: "", CAFE_TOKEN: "", CAFE_PROBE: "1", PI_OFFLINE: "1" }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => stdout += chunk);
+  child.stderr.on("data", (chunk) => stderr += chunk);
+  child.on("error", () => {});
+  child.stdin.write(JSON.stringify({ command: "get_available_tools", id: 1 }) + "\n" + JSON.stringify({ command: "mcp__fake__write", id: 2 }) + "\n");
+  child.stdin.end();
+  const exited = new Promise<number | null>((resolve) => child.once("close", resolve));
+  const killer = setTimeout(() => child.kill("SIGKILL"), 5000);
+  return Promise.race([exited, new Promise<null>((resolve) => setTimeout(() => resolve(null), 5200))]).then(async (code) => {
+    clearTimeout(killer);
+    if (code === null) { try { child.kill("SIGKILL"); } catch {} return { supported: false, reason: "runtime isolation probe timed out" }; }
+    if (existsSync(marker)) return { supported: false, reason: "fake MCP side effect observed" };
+    const expected = agent === "pi" ? ["read", "grep", "find", "ls", "cafe_ask", "cafe_agents", "cafe_reply", "cafe_decline"] : ["read", "grep", "glob", "cafe_ask", "cafe_agents", "cafe_reply", "cafe_decline"];
+    const lower = `${stdout}\n${stderr}`.toLowerCase();
+    return expected.every((tool) => lower.includes(tool)) ? { supported: true } : { supported: false, reason: "runtime did not accept Cafe's read-only tool allowlist" };
+  }).finally(() => { try { rmSync(marker, { recursive: true, force: true }); } catch {} });
+}
+
+/**
+ * Hold a read-only launch until its exact executable and Cafe-extension hashes have passed an
+ * isolated no-model probe. Tests inject probeScript; production uses the sibling helper.
+ */
+export async function probeReadonlyRuntime(binary: string, agent: "pi" | "omp", cafeExtension: string, opts: { home: string; probeScript?: string }): Promise<ProbeResult> {
+  let realBinary: string;
+  try { realBinary = realpathSync(resolve(binary)); }
+  catch { return { supported: false, binaryHash: "", reason: `agent executable not found: ${binary}` }; }
+  let realExtension: string;
+  try { realExtension = realpathSync(resolve(cafeExtension)); }
+  catch { return { supported: false, binaryHash: hashFile(realBinary), reason: `Cafe extension not found: ${cafeExtension}` }; }
+  if (!existsSync(realExtension)) return { supported: false, binaryHash: hashFile(realBinary), reason: `Cafe extension not found: ${cafeExtension}` };
+  const binaryHash = hashFile(realBinary);
+  const extensionHash = hashFile(realExtension);
+  const cacheFile = join(opts.home, "runtime-probes.json");
+  mkdirSync(opts.home, { recursive: true, mode: 0o700 });
+  const cache: Record<string, ProbeResult> = existsSync(cacheFile) ? JSON.parse(readFileSync(cacheFile, "utf8")) : {};
+  const key = `${realBinary}:${binaryHash}:${extensionHash}`;
+  if (cache[key]?.supported) return { ...cache[key], fromCache: true };
+  if (!compatibleRuntime(realBinary, agent)) return { supported: false, binaryHash, reason: "runtime version is not in Cafe's tested read-only table" };
+  const flags = readonlyToolArgs(agent, realExtension);
+  let outcome: { supported?: boolean; reason?: string };
+  if (opts.probeScript) {
+    const result = spawnSync(process.execPath, [opts.probeScript, realBinary, agent, realExtension, ...flags], {
+      cwd: tmpdir(), env: { ...process.env, HOME: opts.home, XDG_CONFIG_HOME: join(opts.home, "xdg"), CAFE_DAEMON: "", CAFE_TOKEN: "", PI_OFFLINE: "1" },
+      encoding: "utf8", timeout: 5000,
+    });
+    try { outcome = JSON.parse(result.stdout.trim().split(/\n/).pop()!); } catch { outcome = { supported: false, reason: result.error?.message ?? `probe exited ${result.status}` }; }
+  } else {
+    outcome = await localProbe(realBinary, agent, realExtension, flags);
+  }
+  const response = { supported: !!outcome.supported, binaryHash, ...(outcome.reason ? { reason: outcome.reason } : {}) };
+  if (response.supported) cache[key] = response; else delete cache[key];
+  writeAtomic(cacheFile, JSON.stringify(cache, null, 2));
+  return response;
+}
+
 export function defaultExtensionPath(): string {
   if (process.env.CAFE_PI_EXTENSION) return process.env.CAFE_PI_EXTENSION;
   // Published package: dist/cli.js sits next to dist/pi-extension.js.
@@ -160,6 +267,8 @@ export class Supervisor {
   private readonly log: (msg: string) => void;
   private readonly failAfter: number;
   private readonly quickExitMs: number;
+  private readonly home: string;
+  private readonly probeScript?: string;
 
   constructor(opts: SupervisorOptions) {
     this.file = join(opts.home, "baristas.json");
@@ -173,6 +282,8 @@ export class Supervisor {
     this.log = opts.log ?? (() => {});
     this.failAfter = opts.failAfter ?? 3;
     this.quickExitMs = opts.quickExitMs ?? 30_000;
+    this.home = opts.home;
+    this.probeScript = opts.probeScript;
     this.env = {
       ...process.env,
       CAFE_DAEMON: opts.daemonAddr,
@@ -270,7 +381,7 @@ export class Supervisor {
         dir,
         team: { rosterDir: dir, spec: { ...team, members: [member] } },
         ...(native ? { agent: runner } : flavor === "omp" ? { bin: "omp" } : {}),
-        ...(member.access ? { access: member.access === "read-only" ? "read-only" : "workspace-write" } : {}),
+        access: member.access === "write" ? "workspace-write" : "read-only",
       };
       const w: Worker = {
         spec: base,
@@ -332,6 +443,7 @@ export class Supervisor {
 
   /** Signal every worker group (SIGTERM, SIGKILL after the grace) and resolve once they are gone or the grace passed. */
   async shutdown(): Promise<void> {
+    await Promise.allSettled(this.workers.map((w) => w.pendingProbe).filter((p): p is Promise<void> => !!p));
     const groups = this.workers.map((w) => w.child?.pid).filter((p): p is number => !!p);
     for (const w of this.workers) this.kill(w);
     const deadline = Date.now() + this.graceMs + 500;
@@ -341,6 +453,25 @@ export class Supervisor {
   // ---------------------------------------------------------------------------
 
   private launch(w: Worker): void {
+    const kind = agentKind(w.spec.bin ?? this.piBin);
+    if (!w.spec.agent && w.spec.access !== "workspace-write" && kind) {
+      const agent = kind;
+      w.pendingProbe = probeReadonlyRuntime(w.spec.bin ?? this.piBin, agent, this.extension, { home: this.home, probeScript: this.probeScript }).then((probe) => {
+        if (w.stopping || w.child || w.failed) return;
+        if (!probe.supported) {
+          w.failed = true;
+          w.lastError = `read-only ${agent} runtime is unsupported: ${probe.reason ?? "isolation probe failed"}`;
+          this.save();
+          return;
+        }
+        this.spawn(w);
+      }).finally(() => { if (w.pendingProbe) delete w.pendingProbe; });
+      return;
+    }
+    this.spawn(w);
+  }
+
+  private spawn(w: Worker): void {
     mkdirSync(this.logDir, { recursive: true });
     let log: CappedLineFile | undefined;
     w.tail = [];
@@ -375,7 +506,11 @@ export class Supervisor {
           ...(w.spec.tui ? ["--tui"] : []),
           ...(w.spec.thread ? ["--thread", w.spec.thread] : []),
         ]
-      : [GUARD, bin, "--mode", "rpc", "--no-session", "-e", this.extension, ...(w.spec.args ?? [])];
+      : [GUARD, bin, "--mode", "rpc", "--no-session", ...(
+          w.spec.access === "workspace-write" || !agentKind(bin)
+            ? ["-e", this.extension]
+            : readonlyToolArgs(agentKind(bin)!, this.extension)
+        ), ...(w.spec.args ?? [])];
     const env = w.member ? { ...this.env, CAFE_TEAM_MEMBER: w.member, CAFE_TEAM_DIR: w.rosterDir! } : this.env;
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.
     const child = spawn(process.execPath, args, { cwd: workDir, env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
