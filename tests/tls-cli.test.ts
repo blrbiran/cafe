@@ -59,8 +59,9 @@ describe("cafe root show", () => {
     writeFileSync(join(h, "tls", "ca.crt"), ca.cert);
     const r = cafe(h, "root", "show");
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain(`cafe connect 10.1.2.3:47821 --token <token> --ca-fingerprint sha256:${ca.fingerprint256}`);
+    expect(r.stdout).toContain(`cafe connect 10.1.2.3:47822 --token <token> --invite <code> --ca-fingerprint sha256:${ca.fingerprint256}`);
     expect(r.stdout).toContain("cafe config get token");
+    expect(r.stdout).toContain("cafe host invite");
     expect(r.stdout).not.toContain("s3cret-token-value");
   });
 

@@ -9,7 +9,7 @@ import { Command, CommanderError } from "commander";
 import { onlineVersions, renderTeamPlaybook, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configKeyPath, isConfigKey, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
-import { fingerprintOf, generateHostKeyPair, hostIdFromCertificate, issueLeaf, keyFingerprintOf, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
+import { fingerprintOf, generateHostKeyPair, hostIdFromCertificate, issuedBy, issueLeaf, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { discoverTls, enrollHostFromRoot, trustCaForClient, tlsAddressOf } from "../../daemon/src/tls/bootstrap.ts";
@@ -1324,37 +1324,64 @@ program
     let enrolledRootId: string | undefined;
     if (o.invite) {
       if (!/^[0-9a-f]{64}$/.test(o.invite)) throw new Error("--invite must be the 64-hex code printed by `cafe host invite`");
-      const config = loadConfig(cafeHome(), { persist: true });
-      const discovered = await discoverTls(clean, { ca: undefined, timeoutMs: 10_000 });
+      const home = cafeHome();
+      const config = loadConfig(home);
+      const discovered = await discoverTls(clean, { timeoutMs: 10_000 });
       if (!discovered.ca || !discovered.rootHostId) throw new Error(`the Root at ${clean} does not expose TLS Host identity; upgrade and restart the Root first`);
-      if (pin && fingerprintOf(discovered.ca) !== pin) throw new Error(`CA fingerprint mismatch: expected ${pin}, got ${fingerprintOf(discovered.ca)}`);
       const rootCa = discovered.ca;
+      const fingerprint = fingerprintOf(rootCa);
+      const previousPin = pin ?? (config.mode === "daemon" && config.root ? config.security.tls.caFingerprint : undefined);
+      if (previousPin && fingerprint !== normalizeFingerprint(previousPin)) throw new Error(`CA fingerprint mismatch: expected ${previousPin}, got ${fingerprint}`);
+      if (config.mode === "daemon" && config.root && config.security.tls.rootHostId && config.security.tls.rootHostId !== discovered.rootHostId) {
+        throw new Error("this Host is configured for a different Root Host identity");
+      }
       const rootTls = await tlsAddressOf(clean, { ca: rootCa });
-      const keys = await generateHostKeyPair();
-      const requestIdPath = join(cafeHome(), "host-enroll.request-id");
-      let requestId: string;
-      try {
-        requestId = readFileSync(requestIdPath, "utf8").trim();
-      } catch {
-        requestId = randomBytes(16).toString("hex");
-        writeFileSync(requestIdPath, requestId, { mode: 0o600 });
+      const dir = join(home, "tls");
+      mkdirSync(dir, { recursive: true });
+      // An exact retry must use the same key and SANs, including when the first response was lost.
+      const pending = join(dir, `enroll-${createHash("sha256").update(o.invite).digest("hex")}.json`);
+      const readPending = () => JSON.parse(readFileSync(pending, "utf8")) as {
+        requestId: string; publicKey: string; privateKey: string; sans: string[]; fingerprint: string; rootHostId: string;
+      };
+      if (!existsSync(pending)) {
+        const keys = await generateHostKeyPair();
+        const sans = sanList({ host: config.host, advertise: config.advertise, lan: localAddresses(), extra: config.security.tls.sans });
+        try {
+          writeFileSync(pending, JSON.stringify({ ...keys, sans, requestId: randomBytes(32).toString("hex"), fingerprint, rootHostId: discovered.rootHostId }), { mode: 0o600, flag: "wx", flush: true });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        }
       }
-      const sans = sanList({ host: config.host, advertise: config.advertise, lan: localAddresses(), extra: config.security.tls.sans });
-      const enrolled = await enrollHostFromRoot(rootTls, rootCa, o.token, { inviteCode: o.invite, requestId, publicKey: keys.publicKey, sans });
-      if (!enrolled.cert || !enrolled.hostId || hostIdFromCertificate(enrolled.cert) !== enrolled.hostId) {
-        throw new Error("the Root returned a certificate without the matching Host ID");
+      const saved = readPending();
+      if (saved.fingerprint !== fingerprint || saved.rootHostId !== discovered.rootHostId) throw new Error("the previous enrollment attempt pinned a different Root");
+      const enrolled = await enrollHostFromRoot(rootTls, rootCa, o.token, {
+        rootHostId: saved.rootHostId, inviteCode: o.invite, requestId: saved.requestId, publicKey: saved.publicKey, sans: saved.sans,
+      });
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(enrolled.host) || !enrolled.cert || !enrolled.hostId ||
+          hostIdFromCertificate(enrolled.cert) !== enrolled.hostId || !issuedBy(rootCa, enrolled.cert) ||
+          keyFingerprintOf(enrolled.cert) !== keyFingerprintOfPublicKey(saved.publicKey)) {
+        throw new Error("the Root returned a certificate without the matching Host identity or public key");
       }
-      mkdirSync(join(cafeHome(), "tls"), { recursive: true });
-      writeFileSync(tlsPaths(cafeHome(), config.host).leafCertPath, enrolled.cert, { mode: 0o644 });
-      writeFileSync(tlsPaths(cafeHome(), config.host).leafKeyPath, keys.privateKey, { mode: 0o600 });
+      writeLeaf(home, enrolled.host, { cert: enrolled.cert, key: saved.privateKey });
+      const caFile = config.security.tls.ca ?? tlsPaths(home, enrolled.host).caPath;
+      writeFileSync(caFile, rootCa, { mode: 0o644 });
+      config.host = enrolled.host;
+      config.mode = "daemon";
+      config.root = clean;
+      config.token = o.token;
+      config.security.mode = "tls";
+      config.security.tls.caFingerprint = fingerprint;
+      config.security.tls.rootHostId = saved.rootHostId;
+      saveConfig(config, home);
+      pin = fingerprint;
       enrolledHostId = enrolled.hostId;
-      enrolledRootId = discovered.rootHostId;
+      enrolledRootId = saved.rootHostId;
+    } else {
+      setConfigValue("mode", "daemon");
+      setConfigValue("root", clean);
+      setConfigValue("token", o.token);
+      if (pin) setConfigValue("security.tls.caFingerprint", pin);
     }
-    setConfigValue("mode", "daemon");
-    setConfigValue("root", clean);
-    setConfigValue("token", o.token);
-    if (pin) setConfigValue("security.tls.caFingerprint", pin);
-    if (enrolledRootId) setConfigValue("security.tls.rootHostId", enrolledRootId);
     out(
       enrolledHostId
         ? `enrolled Host ${enrolledHostId} with Root ${enrolledRootId}; restart required: cafe daemon restart`
@@ -1545,7 +1572,7 @@ root
 root
   .command("show")
   .description("print the Root this Daemon uses and the TLS CA fingerprint to enrol other Hosts")
-  .action(() => {
+  .action(async () => {
     const c = loadConfig();
     const tls = readTlsConfig(c);
     const caPath = tls.ca ?? join(cafeHome(), "tls", "ca.crt");
@@ -1575,7 +1602,20 @@ root
     const fingerprint = fingerprintOf(readFileSync(caPath, "utf8"));
     // On the Root: the command another machine runs to join (the token is read here, never printed).
     // Every candidate address unless `advertise` pins one (#95).
-    const joinInfo = c.mode === "root" ? joinText({ ...joinAddresses({ advertise: c.advertise, port: c.port, lan: localAddresses() }), fingerprint }) : undefined;
+    let candidates = joinAddresses({ advertise: c.advertise, port: c.port, tlsPort: tls.mode === "tls" ? tls.port : undefined, lan: localAddresses() });
+    if (c.mode === "root" && tls.mode === "tls" && tls.port === 0 && /^http:\/\/(?:127\.0\.0\.1|localhost):\d+$/.test(base())) {
+      try {
+        const signal = AbortSignal.timeout(500);
+        const health = await fetch(`${base()}/api/health`, { signal }).then((response) => response.json());
+        if (health.isRoot && health.homeId === homeId()) {
+          const settings = await fetch(`${base()}/api/settings`, { signal }).then((response) => response.json());
+          if (settings.join?.addresses?.length) candidates = settings.join;
+        }
+      } catch {
+        // If the daemon is not reachable, the configured main address is the discovery endpoint.
+      }
+    }
+    const joinInfo = c.mode === "root" ? joinText({ ...candidates, fingerprint, invitationRequired: tls.mode === "tls" }) : undefined;
     const howTo = joinInfo ? `\n${joinInfo.text}` : "";
     out(`${where}\nsha256:${fingerprint}${howTo}`, {
       mode: c.mode,

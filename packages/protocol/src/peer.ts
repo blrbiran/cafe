@@ -28,6 +28,12 @@ export class Peer {
   private fallback?: (method: string, params: any, peer: Peer) => unknown | Promise<unknown>;
   /** Free-form slot for connection state (kind, agentId, host...). */
   meta: Record<string, any> = {};
+  #hostIdentity?: Readonly<{ hostId: string; keyFingerprint: string }>;
+  get hostIdentity() { return this.#hostIdentity; }
+  bindHostIdentity(identity: { hostId: string; keyFingerprint: string }): void {
+    if (this.#hostIdentity) throw new RpcError("bad_identity", "Host identity already bound");
+    this.#hostIdentity = Object.freeze({ ...identity });
+  }
   isClosed = false;
   private socket: FrameSocket;
 
@@ -64,6 +70,7 @@ export class Peer {
   }
 
   async receive(raw: string): Promise<void> {
+    if (this.isClosed) return;
     let frame: Frame;
     try {
       frame = JSON.parse(raw);

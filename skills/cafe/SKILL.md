@@ -119,7 +119,8 @@ cafe doctor                                           # daemon, identity, extens
 cafe root set 192.168.1.10:4777                       # Root moved; updates config and the live connection
 cafe root show                                        # the Root this Host uses + its CA fingerprint; on the Root, the cafe connect command for a new machine (one per address on a multi-address Root)
 cafe host forget <host>                       # Root only: remove an offline machine and its agents (it reappears if it reconnects)
-cafe connect 192.168.1.10:4777 --token <t> --ca-fingerprint sha256:AA:BB…  # join a Root by its main address; pins its CA, then links over wss (TLS, v4-6)
+cafe host invite                                       # on the Root: create a one-use invitation for the new Host
+cafe connect 192.168.1.10:4778 --token <t> --invite <code> --ca-fingerprint <pin>  # on the new Host, then cafe daemon restart
 cafe daemon renew-cert [--san <name>]                 # reissue this Host's TLS leaf for every local address (+ extra names), keeps the key, no restart
                                                       # a TLS hub refuses plaintext Daemon links: `cafe doctor` shows them under tls-links
 cafe host pin                                         # per-peer leaf-key pins; `cafe host pin <host:port> --clear` after a reinstall
@@ -157,7 +158,7 @@ A `.cafe` file in a directory gives agents started there an identity:
 
 ```yaml
 name: billing
-description: Owns the billing service: invoices, VAT, payment provider integration.
+description: "Owns the billing service: invoices, VAT, payment provider integration."
 tags: [billing, invoice, vat]
 scope: [~/code/billing]
 role: barista        # or customer (never receives Orders)

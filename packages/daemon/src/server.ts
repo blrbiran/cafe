@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { createSecureContext, type SecureContext } from "node:tls";
+import { createSecureContext, TLSSocket, type SecureContext } from "node:tls";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { networkInterfaces } from "node:os";
@@ -306,6 +306,7 @@ export interface TlsServerOptions {
    * without a restart. Live connections keep theirs.
    */
   current(): { cert: string; key: string };
+  currentCa?(): string;
   /** Registers a callback the daemon calls after swapping in a renewed leaf. Returns an unsubscribe. */
   onRenew?(fn: () => void): () => void;
 }
@@ -435,7 +436,9 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
       counts.ws++;
       ws.on("close", () => (counts.ws = Math.max(0, counts.ws - 1)));
       // The same handler serves both listeners; only a socket from the TLS listener is encrypted (#89).
-      daemon.accept(ws, isLoopback(req), (req.socket as { encrypted?: boolean }).encrypted === true);
+      const tls = req.socket instanceof TLSSocket ? req.socket : undefined;
+      const certificate = tls?.authorized ? tls.getPeerX509Certificate() : undefined;
+      daemon.accept(ws, isLoopback(req), tls?.encrypted === true, certificate);
     });
   };
 
@@ -515,14 +518,14 @@ function createTlsServer(
   onRequest: (req: IncomingMessage, res: ServerResponse) => void,
   onUpgrade: (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer) => void,
 ): import("node:https").Server {
-  const leaf = () => tls.current();
-  let current = createSecureContext(leaf());
+  const credentials = () => ({ ...tls.current(), ca: tls.currentCa?.() ?? tls.ca });
+  let current = createSecureContext(credentials());
   const server = createHttpsServer(
     {
-      ...leaf(),
-      ca: tls.ca,
-      // No client certificate this round: agent identity/cert lifecycle is phase 2.
-      requestCert: false,
+      ...credentials(),
+      requestCert: true,
+      // HTTP, UI and Agent clients do not need certificates. Host RPC checks authorization on initialize.
+      rejectUnauthorized: false,
       SNICallback: (_servername: string, cb: (err: Error | null, ctx?: SecureContext) => void) => {
         try {
           cb(null, current);
@@ -540,7 +543,7 @@ function createTlsServer(
    * context they negotiated, so renewal never interrupts them.
    */
   tls.onRenew?.(() => {
-    const fresh = leaf();
+    const fresh = credentials();
     current = createSecureContext(fresh);
     server.setSecureContext(fresh);
   });

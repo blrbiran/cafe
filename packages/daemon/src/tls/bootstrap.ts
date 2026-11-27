@@ -2,10 +2,11 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { request } from "node:https";
 import { request as httpRequest } from "node:http";
-import { setDefaultCACertificates, getCACertificates } from "node:tls";
+import { checkServerIdentity, setDefaultCACertificates, getCACertificates } from "node:tls";
+import { X509Certificate } from "node:crypto";
 import { ensureCaAsync, tlsPaths } from "./store.ts";
 import { enrollFingerprint, type TlsConfig } from "./trust.ts";
-import { fingerprintOf, generateCa, type CertPair } from "./certs.ts";
+import { fingerprintOf, generateCa, hostIdFromCertificate, keyFingerprintOf, keyFingerprintOfPublicKey, type CertPair } from "./certs.ts";
 
 /**
  * Trust bootstrap for a Daemon starting under `security.mode: tls` (v4-6 §3.3).
@@ -176,7 +177,7 @@ export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?:
   const viaTls = async (target: string, hint?: number) => {
     const r = await getJson(request, target, "/api/tls", { ...(opts.ca ? { ca: opts.ca } : { insecure: true }), timeoutMs: opts.timeoutMs });
     if (r.status !== 200) throw new Error(`HTTP ${r.status} over TLS at ${target}`);
-    return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, hostId: r.body.hostId ?? undefined, rootHostId: r.body.rootHostId ?? undefined, tlsPort: r.body.tlsPort ?? hint ?? DEFAULT_TLS_PORT };
+    return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, hostId: r.body.hostId ?? undefined, rootHostId: r.body.rootHostId ?? undefined, tlsPort: hint ?? r.body.tlsPort ?? DEFAULT_TLS_PORT };
   };
   try {
     return await viaTls(addr, port);
@@ -246,9 +247,10 @@ export function enrollHostFromRoot(
   rootTls: string,
   caPem: string,
   token: string,
-  input: { inviteCode: string; requestId: string; publicKey: string; sans: string[] },
+  input: { rootHostId: string; inviteCode: string; requestId: string; publicKey: string; sans: string[] },
 ): Promise<{ cert: string; hostId: string; host: string; caFingerprint: string; retry: boolean }> {
-  return postTlsJson(rootTls, caPem, "/api/tls/leaf", JSON.stringify(input), { authorization: `Bearer ${token}` });
+  const { rootHostId, ...payload } = input;
+  return postTlsJson(rootTls, caPem, "/api/tls/leaf", JSON.stringify(payload), { authorization: `Bearer ${token}` }, rootHostId);
 }
 
 /**
@@ -260,21 +262,27 @@ export async function renewHostFromRoot(
   rootTls: string,
   caPem: string,
   token: string,
-  input: { hostId: string; privateKey: string; publicKey: string; sans: string[] },
+  input: { rootHostId: string; hostId: string; privateKey: string; publicKey: string; sans: string[] },
 ): Promise<{ cert: string; hostId: string; caFingerprint: string }> {
-  const challenge = await postTlsJson(rootTls, caPem, "/api/tls/challenge", JSON.stringify({ hostId: input.hostId }), { authorization: `Bearer ${token}` });
+  const headers = { authorization: `Bearer ${token}` };
+  const challenge = await postTlsJson(rootTls, caPem, "/api/tls/challenge", JSON.stringify({ hostId: input.hostId }), headers, input.rootHostId);
   const { signHostRenewal } = await import("./certs.ts");
   const signature = signHostRenewal(input.privateKey, input.hostId, challenge.nonce);
-  return postTlsJson(rootTls, caPem, "/api/tls/leaf", JSON.stringify({
+  const leaf = await postTlsJson(rootTls, caPem, "/api/tls/leaf", JSON.stringify({
     hostId: input.hostId,
     nonce: challenge.nonce,
     signature,
     publicKey: input.publicKey,
     sans: input.sans,
-  }), { authorization: `Bearer ${token}` });
+  }), headers, input.rootHostId);
+  if (leaf.hostId !== input.hostId || hostIdFromCertificate(leaf.cert) !== input.hostId ||
+      keyFingerprintOf(leaf.cert) !== keyFingerprintOfPublicKey(input.publicKey)) {
+    throw new Error("Root returned a renewal for a different Host or key");
+  }
+  return leaf;
 }
 
-function postTlsJson(addr: string, caPem: string, path: string, payload: string, headers: Record<string, string>): Promise<any> {
+function postTlsJson(addr: string, caPem: string, path: string, payload: string, headers: Record<string, string>, rootHostId?: string): Promise<any> {
   const root = addr;
   return new Promise((resolve, reject) => {
     const req = request(
@@ -284,6 +292,14 @@ function postTlsJson(addr: string, caPem: string, path: string, payload: string,
         path,
         method: "POST",
         ca: caPem,
+        agent: false,
+        ...(rootHostId ? { checkServerIdentity: (name, cert) => {
+          const error = checkServerIdentity(name, cert);
+          if (error) return error;
+          const identity = hostIdFromCertificate(new X509Certificate(cert.raw).toString());
+          if (identity !== rootHostId) return new Error("TLS server is not the pinned Root Host");
+          return undefined;
+        } } : {}),
         headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload), ...headers },
       },
       (res) => {

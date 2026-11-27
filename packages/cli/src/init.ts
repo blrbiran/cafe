@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CafeFile } from "@cafe/protocol";
@@ -37,7 +37,8 @@ export async function runInit(opts: InitOptions = {}): Promise<InitResult> {
   const file = join(dir, ".cafe");
   const existing = lstatSync(file, { throwIfNoEntry: false });
   if (existing?.isDirectory()) throw new Error(`${file} is a directory (cafe's data directory); refusing to replace it`);
-  if (existing && !opts.force) throw new Error(`${file} already exists; pass --force to overwrite it`);
+  if (existing && !opts.force) throw new Error(`${file} already exists; edit it in place, or pass --force to replace a standalone identity`);
+  if (existing && !existing.isFile()) throw new Error(`${file} is not a regular file; edit it in place`);
 
   let name = opts.name;
   let description = opts.description;
@@ -80,15 +81,41 @@ export async function runInit(opts: InitOptions = {}): Promise<InitResult> {
   const id = identity.data;
   const content = `# Agent identity for cafe. ${basename(dir)} answers Orders matching this description.
 # See \`cafe --help\` and the cafe skill. Edit this file, then reconnect the agent.
-name: ${id.name}
+name: ${yamlString(id.name)}
 description: ${yamlString(id.description)}
 tags: [${id.tags.map(yamlString).join(", ")}]
 scope: [${id.scope.map(yamlString).join(", ")}]
 role: ${id.role}
 concurrency: ${id.concurrency}
 `;
-  if (existing && !existsSync(file)) throw new Error(`${file} disappeared while writing`);  writeFileSync(file, content, { mode: 0o644, flag: opts.force ? "w" : "wx" });
-  readCafeFile(file); // prove the file we wrote is what the rest of cafe will read
+  if (existing) {
+    if (!existsSync(file)) throw new Error(`${file} disappeared while preparing the replacement`);
+    let current: ReturnType<typeof readCafeFile>;
+    try {
+      current = readCafeFile(file);
+    } catch (err) {
+      throw new Error(`Repair ${file} in place before running init again. Original kept. ${(err as Error).message}`);
+    }
+    if (current.team) throw new Error(`${file} contains a team roster. Edit it in place. Original kept.`);
+  }
+  // Validate the serialized document before it can replace the old file.
+  const scratch = mkdtempSync(join(dir, ".cafe-init-"));
+  const candidate = join(scratch, ".cafe");
+  try {
+    writeFileSync(candidate, content, { mode: existing ? existing.mode & 0o777 : 0o644, flag: "wx" });
+    readCafeFile(candidate);
+    if (existing) {
+      const current = lstatSync(file);
+      if (!current.isFile() || current.dev !== existing.dev || current.ino !== existing.ino || current.ctimeMs !== existing.ctimeMs) {
+        throw new Error(`${file} changed while preparing the replacement; edit it in place`);
+      }
+      renameSync(candidate, file);
+    } else {
+      writeFileSync(file, content, { mode: 0o644, flag: "wx" });
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 
   const next =
     id.role === "barista"

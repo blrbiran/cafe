@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { startDaemon } from "./helpers.ts";
 
 // #18 (narrowed): the Web does not edit the token (rotating it drops every child at once). Instead the
-// Root's Settings shows how to add another machine: its main address and CA fingerprint. The token itself
+// Root's Settings shows how to add another machine: its address and CA fingerprint. The token itself
 // never leaves the API (safe-by-default); the hint says where to read it.
 //
 // Own file: a TLS Daemon adds its CA to the process-wide trust store.
@@ -21,7 +21,7 @@ describe("Settings shows how to join this Root", () => {
     const root = await startDaemon("jroot", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
     cleanup.push(root.stop);
     const { text, body } = await settings(root.addr);
-    expect(body.join).toEqual({ address: `127.0.0.1:${root.server.port}`, addresses: [`127.0.0.1:${root.server.port}`], advertised: true, caFingerprint: `sha256:${root.daemon.tlsStatus().caFingerprint}`, rootHostId: root.daemon.hostId });
+    expect(body.join).toEqual({ address: `127.0.0.1:${root.server.tlsPort}`, addresses: [`127.0.0.1:${root.server.tlsPort}`], advertised: true, caFingerprint: `sha256:${root.daemon.tlsStatus().caFingerprint}`, rootHostId: root.daemon.hostId });
     expect(text).not.toContain("t0k");
   }, 30_000);
 
