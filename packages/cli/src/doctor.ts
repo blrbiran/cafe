@@ -55,7 +55,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
     if (id.file) checks.push({ name: "identity", level: "ok", detail: `${id.file} (${id.cafe.name}, ${id.cafe.role})` });
     else checks.push({ name: "identity", level: "warn", detail: `${opts.cwd} has no .cafe; this session is an anonymous customer`, next: "cafe init" });
   } catch (err) {
-    checks.push({ name: "identity", level: "fail", detail: (err as Error).message, next: "cafe init" });
+    checks.push({ name: "identity", level: "fail", detail: (err as Error).message, next: "back up the existing .cafe and fix the reported YAML or settings in place" });
   }
 
   const userHome = opts.userHome ?? homedir();

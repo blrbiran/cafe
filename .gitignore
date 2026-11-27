@@ -13,3 +13,4 @@ release-out/
 
 cafe_dogfooding
 
+.vitest/

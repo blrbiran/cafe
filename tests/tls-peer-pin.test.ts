@@ -24,8 +24,8 @@ function fakeFingerprint(): string {
   return Array.from({ length: 32 }, (_, i) => (i % 2 ? "AA" : "11")).join(":");
 }
 
-describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
-  it("records a peer leaf on first contact and keeps trusting it afterwards", async () => {
+describe("daemon-to-daemon Host identity", () => {
+  it("caches the Root's authenticated Host and key binding", async () => {
     const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-root-"));
     const childHome = mkdtempSync(join(tmpdir(), "cafe-pin-child-"));
     cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
@@ -42,20 +42,15 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 10_000);
 
-    // First contact recorded the Root's leaf under its `host:port`.
-    const saved = (await import("yaml")).parse(readFileSync(join(childHome, "config.yml"), "utf8"));
-    const pin = saved.security?.tls?.pins?.[rootAddr];
-    expect(pin, "the child should pin the Root's leaf on first contact").toBeTruthy();
-    // The pin is the leaf's **key** fingerprint, so a renewal (same key, new certificate) keeps it.
+    const binding = (child.daemon.store.getKv<import("@cafe/protocol").HostIdentity[]>("rootHostBindings") ?? [])
+      .find((record) => record.hostId === root.daemon.hostId);
     const { keyFingerprintOf } = await import("../packages/daemon/src/tls/certs.ts");
     const served = readFileSync(join(rootHome, "tls", "pinroot.crt"), "utf8");
-    expect(pin).toMatch(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
-    expect(pin).toBe(keyFingerprintOf(served));
-    // And it is not the certificate fingerprint, which changes on every renewal.
-    expect(pin).not.toBe(new X509Certificate(served).fingerprint256);
+    expect(binding?.keyFingerprint === keyFingerprintOf(served)).toBe(true);
+    expect(binding?.keyFingerprint === new X509Certificate(served).fingerprint256).toBe(false);
   }, 40_000);
 
-  it("refuses a peer whose leaf does not match the stored pin", async () => {
+  it("refuses a TLS uplink whose leaf has a different Host ID than the pin", async () => {
     const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-bad-root-"));
     const childHome = mkdtempSync(join(tmpdir(), "cafe-pin-bad-child-"));
     cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
@@ -63,11 +58,10 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     cleanup.push(root.stop);
     const ca = readFileSync(join(rootHome, "tls", "ca.crt"), "utf8");
     const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
-    // The CA is trusted and the child is enrolled, but it holds a *wrong* leaf pin for the Root.
     const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "badpinchild");
     const child = await startDaemon("badpinchild", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId, pins: { [rootAddr]: fakeFingerprint() } } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.hostId } } },
     });
     cleanup.push(child.stop);
 
@@ -105,7 +99,7 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     expect(child.daemon.rootOnline).toBe(true);
   }, 40_000);
 
-  it("forgets a pin on request so a reinstalled Host can be trusted again", async () => {
+  it("clears a legacy address pin without affecting the authenticated Host binding", async () => {
     const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-clear-root-"));
     const childHome = mkdtempSync(join(tmpdir(), "cafe-pin-clear-child-"));
     cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
@@ -115,7 +109,7 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "pinclearchild");
     const child = await startDaemon("pinclearchild", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId, pins: { [rootAddr]: fakeFingerprint() } } } },
     });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 10_000);

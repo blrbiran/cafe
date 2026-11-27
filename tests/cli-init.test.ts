@@ -60,6 +60,28 @@ describe("cafe init", () => {
     expect(readCafeFile(join(dir, ".cafe")).name).toBe("new-name");
   });
 
+  it("preserves a YAML-like name as a string during replacement", () => {
+    const dir = temp();
+    const file = join(dir, ".cafe");
+    writeFileSync(file, "name: keep-me\n");
+    const r = cafe(dir, "init", "--force", "--yes", "--name", "true");
+    expect(r.status).toBe(0);
+    expect(readCafeFile(file).name).toBe("true");
+  });
+
+  it.each([
+    ["team roster", "name: keep-me\nteam:\n  members:\n    - name: lead\n      duty: orchestrator\n"],
+    ["malformed roster", "name: keep-me\nteam: [\n"],
+  ])("preserves an existing %s even with --force", (_kind, contents) => {
+    const dir = temp();
+    const file = join(dir, ".cafe");
+    writeFileSync(file, contents);
+    const r = cafe(dir, "init", "--force", "--yes");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/edit|repair/i);
+    expect(readFileSync(file, "utf8")).toBe(contents);
+  });
+
   it("never overwrites the ~/.cafe data directory", () => {
     const dir = temp();
     mkdirSync(join(dir, ".cafe"));

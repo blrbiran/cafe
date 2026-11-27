@@ -3,7 +3,6 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { parse } from "yaml";
 import { startDaemon, waitFor } from "./helpers.ts";
 import { enrollTestChild } from "./tls-helpers.ts";
 
@@ -36,8 +35,6 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-const pins = (h: string) => (parse(readFileSync(join(h, "config.yml"), "utf8")) as any).security?.tls?.pins ?? {};
-
 describe("joining a TLS network by the Root's main address (#79)", () => {
   it("enrols from the main address and connects over wss to the Root's TLS port", async () => {
     const rootHome = home("root");
@@ -56,7 +53,7 @@ describe("joining a TLS network by the Root's main address (#79)", () => {
     expect(child.daemon.tlsStatus()).toMatchObject({ mode: "tls", network: true });
     expect(child.daemon.hostId).toBe(enrolled.hostId);
     // The uplink went over TLS: only a wss dial records a leaf-key pin, keyed by the TLS port dialled.
-    expect(Object.keys(pins(childHome))).toContain(`127.0.0.1:${root.server.tlsPort}`);
+    expect((child.daemon as any).uplink?.hostIdentity?.hostId).toBe(root.daemon.hostId);
   }, 40_000);
 
   it("never dials the Root in plaintext while it cannot enrol", async () => {
@@ -93,7 +90,7 @@ describe("joining a TLS network by the Root's main address (#79)", () => {
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 15_000);
     expect(child.daemon.tlsStatus().network).toBe(true);
-    expect(Object.keys(pins(childHome))).toContain(`127.0.0.1:${root.server.tlsPort}`);
+    expect((child.daemon as any).uplink?.hostIdentity?.hostId).toBe(root.daemon.hostId);
   }, 40_000);
 
   it("still accepts a root: that names the TLS port (configs written before this change)", async () => {
@@ -134,9 +131,9 @@ describe("Daemon addresses carry TLS on an enrolled network (#80)", () => {
     await waitFor(() => (c1.daemon.peerUrlFor("achild2") ?? "").startsWith("wss://"), 10_000);
     expect(c1.daemon.peerUrlFor("achild2")).toBe(`wss://127.0.0.1:${c2.server.tlsPort}`);
 
-    // A direct link goes over TLS and is pinned by the TLS endpoint.
-    await (c1.daemon as any).link("achild2");
-    expect(Object.keys(pins(h1))).toContain(`127.0.0.1:${c2.server.tlsPort}`);
+    // A direct link authenticates the Host known from the Root, independent of address.
+    const link = await (c1.daemon as any).link("achild2");
+    expect(link.hostIdentity?.hostId).toBe(e2.hostId);
   }, 50_000);
 
   it("upgrades a plaintext address (a hand-set pin, an older Daemon) instead of dialling it in plaintext", async () => {
@@ -159,8 +156,8 @@ describe("Daemon addresses carry TLS on an enrolled network (#80)", () => {
     (c1.daemon as any).peerUrls.set("uchild2", `ws://${c2.addr}`);
     (c1.daemon as any).links.get("uchild2")?.ws.close();
     (c1.daemon as any).links.delete("uchild2");
-    await (c1.daemon as any).link("uchild2");
-    expect(Object.keys(pins(h1))).toContain(`127.0.0.1:${c2.server.tlsPort}`);
+    const link = await (c1.daemon as any).link("uchild2");
+    expect(link.hostIdentity?.hostId).toBe(e2.hostId);
   }, 50_000);
 });
 

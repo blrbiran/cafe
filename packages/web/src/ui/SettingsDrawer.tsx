@@ -30,7 +30,7 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
   const [dir, setDir] = useState("");
   const [agentKind, setAgentKind] = useState("pi");
   const [write, setWrite] = useState(false);
-  const [conn, setConn] = useState<{ root?: string; tokenHint?: string; tokenSet: boolean; join?: { address: string; caFingerprint?: string }; web?: { https: string[] } }>();
+  const [conn, setConn] = useState<Awaited<ReturnType<typeof api.settings>>>();
   const [joinCopied, setJoinCopied] = useState<string | null>(null);
   const [rt, setRt] = useState<RuntimeConfig>();
   const [advertise, setAdvertise] = useState("");
@@ -565,6 +565,7 @@ export function SettingsDrawer({ onClose, closing = false }: { onClose: () => vo
                     </div>
                   ))}
                   <span className="text-muted">{t.settingsJoinToken}</span>
+                  {conn.join?.rootHostId && <span className="text-muted">{t.settingsJoinInvite}</span>}
                   {cmds.length > 1 && <span className="text-muted">{t.settingsJoinAdvertise}</span>}
                 </div>
               );

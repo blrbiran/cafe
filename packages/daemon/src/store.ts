@@ -231,6 +231,11 @@ export class Store {
     `).run(identity.hostId, identity.host, identity.keyFingerprint, identity.state, identity.revision ?? null, record);
   }
 
+  listHostIdentities(): HostIdentity[] {
+    return (this.db.prepare("SELECT record_json FROM host_identities").all() as { record_json: string }[])
+      .map((row) => JSON.parse(row.record_json) as HostIdentity);
+  }
+
   getHostIdentity(hostId: string): HostIdentity | undefined {
     const row = this.db.prepare("SELECT record_json FROM host_identities WHERE host_id = ?").get(hostId) as { record_json: string } | undefined;
     return row ? JSON.parse(row.record_json) as HostIdentity : undefined;

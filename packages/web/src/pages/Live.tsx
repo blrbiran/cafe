@@ -30,6 +30,7 @@ function eventText(t: Dict, agents: Record<string, { address: string }>, env: Th
       return ev.source === "operator" ? t.operatorOverride(name(ev.agentId)) : t.eventReplied(name(ev.agentId), ev.final);
     case "order.declined":
       return t.eventDeclined(name(ev.agentId));
+    case "order.dispatch-failed":
     case "order.failed":
       return t.eventFailed(name(ev.agentId), t.failReason[ev.reason] ?? ev.reason);
     case "order.closed":
@@ -38,6 +39,12 @@ function eventText(t: Dict, agents: Record<string, { address: string }>, env: Th
       return t.eventCancelled;
     case "order.heartbeat":
       return `${name(ev.agentId)}${ev.note ? ` · ${ev.note}` : ""}`;
+    case "order.assigned":
+      return t.eventDelivered(name(ev.assignment.targetAgentId));
+    case "order.replaced":
+      return t.eventCreated(ev.order.from.address);
+    case "order.overridden":
+      return t.operatorOverride(name(ev.targetAgentId));
   }
 }
 

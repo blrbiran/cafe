@@ -4,10 +4,12 @@ export interface JoinHint {
   addresses?: string[];
   advertised?: boolean;
   caFingerprint?: string;
+  rootHostId?: string;
 }
 
-/** One `cafe connect` command per candidate address (#95). The token stays a placeholder. */
+/** One `cafe connect` command per candidate address (#95). Credentials stay placeholders. */
 export function joinCommands(j: JoinHint): string[] {
   const list = j.addresses?.length ? j.addresses : [j.address];
-  return list.map((a) => `cafe connect ${a} --token <token>${j.caFingerprint ? ` --ca-fingerprint ${j.caFingerprint}` : ""}`);
+  const invite = j.rootHostId ? " --invite <code>" : "";
+  return list.map((a) => `cafe connect ${a} --token <token>${invite}${j.caFingerprint ? ` --ca-fingerprint ${j.caFingerprint}` : ""}`);
 }

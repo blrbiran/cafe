@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { Agent as HttpsAgent } from "node:https";
 import { createHash, randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
@@ -8,9 +9,9 @@ import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
 import { watchLiveness } from "./liveness.ts";
 import { discoverRoots } from "./discovery.ts";
-import { pinnedIdentityCheck } from "./tls/trust.ts";
+import { checkServerIdentity, type PeerCertificate } from "node:tls";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
-import { hostIdFromCertificate, keyFingerprintOfPublicKey, localAddresses, missingSans, sanCovers, sanList, verifyHostRenewal } from "./tls/certs.ts";
+import { hostIdFromCertificate, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, missingSans, sanCovers, sanList, verifyHostRenewal } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -36,7 +37,7 @@ import {
   type AgentRecord,
   type AgentStatus,
   type Attachment,
-  type HostIdentity,
+  HostIdentity,
   type DaemonRecord,
   type Order,
   type Party,
@@ -360,6 +361,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.operatorKeyDigest = loadOperatorDigest(opts.home, this.store);
     this.hostId = this.store.getHostIdentityByHost(this.host)?.hostId ?? this.host;
     this.rootHostId = this.isRoot ? this.hostId : this.store.getKv<string>("rootHostId");
+    this.rootBindings = new Map((this.store.getKv<HostIdentity[]>("rootHostBindings") ?? []).map((binding) => [binding.hostId, binding]));
     this.teamsFile = join(opts.home, "teams.json");
     try {
       for (const t of JSON.parse(readFileSync(this.teamsFile, "utf8")) as TeamRecord[]) this.teamRecords.set(rosterKey(t), t);
@@ -536,6 +538,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       ...(previous?.version ? { version: previous.version } : {}),
       ...(previous?.features ? { features: previous.features } : {}),
     });
+    for (const link of this.hostLinks) {
+      const id = link.hostIdentity!;
+      if (id.hostId === result.identity.hostId && id.keyFingerprint !== result.identity.keyFingerprint) link.close();
+    }
+    const bindings = this.store.listHostIdentities();
+    for (const child of this.children.values()) if (child.hostIdentity) child.notify("host/bindings", bindings);
     this.emitDaemons();
     return { hostId: result.identity.hostId, host: result.identity.host, cert: result.redemption.certificate!, caFingerprint: this.tlsContext.caFingerprint, retry: result.retry };
   }
@@ -563,16 +571,20 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!challenge || challenge.nonce !== input.nonce || challenge.expiresAt <= Date.now()) {
       throw new RpcError("challenge_expired", "request a fresh renewal challenge from the Root");
     }
-    this.hostChallenges.delete(input.hostId);
     if (keyFingerprintOfPublicKey(input.publicKey) !== identity.keyFingerprint) {
       throw new RpcError("credential_superseded", "this key is not the enrolled identity for that Host; create a new invite to re-key");
     }
     if (!verifyHostRenewal(input.publicKey, input.hostId, input.nonce, input.signature)) {
       throw new RpcError("bad_signature", "the renewal proof was not signed by the enrolled Host key");
     }
+    this.hostChallenges.delete(input.hostId);
     const sans = [...new Set(input.sans.map((name) => name.trim()).filter(Boolean))].sort();
     if (!sans.length || sans.length > 64) throw new RpcError("bad_request", "sans must contain 1–64 unique Host addresses");
     const leaf = await this.tlsContext.issueHost(sans, input.hostId, input.publicKey);
+    const binding = this.store.getHostIdentity(input.hostId);
+    if (binding?.state !== "enrolled" || binding.keyFingerprint !== identity.keyFingerprint || binding.revision !== identity.revision) {
+      throw new RpcError("credential_superseded", "Host key changed during certificate renewal");
+    }
     if (hostIdFromCertificate(leaf.cert) !== input.hostId) throw new RpcError("bad_identity", "issued certificate does not carry the Host ID");
     return { cert: leaf.cert, hostId: input.hostId, caFingerprint: this.tlsContext.caFingerprint };
   }
@@ -746,7 +758,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    */
   joinHint(): { address: string; addresses: string[]; advertised: boolean; caFingerprint?: string; rootHostId?: string } {
     const fp = this.tlsStatus().caFingerprint;
-    const j = joinAddresses({ advertise: this.config.advertise, port: this.config.port, lan: localAddresses() });
+    const j = joinAddresses({ advertise: this.config.advertise, port: this.config.port, tlsPort: this.tlsPort, lan: localAddresses() });
     return { address: j.addresses[0]!, ...j, ...(fp ? { caFingerprint: `sha256:${fp}` } : {}), ...(this.isRoot && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(this.hostId) ? { rootHostId: this.hostId } : {}) };
   }
 
@@ -888,31 +900,40 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** `ws` client options for a Daemon link: trust exactly the network's CA, never disable verification. */
-  private linkOptions(peerAddr?: string): import("ws").ClientOptions {
+  private linkOptions(host: string | undefined, verified: (cert: X509Certificate) => void): import("ws").ClientOptions {
     if (!this.tlsContext?.network) return {};
-    // Per-peer leaf-key pin (v4-6 §5 A): the CA pin authenticates the trust anchor; a separate pin per
-    // `host:port` catches an unexpected leaf issued under that CA (a compromised CA key, or the wrong
-    // machine answering on an address). First contact records the key; after that a different key is
-    // refused, naming both values so a person can verify the change out of band. `pinnedIdentityCheck`
-    // also runs Node's SAN check — a custom `checkServerIdentity` replaces it, it does not add to it.
-    const check = peerAddr
-      ? pinnedIdentityCheck(
-          peerAddr,
-          () => this.config.security.tls.pins,
-          (peer, keyFingerprint) => this.recordPeerPin(peer, keyFingerprint),
-        )
-      : undefined;
-    // `ws` types `checkServerIdentity` as Node's older `CertMeta` signature, but it passes the option
-    // straight to `tls.connect`, where it receives a `PeerCertificate` (the shape we use).
-    return { ca: this.tlsContext.ca, ...(check ? { checkServerIdentity: check as unknown as import("ws").ClientOptions["checkServerIdentity"] } : {}) };
+    const expected = host === undefined ? this.rootHostId : [...this.rootBindings.values()].find((binding) => binding.host === host)?.hostId ?? (this.isRoot ? this.store.getHostIdentityByHost(host)?.hostId : undefined);
+    if (!expected) throw new RpcError("host_auth_required", "no authenticated Host binding; reconnect to an enrolled Root first");
+    const check = (name: string, peerCert: PeerCertificate): Error | undefined => {
+      const error = checkServerIdentity(name, peerCert);
+      if (error) return error;
+      const certificate = new X509Certificate(peerCert.raw);
+      const enrolledId = hostIdFromCertificate(certificate.toString());
+      if (enrolledId !== expected) return new RpcError("bad_identity", "server certificate has a different Host ID");
+      if (host !== undefined) {
+        const binding = this.trustBinding(expected);
+        if (binding?.state !== "enrolled" || binding.host !== host || binding.keyFingerprint !== keyFingerprintOf(certificate.toString())) {
+          return new RpcError("bad_identity", "server certificate does not match the current Root binding");
+        }
+      }
+      verified(certificate);
+    };
+    return {
+      ...this.tlsContext.current(), ca: this.tlsContext.ca, agent: new HttpsAgent({ maxCachedSessions: 0 }),
+      checkServerIdentity: check as unknown as import("ws").ClientOptions["checkServerIdentity"],
+    };
   }
 
-  /** Persist a peer leaf-key pin learned on first contact (TOFU); later contacts are checked against it. */
-  private recordPeerPin(peer: string, fingerprint: string): void {
-    if (this.config.security.tls.pins[peer] === fingerprint) return;
-    this.config.security.tls.pins[peer] = fingerprint;
-    saveConfig(this.config, this.store.home);
-    this.log(`tls: pinned ${peer} leaf ${fingerprint}`);
+  private hostLinkHello(): Pick<InitializeParams, "hostId" | "hostAuthVersion" | "rootHostId" | "features"> {
+    return { hostId: this.hostId, hostAuthVersion: 1, rootHostId: this.rootHostId, features: [...CURRENT_FEATURES] };
+  }
+
+  private verifyHostHello(hello: { protocolVersion?: number; features?: string[]; hostId?: string; rootHostId?: string }, certificate: X509Certificate): string {
+    if (hello.protocolVersion !== PROTOCOL_VERSION) throw new RpcError("protocol_mismatch", "remote Host uses a different protocol version");
+    if (!hello.features?.includes("host-auth-v1")) throw new RpcError("host_auth_required", "upgrade and enroll the remote Host");
+    const id = hostIdFromCertificate(certificate.toString());
+    if (!id || hello.hostId !== id || hello.rootHostId !== this.rootHostId) throw new RpcError("bad_identity", "remote Host hello does not match the certificate or pinned Root");
+    return id;
   }
 
   get rootOnline(): boolean {
@@ -923,22 +944,83 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // Connections
   // -------------------------------------------------------------------------
 
-  /** Attach a freshly accepted socket. `local` = loopback (no token required). */
-  accept(ws: WebSocket, local: boolean, secure = false): void {
+  private rootBindings = new Map<string, HostIdentity>();
+  private hostLinks = new Set<Peer>();
+
+  private trustBinding(hostId: string): HostIdentity | undefined {
+    return this.isRoot ? this.store.getHostIdentity(hostId) : this.rootBindings.get(hostId);
+  }
+
+  private installRootBindings(raw: unknown): void {
+    if (!Array.isArray(raw)) throw new RpcError("host_auth_required", "Root did not supply Host identity bindings");
+    const bindings = new Map<string, HostIdentity>();
+    for (const item of raw) {
+      const binding = HostIdentity.parse(item);
+      if (bindings.has(binding.hostId)) throw new RpcError("bad_identity", "duplicate Root Host binding");
+      bindings.set(binding.hostId, binding);
+    }
+    this.rootBindings = bindings;
+    this.store.setKv("rootHostBindings", [...bindings.values()]);
+    for (const link of this.hostLinks) {
+      const identity = link.hostIdentity!;
+      const current = bindings.get(identity.hostId);
+      if (current?.state !== "enrolled" || current.keyFingerprint !== identity.keyFingerprint) link.close();
+    }
+  }
+
+  private bindHostCertificate(peer: Peer, certificate: X509Certificate, hostId: string): void {
+    peer.bindHostIdentity({ hostId, keyFingerprint: keyFingerprintOf(certificate.toString()) });
+    this.hostLinks.add(peer);
+    const expiry = Date.parse(certificate.validTo);
+    let timer: ReturnType<typeof setTimeout>;
+    const checkExpiry = () => {
+      const remaining = expiry - Date.now();
+      if (remaining <= 0) peer.close();
+      else {
+        timer = setTimeout(checkExpiry, Math.min(remaining, 2_147_483_647));
+        timer.unref();
+      }
+    };
+    checkExpiry();
+    this.hostLinkCleanup.set(peer, () => clearTimeout(timer));
+  }
+
+  private hostLinkCleanup = new WeakMap<Peer, () => void>();
+  private dropHostCertificate(peer: Peer): void {
+    this.hostLinkCleanup.get(peer)?.();
+    this.hostLinks.delete(peer);
+  }
+
+  /** Attach a freshly accepted socket. `local` = loopback (no token required for UI and Agents). */
+  accept(ws: WebSocket, local: boolean, secure = false, certificate?: X509Certificate): void {
     const peer = new Peer(ws);
     ws.on("message", (data) => void peer.receive(data.toString()));
     ws.on("close", () => {
+      this.dropHostCertificate(peer);
       peer.closed();
       this.onPeerClosed(peer);
     });
     ws.on("error", () => ws.close());
     peer.on(Methods.initialize, (raw) => {
+      if (peer.meta.kind) throw new RpcError("bad_identity", "connection already initialized");
       const p = InitializeParams.parse(raw);
+      const hostLink = p.kind === "daemon" || p.kind === "peer";
       if (!local && p.token !== this.config.token) throw new RpcError("unauthorized", "bad token");
       if (p.protocolVersion !== PROTOCOL_VERSION) throw new RpcError("protocol_mismatch", this.mismatchMessage(p));
-      if ((p.kind === "daemon" || p.kind === "peer") && this.tlsContext) {
+      if (hostLink && this.tlsContext) {
         if (!secure) this.refusePlaintextLink(p);
-        if (p.host) this.refusedPlaintext.delete(p.host);
+        if (!certificate || !this.tlsContext.network || !p.features?.includes("host-auth-v1") || p.hostAuthVersion !== 1) {
+          throw new RpcError("host_auth_required", "Host links require an enrolled certificate. Upgrade cafe and enroll with a Root invitation.");
+        }
+        const id = hostIdFromCertificate(certificate.toString());
+        const binding = id ? this.trustBinding(id) : undefined;
+        if (!id || !binding || binding.state !== "enrolled" || binding.keyFingerprint !== keyFingerprintOf(certificate.toString()) ||
+            p.hostId !== id || p.host !== binding.host || p.rootHostId !== this.rootHostId || id === this.hostId) {
+          throw new RpcError("bad_identity", "Host identity does not match the enrolled certificate binding");
+        }
+        if (p.token !== this.config.token) throw new RpcError("unauthorized", "bad token");
+        this.bindHostCertificate(peer, certificate, id);
+        this.refusedPlaintext.delete(binding.host);
       }
       peer.meta.kind = p.kind;
       peer.meta.features = p.features ?? [];
@@ -953,7 +1035,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         peer.meta.host = p.host;
         if (p.host && p.url && !this.isRoot) this.learnPeers([{ host: p.host, url: p.url }]);
         this.bindLink(peer);
-        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
+        return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, ...this.hostLinkHello(), host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
       }
       if (p.kind === "ui") this.uis.add(peer);
       return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
@@ -1092,6 +1174,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         env.event.type === "order.reported" && env.event.agentId === agentId && env.event.text === p.text);
       const report: ThreadEnvelope = duplicate ?? {
         eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(),
+        ...(this.tlsContext?.network ? { eventHostId: this.hostId } : {}),
+        actor: { kind: "agent", principalId: agentId },
         event: { type: "order.reported", agentId, text: p.text },
       };
       if (!duplicate) {
@@ -1167,7 +1251,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.clearActiveOrder(agentId, p.threadId, p.orderId);
     }
     this.recordEvent(
-      { eventId: ulid(), threadId: p.threadId, orderId: p.orderId, host: this.host, at: Date.now(), event: accepted },
+      {
+        eventId: ulid(), threadId: p.threadId, orderId: p.orderId, host: this.host, at: Date.now(),
+        ...(this.tlsContext?.network ? { eventHostId: this.hostId } : {}),
+        actor: { kind: "agent", principalId: agentId }, event: accepted,
+      },
       closed ? { skipTrack: true } : {},
     );
     return {};
@@ -2679,9 +2767,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const stored = this.peerUrls.get(host);
     if (!stored) return Promise.reject(new Error(`no address for ${host}`));
     const attempt = this.resolveDaemonUrl(stored).then((url) => new Promise<Peer>((resolve, reject) => {
-      // On a TLS network `url` is always `wss://` (a plaintext address was upgraded above); the pin is
-      // keyed by the TLS endpoint dialled, like the uplink's.
-      const ws = new WebSocket(`${url}/ws`, this.linkOptions(url.replace(/^wss?:\/\//, "")));
+      let certificate: X509Certificate | undefined;
+      const ws = new WebSocket(`${url}/ws`, this.linkOptions(host, (cert) => { certificate = cert; }));
       this.watchLink(ws);
       const peer = new Peer(ws);
       peer.meta.kind = "peer";
@@ -2690,11 +2777,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         ws.terminate();
         reject(new Error("connect timeout"));
       }, this.timing.linkConnectTimeoutMs);
-      this.bindLink(peer);
       ws.on("message", (data) => void peer.receive(data.toString()));
       ws.on("error", () => {});
       ws.on("close", () => {
         clearTimeout(timer);
+        this.dropHostCertificate(peer);
         peer.closed();
         this.dropLink(peer);
         if (this.links.get(host)?.peer === peer) this.links.delete(host);
@@ -2702,7 +2789,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       });
       ws.on("open", async () => {
         try {
-          await peer.request(Methods.initialize, { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, kind: "peer", token: this.config.token, host: this.host, url: this.url() });
+          const hello = await peer.request(Methods.initialize, { ...this.hostLinkHello(), protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, kind: "peer", token: this.config.token, host: this.host, url: this.url() });
+          if (this.tlsContext?.network) {
+            if (!certificate) throw new RpcError("host_auth_required", "direct link has no verified certificate");
+            const id = this.verifyHostHello(hello, certificate);
+            const binding = this.trustBinding(id);
+            if (binding?.state !== "enrolled" || binding.host !== host || hello.host !== host || binding.keyFingerprint !== keyFingerprintOf(certificate.toString())) {
+              throw new RpcError("bad_identity", "direct Host binding changed before admission");
+            }
+            this.bindHostCertificate(peer, certificate, id);
+          }
+          this.bindLink(peer);
           clearTimeout(timer);
           this.links.set(host, { peer, ws, lastUsed: Date.now() });
           this.log(`direct link to ${host} open`);
@@ -2791,7 +2888,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const meta = this.metas.get(id) ?? this.store.getThread(id);
       try {
         if (meta) {
-          const events = since ? this.store.readEventsSince(meta.file, since - BACKFILL_SKEW_MS) : this.store.readEvents(meta.file);
+          const events = (since ? this.store.readEventsSince(meta.file, since - BACKFILL_SKEW_MS) : this.store.readEvents(meta.file))
+            .filter((event) => !this.tlsContext?.network || event.eventHostId === this.hostId);
           for (let i = 0; i < events.length; i += BACKFILL_BATCH) {
             await this.uplink!.request(Methods.threadBackfill, { events: events.slice(i, i + BACKFILL_BATCH) }, 30_000);
           }
@@ -3061,7 +3159,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // -------------------------------------------------------------------------
 
   private emitEvent(order: Order, event: ThreadEventBody, opts: { skipTrack?: boolean } = {}): void {
-    const env: ThreadEnvelope = { eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(), event };
+    const env: ThreadEnvelope = {
+      eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(), event,
+      ...(this.tlsContext?.network ? { eventHostId: this.hostId } : {}),
+    };
     this.recordEvent(env, opts);
   }
 
@@ -3273,6 +3374,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
+    if (opts.from?.hostIdentity && (this.isRoot || opts.from.meta.kind === "peer")) {
+      if (env.eventHostId !== opts.from.hostIdentity.hostId || env.host !== opts.from.meta.host) {
+        throw new RpcError("bad_identity", "event source differs from the authenticated Host");
+      }
+    }
     if (this.stopped || this.seen.has(env.eventId)) return;
     const event = env.event;
     const closed = this.closingEvent(env.threadId, env.orderId);
@@ -3323,9 +3429,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const s of subscribers) if (s !== opts.from) s.notify(Methods.threadEvent, env);
     for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
     if (this.isRoot) this.fanOutToChildren(env, opts.from, parent?.from.host);
-    else if (this.rootOnline && opts.from !== this.uplink) this.uplink!.notify(Methods.threadEvent, env);
+    else if (this.rootOnline && opts.from !== this.uplink && (!this.uplink!.hostIdentity || env.eventHostId === this.hostId)) this.uplink!.notify(Methods.threadEvent, env);
     for (const l of this.threadLinks.get(env.threadId) ?? []) {
-      if (l === opts.from || l.isClosed) continue;
+      if (l === opts.from || l.isClosed || (l.hostIdentity && env.eventHostId !== this.hostId)) continue;
       this.touchLink(l);
       l.notify(Methods.threadEvent, env);
     }
@@ -3696,15 +3802,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (prev && prev !== peer) prev.close();
     this.children.set(host, peer);
     this.forgotten.delete(host);
-    // A child that moved networks can reconnect through any of these (#104).
-    peer.notify(Methods.rootMoved, { addresses: this.rootAddressesForPeers() });
     peer.meta.host = host;
     const now = Date.now();
     const override = this.config.hostNames[host];
     const displayName = override?.displayName ?? p.displayName ?? host;
     const aliases = [...new Set([...(p.aliases ?? []), ...(override?.aliases ?? [])])];
     const legacyAliases = [...new Set([...(p.legacyAliases ?? []), ...(override?.legacyAliases ?? [])])];
-    this.daemonRecords.set(host, { host, hostId: host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion, features: p.features ?? [] });
+    this.daemonRecords.set(host, { host, hostId: peer.hostIdentity?.hostId ?? host, displayName, aliases, legacyAliases, url: p.url ?? "", isRoot: false, online: true, connectedAt: now, lastSeenAt: now, version: p.cafeVersion, features: p.features ?? [] });
     if (p.cafeVersion && p.cafeVersion !== this.version) this.log(`daemon ${host} runs cafe ${p.cafeVersion}; this root runs ${this.version}`);
     if (p.url) this.reportedUrls.set(host, p.url);
     if (p.url) void this.rememberChildUrl(host, p.url);
@@ -3815,16 +3919,31 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       await this.routerReady();
       return this.router.decide({ order: x.order, candidates: cands, hints: this.hintsFor(cands), broadcast: x.broadcast });
     });
-    this.emitDaemons();
     this.log(`daemon ${host} connected (${p.url})`);
-    // Send snapshot after the initialize response.
-    queueMicrotask(() => {
+    const publish = () => {
+      if (this.children.get(host) !== peer) return;
+      this.emitDaemons();
       peer.notify(Methods.registrySnapshot, { version: this.registry.version, records: this.registry.all().filter((r) => this.publishableTo(r, peer.meta.features as string[] | undefined)) });
-      // v4-11: replay this Host's teams (and every replicated roster) so a reconnecting child has them.
       for (const team of this.teamRecords.values()) if ((peer.meta.features as string[] | undefined)?.includes("teams")) peer.notify(Methods.teamUpsert, { team });
       this.pushHints(peer);
-    });
-    return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, isRoot: true, registryVersion: this.registry.version };
+    };
+    if (peer.hostIdentity) {
+      peer.on("host/ready", () => {
+        if (peer.meta.hostReady) return {};
+        peer.meta.hostReady = true;
+        // Updates and the fresh snapshot use the same ordered channel.
+        peer.notify("host/bindings", this.store.listHostIdentities());
+        publish();
+        return {};
+      });
+    } else {
+      setImmediate(publish);
+    }
+    return {
+      protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, ...this.hostLinkHello(), host: this.host,
+      displayName: this.displayName, aliases: this.hostAliases, isRoot: true, registryVersion: this.registry.version,
+      ...(peer.hostIdentity ? { hostBindings: this.store.listHostIdentities() } : {}),
+    };
   }
 
   /**
@@ -4019,9 +4138,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // the target this dial was started for, not `config.root`: rotation dials learned addresses (#104).
     if (gen !== this.dialGen || this.stopped || this.dialTarget !== target) return;
     let ws: WebSocket;
+    let certificate: X509Certificate | undefined;
     try {
-      // Pin the Root's leaf by the TLS `host:port` this Host dials (v4-6 §5 A).
-      ws = new WebSocket(`${url}/ws`, this.linkOptions(url.replace(/^wss?:\/\//, "")));
+      ws = new WebSocket(`${url}/ws`, this.linkOptions(undefined, (cert) => { certificate = cert; }));
     } catch (err) {
       // A persisted bad address must not crash the daemon on every boot (#76): say so and keep
       // retrying at the normal backoff, so `cafe root set` can still repair it later.
@@ -4036,10 +4155,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const peer = new Peer(ws);
     ws.on("open", async () => {
       try {
-        const hello = await peer.request<{ host: string; displayName?: string; aliases?: string[]; cafeVersion?: string; features?: string[] }>(Methods.initialize, {
+        const hello = await peer.request<{ host: string; displayName?: string; aliases?: string[]; cafeVersion?: string; features?: string[]; protocolVersion?: number; hostId?: string; rootHostId?: string; hostBindings?: unknown; isRoot?: boolean }>(Methods.initialize, {
+          ...this.hostLinkHello(),
           protocolVersion: PROTOCOL_VERSION,
           cafeVersion: this.version,
-          features: [...CURRENT_FEATURES],
           kind: "daemon",
           token: this.config.token,
           host: this.host,
@@ -4053,6 +4172,20 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         const knownRoot = this.rootHost ?? this.store.getKv<string>("rootHost");
         if (target !== this.config.root && knownRoot && hello.host !== knownRoot) {
           throw new Error(`this address answers as root '${hello.host}', but the Root was '${knownRoot}'; refusing it (run \`cafe root set <host:port>\` if the Root really moved)`);
+        }
+        if (this.tlsContext?.network) {
+          if (!certificate || !hello.isRoot) throw new RpcError("host_auth_required", "uplink requires an authenticated Root");
+          const id = this.verifyHostHello(hello, certificate);
+          if (!Array.isArray(hello.hostBindings) || !hello.hostBindings.some((item) => {
+            const binding = HostIdentity.safeParse(item);
+            return binding.success && binding.data.hostId === id && binding.data.host === hello.host &&
+              binding.data.state === "enrolled" && binding.data.keyFingerprint === keyFingerprintOf(certificate!.toString());
+          })) throw new RpcError("bad_identity", "Root certificate does not match its advertised binding");
+          this.installRootBindings(hello.hostBindings);
+          this.bindHostCertificate(peer, certificate, id);
+          bindUplink();
+          await peer.request("host/ready", {}, this.timing.linkConnectTimeoutMs);
+          if (peer.isClosed || this.uplinkSocket !== ws) throw new RpcError("closed", "Root link was superseded during initialization");
         }
         this.uplink = peer;
         this.bindAgentMethods(peer); // the Root may relay agent/rename down this connection
@@ -4083,6 +4216,30 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.rootFailed();
         ws.close();
       }
+    });
+    const bindUplink = () => this.bindUplinkHandlers(peer, ws);
+    if (!this.tlsContext?.network) bindUplink();
+    ws.on("message", (data) => void peer.receive(data.toString()));
+    ws.on("error", () => {});
+    ws.on("close", () => {
+      this.dropHostCertificate(peer);
+      peer.closed();
+      if (this.uplinkSocket !== ws) return;
+      const wasOnline = this.uplink === peer;
+      this.uplink = undefined;
+      this.rootHints = undefined;
+      if (wasOnline) {
+        this.setRootOnline(false);
+        this.log("root connection lost");
+      }
+      this.rootFailed();
+      this.scheduleReconnect();
+    });
+  }
+
+  private bindUplinkHandlers(peer: Peer, ws: WebSocket): void {
+    peer.on("host/bindings", (bindings: unknown) => {
+      if (peer.hostIdentity?.hostId === this.rootHostId && this.uplinkSocket === ws) this.installRootBindings(bindings);
     });
     peer.on(Methods.registrySnapshot, (x: { version: number; records: AgentRecord[] }) => {
       const remote = x.records.filter((r) => r.host !== this.host);
@@ -4151,21 +4308,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
     peer.on("agent/kick", (x: { agentId: string }) => this.agents.get(x.agentId)?.close());
-    ws.on("message", (data) => void peer.receive(data.toString()));
-    ws.on("error", () => {});
-    ws.on("close", () => {
-      peer.closed();
-      if (this.uplinkSocket !== ws) return;
-      const wasOnline = this.uplink === peer;
-      this.uplink = undefined;
-      this.rootHints = undefined;
-      if (wasOnline) {
-        this.setRootOnline(false);
-        this.log("root connection lost");
-      }
-      this.rootFailed();
-      this.scheduleReconnect();
-    });
   }
 
   private setRootOnline(online: boolean): void {
@@ -4976,10 +5118,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 }
 
 /** The addresses another machine can try to join this Root at (#95); see `Daemon.joinHint()`. */
-export function joinAddresses(o: { advertise?: string; port: number; lan: string[] }): { addresses: string[]; advertised: boolean } {
-  if (o.advertise) return { addresses: [hostWithPort(o.advertise, o.port)], advertised: true };
+export function joinAddresses(o: { advertise?: string; port: number; tlsPort?: number; lan: string[] }): { addresses: string[]; advertised: boolean } {
+  const port = o.tlsPort || o.port;
+  if (o.advertise) {
+    const address = hostWithPort(o.advertise, port);
+    // An explicit public port may be forwarded by NAT. Keep it as a candidate, and include
+    // the TLS listener when the old advertised address explicitly names the main port.
+    const namesMainPort = address === hostWithPort(bareHost(address), o.port);
+    const tlsAddress = hostWithPort(bareHost(address), port);
+    return { addresses: namesMainPort && tlsAddress !== address ? [tlsAddress, address] : [address], advertised: true };
+  }
   const lan = o.lan.length ? o.lan : ["127.0.0.1"];
-  return { addresses: lan.map((a) => hostWithPort(a, o.port)), advertised: false };
+  return { addresses: lan.map((a) => hostWithPort(a, port)), advertised: false };
 }
 
 export function lanAddress(): string {

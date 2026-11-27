@@ -39,6 +39,9 @@ describe("a TLS child daemon reaches a TLS Root", () => {
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "the invoice total is wrong" });
     const events = await untilClosed(c, res.threadId, res.orderId);
-    expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ agentId: b.rec.agentId });
+    const created = events.find((e) => e.event.type === "order.created");
+    const reply = events.find((e) => e.event.type === "order.replied");
+    expect(created?.eventHostId).toBe(child.daemon.hostId);
+    expect(reply).toMatchObject({ eventHostId: root.daemon.hostId, actor: { kind: "agent", principalId: b.rec.agentId }, event: { agentId: b.rec.agentId } });
   }, 40_000);
 });
