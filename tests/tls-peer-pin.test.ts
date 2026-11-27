@@ -1,9 +1,13 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { X509Certificate } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:net";
+import WebSocket from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-import { stringify } from "yaml";
+import { CURRENT_FEATURES, Methods, PROTOCOL_VERSION } from "@cafe/protocol";
+import { Peer } from "@cafe/protocol/peer";
 import { startDaemon, waitFor } from "./helpers.ts";
 import { enrollTestChild } from "./tls-helpers.ts";
 
@@ -91,6 +95,87 @@ describe("daemon-to-daemon Host identity", () => {
     child.daemon.setRoot(root.addr);
     await waitFor(() => child.daemon.rootOnline, 10_000);
     expect((child.daemon as any).uplink?.hostIdentity?.hostId).toBe(root.daemon.hostId);
+  }, 40_000);
+
+  it("accepts the same Root Host identity at a second isolated endpoint", async () => {
+    const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-address-root-"));
+    const childHome = mkdtempSync(join(tmpdir(), "cafe-pin-address-child-"));
+    const secondRootHome = mkdtempSync(join(tmpdir(), "cafe-pin-address-second-root-"));
+    cleanup.push(
+      () => rmSync(rootHome, { recursive: true, force: true }),
+      () => rmSync(childHome, { recursive: true, force: true }),
+      () => rmSync(secondRootHome, { recursive: true, force: true }),
+    );
+    const root = await startDaemon("pinaddressroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "pinaddresschild");
+    const firstEndpoint = `127.0.0.1:${root.server.tlsPort}`;
+    const firstRootCert = readFileSync(join(rootHome, "tls", "pinaddressroot.crt"), "utf8");
+    const child = await startDaemon("pinaddresschild", {
+      home: childHome,
+      config: { root: firstEndpoint, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
+    });
+    cleanup.push(child.stop);
+    await waitFor(() => child.daemon.rootOnline, 10_000);
+
+    // Clone a stopped Root into a distinct scratch home to model the same enrolled Root being
+    // reachable through a new endpoint. Both copies present the same CA, Host ID, and SPKI.
+    await root.stop();
+    const firstPortReservation = createServer();
+    firstPortReservation.listen(Number(firstEndpoint.split(":")[1]), "127.0.0.1");
+    await once(firstPortReservation, "listening");
+    let reservationActive = true;
+    cleanup.push(() => reservationActive
+      ? new Promise<void>((resolve) => firstPortReservation.close(() => { reservationActive = false; resolve(); }))
+      : undefined);
+    cpSync(rootHome, secondRootHome, { recursive: true });
+    const secondRoot = await startDaemon("pinaddressroot", { home: secondRootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(secondRoot.stop);
+    await new Promise<void>((resolve) => firstPortReservation.close(() => { reservationActive = false; resolve(); }));
+    const secondEndpoint = `127.0.0.1:${secondRoot.server.tlsPort}`;
+    expect(secondEndpoint).not.toBe(firstEndpoint);
+    expect(secondRoot.daemon.hostId).toBe(root.daemon.hostId);
+    const secondRootCert = readFileSync(join(secondRootHome, "tls", "pinaddressroot.crt"), "utf8");
+    const { keyFingerprintOf } = await import("../packages/daemon/src/tls/certs.ts");
+    expect(keyFingerprintOf(secondRootCert)).toBe(keyFingerprintOf(firstRootCert));
+
+    child.daemon.setRoot(secondEndpoint);
+    await waitFor(() => child.daemon.rootOnline && (child.daemon as any).uplink?.hostIdentity?.hostId === root.daemon.hostId, 10_000);
+    const bindings = child.daemon.store.getKv<import("@cafe/protocol").HostIdentity[]>("rootHostBindings") ?? [];
+    expect(bindings.find((record) => record.hostId === root.daemon.hostId)).toMatchObject({ hostId: root.daemon.hostId, state: "enrolled" });
+  }, 40_000);
+
+  it("fails closed when a legacy peer omits host-auth-v1", async () => {
+    const rootHome = mkdtempSync(join(tmpdir(), "cafe-pin-legacy-root-"));
+    const probeHome = mkdtempSync(join(tmpdir(), "cafe-pin-legacy-probe-"));
+    cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(probeHome, { recursive: true, force: true }));
+    const root = await startDaemon("pinlegacyroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, probeHome, "pinlegacyprobe");
+    const ca = readFileSync(join(rootHome, "tls", "ca.crt"), "utf8");
+    const ws = new WebSocket(`wss://127.0.0.1:${root.server.tlsPort}/ws`, {
+      ca,
+      cert: readFileSync(join(probeHome, "tls", "pinlegacyprobe.crt"), "utf8"),
+      key: readFileSync(join(probeHome, "tls", "pinlegacyprobe.key"), "utf8"),
+    });
+    const peer = new Peer(ws);
+    cleanup.push(() => ws.terminate());
+    ws.on("message", (data) => void peer.receive(data.toString()));
+    ws.on("close", () => peer.closed());
+    await once(ws, "open");
+
+    await expect(peer.request(Methods.initialize, {
+      kind: "daemon",
+      protocolVersion: PROTOCOL_VERSION,
+      token: "t0k",
+      host: "pinlegacyprobe",
+      hostId: enrolled.hostId,
+      hostAuthVersion: 1,
+      rootHostId: enrolled.rootHostId,
+      features: CURRENT_FEATURES.filter((feature) => feature !== "host-auth-v1"),
+    })).rejects.toMatchObject({ code: "host_auth_required" });
+    await expect(peer.request("registry/sync", { records: [] })).rejects.toMatchObject({ code: "unknown_method" });
+    expect(root.daemon.daemons().find((record) => record.host === "pinlegacyprobe")).toMatchObject({ online: false });
   }, 40_000);
 
   it("closes a connected direct link when the Root replaces the remote key", async () => {
