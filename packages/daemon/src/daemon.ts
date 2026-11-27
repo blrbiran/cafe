@@ -201,6 +201,32 @@ type DaemonEvents = {
   daemons: [DaemonRecord[]];
 };
 
+export function assertAgentEventActor(env: ThreadEnvelope): string | undefined {
+  const event = env.event;
+  const agentId = event.type === "order.acked" || event.type === "order.heartbeat" ||
+    event.type === "order.replied" || event.type === "order.reported" || event.type === "order.declined"
+    ? event.agentId
+    : undefined;
+  if (!agentId) return undefined;
+  if (env.actor?.kind !== "agent" || env.actor.principalId !== agentId) {
+    throw new RpcError("bad_identity", "Agent event actor does not match the event Agent");
+  }
+  return agentId;
+}
+
+export function assertAgentEventAuthority(
+  env: ThreadEnvelope,
+  authenticatedHost: string,
+  registeredAgentHost: (agentId: string) => string | undefined,
+): string | undefined {
+  const agentId = assertAgentEventActor(env);
+  if (!agentId) return undefined;
+  if (registeredAgentHost(agentId) !== authenticatedHost) {
+    throw new RpcError("not_a_target", "Agent event was not authored by its registered Host");
+  }
+  return agentId;
+}
+
 /**
  * One Daemon per Host. With `config.mode === "root"` it is also the Root Daemon:
  * it owns the authoritative Registry and relays every Order (ADR-0001, ADR-0002).
@@ -3378,6 +3404,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (env.eventHostId !== opts.from.hostIdentity.hostId || env.host !== opts.from.meta.host) {
         throw new RpcError("bad_identity", "event source differs from the authenticated Host");
       }
+      assertAgentEventAuthority(env, opts.from.meta.host, (agentId) => this.registry.get(agentId)?.host);
     }
     if (this.stopped || this.seen.has(env.eventId)) return;
     const event = env.event;
