@@ -1,7 +1,8 @@
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { DEFAULT_CHANNEL, type AgentRecord, type HostIdentity, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+import { isDeepStrictEqual } from "node:util";
+import { DEFAULT_CHANNEL, type AgentRecord, type HostIdentity, type OrderAssignment, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 
 /** Decode a Thread's metadata; a Thread written before channels existed is a default-channel Thread. */
 function threadMeta(raw: string): ThreadMeta {
@@ -19,6 +20,24 @@ export interface StoredArtifact {
   size: number;
   sha256: string;
   createdAt: number;
+}
+
+export interface RecipientAssignmentRecord extends OrderAssignment {
+  orderId: string;
+  threadId: string;
+  receivedAt: number;
+}
+
+export interface RecipientAssignmentReceipt {
+  assignmentId: string;
+  agentId: string;
+  acceptedAt: number;
+}
+
+export interface StoredOrderAssignment {
+  orderId: string;
+  threadId: string;
+  assignment: OrderAssignment;
 }
 
 export interface MissingEventAuthority {
@@ -79,6 +98,8 @@ export interface CallerPrincipalRecord {
 }
 
 const PENDING_EVENTS_MAX = 5000;
+// Fail closed at capacity; evicting a receipt could let a replay inject accepted work twice.
+const RECIPIENT_ASSIGNMENTS_MAX = 5000;
 
 /**
  * Thread content lives in append-only JSONL files; SQLite keeps only metadata
@@ -180,6 +201,22 @@ export class Store {
         principal_id TEXT NOT NULL,
         PRIMARY KEY(kind, credential_digest),
         UNIQUE(kind, principal_id)
+      );
+      CREATE TABLE IF NOT EXISTS recipient_assignments (
+        assignment_id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        target_agent_id TEXT NOT NULL,
+        target_host_id TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        received_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS recipient_assignments_received ON recipient_assignments(received_at, assignment_id);
+      CREATE TABLE IF NOT EXISTS recipient_assignment_receipts (
+        assignment_id TEXT PRIMARY KEY REFERENCES recipient_assignments(assignment_id),
+        agent_id TEXT NOT NULL,
+        accepted_at INTEGER NOT NULL,
+        record_json TEXT NOT NULL
       );
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
@@ -432,6 +469,97 @@ export class Store {
     const row = this.db.prepare("SELECT principal_id FROM caller_principals WHERE kind = ? AND credential_digest = ?")
       .get(kind, credentialDigest) as { principal_id: string } | undefined;
     return row?.principal_id;
+  }
+
+  putRecipientAssignment(record: RecipientAssignmentRecord): RecipientAssignmentRecord {
+    if (!record.assignmentId || !record.orderId || !record.threadId || !record.targetAgentId || !record.targetHostId || !record.bodyHash) {
+      throw new Error("recipient assignment requires exact IDs and body hash");
+    }
+    const existing = this.getRecipientAssignment(record.assignmentId);
+    if (existing) {
+      if (!isDeepStrictEqual(existing, record)) throw new Error(`recipient assignment conflict: ${record.assignmentId}`);
+      return existing;
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Recheck under the write lock so parallel retries cannot exceed the bounded inbox.
+      const raced = this.getRecipientAssignment(record.assignmentId);
+      if (raced) {
+        if (!isDeepStrictEqual(raced, record)) throw new Error(`recipient assignment conflict: ${record.assignmentId}`);
+        this.db.exec("COMMIT");
+        return raced;
+      }
+      const count = (this.db.prepare("SELECT COUNT(*) AS n FROM recipient_assignments").get() as { n: number }).n;
+      if (count >= RECIPIENT_ASSIGNMENTS_MAX) throw new Error(`recipient assignment inbox is full (${RECIPIENT_ASSIGNMENTS_MAX})`);
+      this.db.prepare(`
+        INSERT INTO recipient_assignments(assignment_id, order_id, thread_id, target_agent_id, target_host_id, record_json, received_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(record.assignmentId, record.orderId, record.threadId, record.targetAgentId, record.targetHostId, JSON.stringify(record), record.receivedAt);
+      this.db.exec("COMMIT");
+      return record;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getRecipientAssignment(assignmentId: string): RecipientAssignmentRecord | undefined {
+    const row = this.db.prepare("SELECT record_json FROM recipient_assignments WHERE assignment_id = ?")
+      .get(assignmentId) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as RecipientAssignmentRecord : undefined;
+  }
+
+  putRecipientAssignmentReceipt(receipt: RecipientAssignmentReceipt): RecipientAssignmentReceipt {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const assignment = this.getRecipientAssignment(receipt.assignmentId);
+      if (!assignment) throw new Error(`recipient assignment not found: ${receipt.assignmentId}`);
+      const existing = this.getRecipientAssignmentReceipt(receipt.assignmentId);
+      if (existing) {
+        if (!isDeepStrictEqual(existing, receipt)) throw new Error(`recipient receipt conflict: ${receipt.assignmentId}`);
+        this.db.exec("COMMIT");
+        return existing;
+      }
+      if (assignment.targetAgentId !== receipt.agentId) throw new Error("recipient receipt Agent does not match assignment target Agent");
+      this.db.prepare(`
+        INSERT INTO recipient_assignment_receipts(assignment_id, agent_id, accepted_at, record_json)
+        VALUES (?, ?, ?, ?)
+      `).run(receipt.assignmentId, receipt.agentId, receipt.acceptedAt, JSON.stringify(receipt));
+      this.db.exec("COMMIT");
+      return receipt;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getRecipientAssignmentReceipt(assignmentId: string): RecipientAssignmentReceipt | undefined {
+    const row = this.db.prepare("SELECT record_json FROM recipient_assignment_receipts WHERE assignment_id = ?")
+      .get(assignmentId) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as RecipientAssignmentReceipt : undefined;
+  }
+
+  /** Look up one journaled assignment by both its owning Order ID and immutable assignment ID. */
+  getOrderAssignment(file: string, orderId: string, assignmentId: string): StoredOrderAssignment | undefined {
+    let found: StoredOrderAssignment | undefined;
+    for (const env of this.readEvents(file)) {
+      if (env.orderId !== orderId) continue;
+      const event = env.event;
+      const assignments = event.type === "order.assigned"
+        ? [event.assignment]
+        : event.type === "order.replaced" && event.order.orderId === orderId && event.order.threadId === env.threadId
+          ? event.assignments
+          : [];
+      for (const assignment of assignments) {
+        if (assignment.assignmentId !== assignmentId) continue;
+        const candidate = { orderId, threadId: env.threadId, assignment };
+        if (found && !isDeepStrictEqual(found, candidate)) {
+          throw new Error(`assignment ID is ambiguous within Order ${orderId}: ${assignmentId}`);
+        }
+        found = candidate;
+      }
+    }
+    return found;
   }
 
   threadFile(threadId: string, createdAt: number): string {
