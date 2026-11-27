@@ -72,7 +72,7 @@
 - [x] Run `npx vitest run tests/protocol-auth.test.ts tests/store-event-auth.test.ts tests/host-credential-store.test.ts`; confirm pass.
 - [x] Run `npm run typecheck` after narrowing test cleanup to exact temp paths; confirm pass.
 - [x] Run the full `npm test` suite; confirm all tests pass.
-- [ ] Review `git diff --check`, stage only the Task 1 continuation files, and commit with the required attribution trailer; never stage `.vitest/`.
+- [x] Review `git diff --check`, stage only the Task 1 continuation files, and commit with the required attribution trailer; never stage `.vitest/`.
 
 ## Task 2: Host identity certificate lifecycle
 
