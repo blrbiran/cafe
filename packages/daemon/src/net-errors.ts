@@ -38,6 +38,8 @@ export function describeFetchError(err: unknown, target: string): FetchFailure {
   const cause = causeOf(err);
   const code = cause?.code === "UND_ERR_CONNECT_TIMEOUT" ? "ETIMEDOUT" : cause?.code === "UND_ERR_SOCKET" ? "ECONNRESET" : cause?.code;
   switch (code) {
+    case "ERR_SSL_WRONG_VERSION_NUMBER":
+      return { code, error: `cannot establish TLS with ${target} (${code}). Check that the address uses the other machine's encrypted port` };
     case "ECONNREFUSED":
       return {
         code,

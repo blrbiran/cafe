@@ -16,6 +16,12 @@ describe("Network page host diagnostics (#83)", () => {
     expect(hostFailure(en, { code: "ECONNREFUSED", error: "x" })).toMatch(/Docker/);
   });
 
+  it("points to the encrypted port for a TLS protocol mismatch in either language", () => {
+    const problem = { code: "ERR_SSL_WRONG_VERSION_NUMBER" };
+    expect(hostFailure(en, problem)).toMatch(/encrypted port/);
+    expect(hostFailure(zh, problem)).toContain("加密端口");
+  });
+
   it("covers the other common causes", () => {
     for (const code of ["ENOTFOUND", "ETIMEDOUT", "EHOSTUNREACH", "ECONNRESET", "UNAUTHORIZED"]) {
       expect(hostFailure(en, { code, error: "raw" })).not.toBe(`${en.hostUnreachable}: raw`);

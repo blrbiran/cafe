@@ -44,6 +44,14 @@ describe("describeFetchError (#83)", () => {
     expect(describeFetchError(err, "10.255.255.1:4777").code).toBe("ETIMEDOUT");
   });
 
+  it("suggests checking the encrypted port when the other end cannot speak TLS", () => {
+    const cause = Object.assign(new Error("wrong version number"), { code: "ERR_SSL_WRONG_VERSION_NUMBER" });
+    const problem = describeFetchError(new TypeError("fetch failed", { cause }), "pc1:4777");
+    expect(problem.code).toBe("ERR_SSL_WRONG_VERSION_NUMBER");
+    expect(problem.error).toMatch(/encrypted port/i);
+    expect(problem.error).not.toMatch(/certificate rejected/i);
+  });
+
   it("names a certificate problem", () => {
     const err = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("self-signed certificate in certificate chain"), { code: "SELF_SIGNED_CERT_IN_CHAIN" }) });
     const d = describeFetchError(err, "pc1:4778");
