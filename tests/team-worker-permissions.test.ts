@@ -11,7 +11,7 @@ const PROBE = new URL("../scripts/readonly-runtime-probe.mjs", import.meta.url).
 
 function fakeRuntime(name: string, script: string): string {
   const bin = join(root, name);
-  writeFileSync(bin, `#!/usr/bin/env node\n${script}\n`, "utf8");
+  writeFileSync(bin, `#!${process.execPath}\n${script}\n`, "utf8");
   chmodSync(bin, 0o755);
   return bin;
 }
@@ -77,6 +77,14 @@ async function waitForWorker(sup: Supervisor, dir: string, state: "running" | "f
 }
 
 describe("read-only worker launch", () => {
+  it("does not accept an unverified runtime based on RPC tool names alone", async () => {
+    const binary = compliantRuntime("unverified-pi", "pi");
+    const extension = join(root, "unverified-extension.mjs");
+    writeFileSync(extension, "export default () => {};");
+    const result = await probeReadonlyRuntime(binary, "pi", extension, { home: join(root, "unverified-home") });
+    expect(result.supported).toBe(false);
+  });
+
   it("builds the Pi allowlist and disables MCP and extension discovery", () => {
     expect(readonlyToolArgs("pi", "/cafe/ext.ts")).toEqual([
       "--tools", "read,grep,find,ls,cafe_ask,cafe_agents,cafe_reply,cafe_decline",

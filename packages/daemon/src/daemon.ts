@@ -13,6 +13,7 @@ import { checkServerIdentity, type PeerCertificate } from "node:tls";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
 import { hostIdFromCertificate, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, missingSans, sanCovers, sanList, verifyHostRenewal } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
+import { validateMemberPath } from "./team-paths.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
   ACK_TIMEOUT_MS,
@@ -1634,6 +1635,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const key = rosterKey({ host: this.host, team: team.name, channel: team.channel });
     const previous = this.teamRecords.get(key);
     const canonical = realpathSync(rosterDir);
+    try {
+      for (const member of team.members) validateMemberPath(this.store.home, canonical, member.name, member.dir);
+    } catch (err) {
+      throw new RpcError("bad_request", (err as Error).message);
+    }
     const owners = new Map(Object.entries(this.store.getKv<Record<string, string>>("rosterOwners") ?? {}));
     const owner = owners.get(key);
     if (owner && owner !== canonical) {

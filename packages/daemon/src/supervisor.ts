@@ -1,11 +1,12 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { TeamLaunchSpec, type TeamMember, type TeamSpec } from "@cafe/protocol";
+import { effectiveMemberAccess, validateMemberPath } from "./team-paths.ts";
 import { openWorkerLog, type CappedLineFile } from "./proc/cappedLog.ts";
 import { probeGroup, readProcessStart, signalGroup } from "./proc/processStart.ts";
 
@@ -130,9 +131,6 @@ export interface ProbeResult { supported: boolean; binaryHash: string; reason?: 
 
 function hashFile(path: string): string { return createHash("sha256").update(readFileSync(path)).digest("hex"); }
 
-const PI_VERSION = "1.6.0";
-const OMP_VERSION = "19.0.1";
-
 function isPiRuntime(value: string): boolean { return /^pi[ @]/i.test(value.trim()); }
 function isOmpRuntime(value: string): boolean { return /^omp\//i.test(value.trim()); }
 /** The runtime kind a binary path refers to; a custom binary is neither and keeps the legacy launch. */
@@ -146,46 +144,6 @@ function compatibleRuntime(binary: string, agent: "pi" | "omp"): boolean {
   const reported = `${version.stdout}${version.stderr}`.trim();
   return agent === "pi" ? isPiRuntime(reported) || (!isOmpRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported)) : isOmpRuntime(reported) || (!isPiRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported));
 }
-function compatibleVersion(reported: string, agent: "pi" | "omp"): boolean {
-  const clean = reported.trim();
-  const expected = agent === "pi" ? PI_VERSION : OMP_VERSION;
-  if (isOmpRuntime(clean)) return clean === `omp/${expected}`;
-  if (isPiRuntime(clean)) return clean === `pi ${expected}` || clean === `pi@${expected}`;
-  return clean === expected;
-}
-
-function localProbe(binary: string, agent: "pi" | "omp", _extension: string, flags: string[]): Promise<{ supported: boolean; reason?: string }> {
-  const required = agent === "pi" ? ["--tools", "--no-mcp", "--no-extensions", "-e"] : ["--tools", "--no-extensions", "-e"];
-  const help = spawnSync(binary, ["--help"], { encoding: "utf8", timeout: 5000 });
-  if (help.error || help.status !== 0 || !required.every((flag) => help.stdout.includes(flag))) return Promise.resolve({ supported: false, reason: "runtime does not advertise the required isolation flags" });
-  const version = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 5000 });
-  if (version.error || version.status !== 0) return Promise.resolve({ supported: false, reason: "runtime version is not in Cafe's tested read-only table" });
-  const reported = `${version.stdout}${version.stderr}`.trim();
-  const named = agent === "pi" ? isPiRuntime(reported) || (!isOmpRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported)) : isOmpRuntime(reported) || (!isPiRuntime(reported) && /^\d+\.\d+\.\d+$/i.test(reported));
-  if (!named || !compatibleVersion(reported, agent)) return Promise.resolve({ supported: false, reason: "runtime version is not in Cafe's tested read-only table" });
-  const marker = join(tmpdir(), `cafe-probe-side-effect-${process.pid}-${Date.now()}`);
-  const child = spawn(binary, ["--mode", "rpc", "--no-session", "--profile", marker, ...flags], {
-    cwd: tmpdir(), env: { HOME: marker, XDG_CONFIG_HOME: join(marker, ".config"), CAFE_DAEMON: "", CAFE_TOKEN: "", CAFE_PROBE: "1", PI_OFFLINE: "1" }, stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stdout = "", stderr = "";
-  child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => stdout += chunk);
-  child.stderr.on("data", (chunk) => stderr += chunk);
-  child.on("error", () => {});
-  child.stdin.write(JSON.stringify({ command: "get_available_tools", id: 1 }) + "\n" + JSON.stringify({ command: "mcp__fake__write", id: 2 }) + "\n");
-  child.stdin.end();
-  const exited = new Promise<number | null>((resolve) => child.once("close", resolve));
-  const killer = setTimeout(() => child.kill("SIGKILL"), 5000);
-  return Promise.race([exited, new Promise<null>((resolve) => setTimeout(() => resolve(null), 5200))]).then(async (code) => {
-    clearTimeout(killer);
-    if (code === null) { try { child.kill("SIGKILL"); } catch {} return { supported: false, reason: "runtime isolation probe timed out" }; }
-    if (existsSync(marker)) return { supported: false, reason: "fake MCP side effect observed" };
-    const expected = agent === "pi" ? ["read", "grep", "find", "ls", "cafe_ask", "cafe_agents", "cafe_reply", "cafe_decline"] : ["read", "grep", "glob", "cafe_ask", "cafe_agents", "cafe_reply", "cafe_decline"];
-    const lower = `${stdout}\n${stderr}`.toLowerCase();
-    return expected.every((tool) => lower.includes(tool)) ? { supported: true } : { supported: false, reason: "runtime did not accept Cafe's read-only tool allowlist" };
-  }).finally(() => { try { rmSync(marker, { recursive: true, force: true }); } catch {} });
-}
-
 /**
  * Hold a read-only launch until its exact executable and Cafe-extension hashes have passed an
  * isolated no-model probe. Tests inject probeScript; production uses the sibling helper.
@@ -199,6 +157,7 @@ export async function probeReadonlyRuntime(binary: string, agent: "pi" | "omp", 
   catch { return { supported: false, binaryHash: hashFile(realBinary), reason: `Cafe extension not found: ${cafeExtension}` }; }
   if (!existsSync(realExtension)) return { supported: false, binaryHash: hashFile(realBinary), reason: `Cafe extension not found: ${cafeExtension}` };
   const binaryHash = hashFile(realBinary);
+  if (!opts.probeScript) return { supported: false, binaryHash, reason: "Cafe has not yet verified read-only tool isolation for this runtime" };
   const extensionHash = hashFile(realExtension);
   const cacheFile = join(opts.home, "runtime-probes.json");
   mkdirSync(opts.home, { recursive: true, mode: 0o700 });
@@ -207,16 +166,13 @@ export async function probeReadonlyRuntime(binary: string, agent: "pi" | "omp", 
   if (cache[key]?.supported) return { ...cache[key], fromCache: true };
   if (!compatibleRuntime(realBinary, agent)) return { supported: false, binaryHash, reason: "runtime version is not in Cafe's tested read-only table" };
   const flags = readonlyToolArgs(agent, realExtension);
+  const result = spawnSync(process.execPath, [opts.probeScript, realBinary, agent, realExtension, ...flags], {
+    cwd: tmpdir(), env: { ...process.env, HOME: opts.home, XDG_CONFIG_HOME: join(opts.home, "xdg"), CAFE_DAEMON: "", CAFE_TOKEN: "", PI_OFFLINE: "1" },
+    encoding: "utf8", timeout: 5000,
+  });
   let outcome: { supported?: boolean; reason?: string };
-  if (opts.probeScript) {
-    const result = spawnSync(process.execPath, [opts.probeScript, realBinary, agent, realExtension, ...flags], {
-      cwd: tmpdir(), env: { ...process.env, HOME: opts.home, XDG_CONFIG_HOME: join(opts.home, "xdg"), CAFE_DAEMON: "", CAFE_TOKEN: "", PI_OFFLINE: "1" },
-      encoding: "utf8", timeout: 5000,
-    });
-    try { outcome = JSON.parse(result.stdout.trim().split(/\n/).pop()!); } catch { outcome = { supported: false, reason: result.error?.message ?? `probe exited ${result.status}` }; }
-  } else {
-    outcome = await localProbe(realBinary, agent, realExtension, flags);
-  }
+  try { outcome = JSON.parse(result.stdout.trim().split(/\n/).pop()!); }
+  catch { outcome = { supported: false, reason: result.error?.message ?? `probe exited ${result.status}` }; }
   const response = { supported: !!outcome.supported, binaryHash, ...(outcome.reason ? { reason: outcome.reason } : {}) };
   if (response.supported) cache[key] = response; else delete cache[key];
   writeAtomic(cacheFile, JSON.stringify(cache, null, 2));
@@ -346,20 +302,18 @@ export class Supervisor {
    */
   startTeam(rosterDir: string, team: TeamSpec, persist = true): WorkerInfo[] {
     team = TeamLaunchSpec.parse(team);
-    const dir = resolve(rosterDir);
+    const dir = realpathSync(resolve(rosterDir));
     const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
-    // Refuse a roster with a missing worktree before starting anything: spawn would otherwise fail
-    // asynchronously while `team start` reports success (v4-11 review).
-    for (const member of team.members) {
-      if (member.mode === "tui") continue;
-      const memberDir = resolve(dir, member.dir);
-      let isDir = false;
-      try {
-        isDir = statSync(memberDir).isDirectory();
-      } catch {
-        isDir = false;
-      }
-      if (!isDir) throw new Error(`team member ${member.name}: directory ${memberDir} does not exist`);
+    const validatedPaths = new Map(team.members.map((member) => [member.name, validateMemberPath(this.home, dir, member.name, member.dir).realPath]));
+    const writes = team.members.filter((member) => effectiveMemberAccess(member) === "write");
+    for (const [index, member] of writes.entries()) {
+      const target = validatedPaths.get(member.name)!;
+      const overlaps = (otherPath: string) => target === otherPath || target.startsWith(otherPath + sep) || otherPath.startsWith(target + sep);
+      const conflict = writes.slice(0, index).find((other) => overlaps(validatedPaths.get(other.name)!));
+      if (conflict) throw new Error(`${member.name} and ${conflict.name} would write to overlapping directories`);
+      const active = this.workers.find((other) => !(other.rosterDir === dir && other.member === member.name) &&
+        other.spec.access === "workspace-write" && overlaps(other.cwd ?? other.spec.dir));
+      if (active) throw new Error(`${member.name} would overlap an existing write-enabled worker in ${active.cwd ?? active.spec.dir}`);
     }
     // Each worker keeps only its own member definition; save() unions them per roster. A partial
     // `team start` must never overwrite the set that a later restart restores (v4-11 review).
@@ -373,7 +327,7 @@ export class Supervisor {
       const already = this.workers.find((w) => w.rosterDir === dir && w.member === member.name && !w.failed);
       if (already) continue;
       this.workers = this.workers.filter((w) => !(w.rosterDir === dir && w.member === member.name));
-      const memberDir = resolve(dir, member.dir);
+      const memberDir = validatedPaths.get(member.name)!;
       const runner = member.agent ?? team.agent ?? "pi";
       const native = runner === "codex" || runner === "claude";
       const flavor = member.bin ?? runner;

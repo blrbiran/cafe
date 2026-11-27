@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { Supervisor } from "@cafe/daemon";
 import type { TeamSpec } from "@cafe/protocol";
+import { trustMemberPath } from "../packages/daemon/src/team-paths.ts";
 import { waitFor } from "./helpers.ts";
 
 const FAKE_PI = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-pi.mjs");
@@ -26,7 +27,7 @@ function setup(): { home: string; roster: string; pidfile: string } {
   mkdirSync(home);
   mkdirSync(roster);
   mkdirSync(join(root, "repo-arch"));
-  writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members: []\n");
+  writeFileSync(join(roster, ".cafe"), "name: repo\nteam:\n  channel: repo-dev\n  members:\n    - name: lead\n      duty: orchestrator\n    - name: arch\n      dir: ../repo-arch\n");
   const pidfile = join(root, "pids.txt");
   pidfiles.push(pidfile);
   process.env.FAKE_PI_PIDFILE = pidfile;
@@ -55,6 +56,9 @@ describe("supervisor teams (v4-11)", () => {
   it("starts one worker per headless member with its own cwd, and stops only supervised members", async () => {
     const { home, roster, pidfile } = setup();
     const sup = supervisor(home);
+    expect(() => sup.startTeam(roster, team)).toThrow(/exact local grant/);
+    expect(sup.list()).toHaveLength(0);
+    trustMemberPath(home, roster, "repo", "arch", "../repo-arch");
     const started = sup.startTeam(roster, team);
     expect(started.map((w) => w.member).sort()).toEqual(["arch", "dev1", "dev2"]);
     expect(started.find((w) => w.member === "arch")!.cwd).toBe(join(dirname(roster), "repo-arch"));
@@ -80,6 +84,7 @@ describe("supervisor teams (v4-11)", () => {
   it("restores supervised team members after a restart", async () => {
     const { home, roster } = setup();
     const sup = supervisor(home);
+    trustMemberPath(home, roster, "repo", "arch", "../repo-arch");
     sup.startTeam(roster, team);
     await sup.shutdown();
     const again = supervisor(home);
@@ -107,6 +112,18 @@ describe("supervisor teams (v4-11)", () => {
     const again = supervisor(home);
     await again.restore();
     expect(again.list().map((w) => w.member)).toEqual(["dev2"]);
+  });
+
+  it("refuses two write-enabled workers with overlapping directories", () => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    mkdirSync(join(roster, "nested"));
+    const members: TeamSpec["members"] = [
+      { ...team.members[0]!, access: "write" },
+      { ...team.members[1]!, access: "write", dir: "nested" },
+    ];
+    expect(() => sup.startTeam(roster, { ...team, members })).toThrow(/overlapping directories/);
+    expect(sup.list()).toHaveLength(0);
   });
 
   it("refuses a member with a missing worktree before starting anything", () => {
