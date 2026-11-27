@@ -86,6 +86,7 @@ const TOOLS = [
       type: "object",
       properties: {
         threadId: { type: "string" },
+        orderId: { type: "string", description: "The exact Order to override (default: resolve the current one once)." },
         agent: { type: "string", description: "The target Barista's address (name@host)." },
         text: { type: "string" },
         attachments: { type: "array", items: { type: "string" }, description: "Local file paths to attach." },
@@ -124,7 +125,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
     });
     await ensured;
     const owner = path === "/api/orders" || path.endsWith("/cancel");
-    const operator = /^\/api\/threads\/[^/]+\/reply$/.test(path);
+    const operator = /^\/api\/threads\/[^/]+(?:\/orders\/[^/]+)?\/reply$/.test(path);
     if ((owner || operator) && callerCredentialTransport(opts.base) === "remote-plaintext") {
       throw new ToolError("tls_required: caller credentials require loopback HTTP or the configured verified HTTPS endpoint");
     }
@@ -308,10 +309,14 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const threadId = str(args.threadId, "threadId", true)!;
         const agent = str(args.agent, "agent", true)!;
         const text = str(args.text, "text", true)!;
+        if (callerCredentialTransport(opts.base) !== "loopback") throw new ToolError("operator replies must run on the Order-owning Host");
+        const thread = encodeURIComponent(threadId);
+        const orderId = str(args.orderId, "orderId") ?? (await api<{ meta: ThreadMeta }>(`/api/threads/${thread}`)).meta.orderId;
+        if (!orderId) throw new ToolError("an exact Order ID is required");
         const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
         const attachments: Attachment[] = [];
         for (const file of files) attachments.push(await upload(file));
-        await api(`/api/threads/${encodeURIComponent(threadId)}/reply`, {
+        await api(`/api/threads/${thread}/orders/${encodeURIComponent(orderId)}/reply`, {
           method: "POST",
           body: JSON.stringify({ agent, text, final: args.final !== false, ...(attachments.length ? { attachments } : {}) }),
         });

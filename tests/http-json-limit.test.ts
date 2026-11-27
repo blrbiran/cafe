@@ -16,6 +16,7 @@ function post(base: string, body: string, chunked: boolean) {
       headers: {
         "content-type": "application/json",
         authorization: "Bearer t0k",
+        "x-cafe-order-owner": "a".repeat(64),
         ...(chunked ? {} : { "content-length": Buffer.byteLength(body) }),
       },
     }, (res) => {

@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseAttachMarkers } from "../packages/cli/src/artifacts.ts";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
@@ -35,16 +37,16 @@ describe("reply attachments (v4-1 phase 2)", () => {
 
     const up = await upload(d.addr, "note.txt", "from the cli");
     // A non-target cannot reply while the Order is open.
-    const bad = await fetch(`http://${d.addr}/api/threads/${res.threadId}/reply`, {
+    const bad = await fetch(`http://${d.addr}/api/threads/${res.threadId}/orders/${res.orderId}/reply`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-cafe-operator-key": readFileSync(join(d.home, "operator.key"), "utf8") },
       body: JSON.stringify({ agent: "nobody@pc1", text: "x" }),
     });
     expect(bad.status).toBe(400);
 
-    const reply = await fetch(`http://${d.addr}/api/threads/${res.threadId}/reply`, {
+    const reply = await fetch(`http://${d.addr}/api/threads/${res.threadId}/orders/${res.orderId}/reply`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-cafe-operator-key": readFileSync(join(d.home, "operator.key"), "utf8") },
       body: JSON.stringify({ agent: "helper@pc1", text: "here it is", attachments: [up.attachment] }),
     });
     expect(reply.status).toBe(200);
@@ -65,9 +67,9 @@ describe("reply attachments (v4-1 phase 2)", () => {
     cleanup.push(() => c.close());
     const res = await c.ask({ body: "hi", to: "helper" });
     await untilClosed(c, res.threadId, res.orderId);
-    const late = await fetch(`http://${d.addr}/api/threads/${res.threadId}/reply`, {
+    const late = await fetch(`http://${d.addr}/api/threads/${res.threadId}/orders/${res.orderId}/reply`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-cafe-operator-key": readFileSync(join(d.home, "operator.key"), "utf8") },
       body: JSON.stringify({ agent: "helper@pc1", text: "late" }),
     });
     expect(late.status).toBe(400);

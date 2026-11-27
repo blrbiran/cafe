@@ -1051,13 +1051,19 @@ program
   .option("--attach <file>", "attach a file (repeatable; uploaded before the reply)", (v: string, acc: string[]) => [...acc, v], [] as string[])
   .action(async (id: string, words: string[], o) => {
     await ensureDaemon();
+    const operatorKey = localOperatorKey();
+    const thread = encodeURIComponent(id);
+    const orderId = o.order ?? (await api<{ meta: ThreadMeta }>(`/api/threads/${thread}`)).meta.orderId;
+    if (!orderId) throw new Error("an exact Order ID is required");
     const attachments = [];
     for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
-    const res = await api(`/api/threads/${encodeURIComponent(id)}/reply`, {
+    const res = await api(`/api/threads/${thread}/orders/${encodeURIComponent(orderId)}/reply`, {
       method: "POST",
+      headers: { "x-cafe-operator-key": operatorKey },
+      redirect: "error",
       body: JSON.stringify({
         agent: o.agent,
-        orderId: o.order,
+        orderId,
         text: words.join(" "),
         final: !o.interim,
         ...(attachments.length ? { attachments } : {}),

@@ -191,7 +191,7 @@ describe("thread child results", () => {
     const order = await c.ask({ body: "review the release", to: "helper" });
     await waitFor(() => d.daemon.thread(order.threadId)?.meta.status === "working");
 
-    const reply = await fetch(`http://${d.addr}/api/threads/${order.threadId}/reply`, {
+    const reply = await fetch(`http://${d.addr}/api/threads/${order.threadId}/orders/${order.orderId}/reply`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-cafe-operator-key": readFileSync(join(d.home, "operator.key"), "utf8") },
       body: JSON.stringify({ agent: helper.rec.address, text: "reviewed" }),

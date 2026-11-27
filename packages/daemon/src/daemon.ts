@@ -2218,9 +2218,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     ownerKey?: string,
     caller?: { kind: "human" | "connector"; credential: string },
   ): CallerPrincipal | undefined {
-    if (peer?.meta.agentId) {
+    if (peer?.meta.agentId && this.agents.get(peer.meta.agentId) === peer) {
       const principalId = peer.meta.agentId;
-      const scopeKey = ownershipDigest(`agent:${peer.meta.host ?? ""}:${principalId}`);
+      const scopeKey = ownershipDigest(`agent:${this.hostId}:${principalId}`);
       return { kind: "agent", principalId, scopeKey };
     }
     if (caller?.kind === "connector") {
@@ -2328,7 +2328,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (open) {
         const ownsOpen = peer
           ? open.customerPeer === peer || (!!agentId && this.agents.get(agentId) === peer && open.order.from.id === agentId)
-          : this.ownsCancellation(open.order, ownerKey);
+          : principal?.kind === "connector"
+            ? this.store.getKv<string>(`connector-owner:${open.order.orderId}`) === principal.principalId
+            : this.ownsCancellation(open.order, ownerKey);
         if (!ownsOpen || open.order.from.host !== this.host) throw new RpcError("not_order_owner", "only the requester can replace this Order");
         replacing = open;
       } else if ((prior.status === "routing" || prior.status === "delivering" || prior.status === "working") && !this.closingEvent(prior.threadId, prior.orderId)) {
@@ -2403,6 +2405,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (owner?.success) this.store.setKv(`human-owner:${order.orderId}`, ownershipDigest(owner.data));
     const cancellationOwner = !peer ? OwnershipKey.safeParse(ownerKey) : undefined;
     if (cancellationOwner?.success) this.store.setKv(`cancel-owner:${order.orderId}`, ownershipDigest(cancellationOwner.data));
+    if (principal?.kind === "connector") this.store.setKv(`connector-owner:${order.orderId}`, principal.principalId);
     this.knownOrders.set(order.orderId, order);
     // Capture the preceding turn before creating the new turn resets this metadata.
     const answeredBefore = prior ? [...new Set(prior.replies.filter((reply) => reply.at < (prior!.closedAt ?? Number.POSITIVE_INFINITY)).map((r) => r.agentId))] : [];
@@ -3182,7 +3185,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     setTimeout(() => this.tracking.delete(t.order.orderId), 60_000).unref?.();
   }
 
-  cancel(threadId: string, orderId: string, auth: { peer?: Peer; ownerKey?: string; operatorKey?: string; loopback?: boolean }): {} {
+  cancel(threadId: string, orderId: string, auth: { peer?: Peer; ownerKey?: string; connectorKey?: string; operatorKey?: string; loopback?: boolean }): {} {
     if (typeof threadId !== "string" || !threadId || typeof orderId !== "string" || !orderId) {
       throw new RpcError("bad_request", "threadId and orderId are required to cancel an Order");
     }
@@ -3202,6 +3205,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     } else if (auth.operatorKey !== undefined) {
       if (!auth.loopback || !this.verifyOperatorCredential(auth.operatorKey)) throw new RpcError("unauthorized", "cancellation requires the local operator credential on the Order's Host");
       actor = { kind: "operator", principalId: this.store.putCallerPrincipal({ kind: "operator", credentialDigest: this.operatorKeyDigest, principalId: ulid() }) };
+    } else if (auth.connectorKey !== undefined) {
+      const principal = this.resolveCallerPrincipal(undefined, undefined, { kind: "connector", credential: auth.connectorKey });
+      if (!principal || this.store.getKv<string>(`connector-owner:${t.order.orderId}`) !== principal.principalId) {
+        throw new RpcError("not_order_owner", "the installed connector does not own this Order");
+      }
+      actor = { kind: "connector", principalId: principal.principalId };
     } else if (this.ownsCancellation(t.order, auth.ownerKey)) {
       actor = { kind: "human", principalId: this.store.putCallerPrincipal({ kind: "human", credentialDigest: ownershipDigest(auth.ownerKey!), principalId: ulid() }) };
     } else {
@@ -3232,23 +3241,29 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** Record an operator override on an open Order, clearly distinguished from an authenticated Barista reply. */
-  replyAs(threadId: string, p: { orderId?: string; agent: string; text: string; final?: boolean; attachments?: Attachment[] }): {} {
+  replyAs(threadId: string, p: { orderId: string; agent: string; text: string; final?: boolean; attachments?: Attachment[] }): {} {
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) throw new RpcError("not_found", `unknown thread ${threadId}`);
-    const orderId = p.orderId ?? meta.orderId;
+    const orderId = p.orderId;
     const t = this.tracking.get(orderId);
-    if (!t || t.status !== "open" || t.order.threadId !== threadId) throw new RpcError("not_open", `order ${orderId} is not open on this daemon`);
+    if (!t || meta.orderId !== orderId || t.status !== "open" || t.order.threadId !== threadId || t.order.from.host !== this.host) {
+      throw new RpcError("not_open", `order ${orderId} is not open on this daemon`);
+    }
     const ids = this.registry.resolve(this.normalizeAddress(p.agent)).filter((id) => t.targets.has(id));
-    if (!ids.length) throw new RpcError("bad_request", `${p.agent} is not a target of this order`);
+    if (ids.length !== 1) throw new RpcError("bad_request", `${p.agent} must identify one target of this Order`);
+    const targetId = ids[0]!;
+    if (t.targets.get(targetId) === "done") throw new RpcError("target_already_final", "the target already has a terminal result");
+    if (p.final === false && t.targets.get(targetId) === "failed") throw new RpcError("target_already_final", "a failed target cannot receive an interim update");
     const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
+    const actor = { kind: "operator" as const, principalId: this.store.putCallerPrincipal({ kind: "operator", credentialDigest: this.operatorKeyDigest, principalId: ulid() }) };
     this.emitEvent(t.order, {
       type: "order.replied",
-      agentId: ids[0]!,
+      agentId: targetId,
       text: p.text,
       final: p.final ?? true,
       source: "operator",
       ...(attachments?.length ? { attachments } : {}),
-    });
+    }, { actor });
     return {};
   }
 

@@ -126,7 +126,7 @@ describe("restart & reconnect", () => {
     const rec = await b.connect(identity("worker"));
     cleanup.push(() => b.close());
 
-    const res = await fetch(`http://${addr}/api/orders`, { method: "POST", body: JSON.stringify({ body: "long job", to: "worker" }) }).then((r) => r.json());
+    const res = await fetch(`http://${addr}/api/orders`, { method: "POST", headers: { "x-cafe-order-owner": "a".repeat(64) }, body: JSON.stringify({ body: "long job", to: "worker" }) }).then((r) => r.json());
     await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "working");
 
     await d.stop();
@@ -163,6 +163,7 @@ describe("restart & reconnect", () => {
 
     const res = await fetch(`http://${addr}/api/orders`, {
       method: "POST",
+      headers: { "x-cafe-order-owner": "a".repeat(64) },
       body: JSON.stringify({ body: "slow job", to: "slow", collect: "all", deadlineMs: 2000 }),
     }).then((r) => r.json());
     await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "working", 5000);
@@ -186,7 +187,7 @@ describe("restart & reconnect", () => {
     const b = new CafeClient({ daemon: addr });
     b.onOrder((h) => void h.ack().catch(() => {}));
     await b.connect(identity("ghost"));
-    const res = await fetch(`http://${addr}/api/orders`, { method: "POST", body: JSON.stringify({ body: "job", to: "ghost" }) }).then((r) => r.json());
+    const res = await fetch(`http://${addr}/api/orders`, { method: "POST", headers: { "x-cafe-order-owner": "a".repeat(64) }, body: JSON.stringify({ body: "job", to: "ghost" }) }).then((r) => r.json());
     await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "working");
     b.close();
     await d.stop();

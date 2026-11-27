@@ -97,7 +97,7 @@ describe("HTTP caller identity and idempotency", () => {
     const target = await barista(d.addr, identity("target"), async () => new Promise<void>(() => {}));
     cleanups.push(() => target.client.close());
     const order = await d.daemon.createOrder({ body: "operator test", kind: "order", to: target.rec.address }, undefined, "f".repeat(64));
-    const path = `/api/threads/${order.threadId}/reply`;
+    const path = `/api/threads/${order.threadId}/orders/${order.orderId}/reply`;
     const body = JSON.stringify({ agent: target.rec.address, text: "operator answer" });
     const post = (operatorKey?: string) => fetch(`http://${d.addr}${path}`, {
       method: "POST",

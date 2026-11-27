@@ -917,20 +917,24 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const orderId = match[2] ?? input?.orderId;
     const ownerKey = req.headers["x-cafe-order-owner"];
     const operatorKey = req.headers["x-cafe-operator-key"];
+    const connectorKey = req.headers["x-cafe-connector-key"];
+    if ([ownerKey, operatorKey, connectorKey].filter((key) => typeof key === "string").length > 1) throw new RpcError("bad_request", "send only one caller capability");
     return send(res, 200, daemon.cancel(match[1]!, orderId, {
       loopback,
       ownerKey: typeof ownerKey === "string" ? ownerKey : undefined,
+      connectorKey: typeof connectorKey === "string" ? connectorKey : undefined,
       operatorKey: typeof operatorKey === "string" ? operatorKey : undefined,
     }));
   }
-  if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/reply$/.exec(path))) {
+  if (m === "POST" && (match = /^\/api\/threads\/([^/]+)(?:\/orders\/([^/]+))?\/reply$/.exec(path))) {
     const operatorKey = req.headers["x-cafe-operator-key"];
     if (!isLoopback(req) || typeof operatorKey !== "string" || !daemon.verifyOperatorCredential(operatorKey)) {
       throw new RpcError("operator_required", "operator replies require the local operator credential on the Order-owning Host");
     }
     const p = await readJson(req);
-    if (typeof p.agent !== "string" || !p.agent || typeof p.text !== "string") throw new RpcError("bad_request", "agent and text are required");
-    return send(res, 200, daemon.replyAs(match[1]!, p));
+    const orderId = match[2] ?? p?.orderId;
+    if (typeof orderId !== "string" || !orderId || typeof p?.agent !== "string" || !p.agent || typeof p.text !== "string") throw new RpcError("bad_request", "orderId, agent and text are required");
+    return send(res, 200, daemon.replyAs(match[1]!, { ...p, orderId }));
   }
   if (m === "DELETE" && (match = /^\/api\/agents\/([^/]+)$/.exec(path))) {
     daemon.kick(match[1]!);
