@@ -27,6 +27,8 @@ export interface TlsConfig {
   ca?: string;
   /** TOFU pin for the CA, set by `cafe connect --ca-fingerprint`. */
   caFingerprint?: string;
+  /** Stable Root Host ID pinned at enrollment. */
+  rootHostId?: string;
   /** Per-peer leaf pin, keyed by `host:port`. */
   pins: Record<string, string>;
 }
@@ -50,6 +52,7 @@ export function readTlsConfig(raw: unknown): TlsConfig {
     port,
     ...(typeof tls.ca === "string" && tls.ca ? { ca: tls.ca } : {}),
     ...(typeof tls.caFingerprint === "string" && tls.caFingerprint ? { caFingerprint: tls.caFingerprint } : {}),
+    ...(typeof tls.rootHostId === "string" && tls.rootHostId ? { rootHostId: tls.rootHostId } : {}),
     pins: Object.fromEntries(Object.entries(pins).filter(([, v]) => typeof v === "string") as Array<[string, string]>),
   };
 }

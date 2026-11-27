@@ -39,6 +39,39 @@ export interface InviteRedemptionRecord {
   supersededByRevision?: number;
 }
 
+export interface HostInviteRecord {
+  inviteDigest: string;
+  createdAt: number;
+  expiresAt: number;
+  hostId: string;
+  host: string;
+  expectedHostRevision?: number;
+  expectedKeyFingerprint?: string;
+  /** Existing routing slug being re-enrolled, including legacy Hosts without HostIdentity yet. */
+  replaceHostSlug?: string;
+  state: "issued" | "consumed" | "superseded";
+  requestId?: string;
+  publicKeyFingerprint?: string;
+  sansHash?: string;
+}
+
+export interface HostEnrollmentInput {
+  inviteDigest: string;
+  now: number;
+  requestId: string;
+  publicKeyFingerprint: string;
+  sansHash: string;
+  certificate: string;
+  /** Computed by the Root immediately before the synchronous commit. */
+  replacementHostOnline?: boolean;
+}
+
+export interface HostEnrollmentResult {
+  identity: HostIdentity;
+  redemption: InviteRedemptionRecord;
+  retry: boolean;
+}
+
 export interface CallerPrincipalRecord {
   kind: "human" | "connector" | "operator";
   credentialDigest: string;
@@ -134,6 +167,13 @@ export class Store {
         state TEXT NOT NULL,
         record_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS host_invites (
+        invite_digest TEXT PRIMARY KEY,
+        host_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS caller_principals (
         kind TEXT NOT NULL,
         credential_digest TEXT NOT NULL,
@@ -204,6 +244,136 @@ export class Store {
   getHostIdentityByKeyFingerprint(keyFingerprint: string): HostIdentity | undefined {
     const row = this.db.prepare("SELECT record_json FROM host_identities WHERE key_fingerprint = ?").get(keyFingerprint) as { record_json: string } | undefined;
     return row ? JSON.parse(row.record_json) as HostIdentity : undefined;
+  }
+
+  createHostInvite(invite: HostInviteRecord): void {
+    if (invite.state !== "issued" || !invite.inviteDigest || invite.expiresAt <= invite.createdAt) {
+      throw new Error("invalid Host invite");
+    }
+    const current = this.getHostInvite(invite.inviteDigest);
+    if (current) {
+      if (JSON.stringify(current) === JSON.stringify(invite)) return;
+      throw new Error("invite digest already exists");
+    }
+    if (invite.expectedHostRevision !== undefined) {
+      const old = this.getHostIdentity(invite.hostId);
+      if (!old || old.revision !== invite.expectedHostRevision || old.keyFingerprint !== invite.expectedKeyFingerprint) {
+        throw new Error("Host replacement precondition does not match current identity");
+      }
+    } else if (invite.replaceHostSlug) {
+      if (invite.replaceHostSlug !== invite.host || this.getHostIdentityByHost(invite.host)) throw new Error("legacy Host replacement precondition does not match current identity");
+    } else if (this.getHostIdentity(invite.hostId) || this.getHostIdentityByHost(invite.host)) {
+      throw new Error("Host identity or routing slug already exists");
+    }
+    this.db.prepare("INSERT INTO host_invites(invite_digest, host_id, expires_at, state, record_json) VALUES (?, ?, ?, ?, ?)")
+      .run(invite.inviteDigest, invite.hostId, invite.expiresAt, invite.state, JSON.stringify(invite));
+  }
+
+  getHostInvite(inviteDigest: string): HostInviteRecord | undefined {
+    const row = this.db.prepare("SELECT record_json FROM host_invites WHERE invite_digest = ?").get(inviteDigest) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as HostInviteRecord : undefined;
+  }
+
+  commitHostEnrollment(input: {
+    inviteDigest: string;
+    now: number;
+    requestId: string;
+    publicKeyFingerprint: string;
+    sansHash: string;
+    certificate: string;
+    replacementHostOnline?: boolean;
+  }): HostEnrollmentResult {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const invite = this.getHostInvite(input.inviteDigest);
+      if (!invite) throw new Error("unknown Host invite");
+      const existingRedemption = this.getInviteRedemption(input.inviteDigest);
+      const sameRequest = invite.requestId === input.requestId &&
+        invite.publicKeyFingerprint === input.publicKeyFingerprint && invite.sansHash === input.sansHash;
+      const identity = this.getHostIdentity(invite.hostId);
+      if (invite.state === "superseded" || existingRedemption?.state === "superseded") {
+        if (!identity || !existingRedemption) throw new Error("credential_superseded");
+        this.db.exec("COMMIT");
+        return { identity, redemption: existingRedemption, retry: false };
+      }
+      if (invite.state === "consumed") {
+        if (!sameRequest || !existingRedemption) throw new Error("invite already redeemed by a different request");
+        if (!identity || identity.keyFingerprint !== input.publicKeyFingerprint) throw new Error("credential_superseded");
+        this.db.exec("COMMIT");
+        return { identity, redemption: existingRedemption, retry: true };
+      }
+      if (input.now >= invite.expiresAt) throw new Error("Host invite expired");
+      if (invite.expectedHostRevision !== undefined || invite.replaceHostSlug) {
+        if (input.replacementHostOnline !== false) throw new Error("Host replacement requires the previous Host to be offline");
+        if (invite.expectedHostRevision !== undefined) {
+          if (!identity || identity.revision !== invite.expectedHostRevision || identity.keyFingerprint !== invite.expectedKeyFingerprint) {
+            throw new Error("Host replacement revision/fingerprint conflict");
+          }
+        } else if (identity || this.getHostIdentityByHost(invite.host)) {
+          throw new Error("legacy Host replacement precondition changed");
+        }
+      } else if (identity || this.getHostIdentityByHost(invite.host)) {
+        throw new Error("Host identity or routing slug already exists");
+      }
+      const nextRevision = invite.expectedHostRevision === undefined ? 1 : invite.expectedHostRevision + 1;
+      const nextIdentity: HostIdentity = {
+        hostId: invite.hostId,
+        host: invite.host,
+        keyFingerprint: input.publicKeyFingerprint,
+        state: "enrolled",
+        revision: nextRevision,
+      };
+      const redemption: InviteRedemptionRecord = {
+        inviteDigest: invite.inviteDigest,
+        requestId: input.requestId,
+        publicKeyFingerprint: input.publicKeyFingerprint,
+        sansHash: input.sansHash,
+        hostId: invite.hostId,
+        certificate: input.certificate,
+        state: "current",
+      };
+      const consumed: HostInviteRecord = {
+        ...invite,
+        state: "consumed",
+        requestId: input.requestId,
+        publicKeyFingerprint: input.publicKeyFingerprint,
+        sansHash: input.sansHash,
+      };
+      this.putHostIdentity(nextIdentity);
+      this.db.prepare("UPDATE host_invites SET state = ?, record_json = ? WHERE invite_digest = ?")
+        .run(consumed.state, JSON.stringify(consumed), invite.inviteDigest);
+      this.db.prepare(`
+        INSERT INTO invite_redemptions(invite_digest, request_id, public_key_fingerprint, sans_hash, host_id, state, record_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(redemption.inviteDigest, redemption.requestId, redemption.publicKeyFingerprint, redemption.sansHash,
+        redemption.hostId, redemption.state, JSON.stringify(redemption));
+      if (invite.expectedHostRevision !== undefined) {
+        const oldRows = this.db.prepare("SELECT invite_digest, record_json FROM invite_redemptions WHERE host_id = ? AND invite_digest <> ? AND state = 'current'")
+          .all(invite.hostId, invite.inviteDigest) as { invite_digest: string; record_json: string }[];
+        for (const oldRow of oldRows) {
+          const oldRedemption = JSON.parse(oldRow.record_json) as InviteRedemptionRecord;
+          const tombstone: InviteRedemptionRecord = {
+            ...oldRedemption,
+            certificate: undefined,
+            state: "superseded",
+            supersededByHostId: invite.hostId,
+            supersededByRevision: nextRevision,
+          };
+          this.db.prepare("UPDATE invite_redemptions SET state = ?, record_json = ? WHERE invite_digest = ?")
+            .run(tombstone.state, JSON.stringify(tombstone), oldRow.invite_digest);
+          const oldInvite = this.getHostInvite(oldRow.invite_digest);
+          if (oldInvite) {
+            this.db.prepare("UPDATE host_invites SET state = ?, record_json = ? WHERE invite_digest = ?")
+              .run("superseded", JSON.stringify({ ...oldInvite, state: "superseded" }), oldRow.invite_digest);
+          }
+        }
+      }
+      this.db.exec("COMMIT");
+      return { identity: nextIdentity, redemption, retry: false };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   putInviteRedemption(record: InviteRedemptionRecord): InviteRedemptionRecord {

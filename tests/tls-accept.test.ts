@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { PROTOCOL_VERSION } from "@cafe/protocol";
 import { startDaemon, waitFor } from "./helpers.ts";
+import { startEnrolledChild } from "./tls-helpers.ts";
 
 /**
  * Dogfooding #89: fail-closed must hold on the accepting side too. A Daemon with TLS on refuses a
@@ -79,7 +80,7 @@ describe("a refused Host that comes back over TLS (#89)", () => {
     const plain = await startDaemon("flipper", { config: { root: root.addr } });
     await waitFor(() => !!root.daemon.daemons().find((d) => d.host === "flipper")?.refused, 10_000);
     await plain.stop();
-    const tls = await startDaemon("flipper", { config: { ...TLS, root: root.addr } });
+    const tls = await startEnrolledChild(root, "flipper", {});
     cleanup.push(tls.stop);
     await waitFor(() => root.daemon.daemons().find((d) => d.host === "flipper")?.online === true, 15_000);
     expect(root.daemon.daemons().find((d) => d.host === "flipper")?.refused).toBeUndefined();

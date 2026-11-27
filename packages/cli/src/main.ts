@@ -9,10 +9,10 @@ import { Command, CommanderError } from "commander";
 import { onlineVersions, renderTeamPlaybook, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configKeyPath, isConfigKey, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
-import { fingerprintOf, issueLeaf, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
+import { fingerprintOf, generateHostKeyPair, hostIdFromCertificate, issueLeaf, keyFingerprintOf, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
-import { trustCaForClient } from "../../daemon/src/tls/bootstrap.ts";
+import { discoverTls, enrollHostFromRoot, trustCaForClient, tlsAddressOf } from "../../daemon/src/tls/bootstrap.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { joinAddresses } from "@cafe/daemon";
@@ -66,6 +66,21 @@ function orderOwnerKey(): string {
   }
   const key = readFileSync(path, "utf8");
   if (!/^[0-9a-f]{64}$/.test(key)) throw new Error("invalid Cafe CLI order ownership key");
+  return key;
+}
+
+function localOperatorKey(): string {
+  const target = new URL(base());
+  const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!(host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host))) {
+    throw new Error("operator actions must run on the Host that owns the Cafe Daemon; refusing to send the local operator key remotely");
+  }
+  const path = join(cafeHome(), "operator.key");
+  if (!existsSync(path)) throw new Error(`local operator key is missing at ${path}; restart the local Cafe Daemon and retry`);
+  const stat = lstatSync(path);
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error(`local operator key must be a mode-0600 file: ${path}`);
+  const key = readFileSync(path, "utf8");
+  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error("invalid local Cafe operator key");
   return key;
 }
 
@@ -1293,7 +1308,8 @@ program
   .description("join another machine's Root: saves mode, root and token")
   .option("--token <token>", "the Root's token (cafe config get token on the Root)")
   .option("--ca-fingerprint <sha256>", "the Root's CA fingerprint (`cafe root show` on the Root); pins the trust anchor")
-  .action((addr: string, o) => {
+  .option("--invite <code>", "one-use invitation from `cafe host invite` on the Root")
+  .action(async (addr: string, o: { token?: string; caFingerprint?: string; invite?: string }) => {
     if (!o.token) throw new Error("--token is required (cafe config get token on the Root)");
     const clean = assertDaemonAddress(addr);
     // Validate the pin before writing anything: a bad pin must not leave a half-configured Host.
@@ -1304,13 +1320,46 @@ program
         throw new Error("--ca-fingerprint must be a SHA-256 fingerprint (64 hex digits, e.g. from `cafe root show` on the Root)");
       }
     }
+    let enrolledHostId: string | undefined;
+    let enrolledRootId: string | undefined;
+    if (o.invite) {
+      if (!/^[0-9a-f]{64}$/.test(o.invite)) throw new Error("--invite must be the 64-hex code printed by `cafe host invite`");
+      const config = loadConfig(cafeHome(), { persist: true });
+      const discovered = await discoverTls(clean, { ca: undefined, timeoutMs: 10_000 });
+      if (!discovered.ca || !discovered.rootHostId) throw new Error(`the Root at ${clean} does not expose TLS Host identity; upgrade and restart the Root first`);
+      if (pin && fingerprintOf(discovered.ca) !== pin) throw new Error(`CA fingerprint mismatch: expected ${pin}, got ${fingerprintOf(discovered.ca)}`);
+      const rootCa = discovered.ca;
+      const rootTls = await tlsAddressOf(clean, { ca: rootCa });
+      const keys = await generateHostKeyPair();
+      const requestIdPath = join(cafeHome(), "host-enroll.request-id");
+      let requestId: string;
+      try {
+        requestId = readFileSync(requestIdPath, "utf8").trim();
+      } catch {
+        requestId = randomBytes(16).toString("hex");
+        writeFileSync(requestIdPath, requestId, { mode: 0o600 });
+      }
+      const sans = sanList({ host: config.host, advertise: config.advertise, lan: localAddresses(), extra: config.security.tls.sans });
+      const enrolled = await enrollHostFromRoot(rootTls, rootCa, o.token, { inviteCode: o.invite, requestId, publicKey: keys.publicKey, sans });
+      if (!enrolled.cert || !enrolled.hostId || hostIdFromCertificate(enrolled.cert) !== enrolled.hostId) {
+        throw new Error("the Root returned a certificate without the matching Host ID");
+      }
+      mkdirSync(join(cafeHome(), "tls"), { recursive: true });
+      writeFileSync(tlsPaths(cafeHome(), config.host).leafCertPath, enrolled.cert, { mode: 0o644 });
+      writeFileSync(tlsPaths(cafeHome(), config.host).leafKeyPath, keys.privateKey, { mode: 0o600 });
+      enrolledHostId = enrolled.hostId;
+      enrolledRootId = discovered.rootHostId;
+    }
     setConfigValue("mode", "daemon");
     setConfigValue("root", clean);
     setConfigValue("token", o.token);
     if (pin) setConfigValue("security.tls.caFingerprint", pin);
+    if (enrolledRootId) setConfigValue("security.tls.rootHostId", enrolledRootId);
     out(
-      `saved root ${clean}${pin ? ` with CA pin ${pin}` : ""}; restart required: cafe daemon restart`,
-      { mode: "daemon", root: clean, restartRequired: true, ...(pin ? { caFingerprint: pin } : {}) },
+      enrolledHostId
+        ? `enrolled Host ${enrolledHostId} with Root ${enrolledRootId}; restart required: cafe daemon restart`
+        : `saved root ${clean}${pin ? ` with CA pin ${pin}` : ""}; restart required: cafe daemon restart`,
+      { mode: "daemon", root: clean, restartRequired: true, ...(pin ? { caFingerprint: pin } : {}), ...(enrolledHostId ? { hostId: enrolledHostId, rootHostId: enrolledRootId } : {}) },
     );
   });
 
@@ -1328,6 +1377,35 @@ host
       out(`${name} (saved; takes effect when the daemon starts)`, { displayName: name });
     }
   });
+host
+  .command("invite")
+  .description("Root only: create a one-use invitation for another Host (printed once; expires in 30 minutes)")
+  .option("--name <name>", "the joining Host's routing name")
+  .option("--replace <host>", "re-enroll this offline Host after a key change")
+  .action(async (o: { name?: string; replace?: string }) => {
+    if (!(await healthy())) throw new Error("cafe daemon is not running");
+    const r = await api<{ inviteCode: string; hostId: string; host: string; expiresAt: number }>("/api/host/invites", {
+      method: "POST",
+      headers: { "x-cafe-operator-key": localOperatorKey() },
+      body: JSON.stringify({ ...(o.name ? { name: o.name } : {}), ...(o.replace ? { replaceHost: o.replace } : {}) }),
+    });
+    out(
+      `Host invitation for ${r.host} (expires ${new Date(r.expiresAt).toLocaleTimeString()})\n` +
+        `run on that machine:\n  cafe connect <root-address> --token <token> --invite ${r.inviteCode} --ca-fingerprint <root-ca>\n` +
+        "the code is shown once and is stored only as a digest on this Root",
+      r,
+    );
+  });
+
+host
+  .command("identity")
+  .description("show this Host's stable Host ID and pinned Root Host ID")
+  .action(async () => {
+    if (!(await healthy())) throw new Error("cafe daemon is not running");
+    const h = await api<{ host: string; hostId?: string; rootHostId?: string; isRoot: boolean }>("/api/health");
+    out(`${h.host}\nHost ID: ${h.hostId ?? "(legacy)"}\nRoot Host ID: ${h.rootHostId ?? "(not pinned)"}`, h);
+  });
+
 host
   .command("alias")
   .argument("<alias>")

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { generateCa, issueLeaf, localAddresses, missingSans, sanList } from "../packages/daemon/src/tls/certs.ts";
 import { startDaemon, waitFor } from "./helpers.ts";
+import { startEnrolledChild } from "./tls-helpers.ts";
 
 // Made-up addresses come from 192.0.2.0/24 (TEST-NET-1, RFC 5737). A real one (a tester's VPN
 // address) made "the leaf lacks this address" fail on the one machine that has it.
@@ -84,7 +85,7 @@ describe("a running Daemon keeps its leaf in step with its addresses", () => {
   it("a child renews through its Root when asked over the API", async () => {
     const root = await startDaemon("sansparent", { mode: "root", config: TLS() });
     cleanup.push(root.stop);
-    const child = await startDaemon("sanschild", { config: { ...TLS(), root: root.addr } });
+    const child = await startEnrolledChild(root, "sanschild", { config: { security: { mode: "tls", tls: { port: 0, sans: ["10.20.30.40"] } } } });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 15_000);
     const res = await fetch(`http://${child.addr}/api/tls/renew`, {

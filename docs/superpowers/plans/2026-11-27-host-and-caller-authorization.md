@@ -76,23 +76,29 @@
 
 ## Task 2: Host identity certificate lifecycle
 
-**Files:** `packages/daemon/src/tls/certs.ts`, `tls/store.ts`, `tls/bootstrap.ts`, `tls/trust.ts`, `config.ts`, `store.ts`, `tests/tls-certs.test.ts`, `tests/tls-bootstrap.test.ts`
+**Files:** `packages/daemon/src/tls/certs.ts`, `packages/daemon/src/tls/store.ts`, `packages/daemon/src/tls/bootstrap.ts`, `packages/daemon/src/tls/trust.ts`, `packages/daemon/src/config.ts`, `packages/daemon/src/store.ts`, `packages/daemon/src/server.ts`, `packages/daemon/src/daemon.ts`, `packages/cli/src/main.ts`, create `tests/host-invite-store.test.ts`, `tests/tls-host-enrollment.test.ts`, plus existing TLS tests.
 
 **Interfaces:**
 - `issueHostLeaf(ca, sans, hostId, existingKey?) -> CertPair` issues serverAuth+clientAuth and signed Host-ID SAN.
-- `createInvite(replaceHost?, expectedHostRevision?) -> { invite, expiresAt }` returns plaintext invite once and stores only its hash.
-- `redeemInvite({ invite, requestId, publicKey, sans }) -> { hostId, cert, host, retry }` binds the one-use invite to key/SAN/request ID; same redemption retries are idempotent.
 - `renewHostLeaf({ hostId, requestId, nonce, signature, publicKey, sans }) -> CertPair` requires possession of the enrolled private key, including after leaf expiry.
+- `HostInviteRecord { inviteDigest, createdAt, expiresAt, hostId, host, expectedHostRevision?, expectedKeyFingerprint?, state }` persists only the invite digest and the replacement precondition.
+- `createHostInvite(record) -> void`, `getHostInvite(inviteDigest) -> HostInviteRecord|undefined`, and `commitHostEnrollment({ inviteDigest, now, requestId, publicKeyFingerprint, sansHash, certificate }) -> { identity, redemption, retry }` atomically enforce expiry, one-use key/SAN binding, replacement revision compare-and-swap, and same-request replay/tombstone behavior.
+- `POST /api/host/invites` is loopback + local operator-key only; `POST /api/tls/leaf` redeems a one-use invite with requestId, public key, and SANs over the pinned Root TLS endpoint. The endpoint returns the same committed result for the same invite/request/SPKI/SAN hash.
+- `cafe host invite [--name name] [--replace host]` creates an invite on the local Root. `cafe connect <root> --invite code [--ca-fingerprint fp]` persists a new private key before redemption and verifies Root hostId over TLS before sending the invite/token.
 
-- [ ] Add failing cert tests for dual EKU, hostId SAN, wrong key/host binding, and leaf renewal preserving hostId.
-- [ ] Add failing invite tests for one-use atomic redemption, lost-response retry, changed key/SAN rejection, replacement compare-and-swap, and `credential_superseded` tombstones.
-- [ ] Run the focused TLS tests and confirm expected RED failures.
-- [ ] Implement CA-issued Host identity certificates and persist Root's `hostId -> routing slug/SPKI/revision` map.
-- [ ] Make Root invitation consumption and replacement one durable Store transaction; store a non-secret tombstone after rekey.
-- [ ] Implement key possession renewal challenge over pinned Root TLS; start a child with expired/unavailable Root leaf in local-only mode and retry without plaintext downgrade.
-- [ ] Verify `cafe connect` fetches public CA without credentials, verifies the Root Host ID over TLS, and only then sends token/invite/SANs.
-- [ ] Run focused TLS/bootstrap tests and `npm run typecheck`; confirm all pass.
-- [ ] Review `git diff --check`, stage only Task 2 files, and commit with the required attribution trailer; never stage `.vitest/`.
+- [x] Add failing cert tests for dual EKU, hostId SAN, wrong key/host binding, and leaf renewal preserving hostId.
+- [x] Run `npx vitest run tests/tls-certs.test.ts` and confirm it fails because `issueHostLeaf` is missing.
+- [x] Implement `issueHostLeaf`/`hostIdFromCertificate`, preserving legacy server-only `issueLeaf` behavior.
+- [x] Run `npx vitest run tests/tls-certs.test.ts`; confirm 6/6 pass.
+- [x] Add failing invite Store tests in `tests/host-invite-store.test.ts` for one-use create/consume, expiry, same-request retry after response loss, changed key/SAN rejection, replacement compare-and-swap, and superseded tombstones.
+- [x] Run `npx vitest run tests/host-invite-store.test.ts` and confirm invite persistence/consumption APIs are missing.
+- [x] Implement `HostInviteRecord`, `createHostInvite`, and `commitHostEnrollment` as one Store transaction that binds Root assignment, HostIdentity, redemption certificate, and consumed invite state.
+- [x] Add failing Root/CLI tests in `tests/tls-host-enrollment.test.ts` for loopback operator auth, Root Host-ID verification before credential send, one-use redemption, expiry, and `cafe connect --invite` private-key retention.
+- [x] Run `npx vitest run tests/tls-host-enrollment.test.ts` and confirm the Root/CLI enrollment path is absent.
+- [x] Implement Root/child local Host ID initialization, `/api/host/invites`, invite redemption at `/api/tls/leaf`, and `cafe host invite` / `cafe connect --invite` using the durable Store transaction.
+- [x] Implement signed key-possession renewal over pinned Root TLS; start a child with expired/unavailable Root leaf in local-only mode and retry without plaintext downgrade.
+- [x] Run `npx vitest run tests/tls-certs.test.ts tests/tls-bootstrap.test.ts tests/host-invite-store.test.ts tests/tls-host-enrollment.test.ts` and `npm run typecheck`; confirm all pass.
+- [x] Review `git diff --check`, stage only Task 2 files, and commit with the required attribution trailer; never stage `.vitest/`.
 
 ## Task 3: Mutual TLS admission and Host identity pinning
 

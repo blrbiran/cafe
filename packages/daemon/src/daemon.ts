@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { createHash, X509Certificate } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
@@ -10,7 +10,7 @@ import { watchLiveness } from "./liveness.ts";
 import { discoverRoots } from "./discovery.ts";
 import { pinnedIdentityCheck } from "./tls/trust.ts";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
-import { localAddresses, missingSans, sanCovers, sanList } from "./tls/certs.ts";
+import { hostIdFromCertificate, keyFingerprintOfPublicKey, localAddresses, missingSans, sanCovers, sanList, verifyHostRenewal } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -36,6 +36,7 @@ import {
   type AgentRecord,
   type AgentStatus,
   type Attachment,
+  type HostIdentity,
   type DaemonRecord,
   type Order,
   type Party,
@@ -58,7 +59,7 @@ import { type CafeConfig, diffConfig, loadConfig, saveConfig } from "./config.ts
 import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints.ts";
 import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
-import { Store } from "./store.ts";
+import { Store, type HostInviteRecord } from "./store.ts";
 import { summarize } from "./summary.ts";
 import { describeFetchError } from "./net-errors.ts";
 
@@ -66,6 +67,26 @@ import { describeFetchError } from "./net-errors.ts";
 const rosterKey = (t: { host: string; team: string; channel: string }): string => `${t.host}/${t.team}/${t.channel}`;
 const OwnershipKey = AgentIdentity.shape.resumeAgentId.unwrap().regex(/^[0-9a-f]{64}$/);
 const ownershipDigest = (key: string): string => createHash("sha256").update(key).digest("hex");
+
+function loadOperatorDigest(home: string, store: Store): string {
+  const file = join(home, "operator.key");
+  const priorDigest = store.getKv<string>("operator-key-digest");
+  if (!existsSync(file)) {
+    if (priorDigest) throw new Error(`operator key is missing from ${file}; restore it from backup before starting Cafe`);
+    try {
+      writeFileSync(file, randomBytes(32).toString("hex"), { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  const key = readFileSync(file, "utf8");
+  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error(`invalid Cafe operator key at ${file}`);
+  if ((statSync(file).mode & 0o077) !== 0) throw new Error(`Cafe operator key must be mode 0600: ${file}`);
+  const digest = ownershipDigest(key);
+  if (priorDigest && priorDigest !== digest) throw new Error("Cafe operator key does not match its stored digest");
+  if (!priorDigest) store.setKv("operator-key-digest", digest);
+  return digest;
+}
 
 export interface DaemonOptions {
   config: CafeConfig;
@@ -186,6 +207,7 @@ type DaemonEvents = {
 export class Daemon extends EventEmitter<DaemonEvents> {
   readonly config: CafeConfig;
   readonly store: Store;
+  private operatorKeyDigest: string;
   readonly registry = new Registry();
   readonly isRoot: boolean;
   /** Headless Barista process supervisor (set by runDaemon). */
@@ -213,6 +235,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
      * reissue keep the caller's key, so a peer's pin on that Host still matches.
      */
     issue?(sans: string[], publicKey?: string): Promise<{ cert: string; key: string }>;
+    issueHost?(sans: string[], hostId: string, publicKey: string): Promise<{ cert: string; key: string }>;
+    issueHost?(sans: string[], hostId: string, publicKey: string): Promise<{ cert: string; key: string }>;
     /**
      * Reissue this Host's leaf and swap it in (v4-6 §5 B). A long-running Daemon would otherwise
      * outlive its 90-day leaf and the whole fleet would fail closed at once. The renewal keeps the
@@ -226,6 +250,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     enrol?(): Promise<void>;
   };
   readonly host: string;
+  hostId: string;
+  rootHostId?: string;
   readonly version: string;
   private router: Router;
   private routerFactory?: (model: string) => Promise<Router>;
@@ -331,6 +357,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.hostAliases = [...opts.config.aliases];
     this.hostLegacyAliases = [...(opts.config.legacyAliases ?? [])];
     this.store = new Store(opts.home);
+    this.operatorKeyDigest = loadOperatorDigest(opts.home, this.store);
+    this.hostId = this.store.getHostIdentityByHost(this.host)?.hostId ?? this.host;
+    this.rootHostId = this.isRoot ? this.hostId : this.store.getKv<string>("rootHostId");
     this.teamsFile = join(opts.home, "teams.json");
     try {
       for (const t of JSON.parse(readFileSync(this.teamsFile, "utf8")) as TeamRecord[]) this.teamRecords.set(rosterKey(t), t);
@@ -376,7 +405,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Replica restored from disk; the Root will resync on connect.
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
-    this.daemonRecords.set(this.host, { host: this.host, hostId: this.host, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version, features: [...CURRENT_FEATURES] });
+    this.daemonRecords.set(this.host, { host: this.host, hostId: this.hostId, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version, features: [...CURRENT_FEATURES] });
     this.schedulePrune();
     this.schedulePulls();
     this.stagingTimer = setInterval(() => {
@@ -411,6 +440,141 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.linkSweep = setInterval(() => this.sweepLinks(), Math.min(this.timing.linkIdleMs, 60_000));
       this.linkSweep.unref?.();
     }
+  }
+
+  setLocalHostIdentity(identity: HostIdentity): void {
+    if (identity.host !== this.host) throw new Error(`Host identity slug ${identity.host} does not match this Daemon (${this.host})`);
+    this.store.putHostIdentity(identity);
+    this.hostId = identity.hostId;
+    if (this.isRoot) {
+      this.rootHostId = identity.hostId;
+      this.store.setKv("rootHostId", identity.hostId);
+    }
+    const record = this.daemonRecords.get(this.host);
+    if (record) record.hostId = identity.hostId;
+    this.emitDaemons();
+  }
+
+  verifyOperatorCredential(candidate: string | undefined): boolean {
+    if (!candidate || !/^[0-9a-f]{64}$/.test(candidate)) return false;
+    return timingSafeEqual(Buffer.from(ownershipDigest(candidate), "hex"), Buffer.from(this.operatorKeyDigest, "hex"));
+  }
+
+  createHostInvite(input: { name?: string; replaceHost?: string }): { inviteCode: string; hostId: string; host: string; expiresAt: number } {
+    if (!this.isRoot) throw new RpcError("not_root", "Host invitations can only be created on the Root");
+    const now = Date.now();
+    const expiresAt = now + 30 * 60_000;
+    let host: string;
+    let hostId: string;
+    let replacement: Pick<HostInviteRecord, "expectedHostRevision" | "expectedKeyFingerprint" | "replaceHostSlug"> = {};
+    if (input.replaceHost) {
+      const current = this.daemonRecords.get(input.replaceHost);
+      const identity = this.store.getHostIdentityByHost(input.replaceHost);
+      if (!current && !identity) throw new RpcError("not_found", `unknown Host '${input.replaceHost}'`);
+      if (current?.online) throw new RpcError("host_online", `Host '${input.replaceHost}' must be offline before re-enrollment`);
+      host = input.replaceHost;
+      if (identity) {
+        hostId = identity.hostId;
+        replacement = { expectedHostRevision: identity.revision ?? 1, expectedKeyFingerprint: identity.keyFingerprint, replaceHostSlug: host };
+      } else {
+        // Legacy peer without an identity certificate: retain its routing slug but assign a fresh Host ID.
+        hostId = ulid();
+        replacement = { replaceHostSlug: host };
+      }
+    } else {
+      if (input.name && !/^[a-zA-Z0-9_.-]{1,64}$/.test(input.name)) throw new RpcError("bad_request", "Host name must use letters, numbers, dot, underscore, or dash");
+      host = input.name?.trim() || `host-${ulid().slice(-8).toLowerCase()}`;
+      if (this.daemonRecords.has(host) || this.store.getHostIdentityByHost(host)) throw new RpcError("conflict", `Host '${host}' already exists; choose another name or use --replace`);
+      hostId = ulid();
+    }
+    const inviteCode = randomBytes(32).toString("hex");
+    this.store.createHostInvite({ inviteDigest: ownershipDigest(inviteCode), createdAt: now, expiresAt, hostId, host, state: "issued", ...replacement });
+    return { inviteCode, hostId, host, expiresAt };
+  }
+
+  async redeemHostInvite(input: { inviteCode: string; requestId: string; publicKey: string; sans: string[] }): Promise<{ hostId: string; host: string; cert: string; caFingerprint: string; retry: boolean }> {
+    if (!this.isRoot || !this.tlsContext?.issueHost) throw new RpcError("not_root", "only an enrolled Root can issue Host identity certificates");
+    if (!/^[0-9a-f]{64}$/.test(input.inviteCode) || !input.requestId || !input.publicKey.includes("PUBLIC KEY")) {
+      throw new RpcError("bad_request", "inviteCode, requestId, and an SPKI public key are required");
+    }
+    const sans = [...new Set(input.sans.map((name) => name.trim()).filter(Boolean))].sort();
+    if (!sans.length || sans.length > 64) throw new RpcError("bad_request", "sans must contain 1–64 unique Host addresses");
+    const inviteDigest = ownershipDigest(input.inviteCode);
+    const invite = this.store.getHostInvite(inviteDigest);
+    if (!invite) throw new RpcError("invite_not_found", "Host invite is unknown or expired");
+    const publicKeyFingerprint = keyFingerprintOfPublicKey(input.publicKey);
+    const sansHash = createHash("sha256").update(JSON.stringify(sans)).digest("hex");
+    const existingRedemption = this.store.getInviteRedemption(inviteDigest);
+    const replacementHostOnline = !!(invite.replaceHostSlug && this.daemonRecords.get(invite.replaceHostSlug)?.online);
+    if (existingRedemption) {
+      const replay = this.store.commitHostEnrollment({
+        inviteDigest, now: Date.now(), requestId: input.requestId, publicKeyFingerprint, sansHash,
+        certificate: existingRedemption.certificate ?? "", replacementHostOnline,
+      });
+      if (replay.redemption.state === "superseded") throw new RpcError("credential_superseded", "this invitation's Host key was replaced; create a new invite");
+      return { hostId: replay.identity.hostId, host: replay.identity.host, cert: replay.redemption.certificate!, caFingerprint: this.tlsContext.caFingerprint, retry: true };
+    }
+    const leaf = await this.tlsContext.issueHost(sans, invite.hostId, input.publicKey);
+    // The old Host can reconnect while RSA signing yields; check online state immediately before the synchronous DB commit.
+    const stillOnline = !!(invite.replaceHostSlug && this.daemonRecords.get(invite.replaceHostSlug)?.online);
+    const result = this.store.commitHostEnrollment({
+      inviteDigest, now: Date.now(), requestId: input.requestId, publicKeyFingerprint, sansHash,
+      certificate: leaf.cert, replacementHostOnline: stillOnline,
+    });
+    if (result.redemption.state === "superseded") throw new RpcError("credential_superseded", "this invitation's Host key was replaced; create a new invite");
+    const previous = this.daemonRecords.get(result.identity.host);
+    this.daemonRecords.set(result.identity.host, {
+      host: result.identity.host,
+      hostId: result.identity.hostId,
+      displayName: previous?.displayName ?? result.identity.host,
+      aliases: previous?.aliases ?? [],
+      legacyAliases: previous?.legacyAliases ?? [],
+      url: previous?.url ?? this.config.knownDaemons[result.identity.host] ?? "",
+      isRoot: false,
+      online: previous?.online ?? false,
+      lastSeenAt: previous?.lastSeenAt ?? Date.now(),
+      ...(previous?.version ? { version: previous.version } : {}),
+      ...(previous?.features ? { features: previous.features } : {}),
+    });
+    this.emitDaemons();
+    return { hostId: result.identity.hostId, host: result.identity.host, cert: result.redemption.certificate!, caFingerprint: this.tlsContext.caFingerprint, retry: result.retry };
+  }
+
+  /** Root: short-lived nonces for enrolled Host leaf renewal (hostId → nonce/expiry). */
+  private hostChallenges = new Map<string, { nonce: string; expiresAt: number }>();
+
+  issueHostChallenge(hostId: string): { nonce: string; expiresAt: number } {
+    if (!this.isRoot) throw new RpcError("not_root", "only the Root issues Host renewal challenges");
+    const identity = this.store.getHostIdentity(hostId);
+    if (!identity || identity.state !== "enrolled") throw new RpcError("not_found", "no enrolled Host with that Host ID");
+    const now = Date.now();
+    for (const [id, challenge] of this.hostChallenges) if (challenge.expiresAt <= now) this.hostChallenges.delete(id);
+    const challenge = { nonce: randomBytes(32).toString("hex"), expiresAt: now + 2 * 60_000 };
+    this.hostChallenges.set(hostId, challenge);
+    if (this.hostChallenges.size > 1000) this.hostChallenges.delete(this.hostChallenges.keys().next().value!);
+    return challenge;
+  }
+
+  async renewHostLeaf(input: { hostId: string; nonce: string; signature: string; publicKey: string; sans: string[] }): Promise<{ cert: string; hostId: string; caFingerprint: string }> {
+    if (!this.isRoot || !this.tlsContext?.issueHost) throw new RpcError("not_root", "only the Root issues Host certificates");
+    const identity = this.store.getHostIdentity(input.hostId);
+    if (!identity || identity.state !== "enrolled") throw new RpcError("not_found", "no enrolled Host with that Host ID");
+    const challenge = this.hostChallenges.get(input.hostId);
+    if (!challenge || challenge.nonce !== input.nonce || challenge.expiresAt <= Date.now()) {
+      throw new RpcError("challenge_expired", "request a fresh renewal challenge from the Root");
+    }
+    this.hostChallenges.delete(input.hostId);
+    if (keyFingerprintOfPublicKey(input.publicKey) !== identity.keyFingerprint) {
+      throw new RpcError("credential_superseded", "this key is not the enrolled identity for that Host; create a new invite to re-key");
+    }
+    if (!verifyHostRenewal(input.publicKey, input.hostId, input.nonce, input.signature)) {
+      throw new RpcError("bad_signature", "the renewal proof was not signed by the enrolled Host key");
+    }
+    const sans = [...new Set(input.sans.map((name) => name.trim()).filter(Boolean))].sort();
+    if (!sans.length || sans.length > 64) throw new RpcError("bad_request", "sans must contain 1–64 unique Host addresses");
+    const leaf = await this.tlsContext.issueHost(sans, input.hostId, input.publicKey);
+    if (hostIdFromCertificate(leaf.cert) !== input.hostId) throw new RpcError("bad_identity", "issued certificate does not carry the Host ID");
+    return { cert: leaf.cert, hostId: input.hostId, caFingerprint: this.tlsContext.caFingerprint };
   }
 
   /**
@@ -580,10 +744,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * VPN is reached at a different address from each, and only the person knows which one the other
    * machine can reach. `address` is the first, kept for older clients.
    */
-  joinHint(): { address: string; addresses: string[]; advertised: boolean; caFingerprint?: string } {
+  joinHint(): { address: string; addresses: string[]; advertised: boolean; caFingerprint?: string; rootHostId?: string } {
     const fp = this.tlsStatus().caFingerprint;
     const j = joinAddresses({ advertise: this.config.advertise, port: this.config.port, lan: localAddresses() });
-    return { address: j.addresses[0]!, ...j, ...(fp ? { caFingerprint: `sha256:${fp}` } : {}) };
+    return { address: j.addresses[0]!, ...j, ...(fp ? { caFingerprint: `sha256:${fp}` } : {}), ...(this.isRoot && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(this.hostId) ? { rootHostId: this.hostId } : {}) };
   }
 
   /**

@@ -71,6 +71,8 @@ export const CafeConfig = z.object({
           ca: z.string().optional(),
           /** TOFU pin for the CA (`cafe connect --ca-fingerprint`). */
           caFingerprint: z.string().optional(),
+          /** Stable Root Host ID pinned together with the CA at enrollment. */
+          rootHostId: z.string().optional(),
           /** Per-peer leaf pin, keyed by `host:port`. */
           pins: z.record(z.string(), z.string()).default({}),
           /**

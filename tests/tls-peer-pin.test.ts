@@ -5,6 +5,7 @@ import { X509Certificate } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import { startDaemon, waitFor } from "./helpers.ts";
+import { enrollTestChild } from "./tls-helpers.ts";
 
 /**
  * v4-6 §5 A: the CA pin authenticates the trust anchor, but rejecting an unexpected leaf *issued
@@ -32,10 +33,11 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     cleanup.push(root.stop);
     const ca = readFileSync(join(rootHome, "tls", "ca.crt"), "utf8");
     const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "pinchild");
 
     const child = await startDaemon("pinchild", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0 } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
     });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 10_000);
@@ -61,10 +63,11 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     cleanup.push(root.stop);
     const ca = readFileSync(join(rootHome, "tls", "ca.crt"), "utf8");
     const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
-    // The CA is trusted, but the child has a *wrong* leaf pin for the Root: this must fail closed.
+    // The CA is trusted and the child is enrolled, but it holds a *wrong* leaf pin for the Root.
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "badpinchild");
     const child = await startDaemon("badpinchild", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, pins: { [rootAddr]: fakeFingerprint() } } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId, pins: { [rootAddr]: fakeFingerprint() } } } },
     });
     cleanup.push(child.stop);
 
@@ -82,9 +85,10 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     const root = await startDaemon("pinrenewroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
     cleanup.push(root.stop);
     const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "pinrenewchild");
     const child = await startDaemon("pinrenewchild", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0 } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
     });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 10_000);
@@ -108,9 +112,10 @@ describe("daemon-to-daemon leaf pin (v4-6 §5 A)", () => {
     const root = await startDaemon("pinclearroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
     cleanup.push(root.stop);
     const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "pinclearchild");
     const child = await startDaemon("pinclearchild", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0 } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
     });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 10_000);

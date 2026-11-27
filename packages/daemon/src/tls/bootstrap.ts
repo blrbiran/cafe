@@ -158,12 +158,12 @@ function loopbackHost(host: string): boolean {
  * `fallbackPorts` are always tried; the implicit default is skipped for loopback, where a port names
  * one instance and 4778 would be an unrelated Daemon.
  */
-export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?: number; fallbackPorts?: number[] } = {}): Promise<{ ca?: string; fingerprint256?: string; tlsPort: number }> {
+export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?: number; fallbackPorts?: number[] } = {}): Promise<{ ca?: string; fingerprint256?: string; hostId?: string; rootHostId?: string; tlsPort: number }> {
   const { host, port } = splitAddr(addr);
   let first: Error | undefined;
   try {
     const r = await getJson(httpRequest, addr, "/api/tls", { timeoutMs: opts.timeoutMs });
-    if (r.status === 200) return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, tlsPort: r.body.tlsPort ?? DEFAULT_TLS_PORT };
+    if (r.status === 200) return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, hostId: r.body.hostId ?? undefined, rootHostId: r.body.rootHostId ?? undefined, tlsPort: r.body.tlsPort ?? DEFAULT_TLS_PORT };
     first = new Error(`HTTP ${r.status}`);
   } catch (err) {
     first = err as Error;
@@ -176,7 +176,7 @@ export async function discoverTls(addr: string, opts: { ca?: string; timeoutMs?:
   const viaTls = async (target: string, hint?: number) => {
     const r = await getJson(request, target, "/api/tls", { ...(opts.ca ? { ca: opts.ca } : { insecure: true }), timeoutMs: opts.timeoutMs });
     if (r.status !== 200) throw new Error(`HTTP ${r.status} over TLS at ${target}`);
-    return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, tlsPort: r.body.tlsPort ?? hint ?? DEFAULT_TLS_PORT };
+    return { ca: r.body.ca ?? undefined, fingerprint256: r.body.fingerprint256 ?? undefined, hostId: r.body.hostId ?? undefined, rootHostId: r.body.rootHostId ?? undefined, tlsPort: r.body.tlsPort ?? hint ?? DEFAULT_TLS_PORT };
   };
   try {
     return await viaTls(addr, port);
@@ -207,8 +207,8 @@ export async function tlsAddressOf(addr: string, opts: { ca?: string } = {}): Pr
  * The CA is authenticated by the fingerprint, not by the transport: with a configured pin a wrong CA is
  * refused; without one this is the documented TOFU first contact.
  */
-export async function fetchRootCa(root: string, expected: string | undefined, _token?: string): Promise<CertPair & { tlsPort: number }> {
-  let body: { ca?: string; tlsPort: number };
+export async function fetchRootCa(root: string, expected: string | undefined, _token?: string): Promise<CertPair & { tlsPort: number; rootId?: string }> {
+  let body: { ca?: string; tlsPort: number; rootHostId?: string };
   try {
     body = await discoverTls(root, { timeoutMs: 10_000 });
   } catch (err) {
@@ -219,7 +219,7 @@ export async function fetchRootCa(root: string, expected: string | undefined, _t
   }
   const check = enrollFingerprint(fingerprintOf(body.ca), expected);
   if (!check.ok) throw new Error(check.reason);
-  return { cert: body.ca, key: "", fingerprint256: fingerprintOf(body.ca), tlsPort: body.tlsPort };
+  return { cert: body.ca, key: "", fingerprint256: fingerprintOf(body.ca), tlsPort: body.tlsPort, ...(body.rootHostId ? { rootId: body.rootHostId } : {}) };
 }
 
 /**
@@ -234,15 +234,57 @@ export async function fetchRootCa(root: string, expected: string | undefined, _t
 export function fetchLeafFromRoot(rootTls: string, caPem: string, token: string, sans: string[], publicKey?: string): Promise<{ cert: string; key: string }> {
   const root = rootTls;
   const payload = JSON.stringify({ sans, ...(publicKey ? { publicKey } : {}) });
+  return postTlsJson(root, caPem, "/api/tls/leaf", payload, { authorization: `Bearer ${token}` });
+}
+
+/**
+ * Redeem a one-use Root invitation for this Host's durable public key. The Root verifies its Root
+ * Host ID before this call; every retry keeps the same requestId so a lost response replays the
+ * committed certificate rather than issuing another Host identity.
+ */
+export function enrollHostFromRoot(
+  rootTls: string,
+  caPem: string,
+  token: string,
+  input: { inviteCode: string; requestId: string; publicKey: string; sans: string[] },
+): Promise<{ cert: string; hostId: string; host: string; caFingerprint: string; retry: boolean }> {
+  return postTlsJson(rootTls, caPem, "/api/tls/leaf", JSON.stringify(input), { authorization: `Bearer ${token}` });
+}
+
+/**
+ * Renew an already-enrolled Host's leaf without a new invitation: ask the pinned Root for a short
+ * nonce, sign it with the key the Host already owns, and let the Root verify the signature against
+ * the enrolled SPKI before issuing a replacement certificate for the same Host ID.
+ */
+export async function renewHostFromRoot(
+  rootTls: string,
+  caPem: string,
+  token: string,
+  input: { hostId: string; privateKey: string; publicKey: string; sans: string[] },
+): Promise<{ cert: string; hostId: string; caFingerprint: string }> {
+  const challenge = await postTlsJson(rootTls, caPem, "/api/tls/challenge", JSON.stringify({ hostId: input.hostId }), { authorization: `Bearer ${token}` });
+  const { signHostRenewal } = await import("./certs.ts");
+  const signature = signHostRenewal(input.privateKey, input.hostId, challenge.nonce);
+  return postTlsJson(rootTls, caPem, "/api/tls/leaf", JSON.stringify({
+    hostId: input.hostId,
+    nonce: challenge.nonce,
+    signature,
+    publicKey: input.publicKey,
+    sans: input.sans,
+  }), { authorization: `Bearer ${token}` });
+}
+
+function postTlsJson(addr: string, caPem: string, path: string, payload: string, headers: Record<string, string>): Promise<any> {
+  const root = addr;
   return new Promise((resolve, reject) => {
     const req = request(
       {
         host: root.replace(/:\d+$/, "").replace(/^\[|\]$/g, ""),
         port: Number(/:(\d+)$/.exec(root)?.[1] ?? 4778),
-        path: "/api/tls/leaf",
+        path,
         method: "POST",
         ca: caPem,
-        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload), authorization: `Bearer ${token}` },
+        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload), ...headers },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -250,17 +292,26 @@ export function fetchLeafFromRoot(rootTls: string, caPem: string, token: string,
         res.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf8");
           const status = res.statusCode ?? 0;
-          if (status !== 200) return reject(new Error(`the Root refused to issue a leaf: HTTP ${status}; set security.tls.ca to the Root's ca.crt instead`));
+          if (status !== 200) {
+            let detail = "";
+            try {
+              const body = JSON.parse(text) as { error?: string; message?: string };
+              detail = body.message ? `: ${body.message}` : body.error ? `: ${body.error}` : "";
+            } catch {
+              // Keep the status-only explanation when the Root did not send JSON.
+            }
+            return reject(new Error(`the Root refused Host certificate enrollment: HTTP ${status}${detail}`));
+          }
           try {
             resolve(JSON.parse(text));
           } catch {
-            reject(new Error("the Root returned an unreadable leaf response"));
+            reject(new Error("the Root returned an unreadable enrollment response"));
           }
         });
       },
     );
-    req.on("error", (err) => reject(new Error(`could not reach the Root at ${root} to request a leaf: ${err.message}`)));
-    req.setTimeout(10_000, () => req.destroy(new Error("timed out requesting a leaf from the Root")));
+    req.on("error", (err) => reject(new Error(`could not reach the Root at ${root} to enroll this Host: ${err.message}`)));
+    req.setTimeout(10_000, () => req.destroy(new Error("timed out enrolling this Host with the Root")));
     req.end(payload);
   });
 }

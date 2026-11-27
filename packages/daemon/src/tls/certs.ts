@@ -5,7 +5,7 @@
  * needs forge when it first issues its own leaf. `CafeClient` and `server.ts` use Node's built-in
  * `node:tls` / `node:https` — forge never runs on the hot path.
  */
-import { X509Certificate, createHash } from "node:crypto";
+import { X509Certificate, createHash, createPublicKey, createSign, createVerify } from "node:crypto";
 import { networkInterfaces } from "node:os";
 
 export interface CertPair {
@@ -45,6 +45,28 @@ export function keyFingerprintOf(certPem: string): string {
   return spkiFingerprint(new X509Certificate(certPem).publicKey.export({ type: "spki", format: "der" }));
 }
 
+/** Stable SPKI fingerprint for a public key PEM submitted during Host enrollment. */
+export function keyFingerprintOfPublicKey(publicKeyPem: string): string {
+  return spkiFingerprint(createPublicKey(publicKeyPem).export({ type: "spki", format: "der" }));
+}
+
+/** What a Host signs to renew an expired/expiring leaf without a new invitation. */
+export function hostRenewalPayload(hostId: string, nonce: string): Buffer {
+  return Buffer.from(`cafe-host-renew:v1:${hostId}:${nonce}`, "utf8");
+}
+
+export function signHostRenewal(privateKeyPem: string, hostId: string, nonce: string): string {
+  return createSign("sha256").update(hostRenewalPayload(hostId, nonce)).sign(privateKeyPem, "hex");
+}
+
+export function verifyHostRenewal(publicKeyPem: string, hostId: string, nonce: string, signatureHex: string): boolean {
+  try {
+    return createVerify("sha256").update(hostRenewalPayload(hostId, nonce)).verify(publicKeyPem, signatureHex, "hex");
+  } catch {
+    return false;
+  }
+}
+
 /** `keyFingerprintOf` from a certificate's DER (`PeerCertificate.raw` in a TLS callback). */
 export function keyFingerprintFromRaw(certDer: Buffer): string {
   return spkiFingerprint(new X509Certificate(certDer).publicKey.export({ type: "spki", format: "der" }));
@@ -72,6 +94,16 @@ async function forge(): Promise<Forge> {
 /** A CN is not an identity in TLS, but it keeps `cafe root show` readable. */
 const CA_CN = "cafe Root CA";
 const LEAF_CN = "cafe daemon";
+
+/** Generate the child-owned private key used for Host enrollment; only its SPKI goes to the Root. */
+export async function generateHostKeyPair(): Promise<{ privateKey: string; publicKey: string }> {
+  const { pki } = await forge();
+  const keys = pki.rsa.generateKeyPair(2048);
+  return {
+    privateKey: pki.privateKeyToPem(keys.privateKey),
+    publicKey: pki.publicKeyToPem(keys.publicKey),
+  };
+}
 
 /**
  * A Root CA: RSA-2048, ~10-year validity, `basicConstraints.cA`. The private key stays on the
@@ -194,6 +226,28 @@ export function issuedBy(caPem: string, leafPem: string): boolean {
  * and per reconnect; cafe keeps one long-lived WebSocket, so steady-state cost is unchanged.
  */
 export async function issueLeaf(ca: CertPair, sans: string[], days = 90, key?: string): Promise<CertPair> {
+  return issueSignedLeaf(ca, sans, days, key);
+}
+
+/** Issue a dual-use certificate with a Root-assigned Host ID URI SAN. */
+export async function issueHostLeaf(ca: CertPair, sans: string[], hostId: string, key?: string): Promise<CertPair> {
+  if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(hostId)) throw new Error("hostId must be a ULID");
+  return issueSignedLeaf(ca, sans, 90, key, hostId);
+}
+
+/** Return the signed Cafe Host ID URI SAN, or undefined for legacy/non-Host certificates. */
+export function hostIdFromCertificate(certPem: string): string | undefined {
+  try {
+    const entries = (new X509Certificate(certPem).subjectAltName ?? "").split(/,\s*/);
+    const prefix = "URI:spiffe://cafe/host/";
+    const ids = entries.filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length));
+    return ids.length === 1 && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(ids[0]!) ? ids[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function issueSignedLeaf(ca: CertPair, sans: string[], days: number, key?: string, hostId?: string): Promise<CertPair> {
   const { pki, md } = await forge();
   const caCert = pki.certificateFromPem(ca.cert);
   const caKey = pki.privateKeyFromPem(ca.key);
@@ -223,8 +277,14 @@ export async function issueLeaf(ca: CertPair, sans: string[], days = 90, key?: s
   cert.setExtensions([
     { name: "basicConstraints", cA: false },
     { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
-    { name: "extKeyUsage", serverAuth: true },
-    { name: "subjectAltName", altNames: sans.map((value) => (isIp(value) ? { type: 7, ip: value } : { type: 2, value })) },
+    { name: "extKeyUsage", serverAuth: true, ...(hostId ? { clientAuth: true } : {}) },
+    {
+      name: "subjectAltName",
+      altNames: [
+        ...sans.map((value) => (isIp(value) ? { type: 7, ip: value } : { type: 2, value })),
+        ...(hostId ? [{ type: 6, value: `spiffe://cafe/host/${hostId}` }] : []),
+      ],
+    },
   ]);
   cert.sign(caKey, md.sha256.create());
   const certPem = pki.certificateToPem(cert);

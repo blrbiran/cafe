@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { startDaemon, waitFor } from "./helpers.ts";
+import { enrollTestChild } from "./tls-helpers.ts";
 
 /**
  * v4-6 §10.3 (dogfooding #79 #80): `root:` is the Root's main address — the one people type. A child
@@ -43,12 +44,17 @@ describe("joining a TLS network by the Root's main address (#79)", () => {
     const root = await startDaemon("jroot", { home: rootHome, mode: "root", config: TLS });
     cleanup.push(root.stop);
     const childHome = home("child");
-    const child = await startDaemon("jchild", { home: childHome, config: { ...TLS, root: root.addr } });
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "jchild");
+    const child = await startDaemon("jchild", {
+      home: childHome,
+      config: { ...TLS, root: root.addr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
+    });
     cleanup.push(child.stop);
 
     await waitFor(() => child.daemon.rootOnline, 15_000);
     expect(readFileSync(join(childHome, "tls", "ca.crt"), "utf8")).toBe(readFileSync(join(rootHome, "tls", "ca.crt"), "utf8"));
     expect(child.daemon.tlsStatus()).toMatchObject({ mode: "tls", network: true });
+    expect(child.daemon.hostId).toBe(enrolled.hostId);
     // The uplink went over TLS: only a wss dial records a leaf-key pin, keyed by the TLS port dialled.
     expect(Object.keys(pins(childHome))).toContain(`127.0.0.1:${root.server.tlsPort}`);
   }, 40_000);
@@ -71,16 +77,20 @@ describe("joining a TLS network by the Root's main address (#79)", () => {
     expect(doctor.checks.find((c) => c.name === "tls")).toMatchObject({ level: "fail" });
   }, 30_000);
 
-  it("joins without a restart once a Root comes up on the main address it was given", async () => {
+  it("joins the main address of a Root that appeared after an invited enrollment", async () => {
     const mainPort = await freePort();
-    const childHome = home("late");
-    const child = await startDaemon("latejoin", { home: childHome, config: { ...TLS, root: `127.0.0.1:${mainPort}` }, timing: FAST_ENROL });
-    cleanup.push(child.stop);
-    expect(child.daemon.rootOnline).toBe(false);
-    expect(existsSync(join(childHome, "tls", "ca.crt"))).toBe(false);
-
+    const rootHome = home("late-root");
     const root = await startDaemon("lateroot2", { mode: "root", config: { ...TLS, port: mainPort } });
     cleanup.push(root.stop);
+
+    const childHome = home("late");
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "latejoin");
+    const child = await startDaemon("latejoin", {
+      home: childHome,
+      config: { ...TLS, root: `127.0.0.1:${mainPort}`, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
+      timing: FAST_ENROL,
+    });
+    cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 15_000);
     expect(child.daemon.tlsStatus().network).toBe(true);
     expect(Object.keys(pins(childHome))).toContain(`127.0.0.1:${root.server.tlsPort}`);
@@ -89,7 +99,12 @@ describe("joining a TLS network by the Root's main address (#79)", () => {
   it("still accepts a root: that names the TLS port (configs written before this change)", async () => {
     const root = await startDaemon("tlsportroot", { mode: "root", config: TLS });
     cleanup.push(root.stop);
-    const child = await startDaemon("tlsportchild", { home: home("tlsport"), config: { ...TLS, root: `127.0.0.1:${root.server.tlsPort}` } });
+    const childHome = home("tlsport");
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "tlsportchild");
+    const child = await startDaemon("tlsportchild", {
+      home: childHome,
+      config: { ...TLS, root: `127.0.0.1:${root.server.tlsPort}`, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
+    });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 15_000);
     expect(child.daemon.tlsStatus().network).toBe(true);
@@ -101,9 +116,16 @@ describe("Daemon addresses carry TLS on an enrolled network (#80)", () => {
     const root = await startDaemon("aroot", { mode: "root", config: TLS });
     cleanup.push(root.stop);
     const h1 = home("a1");
-    const c1 = await startDaemon("achild1", { home: h1, config: { ...TLS, root: root.addr } });
+    const h2 = home("a2");
+    const e1 = await enrollTestChild(root, root.daemon.hostId, h1, "achild1");
+    const e2 = await enrollTestChild(root, root.daemon.hostId, h2, "achild2");
+    const childConfig = (e: { caFingerprint: string; rootHostId: string }) => ({
+      ...TLS, root: root.addr,
+      security: { mode: "tls", tls: { port: 0, caFingerprint: e.caFingerprint, rootHostId: e.rootHostId } },
+    });
+    const c1 = await startDaemon("achild1", { home: h1, config: childConfig(e1) });
     cleanup.push(c1.stop);
-    const c2 = await startDaemon("achild2", { home: home("a2"), config: { ...TLS, root: root.addr } });
+    const c2 = await startDaemon("achild2", { home: h2, config: childConfig(e2) });
     cleanup.push(c2.stop);
     await waitFor(() => c1.daemon.rootOnline && c2.daemon.rootOnline, 15_000);
 
@@ -121,9 +143,16 @@ describe("Daemon addresses carry TLS on an enrolled network (#80)", () => {
     const root = await startDaemon("uroot", { mode: "root", config: TLS });
     cleanup.push(root.stop);
     const h1 = home("u1");
-    const c1 = await startDaemon("uchild1", { home: h1, config: { ...TLS, root: root.addr } });
+    const h2 = home("u2");
+    const e1 = await enrollTestChild(root, root.daemon.hostId, h1, "uchild1");
+    const e2 = await enrollTestChild(root, root.daemon.hostId, h2, "uchild2");
+    const childConfig = (e: { caFingerprint: string; rootHostId: string }) => ({
+      ...TLS, root: root.addr,
+      security: { mode: "tls", tls: { port: 0, caFingerprint: e.caFingerprint, rootHostId: e.rootHostId } },
+    });
+    const c1 = await startDaemon("uchild1", { home: h1, config: childConfig(e1) });
     cleanup.push(c1.stop);
-    const c2 = await startDaemon("uchild2", { home: home("u2"), config: { ...TLS, root: root.addr } });
+    const c2 = await startDaemon("uchild2", { home: h2, config: childConfig(e2) });
     cleanup.push(c2.stop);
     await waitFor(() => c1.daemon.rootOnline && c2.daemon.rootOnline, 15_000);
 

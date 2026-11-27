@@ -559,7 +559,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const root = daemon.isRoot
       ? {}
       : { root: daemon.config.root, rootOnline: daemon.rootOnline, rootConnected: daemon.rootConnected, rootLastSeenAt: daemon.rootLastSeen };
-    return send(res, 200, { ok: true, host: daemon.host, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, tls: daemon.tlsStatus(), isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, features: [...daemon.features()], ...(daemon.isRoot ? {} : { rootFeatures: daemon.rootFeatureList() }), draining: daemon.isDraining, ...root, ...daemon.routerStatus(), metrics: daemon.metrics() });
+    return send(res, 200, { ok: true, host: daemon.host, hostId: daemon.hostId, rootHostId: daemon.rootHostId, homeId: homeId(daemon.store.home), startedAt: daemon.startedAt, tls: daemon.tlsStatus(), isRoot: daemon.isRoot, pid: process.pid, version: daemon.version, features: [...daemon.features()], ...(daemon.isRoot ? {} : { rootFeatures: daemon.rootFeatureList() }), draining: daemon.isDraining, ...root, ...daemon.routerStatus(), metrics: daemon.metrics() });
   }
   if (m === "GET" && path === "/api/router/models") {
     return send(res, 200, { models: await routerModels(url.searchParams.get("search") ?? undefined) });
@@ -617,6 +617,8 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       ? send(res, 200, {
           ca: daemon.tlsContext.ca,
           fingerprint256: daemon.tlsContext.caFingerprint,
+          hostId: daemon.hostId,
+          rootHostId: daemon.rootHostId,
           ...(daemon.tlsPort ? { tlsPort: daemon.tlsPort } : {}),
           // The encrypted Web addresses the leaf names (v4-9); public like the rest of this answer, so
           // the token prompt can offer them before the person has a token.
@@ -624,19 +626,44 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
         })
       : send(res, 200, { ca: null, fingerprint256: null, note: "TLS is off (security.mode: plaintext)" });
   }
-  if (m === "POST" && path === "/api/tls/leaf") {
-    // A child Host with this network's token asks the Root to issue its leaf. Only the Root has the
-    // CA key; every other Host gets a clear refusal instead of a fake certificate.
-    if (!daemon.isRoot || !daemon.tlsContext?.issue) return send(res, 400, { error: "not_root", message: "only the Root issues leaf certificates; set security.tls.ca to the Root's ca.crt on this Host" });
-    const issue = daemon.tlsContext.issue;
+  if (m === "POST" && path === "/api/host/invites") {
+    const operatorKey = req.headers["x-cafe-operator-key"];
+    if (!isLoopback(req) || typeof operatorKey !== "string" || !daemon.verifyOperatorCredential(operatorKey)) {
+      return send(res, 403, { error: "operator_required", message: "run `cafe host invite` on this Root using its local operator credential" });
+    }
     const body = await readJson(req);
-    const sans = Array.isArray(body.sans) ? body.sans.filter((s: unknown): s is string => typeof s === "string" && !!s) : [];
-    if (!sans.length) throw new RpcError("bad_request", "sans must be a non-empty string array");
-    const publicKey = typeof body.publicKey === "string" && body.publicKey.includes("PUBLIC KEY") ? body.publicKey : undefined;
-    const issued = await issue(sans, publicKey);
-    // A reissue for the caller's own key returns the certificate only: the Root must never send a
-    // private key. The child keeps the key it already has.
-    return send(res, 200, publicKey ? { cert: issued.cert } : issued);
+    if (body.name !== undefined && typeof body.name !== "string") throw new RpcError("bad_request", "name must be a string");
+    if (body.replaceHost !== undefined && typeof body.replaceHost !== "string") throw new RpcError("bad_request", "replaceHost must be a Host slug");
+    return send(res, 200, daemon.createHostInvite({ ...(body.name ? { name: body.name } : {}), ...(body.replaceHost ? { replaceHost: body.replaceHost } : {}) }));
+  }
+  if (m === "POST" && path === "/api/tls/challenge") {
+    if (!daemon.isRoot || (req.socket as { encrypted?: boolean }).encrypted !== true) return send(res, 403, { error: "tls_required", message: "renewal challenges are only issued over the Root's verified TLS port" });
+    if (tokenOf(req) !== daemon.config.token) return send(res, 401, { error: "unauthorized", message: "a matching Root token is required" });
+    const body = await readJson(req);
+    if (typeof body.hostId !== "string" || !body.hostId) throw new RpcError("bad_request", "hostId is required");
+    return send(res, 200, daemon.issueHostChallenge(body.hostId));
+  }
+  if (m === "POST" && path === "/api/tls/leaf") {
+    if (!daemon.isRoot || !daemon.tlsContext?.issueHost) return send(res, 400, { error: "not_root", message: "only the Root issues enrolled Host certificates" });
+    if ((req.socket as { encrypted?: boolean }).encrypted !== true) {
+      return send(res, 403, { error: "tls_required", message: "Host enrollment requires the Root's verified TLS address" });
+    }
+    if (tokenOf(req) !== daemon.config.token) return send(res, 401, { error: "unauthorized", message: "a matching Root token is required for Host enrollment" });
+    const body = await readJson(req);
+    if (typeof body.hostId === "string" && typeof body.nonce === "string" && typeof body.signature === "string" && typeof body.publicKey === "string") {
+      if (!Array.isArray(body.sans)) throw new RpcError("bad_request", "sans must be a string array");
+      const renewed = await daemon.renewHostLeaf({ hostId: body.hostId, nonce: body.nonce, signature: body.signature, publicKey: body.publicKey, sans: body.sans });
+      return send(res, 200, renewed);
+    }
+    if (typeof body.inviteCode !== "string" || typeof body.requestId !== "string" || typeof body.publicKey !== "string") {
+      return send(res, 403, { error: "invite_required", message: "redeem a one-use invite from `cafe host invite`" });
+    }
+    if (!Array.isArray(body.sans) || body.sans.length === 0 || !body.sans.every((value: unknown) => typeof value === "string" && value.trim())) {
+      throw new RpcError("bad_request", "sans must be a non-empty string array");
+    }
+    const result = await daemon.redeemHostInvite({ inviteCode: body.inviteCode, requestId: body.requestId, publicKey: body.publicKey, sans: body.sans });
+    // The joining Host already owns its private key; the Root returns only its signed certificate.
+    return send(res, 200, { cert: result.cert, hostId: result.hostId, host: result.host, caFingerprint: result.caFingerprint, retry: result.retry });
   }
   if (m === "GET" && path === "/api/agents") return send(res, 200, daemon.registry.all());
   if (m === "POST" && path === "/api/host") {

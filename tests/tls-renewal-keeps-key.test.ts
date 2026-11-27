@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { X509Certificate, createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { startDaemon, waitFor } from "./helpers.ts";
+import { enrollTestChild } from "./tls-helpers.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 /**
@@ -54,12 +55,11 @@ describe("renewal keeps the leaf key", () => {
     cleanup.push(() => rmSync(rootHome, { recursive: true, force: true }), () => rmSync(childHome, { recursive: true, force: true }));
     const root = await startDaemon("kidroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
     cleanup.push(root.stop);
-    mkdirSync(join(childHome, "tls"), { recursive: true });
-    writeFileSync(join(childHome, "tls", "ca.crt"), readFileSync(join(rootHome, "tls", "ca.crt"), "utf8"));
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "kid");
     const rootAddr = `127.0.0.1:${root.server.tlsPort}`;
     const child = await startDaemon("kid", {
       home: childHome,
-      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0 } } },
+      config: { root: rootAddr, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
     });
     cleanup.push(child.stop);
     await waitFor(() => child.daemon.rootOnline, 10_000);

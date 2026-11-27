@@ -1,42 +1,13 @@
-import { mkdtempSync, readdirSync, rmdirSync, statSync, unlinkSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
 import type { HostIdentity } from "@cafe/protocol";
 import { Store, type CallerPrincipalRecord, type InviteRedemptionRecord } from "../packages/daemon/src/store.ts";
 
-const homes: string[] = [];
 function home(): string {
-  const path = mkdtempSync(join(tmpdir(), "cafe-identity-store-"));
-  homes.push(path);
-  return path;
+  return mkdtempSync(join(tmpdir(), "cafe-identity-store-"));
 }
-
-afterEach(() => {
-  while (homes.length) {
-    const path = homes.pop()!;
-    if (dirname(path) !== tmpdir() || !basename(path).startsWith("cafe-identity-store-")) {
-      throw new Error(`refusing to clean unexpected test directory: ${path}`);
-    }
-    for (const entry of readdirSync(path, { withFileTypes: true })) {
-      const child = join(path, entry.name);
-      if (entry.isDirectory() && entry.name === "sessions") {
-        for (const day of readdirSync(child, { withFileTypes: true })) {
-          const dayPath = join(child, day.name);
-          if (!day.isDirectory()) throw new Error(`unexpected Store session entry: ${dayPath}`);
-          for (const file of readdirSync(dayPath)) unlinkSync(join(dayPath, file));
-          rmdirSync(dayPath);
-        }
-        rmdirSync(child);
-      } else if (entry.isFile() && statSync(child).isFile()) {
-        unlinkSync(child);
-      } else {
-        throw new Error(`refusing to remove unexpected test entry: ${child}`);
-      }
-    }
-    rmdirSync(path);
-  }
-});
 
 const host: HostIdentity = {
   hostId: "01J22222222222222222222222",

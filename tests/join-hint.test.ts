@@ -21,7 +21,7 @@ describe("Settings shows how to join this Root", () => {
     const root = await startDaemon("jroot", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
     cleanup.push(root.stop);
     const { text, body } = await settings(root.addr);
-    expect(body.join).toEqual({ address: `127.0.0.1:${root.server.port}`, addresses: [`127.0.0.1:${root.server.port}`], advertised: true, caFingerprint: `sha256:${root.daemon.tlsStatus().caFingerprint}` });
+    expect(body.join).toEqual({ address: `127.0.0.1:${root.server.port}`, addresses: [`127.0.0.1:${root.server.port}`], advertised: true, caFingerprint: `sha256:${root.daemon.tlsStatus().caFingerprint}`, rootHostId: root.daemon.hostId });
     expect(text).not.toContain("t0k");
   }, 30_000);
 

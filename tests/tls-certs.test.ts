@@ -1,6 +1,6 @@
-import { X509Certificate } from "node:crypto";
+import { createPublicKey, X509Certificate } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { fingerprintOf, generateCa, issueLeaf, sanList } from "../packages/daemon/src/tls/certs.ts";
+import { fingerprintOf, generateCa, issueLeaf, sanList, type CertPair } from "../packages/daemon/src/tls/certs.ts";
 
 describe("cafe TLS certificates", () => {
   it("generates a CA and a leaf the CA verifies", async () => {
@@ -54,5 +54,30 @@ describe("cafe TLS certificates", () => {
     const { createPrivateKey } = await import("node:crypto");
     expect(() => createPrivateKey(leaf.key)).not.toThrow();
     expect(() => createPrivateKey(ca.key)).not.toThrow();
+  });
+
+  it("issues a dual-use certificate bound to the stable Root-assigned Host ID", async () => {
+    const api = await import("../packages/daemon/src/tls/certs.ts") as unknown as {
+      issueHostLeaf?: (ca: CertPair, sans: string[], hostId: string, key?: string) => Promise<CertPair>;
+      hostIdFromCertificate?: (cert: string) => string | undefined;
+      keyFingerprintOfPublicKey?: (publicKey: string) => string;
+      keyFingerprintOf?: (cert: string) => string;
+    };
+    expect(typeof api.issueHostLeaf).toBe("function");
+    expect(typeof api.hostIdFromCertificate).toBe("function");
+    expect(typeof api.keyFingerprintOfPublicKey).toBe("function");
+    const ca = await generateCa();
+    const hostId = "01J22222222222222222222222";
+    const first = await api.issueHostLeaf!(ca, ["localhost"], hostId);
+    const x = new X509Certificate(first.cert);
+    expect(x.subjectAltName).toContain(`URI:spiffe://cafe/host/${hostId}`);
+    expect(x.keyUsage).toEqual(expect.arrayContaining(["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"]));
+    expect(api.hostIdFromCertificate!(first.cert)).toBe(hostId);
+    const publicKey = createPublicKey(first.key).export({ type: "spki", format: "pem" }).toString();
+    expect(api.keyFingerprintOfPublicKey!(publicKey)).toBe(api.keyFingerprintOf!(first.cert));
+
+    const renewed = await api.issueHostLeaf!(ca, ["localhost"], hostId, first.key);
+    expect(api.hostIdFromCertificate!(renewed.cert)).toBe(hostId);
+    expect(fingerprintOf(renewed.cert)).not.toBe(fingerprintOf(first.cert));
   });
 });

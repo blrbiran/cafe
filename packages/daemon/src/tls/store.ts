@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
 import { join } from "node:path";
-import { fingerprintOf, generateCa, issuedBy, issueLeaf, publicKeyOf, sanCovers, sanList, type CertPair } from "./certs.ts";
+import { fingerprintOf, generateCa, hostIdFromCertificate, issuedBy, issueHostLeaf, issueLeaf, publicKeyOf, sanCovers, sanList, type CertPair } from "./certs.ts";
 
 /**
  * A child Host's leaf: read `CAFE_HOME/tls/<host>.crt` + `.key`, or write a leaf the Root issued.
@@ -10,6 +10,13 @@ export function readLeaf(home: string, host: string): { cert: string; key: strin
   const p = tlsPaths(home, host);
   if (!existsSync(p.leafCertPath) || !existsSync(p.leafKeyPath)) return undefined;
   return { cert: readFileSync(p.leafCertPath, "utf8"), key: readFileSync(p.leafKeyPath, "utf8") };
+}
+
+/** The child key saved before enrollment, paired with its not-yet-issued certificate. */
+export function readPendingHostKey(home: string, host: string): { cert: ""; key: string } | undefined {
+  const p = tlsPaths(home, host);
+  if (!existsSync(p.leafKeyPath)) return undefined;
+  return { cert: "", key: readFileSync(p.leafKeyPath, "utf8") };
 }
 
 export function writeLeaf(home: string, host: string, leaf: { cert: string; key: string }): void {
@@ -56,6 +63,8 @@ export interface TlsContext {
   ca: string;
   /** CA fingerprint, for enrolment. */
   caFingerprint: string;
+  /** Root-assigned Host identity carried by the signed leaf, when enrolled. */
+  hostId?: string;
   /** SANs the current leaf carries. */
   sans: string[];
 }
@@ -123,35 +132,39 @@ export async function ensureLeaf(
   host: string,
   ca: CertPair,
   sansInput: { host: string; advertise?: string; lan?: string | string[]; extra?: string[] },
-  opts: { fetchLeaf?: (sans: string[], publicKey?: string) => Promise<{ cert: string; key: string }> } = {},
+  opts: { hostId?: string; standalone?: boolean; fetchLeaf?: (sans: string[], publicKey?: string, hostId?: string) => Promise<{ cert: string; key: string } | undefined> } = {},
 ): Promise<TlsContext> {
   const sans = sanList(sansInput);
   const existing = readLeaf(home, host);
-  // Reissue when the SAN set no longer covers the requested names (e.g. advertise changed), the leaf
-  // is nearing expiry, or a different CA signed it (a Host that booted on a temporary local CA and has
-  // since enrolled the real one would otherwise keep a leaf no peer accepts).
   if (existing) {
-    // Exact SAN match (not a prefix: `127.0.0.1` must not "cover" `127.0.0.10`), not near expiry, and
-    // still issued by the CA in force.
     const covered = sans.every((s) => sanCovers(existing.cert, s));
-    if (covered && issuedBy(ca.cert, existing.cert) && !leafNeedsRenewal(existing.cert)) {
-      return { cert: existing.cert, key: existing.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
+    const identityMatches = !opts.hostId || hostIdFromCertificate(existing.cert) === opts.hostId;
+    if (covered && identityMatches && issuedBy(ca.cert, existing.cert) && !leafNeedsRenewal(existing.cert)) {
+      return { cert: existing.cert, key: existing.key, ca: ca.cert, caFingerprint: ca.fingerprint256, ...(opts.hostId ? { hostId: opts.hostId } : {}), sans };
     }
   }
   let leaf: { cert: string; key: string };
   if (ca.key) {
-    // Reissue for the existing key so the leaf's identity (which a peer may have pinned) survives.
-    leaf = await issueLeaf(ca, sans, 90, existing?.key);
+    leaf = opts.hostId
+      ? await issueHostLeaf(ca, sans, opts.hostId, existing?.key)
+      : await issueLeaf(ca, sans, 90, existing?.key);
+  } else if (opts.standalone) {
+    const local = await generateCa();
+    leaf = opts.hostId
+      ? await issueHostLeaf(local, sans, opts.hostId)
+      : await issueLeaf(local, sans);
+    ca.cert = local.cert;
+    ca.key = local.key;
+    ca.fingerprint256 = local.fingerprint256;
   } else if (opts.fetchLeaf) {
-    // A child Host never holds the CA key: the Root issues the leaf over TLS with our token, for the
-    // public key the child already has so its identity is unchanged. A first issuance (no existing
-    // key) comes back with a generated key.
-    const fetched = await opts.fetchLeaf(sans, publicKeyOf(existing?.cert));
+    const fetched = await opts.fetchLeaf(sans, publicKeyOf(existing?.cert), opts.hostId);
+    if (!fetched) throw new Error(`no Root is configured to issue this Host's certificate; run \`cafe connect <root> --invite <code>\``);
     leaf = { cert: fetched.cert, key: fetched.key || existing?.key || "" };
     if (!leaf.key) throw new Error(`the Root returned a leaf for ${host} without a private key and no local key exists`);
+    if (opts.hostId && hostIdFromCertificate(leaf.cert) !== opts.hostId) throw new Error(`the Root returned a leaf for the wrong Host ID (${opts.hostId})`);
   } else {
     throw new Error(`no leaf for ${host} and this Host cannot issue one (no CA key); run \`cafe daemon renew-cert\``);
   }
   writeLeaf(home, host, leaf);
-  return { cert: leaf.cert, key: leaf.key, ca: ca.cert, caFingerprint: ca.fingerprint256, sans };
+  return { cert: leaf.cert, key: leaf.key, ca: ca.cert, caFingerprint: ca.fingerprint256, ...(opts.hostId ? { hostId: opts.hostId } : {}), sans };
 }

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { startDaemon, waitFor } from "./helpers.ts";
+import { startEnrolledChild } from "./tls-helpers.ts";
 
 /**
  * #92: on a TLS network the Root showed a connected child as `online` with a plaintext, stale address
@@ -21,7 +22,7 @@ async function network() {
   const root = await startDaemon("addrroot", { mode: "root", config: { ...TLS, knownDaemons: { c1: STALE } } });
   cleanup.push(root.stop);
   // The child is reachable from the Root only through its uplink: the address it reports is not.
-  const c1 = await startDaemon("c1", { config: { ...TLS, root: root.addr, advertise: "10.255.255.1" } });
+  const c1 = await startEnrolledChild(root, "c1", { config: { advertise: "10.255.255.1" } });
   cleanup.push(c1.stop);
   await waitFor(() => root.daemon.daemons().some((d) => d.host === "c1" && d.online), 15_000);
   return { root, c1 };
@@ -32,7 +33,7 @@ const urlOf = (d: { daemon: { daemons(): Array<{ host: string; url: string }> } 
 describe("Daemon addresses on a TLS network (#92)", () => {
   it("never hands a stale plaintext address to the other children", async () => {
     const { root } = await network();
-    const c2 = await startDaemon("c2", { config: { ...TLS, root: root.addr } });
+    const c2 = await startEnrolledChild(root, "c2", {});
     cleanup.push(c2.stop);
     await waitFor(() => c2.daemon.rootOnline, 15_000);
     await new Promise((r) => setTimeout(r, 400));

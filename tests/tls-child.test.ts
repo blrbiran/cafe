@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
+import { enrollTestChild } from "./tls-helpers.ts";
 
 /**
  * A TLS child Daemon reaching a TLS Root over `wss://` (v4-6). In its own file: the child adds the
@@ -23,13 +24,11 @@ describe("a TLS child daemon reaches a TLS Root", () => {
 
     const root = await startDaemon("tlsroot", { home: rootHome, mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
     cleanup.push(root.stop);
-    // A child copies the Root's CA on enrolment (what `cafe connect` will do for a person).
-    const ca = readFileSync(join(rootHome, "tls", "ca.crt"), "utf8");
-    mkdirSync(join(childHome, "tls"), { recursive: true });
-    writeFileSync(join(childHome, "tls", "ca.crt"), ca);
+    // Enrollment installs the Root's CA plus this child's identity certificate and pinned Root ID.
+    const enrolled = await enrollTestChild(root, root.daemon.hostId, childHome, "tlschild");
     const child = await startDaemon("tlschild", {
       home: childHome,
-      config: { root: `127.0.0.1:${root.server.tlsPort}`, security: { mode: "tls", tls: { port: 0 } } },
+      config: { root: `127.0.0.1:${root.server.tlsPort}`, security: { mode: "tls", tls: { port: 0, caFingerprint: enrolled.caFingerprint, rootHostId: enrolled.rootHostId } } },
     });
     cleanup.push(child.stop);
 

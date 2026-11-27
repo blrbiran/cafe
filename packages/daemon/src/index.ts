@@ -1,4 +1,5 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { ulid } from "ulid";
 import { join } from "node:path";
 import { Daemon, type DaemonOptions } from "./daemon.ts";
 import { cafeHome, loadConfig, saveConfig } from "./config.ts";
@@ -7,10 +8,11 @@ import { Supervisor } from "./supervisor.ts";
 import { advertiseRoot, discoverRoots } from "./discovery.ts";
 import { advertisedAddress } from "./daemon.ts";
 import { daemonLog } from "./proc/daemonLog.ts";
-import { ensureLeaf, leafNeedsRenewal, tlsPaths, writeLeaf } from "./tls/store.ts";
-import { bootstrapCa, fetchLeafFromRoot, fetchRootCa, tlsAddressOf, trustCaForClient } from "./tls/bootstrap.ts";
+import { ensureLeaf, leafNeedsRenewal, readLeaf, tlsPaths, writeLeaf } from "./tls/store.ts";
+import { bootstrapCa, fetchLeafFromRoot, fetchRootCa, renewHostFromRoot, tlsAddressOf, trustCaForClient } from "./tls/bootstrap.ts";
 import { readTlsConfig } from "./tls/trust.ts";
-import { issueLeaf, localAddresses, missingSans, publicKeyOf } from "./tls/certs.ts";
+import { hostIdFromCertificate, issueHostLeaf, issueLeaf, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, missingSans, publicKeyOf } from "./tls/certs.ts";
+import { createHash, createPublicKey } from "node:crypto";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 
 export { Daemon, assertDaemonAddress, hostWithPort, joinAddresses, lanAddress, advertisedAddress, type DaemonOptions, type Timing } from "./daemon.ts";
@@ -117,8 +119,11 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             saveConfig(config, home);
           }
           const leafSans = () => daemon.desiredSans();
+          const storedHostIdentity = daemon.store.getHostIdentityByHost(config.host);
+          const existingHostLeaf = readLeaf(home, config.host);
+          const hostId = storedHostIdentity?.hostId ?? (existingHostLeaf ? hostIdFromCertificate(existingHostLeaf.cert) : undefined) ?? ulid();
           // The leaf in force, set below. `fetchFromRoot` runs during the boot issuance too, when no
-          // active leaf exists yet: then it is a first issuance and no key is sent.
+          // active leaf exists yet: then a first enrollment must use the explicit one-use invite.
           let active: { cert: string; key: string } | undefined;
           /**
            * Ask the Root (over TLS with our token) for a leaf, for a Host that holds no CA key. `root:`
@@ -126,24 +131,51 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
            */
           const fetchFromRoot = async (sans?: string[]) =>
             fetchLeafFromRoot(await tlsAddressOf(config.root!, { ca: ca.cert }), ca.cert, config.token, sans?.length ? sans : leafSans(), publicKeyOf(active?.cert));
+          /** A child proves possession of its enrolled key instead of redeeming a new invite. */
+          const renewFromRoot = async (sans: string[], key: string) => {
+            const publicKey = publicKeyOf(active?.cert);
+            if (!publicKey || !config.root) throw new Error("this Host has no enrolled key to renew with");
+            return renewHostFromRoot(await tlsAddressOf(config.root, { ca: ca.cert }), ca.cert, config.token, {
+              hostId,
+              privateKey: key,
+              publicKey,
+              sans: sans.length ? sans : leafSans(),
+            });
+          };
           const leaf = await ensureLeaf(
             home,
             config.host,
             ca,
             { host: config.host, advertise: config.advertise, lan: localAddresses(), extra: config.security.tls.sans },
             {
-              // A child Host holds the CA certificate but not its key; the Root issues the leaf. The
-              // request carries the public key the child already has, so a reissue keeps its identity.
+              hostId,
+              standalone: !config.root && boot.fetchedFromRoot === false && !boot.pendingRoot,
+              // Existing enrolled Host: renew by signed proof of the key it already holds.
               fetchLeaf: async (sans: string[]) => {
-                if (!config.root) throw new Error("no leaf for this Host and no Root configured to issue one");
-                // Trust the enrolled CA for this one call. A dedicated `https` request with `ca` is
-                // deterministic; the process-wide default store could be racing other Daemons in tests.
-                return fetchFromRoot(sans);
+                const existing = readLeaf(home, config.host);
+                if (storedHostIdentity && existing?.key) {
+                  const renewed = await renewFromRoot(sans, existing.key);
+                  return { cert: renewed.cert, key: existing.key };
+                }
+                return undefined;
               },
             },
           );
           // `current()` reads run through this closure: a later renewal swaps it in place.
           active = { cert: leaf.cert, key: leaf.key };
+          daemon.setLocalHostIdentity({
+            hostId,
+            host: config.host,
+            keyFingerprint: keyFingerprintOf(leaf.cert),
+            state: "enrolled",
+            revision: storedHostIdentity?.revision ?? 1,
+          });
+          if (!isRoot && config.root && !boot.pendingRoot) {
+            const pinnedRootId = config.security.tls.rootHostId ?? security.rootHostId;
+            if (!pinnedRootId) throw new Error("this Host joined without a pinned Root Host ID; run `cafe connect <root> --invite <code>` again");
+            daemon.rootHostId = pinnedRootId;
+            daemon.store.setKv("rootHostId", pinnedRootId);
+          }
           const renewListeners = new Set<() => void>();
           // Write-through: a leaf issued here or by the Root replaces the on-disk one too, so a
           // restart after a renewal uses the fresh leaf instead of a stale file.
@@ -169,8 +201,12 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             ...(isRoot
               ? {
                   issue: async (sans: string[], publicKey?: string) => {
-                    // A child that sends its public key keeps it; otherwise this is a first issuance.
+                    // Legacy reissue path remains for compatibility during the migration window.
                     const fresh = await issueLeaf(ca, sans, 90, publicKey);
+                    return { cert: fresh.cert, key: fresh.key };
+                  },
+                  issueHost: async (sans: string[], hostId: string, publicKey: string) => {
+                    const fresh = await issueHostLeaf(ca, sans, hostId, publicKey);
                     return { cert: fresh.cert, key: fresh.key };
                   },
                 }
@@ -181,8 +217,15 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             renew: async (sans?: string[]) => {
               const names = sans?.length ? sans : leafSans();
               const prev = active!;
-              const next = ca.key ? await issueLeaf(ca, names, 90, prev.key) : await fetchFromRoot(names);
-              swap(next.key ? { cert: next.cert, key: next.key } : { cert: next.cert, key: prev.key });
+              if (ca.key) {
+                const next = isRoot || !config.root
+                  ? await issueHostLeaf(ca, names, hostId, prev.key)
+                  : await issueLeaf(ca, names, 90, prev.key);
+                swap({ cert: next.cert, key: prev.key });
+                return;
+              }
+              const renewed = await renewFromRoot(names, prev.key);
+              swap({ cert: renewed.cert, key: prev.key });
             },
             /**
              * A child that booted while its Root was unreachable runs on a temporary local CA; this
@@ -201,17 +244,20 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
                       saveConfig(config, home);
                     }
                     trustCaForClient(enrolled.cert);
-                    // Reissue for the key we already use: a peer that pinned this Host keeps matching.
-                    const rootTls = `${config.root!.replace(/:\d+$/, "")}:${enrolled.tlsPort}`;
-                    const next = await fetchLeafFromRoot(rootTls, enrolled.cert, config.token, leafSans(), publicKeyOf(active?.cert));
-                    swap(next.key ? { cert: next.cert, key: next.key } : { cert: next.cert, key: active!.key });
-                    ca.cert = enrolled.cert;
-                    ca.fingerprint256 = enrolled.fingerprint256;
-                    daemon.tlsContext!.ca = enrolled.cert;
-                    daemon.tlsContext!.caFingerprint = enrolled.fingerprint256;
-                    daemon.tlsContext!.network = true;
-                    // Drop the current uplink so the next dial follows the new scheme (`wss://`).
-                    daemon.setRoot(config.root!);
+                    const existing = readLeaf(home, config.host);
+                    if (storedHostIdentity && existing?.key && enrolled.rootId) {
+                      // Already enrolled earlier: renew by proof of the existing key, never a new identity.
+                      const renewed = await renewFromRoot(leafSans(), existing.key);
+                      swap({ cert: renewed.cert, key: existing.key });
+                      ca.cert = enrolled.cert;
+                      ca.fingerprint256 = enrolled.fingerprint256;
+                      daemon.tlsContext!.ca = enrolled.cert;
+                      daemon.tlsContext!.caFingerprint = enrolled.fingerprint256;
+                      daemon.tlsContext!.network = true;
+                      daemon.setRoot(config.root!);
+                      return;
+                    }
+                    throw new Error("this Host has no Host identity yet: on the Root run `cafe host invite`, then run `cafe connect <root> --invite <code>` here");
                   },
                 }
               : {}),
