@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,10 +17,10 @@ afterEach(async () => {
 });
 
 /** An MCP client over in-memory streams talking to runMcp. */
-function mcpClient(base: string, maxWaitS?: number) {
+function mcpClient(base: string, maxWaitS?: number, operatorKey?: string) {
   const input = new PassThrough();
   const output = new PassThrough();
-  const done = runMcp({ base, token: "t0k", version: "test", input, output, maxWaitS });
+  const done = runMcp({ base, token: "t0k", version: "test", input, output, maxWaitS, operatorKey });
   cleanup.push(async () => {
     input.end();
     await done;
@@ -67,7 +68,10 @@ describe("cafe mcp", () => {
     expect(init.result).toMatchObject({ protocolVersion: "2025-06-18", serverInfo: { name: "cafe" }, capabilities: { tools: {} } });
     m.notify("notifications/initialized");
     const tools = await m.request("tools/list");
-    expect(tools.result.tools.map((t: { name: string }) => t.name)).toEqual(["cafe_agents", "cafe_ask", "cafe_wait", "cafe_cancel", "cafe_reply"]);
+    expect(tools.result.tools.map((t: { name: string }) => t.name)).toEqual(["cafe_agents", "cafe_ask", "cafe_wait", "cafe_cancel"]);
+    const operator = mcpClient(base, undefined, readFileSync(join(root.home, "operator.key"), "utf8"));
+    await operator.request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "operator" }, capabilities: {} });
+    expect((await operator.request("tools/list")).result.tools.map((t: { name: string }) => t.name)).toContain("cafe_reply");
     expect((await m.request("ping")).result).toEqual({});
     expect((await m.request("nope/nope")).error.code).toBe(-32601);
 
@@ -78,6 +82,7 @@ describe("cafe mcp", () => {
     expect(ask.isError).toBe(false);
     expect(ask.text).toContain("status: done");
     expect(ask.text).toContain("## echo#1@root\necho says: ping");
+    expect(ask.text).toContain("claimed relay (unverified): claude-code@root");
     const threadId = /threadId: (\S+)/.exec(ask.text)![1]!;
     expect(root.daemon.thread(threadId)?.meta.from.address).toBe("claude-code@root");
 
@@ -94,10 +99,12 @@ describe("cafe mcp", () => {
     const threadId = /threadId: (\S+)/.exec(parent.text)![1]!;
     const orderId = /orderId: (\S+)/.exec(parent.text)![1]!;
 
-    const forged = await m.call("cafe_ask", { question: "unverified linked child", to: "echo", parent_order_id: orderId, parent_thread_id: threadId });
+    const attacker = mcpClient(base);
+    await attacker.request("initialize", { protocolVersion: "2025-06-18", clientInfo: { name: "second-mcp-caller" }, capabilities: {} });
+    const forged = await attacker.call("cafe_ask", { question: "unverified linked child", to: "echo", parent_order_id: orderId, parent_thread_id: threadId });
     expect(forged.isError).toBe(true);
-    expect(forged.text).toContain("not_a_target");
-    const forgedEscalation = await m.call("cafe_ask", { question: "unverified escalation", to: "echo", parent_order_id: orderId, parent_thread_id: threadId, escalate: true });
+    expect(forged.text).toContain("not_owner");
+    const forgedEscalation = await attacker.call("cafe_ask", { question: "unverified escalation", to: "echo", parent_order_id: orderId, parent_thread_id: threadId, escalate: true });
     expect(forgedEscalation.isError).toBe(true);
     expect(forgedEscalation.text).toContain("not_a_target");
   });
@@ -148,7 +155,7 @@ describe("cafe mcp", () => {
 
   it("`cafe mcp` speaks MCP on stdio; `cafe mcp install --dry-run` prints the registration commands", async () => {
     const { root } = await network();
-    const child = spawn(process.execPath, [CAFE, "mcp"], { env: { ...process.env, CAFE_DAEMON: root.addr, CAFE_TOKEN: "t0k" }, stdio: ["pipe", "pipe", "inherit"] });
+    const child = spawn(process.execPath, [CAFE, "mcp"], { env: { ...process.env, CAFE_HOME: root.home, CAFE_DAEMON: root.addr, CAFE_TOKEN: "t0k" }, stdio: ["pipe", "pipe", "inherit"] });
     cleanup.push(() => void child.kill());
     const lines = createInterface({ input: child.stdout! });
     const next = () => new Promise<any>((r) => lines.once("line", (l) => r(JSON.parse(l))));

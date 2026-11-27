@@ -13,7 +13,7 @@ import { fingerprintOf, generateHostKeyPair, hostIdFromCertificate, issuedBy, is
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { discoverTls, enrollHostFromRoot, trustCaForClient, tlsAddressOf } from "../../daemon/src/tls/bootstrap.ts";
-import { daemonHttpUrl } from "@cafe/protocol/urls";
+import { daemonHttpUrl, callerCredentialTransport } from "@cafe/protocol/urls";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { joinAddresses } from "@cafe/daemon";
 import { joinText } from "./join-text.ts";
@@ -43,14 +43,29 @@ const MAIN = fileURLToPath(import.meta.url);
 // ---------------------------------------------------------------------------
 
 function base(): string {
-  if (process.env.CAFE_DAEMON) return `http://${process.env.CAFE_DAEMON}`;
-  return `http://127.0.0.1:${loadConfig().port}`;
+  const configured = process.env.CAFE_DAEMON;
+  if (configured) {
+    if (/^https:\/\//i.test(configured)) {
+      const caPath = tlsPaths(cafeHome(), "unused").caPath;
+      if (existsSync(caPath)) trustCaForClient(readFileSync(caPath, "utf8"));
+      return configured.replace(/\/+$/, "");
+    }
+    if (/^http:\/\//i.test(configured)) return configured.replace(/\/+$/, "");
+    return daemonHttpUrl(configured);
+  }
+  return daemonHttpUrl(`127.0.0.1:${loadConfig().port}`);
 }
 
 async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
-  const res = await fetch(`${base()}${path}`, { ...init, headers: { ...headers, ...(init.headers as any) } });
+  const extra = init.headers as Record<string, string> | undefined;
+  Object.assign(headers, extra);
+  if ((headers["x-cafe-order-owner"] || headers["x-cafe-connector-key"] || headers["x-cafe-operator-key"]) &&
+      callerCredentialTransport(base()) === "remote-plaintext") {
+    throw new Error("tls_required: caller credentials require loopback HTTP or the configured verified HTTPS endpoint");
+  }
+  const res = await fetch(`${base()}${path}`, { ...init, headers });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(formatApiError(body, res.status));
   return body as T;
@@ -64,6 +79,8 @@ function orderOwnerKey(): string {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
   }
+  const stat = lstatSync(path);
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error(`CLI order owner key must be a mode-0600 file: ${path}`);
   const key = readFileSync(path, "utf8");
   if (!/^[0-9a-f]{64}$/.test(key)) throw new Error("invalid Cafe CLI order ownership key");
   return key;
@@ -81,6 +98,21 @@ async function cancelOrder(threadId: string, orderId: string | undefined, operat
   if (!target) throw new Error("an exact Order ID is required");
   const headers: Record<string, string> = operator ? { "x-cafe-operator-key": localOperatorKey() } : { "x-cafe-order-owner": orderOwnerKey() };
   return api(`/api/threads/${thread}/orders/${encodeURIComponent(target)}/cancel`, { method: "POST", headers, redirect: "error" });
+}
+
+function mcpOwnerKey(): string {
+  const path = join(cafeHome(), "mcp-owner.key");
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(path, randomBytes(32).toString("hex"), { flag: "wx", mode: 0o600 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const stat = lstatSync(path);
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error(`MCP owner key must be a mode-0600 file: ${path}`);
+  const key = readFileSync(path, "utf8");
+  if (!/^[0-9a-f]{64}$/.test(key)) throw new Error("invalid Cafe MCP owner key");
+  return key;
 }
 
 function localOperatorKey(): string {
@@ -462,6 +494,10 @@ async function follow(threadId: string, opts: { quiet?: boolean; orderId?: strin
 }
 
 async function followStream(threadId: string, opts: { quiet?: boolean; orderId?: string; warnings?: string[] }, agents: Map<string, AgentRecord>, signal: AbortSignal): Promise<string> {
+  const detail = await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`).catch(() => undefined);
+  if (!JSON_OUT && !opts.quiet && detail?.meta.origin === "agent" && detail.meta.provenanceVerified !== true) {
+    console.log(`claimed relay (unverified): ${detail.meta.via?.address ?? detail.meta.from.address}`);
+  }
   const res = await fetch(`${base()}/api/threads/${threadId}/stream${opts.orderId ? `?orderId=${opts.orderId}` : ""}`, {
     headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
     signal,
@@ -939,7 +975,7 @@ program
     for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
     const res = await api("/api/orders", {
       method: "POST",
-      ...(o.origin === "human" && !o.escalate && !o.notice ? { headers: { "x-cafe-order-owner": orderOwnerKey() } } : {}),
+      headers: { "x-cafe-order-owner": orderOwnerKey() },
       body: JSON.stringify({
         body: words.join(" "),
         to: o.to,
@@ -2113,8 +2149,9 @@ const mcp = program
   .command("mcp")
   .description("run cafe as an MCP server on stdio (tools: cafe_agents, cafe_ask, cafe_wait, cafe_cancel)")
   .option("--as <name>", "customer name shown to others (default: the MCP client's name)")
+  .option("--operator", "enable local cafe_reply operator overrides")
   .action(async (o) => {
-    await runMcp({ base: base(), token: process.env.CAFE_TOKEN, ensure: ensureDaemon, as: o.as, version: cafeVersion() });
+    await runMcp({ base: base(), token: process.env.CAFE_TOKEN, ownerKey: mcpOwnerKey(), ...(o.operator ? { operatorKey: localOperatorKey() } : {}), ensure: ensureDaemon, as: o.as, version: cafeVersion() });
   });
 mcp
   .command("install")
@@ -2200,7 +2237,7 @@ program
     const cmd = o.exec ?? (o.preset ? presetCommand(o.preset, !!o.write) : undefined);
     if (!cmd) throw new Error(`pass --exec "<cmd>" or --preset ${Object.keys(PRESETS).join("|")}`);
     await ensureDaemon();
-    const { stop } = await serve({ exec: cmd, dir: o.dir, daemon: base().replace(/^http:\/\//, ""), token: process.env.CAFE_TOKEN, timeoutMs: o.timeout });
+    const { stop } = await serve({ exec: cmd, dir: o.dir, daemon: base().replace(/^https?:\/\//, ""), token: process.env.CAFE_TOKEN, timeoutMs: o.timeout });
     const quit = () => {
       stop();
       process.exit(0);

@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,9 +37,16 @@ async function daemonWithBarista(orders: Array<{ body: string; threadId: string;
 function mockConfig(d: Awaited<ReturnType<typeof startDaemon>>, stateDir: string, config: Record<string, unknown>) {
   const configPath = join(stateDir, "config.json");
   writeFileSync(configPath, JSON.stringify(config));
+  const connectorKey = randomBytes(32).toString("hex");
+  d.daemon.store.putCallerPrincipal({
+    kind: "connector",
+    credentialDigest: createHash("sha256").update(connectorKey).digest("hex"),
+    principalId: `connector:${config.name ?? "test"}`,
+  });
   return {
     CAFE_DAEMON: d.addr,
     CAFE_TOKEN: "t0k",
+    CAFE_CONNECTOR_KEY: connectorKey,
     CAFE_CONNECTOR_NAME: "mock",
     CAFE_CONNECTOR_STATE: stateDir,
     CAFE_CONNECTOR_CONFIG: configPath,
@@ -177,7 +185,7 @@ describe("/api/orders idempotencyKey", () => {
   async function post(addr: string, body: Record<string, unknown>) {
     const res = await fetch(`http://${addr}/api/orders`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-cafe-order-owner": "e".repeat(64) },
       body: JSON.stringify(body),
     });
     const text = await res.text();

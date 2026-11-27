@@ -463,7 +463,7 @@ function connectorEnv(home: string, name: string, manifest: ConnectorManifest, o
   const token = opts.token || process.env.CAFE_TOKEN || local.token;
   return {
     ...process.env,
-    CAFE_DAEMON: daemon.replace(/^https?:\/\//, ""),
+    CAFE_DAEMON: daemon,
     CAFE_TOKEN: token,
     CAFE_CONNECTOR_NAME: name,
     CAFE_CONNECTOR_CONFIG: configPath,

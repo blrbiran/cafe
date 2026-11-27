@@ -21,3 +21,16 @@ export function daemonWsUrl(addr: string, opts: SchemeOptions = {}): string {
 export function daemonHttpUrl(addr: string, opts: SchemeOptions = {}): string {
   return `${opts.tls ? "https" : "http"}://${addr}`;
 }
+
+/** Transport allowed for owner, connector, and operator capabilities. */
+export function callerCredentialTransport(target: string): "loopback" | "verified-tls" | "remote-plaintext" {
+  try {
+    const url = new URL(/^https?:\/\//i.test(target) ? target : `http://${target}`);
+    if (url.protocol === "https:") return "verified-tls";
+    const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host)) return "loopback";
+  } catch {
+    return "remote-plaintext";
+  }
+  return "remote-plaintext";
+}

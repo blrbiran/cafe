@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { barista, customer, identity, startDaemon, untilClosed } from "./helpers.ts";
+import { askerOf } from "../packages/web/src/outcome.ts";
+import { dictFor } from "../packages/web/src/i18n.ts";
 
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -21,6 +23,7 @@ describe("order provenance", () => {
     expect(meta.origin).toBe("agent");
     expect(meta.via?.address).toBe(a.rec.address);
     expect(meta.from.address).toBe(a.rec.address);
+    expect(meta.provenanceVerified).toBe(true);
   });
 
   it("keeps an explicit origin and via from the caller", async () => {
@@ -36,6 +39,7 @@ describe("order provenance", () => {
     const meta = root.daemon.thread(res.threadId)!.meta;
     expect(meta.origin).toBe("agent");
     expect(meta.via).toEqual({ address: "claude#1@mac" });
+    expect(meta.provenanceVerified).toBe(false);
   });
 
   it("defaults a web Order to human with no via", async () => {
@@ -45,5 +49,16 @@ describe("order provenance", () => {
     const meta = root.daemon.thread(res.threadId)!.meta;
     expect(meta.origin).toBe("human");
     expect(meta.via).toBeUndefined();
+    expect(meta.provenanceVerified).toBe(false);
+  });
+
+  it("labels a claimed Agent relay as unverified in Web provenance", () => {
+    const display = askerOf(dictFor("en"), {
+      from: { address: "mcp@root" },
+      origin: "agent",
+      via: { address: "claimed-agent@remote" },
+      provenanceVerified: false,
+    });
+    expect(display).toEqual({ who: "claimed-agent@remote", verb: "claimed relay (unverified)" });
   });
 });

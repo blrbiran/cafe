@@ -75,7 +75,7 @@ export function createConnectorContext(opts: ConnectorOptions = {}): ConnectorCo
   const configuredAddress = typeof config.address === "string" && config.address ? config.address : undefined;
 
   return {
-    cafe: new CafeHttpClient({ daemon: env.CAFE_DAEMON, token: env.CAFE_TOKEN }),
+    cafe: new CafeHttpClient({ daemon: env.CAFE_DAEMON, token: env.CAFE_TOKEN, connectorKey: env.CAFE_CONNECTOR_KEY }),
     config,
     stateDir,
     name,

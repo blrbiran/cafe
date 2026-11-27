@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import type { AgentRecord, Attachment, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { callerCredentialTransport } from "@cafe/protocol/urls";
 
 /** Below Claude Code's 2-minute auto-background and Codex's 300 s tool timeout (v3-1 Q77). */
 export const MAX_WAIT_S = 100;
@@ -12,11 +13,14 @@ export interface McpOptions {
   /** `http://host:port` of the local Daemon. */
   base: string;
   token?: string;
+  /** Stable human owner capability for this stdio MCP client. */
+  ownerKey?: string;
+  /** Local operator credential; enables cafe_reply. */
+  operatorKey?: string;
   /** Start the local Daemon if needed; called before the first tool runs. */
   ensure?: () => Promise<void>;
   /** Customer name shown to others; default: the MCP client's name (e.g. claude-code, codex-mcp-client). */
   as?: string;
-  ownerKey?: string;
   version: string;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
@@ -104,13 +108,14 @@ export function runMcp(opts: McpOptions): Promise<void> {
   const output = opts.output ?? process.stdout;
   const maxWait = Math.min(opts.maxWaitS ?? MAX_WAIT_S, MAX_WAIT_S);
   let customer = opts.as;
-  // Embedded MCP servers keep a session-scoped identity when no persistent key was provided.
   const ownerKey = opts.ownerKey ?? randomBytes(32).toString("hex");
   let ensured: Promise<void> | undefined;
 
-  const headers = (): Record<string, string> => ({
+  const headers = (owner = false, operator = false): Record<string, string> => ({
     "content-type": "application/json",
     ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
+    ...(owner ? { "x-cafe-order-owner": ownerKey } : {}),
+    ...(operator && opts.operatorKey ? { "x-cafe-operator-key": opts.operatorKey } : {}),
   });
   const api = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
     ensured ??= (opts.ensure?.() ?? Promise.resolve()).catch((e) => {
@@ -118,9 +123,14 @@ export function runMcp(opts: McpOptions): Promise<void> {
       throw e;
     });
     await ensured;
-    const allHeaders = new Headers(headers());
+    const owner = path === "/api/orders" || path.endsWith("/cancel");
+    const operator = /^\/api\/threads\/[^/]+\/reply$/.test(path);
+    if ((owner || operator) && callerCredentialTransport(opts.base) === "remote-plaintext") {
+      throw new ToolError("tls_required: caller credentials require loopback HTTP or the configured verified HTTPS endpoint");
+    }
+    const allHeaders = new Headers(headers(owner, operator));
     new Headers(init.headers).forEach((value, name) => allHeaders.set(name, value));
-    const res = await fetch(`${opts.base}${path}`, { ...init, headers: allHeaders });
+    const res = await fetch(`${opts.base}${path}`, { ...init, headers: allHeaders, ...(owner || operator ? { redirect: "error" } : {}) });
     const body = (await res.json().catch(() => ({}))) as any;
     if (!res.ok) throw new ToolError(`${body.error ?? res.status}: ${body.message ?? ""}`.trim());
     return body as T;
@@ -182,10 +192,16 @@ export function runMcp(opts: McpOptions): Promise<void> {
       clearTimeout(timer);
       ctrl.abort();
     }
-    const result = status ? await api<{ taskStatus?: ThreadMeta["taskStatus"]; reports: { agentId: string; text: string }[] }>(
-      `/api/threads/${encodeURIComponent(threadId)}/result?orderId=${encodeURIComponent(orderId)}`,
-    ).catch(() => undefined) : undefined;
+    const [result, thread] = await Promise.all([
+      status ? api<{ taskStatus?: ThreadMeta["taskStatus"]; reports: { agentId: string; text: string }[] }>(
+        `/api/threads/${encodeURIComponent(threadId)}/result?orderId=${encodeURIComponent(orderId)}`,
+      ).catch(() => undefined) : Promise.resolve(undefined),
+      api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`).catch(() => undefined),
+    ]);
     const lines = [`threadId: ${threadId}`, `orderId: ${orderId}`, `status: ${status ?? "still working"}`];
+    if (thread?.meta.origin === "agent" && thread.meta.provenanceVerified !== true) {
+      lines.push(`claimed relay (unverified): ${thread.meta.via?.address ?? thread.meta.from.address}`);
+    }
     for (const r of replies) lines.push("", `## ${r.source === "operator" ? `operator override for ${r.from}` : r.from}${r.final ? "" : " (progress)"}`, r.text);
     for (const r of result?.reports ?? []) lines.push("", `## ${who(r.agentId)} (result report)`, r.text);
     if (notes.length) lines.push("", ...notes);
@@ -288,6 +304,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
         return { text: `cancelled ${threadId}` };
       }
       case "cafe_reply": {
+        if (!opts.operatorKey) throw new ToolError("cafe_reply is disabled; restart `cafe mcp --operator` on the Order-owning Host");
         const threadId = str(args.threadId, "threadId", true)!;
         const agent = str(args.agent, "agent", true)!;
         const text = str(args.text, "text", true)!;
@@ -324,7 +341,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
       case "ping":
         return reply({});
       case "tools/list":
-        return reply({ tools: TOOLS });
+        return reply({ tools: opts.operatorKey ? TOOLS : TOOLS.filter((tool) => tool.name !== "cafe_reply") });
       case "tools/call": {
         try {
           const r = await callTool(String(msg.params?.name), (msg.params?.arguments ?? {}) as Record<string, unknown>);

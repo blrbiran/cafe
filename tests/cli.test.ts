@@ -193,7 +193,7 @@ describe("thread child results", () => {
 
     const reply = await fetch(`http://${d.addr}/api/threads/${order.threadId}/reply`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-cafe-operator-key": readFileSync(join(d.home, "operator.key"), "utf8") },
       body: JSON.stringify({ agent: helper.rec.address, text: "reviewed" }),
     });
     expect(reply.status).toBe(200);

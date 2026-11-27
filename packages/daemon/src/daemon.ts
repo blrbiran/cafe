@@ -37,6 +37,7 @@ import {
   type AgentRecord,
   type AgentStatus,
   type Attachment,
+  type EventActor,
   HostIdentity,
   type DaemonRecord,
   type Order,
@@ -68,6 +69,14 @@ import { describeFetchError } from "./net-errors.ts";
 const rosterKey = (t: { host: string; team: string; channel: string }): string => `${t.host}/${t.team}/${t.channel}`;
 const OwnershipKey = AgentIdentity.shape.resumeAgentId.unwrap().regex(/^[0-9a-f]{64}$/);
 const ownershipDigest = (key: string): string => createHash("sha256").update(key).digest("hex");
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
 
 function loadOperatorDigest(home: string, store: Store): string {
   const file = join(home, "operator.key");
@@ -187,11 +196,13 @@ const IDEMPOTENCY_WINDOW_MS = 10 * 60_000;
 const IDEMPOTENCY_MAX_ENTRIES = 1000;
 
 type CreatedOrder = { orderId: string; threadId: string; decision: RoutingDecision };
+type CallerPrincipal = { kind: "human" | "connector" | "agent"; principalId: string; scopeKey: string };
 
-/** One in-flight or completed idempotent create, keyed by the caller's idempotencyKey. */
+/** One in-flight or completed idempotent create, keyed by authenticated caller and caller key. */
 interface IdempotentOrder {
   at: number;
   expiresAt: number;
+  requestHash: string;
   /** The first request is still routing: concurrent duplicates await it. */
   pending?: Promise<CreatedOrder>;
   result?: CreatedOrder;
@@ -2164,19 +2175,32 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * window return the first Order/Thread; the key is the caller's (a platform
    * event id for connectors, v4-3 Q4). Without a key nothing is deduplicated.
    */
-  async createOrder(p: CreateOrderParams, peer?: Peer, ownerKey?: string): Promise<CreatedOrder> {
+  async createOrder(
+    p: CreateOrderParams,
+    peer?: Peer,
+    ownerKey?: string,
+    caller?: { kind: "human" | "connector"; credential: string },
+  ): Promise<CreatedOrder> {
+    const principal = this.resolveCallerPrincipal(peer, ownerKey, caller);
+    if ((ownerKey !== undefined || caller !== undefined) && !principal) {
+      throw new RpcError("caller_identity_required", "the supplied caller credential is invalid or is not provisioned on this Host");
+    }
     const key = p.idempotencyKey;
-    if (!key) return this.createOrderInner(p, peer, ownerKey);
+    if (!key) return this.createOrderInner(p, peer, ownerKey, principal);
+    if (!principal) throw new RpcError("caller_identity_required", "an authenticated caller is required for idempotency");
     const now = Date.now();
     this.pruneIdempotent(now);
-    const hit = this.idempotentOrders.get(key);
+    const scopedKey = `${principal.scopeKey}:${key}`;
+    const requestHash = createHash("sha256").update(canonicalJson(p)).digest("hex");
+    const hit = this.idempotentOrders.get(scopedKey);
     if (hit && hit.expiresAt > now) {
+      if (hit.requestHash !== requestHash) throw new RpcError("idempotency_conflict", "this idempotency key was already used with a different request");
       if (hit.result) return hit.result;
       if (hit.pending) return hit.pending;
     }
-    const entry: IdempotentOrder = { at: now, expiresAt: now + IDEMPOTENCY_WINDOW_MS };
-    this.idempotentOrders.set(key, entry);
-    entry.pending = this.createOrderInner(p, peer, ownerKey);
+    const entry: IdempotentOrder = { at: now, expiresAt: now + IDEMPOTENCY_WINDOW_MS, requestHash };
+    this.idempotentOrders.set(scopedKey, entry);
+    entry.pending = this.createOrderInner(p, peer, ownerKey, principal);
     try {
       const result = await entry.pending;
       entry.result = result;
@@ -2184,9 +2208,33 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return result;
     } catch (err) {
       // A failed create is not a result: let the caller retry with the same key.
-      this.idempotentOrders.delete(key);
+      this.idempotentOrders.delete(scopedKey);
       throw err;
     }
+  }
+
+  private resolveCallerPrincipal(
+    peer?: Peer,
+    ownerKey?: string,
+    caller?: { kind: "human" | "connector"; credential: string },
+  ): CallerPrincipal | undefined {
+    if (peer?.meta.agentId) {
+      const principalId = peer.meta.agentId;
+      const scopeKey = ownershipDigest(`agent:${peer.meta.host ?? ""}:${principalId}`);
+      return { kind: "agent", principalId, scopeKey };
+    }
+    if (caller?.kind === "connector") {
+      const parsed = OwnershipKey.safeParse(caller.credential);
+      if (!parsed.success) return undefined;
+      const digest = ownershipDigest(parsed.data);
+      const principalId = this.store.getCallerPrincipal("connector", digest);
+      return principalId ? { kind: "connector", principalId, scopeKey: digest } : undefined;
+    }
+    const parsed = OwnershipKey.safeParse(caller?.credential ?? ownerKey);
+    if (!parsed.success) return undefined;
+    const digest = ownershipDigest(parsed.data);
+    const principalId = this.store.putCallerPrincipal({ kind: "human", credentialDigest: digest, principalId: `human:${ulid()}` });
+    return { kind: "human", principalId, scopeKey: digest };
   }
 
   private pruneIdempotent(now: number): void {
@@ -2201,7 +2249,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  private async createOrderInner(p: CreateOrderParams, peer?: Peer, ownerKey?: string): Promise<CreatedOrder> {
+  private async createOrderInner(p: CreateOrderParams, peer?: Peer, ownerKey?: string, principal?: CallerPrincipal): Promise<CreatedOrder> {
     if (this.draining) throw new RpcError("daemon_draining", "the daemon is draining for an update; retry after it restarts");
     const from: Party = peer?.meta.party ?? { id: `cli:${ulid()}`, address: `${p.as ?? "cli"}@${this.host}`, host: this.host };
     if (p.escalate && !p.parentOrderId) throw new RpcError("unknown_parent", "escalate: true requires parentOrderId");
@@ -2264,9 +2312,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const parentCreator = !!(linkedFollowup && peer && agentId === prior!.from.id && prior!.from.host === this.host && linkedParent && this.wasDelivered(linkedParent, agentId, this.host));
     const priorChildOrder = linkedFollowup ? this.findParentOrder(prior!.orderId, prior!.threadId) : undefined;
     const priorChildDelivery = !!(peer && agentId && this.agents.get(agentId) === peer && priorChildOrder && this.wasDelivered(priorChildOrder, agentId, this.host));
-    const ownerLinkedParent = !!(!peer && p.origin !== "agent" && linkedParent && this.ownsHumanOrder(linkedParent, ownerKey));
+    const ownerLinkedParent = !!(!peer && principal?.kind === "human" && linkedParent && this.ownsHumanOrder(linkedParent, ownerKey));
     if (linkedTask && !parentAgentDelivery && !parentCreator && !priorChildDelivery && !ownerLinkedParent) {
-      throw new RpcError(p.origin === "agent" || peer ? "not_a_target" : "not_owner", "linked work requires the parent recipient or its human owner");
+      throw new RpcError(principal?.kind === "agent" || peer ? "not_a_target" : "not_owner", "linked work requires the parent recipient or its human owner");
     }
     let replacing: Tracking | undefined;
     if (p.replaceOrderId && (!prior || prior.orderId !== p.replaceOrderId)) throw new RpcError("stale_order", "the Order selected for replacement is no longer current");
@@ -2318,7 +2366,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // Blobs were uploaded to this daemon before the Order; move them into the Thread now.
     const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
-    const owner = !peer && p.origin !== "agent" && !p.escalate && p.kind === "order" ? OwnershipKey.safeParse(ownerKey) : undefined;
+    const authenticatedAgent = !!(peer?.meta.agentId && principal?.kind === "agent");
+    const owner = !peer && principal?.kind === "human" && !p.escalate && p.kind === "order" ? OwnershipKey.safeParse(ownerKey) : undefined;
     const order: Order = {
       orderId: ulid(),
       threadId,
@@ -2329,8 +2378,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       ...(owner?.success ? { humanClarifications: true as const } : {}),
       ...(needsHuman ? { needsHuman: true as const } : {}),
       // Agent RPC identity is authoritative; HTTP owner-linked children are attributed to their human owner.
-      origin: ownerLinkedParent ? "human" : peer?.meta.party ? "agent" : p.origin ?? "human",
-      via: ownerLinkedParent ? undefined : peer?.meta.party ? { id: peer.meta.party.id, address: peer.meta.party.address } : p.via,
+      origin: authenticatedAgent ? "agent" : ownerLinkedParent ? "human" : p.origin ?? "human",
+      provenanceVerified: authenticatedAgent,
+      via: authenticatedAgent ? { id: peer!.meta.party!.id, address: peer!.meta.party!.address } : p.via,
       to: p.to,
       body: p.body,
       ...(attachments?.length ? { attachments } : {}),
@@ -2374,7 +2424,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const customerPeer = peer && !peer.meta.party ? peer : undefined;
     const t: Tracking = { order, customerPeer, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
     this.tracking.set(order.orderId, t);
-    this.emitEvent(order, { type: "order.created", order });
+    const actor: EventActor | undefined = principal ? { kind: principal.kind, principalId: principal.principalId } : undefined;
+    this.emitEvent(order, { type: "order.created", order }, { actor });
 
     const decision: RoutingDecision = needsHuman
       ? { targets: [], mode: "unicast", reason: "escalate to the person in the original conversation", router: "explicit", candidates: [], needsHuman: true }
@@ -3666,6 +3717,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         from: ev.order.from,
         ...(ev.order.origin ? { origin: ev.order.origin } : {}),
         ...(ev.order.via ? { via: ev.order.via } : {}),
+        ...(ev.order.provenanceVerified !== undefined ? { provenanceVerified: ev.order.provenanceVerified } : {}),
         targets: [],
         status: "routing",
         summary: summarize(ev.order.body),
@@ -3706,6 +3758,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           if (list.length < MAX_META_ATTACHMENTS && !list.some((x) => x.id === a.id)) list.push(a);
         }
         meta.turnStartedAt = ev.order.createdAt;
+        meta.origin = ev.order.origin;
+        meta.via = ev.order.via;
+        meta.provenanceVerified = ev.order.provenanceVerified;
         meta.reason = undefined;
         meta.router = undefined;
         meta.status = "routing";
