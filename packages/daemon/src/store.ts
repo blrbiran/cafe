@@ -1,7 +1,7 @@
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { DEFAULT_CHANNEL, type AgentRecord, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+import { DEFAULT_CHANNEL, type AgentRecord, type HostIdentity, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 
 /** Decode a Thread's metadata; a Thread written before channels existed is a default-channel Thread. */
 function threadMeta(raw: string): ThreadMeta {
@@ -24,6 +24,25 @@ export interface StoredArtifact {
 export interface MissingEventAuthority {
   kind: "order" | "assignment";
   id: string;
+}
+
+export interface InviteRedemptionRecord {
+  inviteDigest: string;
+  requestId: string;
+  publicKeyFingerprint: string;
+  sansHash: string;
+  hostId: string;
+  /** Returned only while this issuance remains current; cleared on supersession. */
+  certificate?: string;
+  state: "current" | "superseded";
+  supersededByHostId?: string;
+  supersededByRevision?: number;
+}
+
+export interface CallerPrincipalRecord {
+  kind: "human" | "connector" | "operator";
+  credentialDigest: string;
+  principalId: string;
 }
 
 const PENDING_EVENTS_MAX = 5000;
@@ -98,6 +117,30 @@ export class Store {
         at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS pending_events_order_at ON pending_events(order_id, at, event_id);
+      CREATE TABLE IF NOT EXISTS host_identities (
+        host_id TEXT PRIMARY KEY,
+        host TEXT NOT NULL UNIQUE,
+        key_fingerprint TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        revision INTEGER,
+        record_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS invite_redemptions (
+        invite_digest TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        public_key_fingerprint TEXT NOT NULL,
+        sans_hash TEXT NOT NULL,
+        host_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS caller_principals (
+        kind TEXT NOT NULL,
+        credential_digest TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        PRIMARY KEY(kind, credential_digest),
+        UNIQUE(kind, principal_id)
+      );
     `);
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
@@ -132,6 +175,88 @@ export class Store {
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_parent ON threads(parent_thread_id, created_at DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_parent_order ON threads(parent_thread_id, parent_order_id, created_at DESC)");
     this.upsertIndexRows = this.prepareIndexRows();
+  }
+
+  putHostIdentity(identity: HostIdentity): void {
+    const record = JSON.stringify(identity);
+    this.db.prepare(`
+      INSERT INTO host_identities(host_id, host, key_fingerprint, state, revision, record_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(host_id) DO UPDATE SET
+        host = excluded.host,
+        key_fingerprint = excluded.key_fingerprint,
+        state = excluded.state,
+        revision = excluded.revision,
+        record_json = excluded.record_json
+    `).run(identity.hostId, identity.host, identity.keyFingerprint, identity.state, identity.revision ?? null, record);
+  }
+
+  getHostIdentity(hostId: string): HostIdentity | undefined {
+    const row = this.db.prepare("SELECT record_json FROM host_identities WHERE host_id = ?").get(hostId) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as HostIdentity : undefined;
+  }
+
+  getHostIdentityByHost(host: string): HostIdentity | undefined {
+    const row = this.db.prepare("SELECT record_json FROM host_identities WHERE host = ?").get(host) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as HostIdentity : undefined;
+  }
+
+  getHostIdentityByKeyFingerprint(keyFingerprint: string): HostIdentity | undefined {
+    const row = this.db.prepare("SELECT record_json FROM host_identities WHERE key_fingerprint = ?").get(keyFingerprint) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as HostIdentity : undefined;
+  }
+
+  putInviteRedemption(record: InviteRedemptionRecord): InviteRedemptionRecord {
+    const existing = this.getInviteRedemption(record.inviteDigest);
+    if (existing) {
+      const sameRequest = existing.requestId === record.requestId &&
+        existing.publicKeyFingerprint === record.publicKeyFingerprint &&
+        existing.sansHash === record.sansHash;
+      if (!sameRequest) throw new Error("invite already redeemed by a different request");
+      if (existing.hostId !== record.hostId) throw new Error("invite redemption host identity conflict");
+      if (existing.state === "superseded") return existing;
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT INTO invite_redemptions(invite_digest, request_id, public_key_fingerprint, sans_hash, host_id, state, record_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(record.inviteDigest, record.requestId, record.publicKeyFingerprint, record.sansHash, record.hostId, record.state, JSON.stringify(record));
+    return record;
+  }
+
+  getInviteRedemption(inviteDigest: string): InviteRedemptionRecord | undefined {
+    const row = this.db.prepare("SELECT record_json, state FROM invite_redemptions WHERE invite_digest = ?").get(inviteDigest) as { record_json: string; state: InviteRedemptionRecord["state"] } | undefined;
+    if (!row) return undefined;
+    const record = JSON.parse(row.record_json) as InviteRedemptionRecord;
+    return { ...record, ...(row.state === "superseded" ? { certificate: undefined } : {}) };
+  }
+
+  markInviteSuperseded(inviteDigest: string, supersededByHostId: string, revision: number): void {
+    const current = this.getInviteRedemption(inviteDigest);
+    if (!current) throw new Error("unknown invite redemption");
+    const record: InviteRedemptionRecord = {
+      ...current,
+      certificate: undefined,
+      state: "superseded",
+      supersededByHostId,
+      supersededByRevision: revision,
+    };
+    this.db.prepare("UPDATE invite_redemptions SET state = ?, record_json = ? WHERE invite_digest = ?")
+      .run(record.state, JSON.stringify(record), inviteDigest);
+  }
+
+  putCallerPrincipal(principal: CallerPrincipalRecord): string {
+    const existing = this.getCallerPrincipal(principal.kind, principal.credentialDigest);
+    if (existing) return existing;
+    this.db.prepare("INSERT INTO caller_principals(kind, credential_digest, principal_id) VALUES (?, ?, ?)")
+      .run(principal.kind, principal.credentialDigest, principal.principalId);
+    return principal.principalId;
+  }
+
+  getCallerPrincipal(kind: CallerPrincipalRecord["kind"], credentialDigest: string): string | undefined {
+    const row = this.db.prepare("SELECT principal_id FROM caller_principals WHERE kind = ? AND credential_digest = ?")
+      .get(kind, credentialDigest) as { principal_id: string } | undefined;
+    return row?.principal_id;
   }
 
   threadFile(threadId: string, createdAt: number): string {

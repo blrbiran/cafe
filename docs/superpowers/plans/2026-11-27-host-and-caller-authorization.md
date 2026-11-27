@@ -47,7 +47,7 @@
 
 ## Task 1: Protocol and persistence primitives
 
-**Files:** `packages/protocol/src/index.ts`, `packages/protocol/src/version.ts`, `packages/daemon/src/store.ts`, create `tests/protocol-auth.test.ts`, create `tests/store-event-auth.test.ts`
+**Files:** `packages/protocol/src/index.ts`, `packages/protocol/src/version.ts`, `packages/daemon/src/store.ts`, create `tests/protocol-auth.test.ts`, create `tests/store-event-auth.test.ts`, create `tests/host-credential-store.test.ts`
 
 **Interfaces:**
 - Add `HostIdentity { hostId, host, keyFingerprint, state }` and optional `InitializeParams.hostId`/`hostAuthVersion`; `DaemonRecord.hostId` becomes the stable ID, while `host` remains the routing slug.
@@ -56,7 +56,7 @@
 - Add `parentOwnerAttestationId`/`parentOwnerAttestation` to linked human follow-up Orders; keep `parentOwnerVerified` only as derived local metadata.
 - Add `order.replaced`, `order.overridden`, and durable `order.assigned` event variants.
 - Add `caller-auth-v1`, `host-auth-v1`, and `team-roster-ack-v1` feature names.
-- Store methods: `putHostIdentity`, `getHostIdentity`, `putInviteRedemption`, `getInviteRedemption`, `putCallerPrincipal`, `getCallerPrincipal`, `stagePendingEvent(env, missingAuthority)`, `listPendingEvents(threadId?)`, `commitPendingEvents(file, eventIds)`, and `readOrderEvents` support for indexing `order.replaced` under both old/new IDs.
+- Store methods: `putHostIdentity(HostIdentity)`, `getHostIdentity(hostId)`, `getHostIdentityByHost(host)`, `getHostIdentityByKeyFingerprint(spki)`, `putInviteRedemption(record)`, `getInviteRedemption(inviteDigest)`, `markInviteSuperseded(inviteDigest, supersedingHostId, revision)`, `putCallerPrincipal(record)`, `getCallerPrincipal(kind, credentialDigest)`, `stagePendingEvent(env, missingAuthority)`, `listPendingEvents(threadId?)`, and `commitPendingEvents(file, eventIds)`; `readOrderEvents` indexes `order.replaced` under both old/new IDs.
 
 - [x] Write failing protocol parsing tests for host/actor fields, assignment IDs, replacement/override events, attestation, and capability names.
 - [x] Run `npx vitest run tests/protocol-auth.test.ts` and confirm each new contract fails before implementation.
@@ -66,6 +66,13 @@
 - [x] Implement atomic pending-event and replacement indexes in `packages/daemon/src/store.ts`; preserve JSONL as the event source of truth.
 - [x] Run `npx vitest run tests/protocol-auth.test.ts tests/store-event-auth.test.ts` and confirm pass.
 - [x] Review `git diff --check`, stage only Task 1 files, and commit with the required attribution trailer; never stage `.vitest/`.
+- [x] Add failing Store tests in `tests/host-credential-store.test.ts` for durable Host identity mapping, idempotent invite redemption/tombstones, and stable actor-principal lookup by credential digest.
+- [x] Run `npx vitest run tests/host-credential-store.test.ts` and confirm the Store APIs/tables are missing.
+- [x] Implement `putHostIdentity`/lookup, invite-redemption records, and `putCallerPrincipal`/lookup in `packages/daemon/src/store.ts`; store only token digests and keep hostSlug/SPKI constraints unique.
+- [x] Run `npx vitest run tests/protocol-auth.test.ts tests/store-event-auth.test.ts tests/host-credential-store.test.ts`; confirm pass.
+- [x] Run `npm run typecheck` after narrowing test cleanup to exact temp paths; confirm pass.
+- [x] Run the full `npm test` suite; confirm all tests pass.
+- [ ] Review `git diff --check`, stage only the Task 1 continuation files, and commit with the required attribution trailer; never stage `.vitest/`.
 
 ## Task 2: Host identity certificate lifecycle
 
