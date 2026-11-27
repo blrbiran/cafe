@@ -1,4 +1,5 @@
 import type { AgentRecord, Attachment, ConnectorStatusRow, DaemonRecord, RoutingDecision, RoutingHint, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { callerCredentialTransport } from "@cafe/protocol/urls";
 import type { JoinHint } from "./join.ts";
 import { authHeaders, authState, bootToken, tokenStore } from "./auth.ts";
 
@@ -102,6 +103,9 @@ function orderOwnerKey(): string | undefined {
 }
 
 async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, ownerKey?: string): Promise<T> {
+  if (ownerKey && callerCredentialTransport(location.origin) === "remote-plaintext") {
+    throw new ApiError("tls_required", "caller credentials require loopback access or the HTTPS Cafe address");
+  }
   const res = await fetch(path, {
     method,
     signal,

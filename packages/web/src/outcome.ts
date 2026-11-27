@@ -30,10 +30,13 @@ export function whoAddress(id: string, agents: Record<string, AgentRecord>, meta
  */
 export function askerOf(
   t: Dict,
-  source: { from: { address: string }; origin?: "human" | "agent"; via?: { address: string } },
+  source: { from: { address: string }; origin?: "human" | "agent"; via?: { address: string }; provenanceVerified?: boolean },
   followUp = false,
 ): { who: string; verb: string } {
-  if (source.origin === "agent") return { who: source.via?.address ?? source.from.address, verb: t.relayedVerb };
+  if (source.origin === "agent") return {
+    who: source.via?.address ?? source.from.address,
+    verb: source.provenanceVerified === true ? t.relayedVerb : t.unverifiedRelayedVerb,
+  };
   if (source.from.address.startsWith("web@")) return { who: t.you, verb: followUp ? t.followUpLabel : t.askedVerb };
   return { who: source.from.address, verb: followUp ? t.followUpLabel : t.askedVerb };
 }

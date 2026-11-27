@@ -353,6 +353,8 @@ export const Order = z.object({
   /** Absent on Threads created before provenance existed. */
   origin: OrderOrigin.optional(),
   via: OrderVia.optional(),
+  /** Caller supplied origin/via fields are display claims unless a registered Agent peer authored the Order. */
+  provenanceVerified: z.boolean().optional(),
   /** Explicit Address requested by the Customer; skips LLM routing. */
   to: z.string().optional(),
   body: z.string(),
@@ -540,6 +542,8 @@ export const ThreadMeta = z.object({
   /** Provenance of the first question; absent on older Threads. */
   origin: OrderOrigin.optional(),
   via: OrderVia.optional(),
+  /** Whether origin/via are authenticated actor provenance rather than display claims. */
+  provenanceVerified: z.boolean().optional(),
   targets: z.array(z.string()),
   mode: DeliveryMode.optional(),
   status: ThreadStatus,

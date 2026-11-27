@@ -416,7 +416,7 @@ export function startServer(daemon: Daemon, opts: { port: number; bind?: string;
         res.setHeader("connection", "close");
         return send(res, 413, { error: e.code, message: e.message });
       }
-      send(res, e.code === "not_found" ? 404 : e.code === "host_online" || e.code === "conflict" ? 409 : 400, { error: e.code ?? "error", message: e.message });
+      send(res, e.code === "not_found" ? 404 : e.code === "host_online" || e.code === "conflict" || e.code === "idempotency_conflict" ? 409 : e.code === "caller_identity_required" ? 401 : e.code === "tls_required" || e.code === "operator_required" ? 403 : 400, { error: e.code ?? "error", message: e.message });
     }
   };
 
@@ -881,10 +881,25 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
   }
   if (m === "GET" && (match = /^\/api\/threads\/([^/]+)\/stream$/.exec(path))) return stream(daemon, match[1]!, url.searchParams.get("orderId") ?? undefined, req, res);
   if (m === "POST" && path === "/api/orders") {
+    if (!isLoopback(req) && (req.socket as { encrypted?: boolean }).encrypted !== true) {
+      throw new RpcError("tls_required", "caller credentials require loopback HTTP or Root-CA-verified TLS");
+    }
     const parsed = CreateOrderParams.safeParse(await readJson(req));
     if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
     const ownerKey = req.headers["x-cafe-order-owner"];
-    return send(res, 200, await daemon.createOrder(parsed.data, undefined, typeof ownerKey === "string" ? ownerKey : undefined));
+    const connectorKey = req.headers["x-cafe-connector-key"];
+    if (typeof ownerKey !== "string" && typeof connectorKey !== "string") {
+      throw new RpcError("caller_identity_required", "send an owner capability or an installed connector capability");
+    }
+    if (typeof ownerKey === "string" && typeof connectorKey === "string") {
+      throw new RpcError("bad_request", "send only one caller capability");
+    }
+    return send(res, 200, await daemon.createOrder(
+      parsed.data,
+      undefined,
+      typeof ownerKey === "string" ? ownerKey : undefined,
+      typeof connectorKey === "string" ? { kind: "connector", credential: connectorKey } : undefined,
+    ));
   }
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/clarifications\/([^/]+)\/answer$/.exec(path))) {
     const input = await readJson(req);
@@ -896,6 +911,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     return send(res, 200, daemon.cancel(match[1]!, "cli"));
   }
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/reply$/.exec(path))) {
+    const operatorKey = req.headers["x-cafe-operator-key"];
+    if (!isLoopback(req) || typeof operatorKey !== "string" || !daemon.verifyOperatorCredential(operatorKey)) {
+      throw new RpcError("operator_required", "operator replies require the local operator credential on the Order-owning Host");
+    }
     const p = await readJson(req);
     if (typeof p.agent !== "string" || !p.agent || typeof p.text !== "string") throw new RpcError("bad_request", "agent and text are required");
     return send(res, 200, daemon.replyAs(match[1]!, p));

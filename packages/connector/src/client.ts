@@ -1,9 +1,12 @@
 import type { ThreadEnvelope } from "@cafe/protocol";
+import { callerCredentialTransport } from "@cafe/protocol/urls";
 
 export interface CafeHttpClientOptions {
   /** `host:port` (or `http(s)://host:port`); defaults to CAFE_DAEMON or 127.0.0.1:4777. */
   daemon?: string;
   token?: string;
+  /** Provisioned per-install connector capability. */
+  connectorKey?: string;
 }
 
 export interface SendOrderOptions {
@@ -49,19 +52,30 @@ function errorFrom(status: number, body: unknown): Error {
 export class CafeHttpClient {
   readonly base: string;
   private token?: string;
+  private connectorKey?: string;
 
   constructor(opts: CafeHttpClientOptions = {}) {
     const daemon = opts.daemon ?? process.env.CAFE_DAEMON ?? "127.0.0.1:4777";
     this.base = /^https?:\/\//.test(daemon) ? daemon.replace(/\/+$/, "") : `http://${daemon}`;
     this.token = opts.token ?? process.env.CAFE_TOKEN;
+    this.connectorKey = opts.connectorKey ?? process.env.CAFE_CONNECTOR_KEY;
   }
 
-  private headers(extra: Record<string, string> = {}): Record<string, string> {
-    return { "content-type": "application/json", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}), ...extra };
+  private headers(extra: Record<string, string> = {}, withCaller = false): Record<string, string> {
+    return {
+      "content-type": "application/json",
+      ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+      ...(withCaller && this.connectorKey ? { "x-cafe-connector-key": this.connectorKey } : {}),
+      ...extra,
+    };
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const res = await fetch(`${this.base}${path}`, { ...init, headers: this.headers(init.headers as Record<string, string>) });
+    const withCaller = path === "/api/orders" && !!this.connectorKey;
+    if (withCaller && callerCredentialTransport(this.base) === "remote-plaintext") {
+      throw new Error("tls_required: connector credentials require loopback HTTP or the configured verified HTTPS endpoint");
+    }
+    const res = await fetch(`${this.base}${path}`, { ...init, headers: this.headers(init.headers as Record<string, string>, withCaller) });
     const text = await res.text();
     let body: unknown = {};
     try {
