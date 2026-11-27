@@ -8,7 +8,8 @@ export const DEFAULT_PORT = 4777;
  */
 export const FEATURES = ["teams", "channels", "escalate", "collect", "digests", "team-sessions", "team-child-view", "human-clarifications", "host-auth-v1", "caller-auth-v1", "team-roster-ack-v1"] as const;
 export type Feature = (typeof FEATURES)[number];
-export const CURRENT_FEATURES: readonly Feature[] = FEATURES;
+// Recognize reserved wire names without promising that their enforcement is enabled.
+export const CURRENT_FEATURES: readonly Feature[] = FEATURES.filter((feature) => feature !== "caller-auth-v1" && feature !== "team-roster-ack-v1");
 
 /** Features in `need` that `have` lacks (undefined/absent = none). */
 export function missingFeatures(have: readonly string[] | undefined, need: readonly string[]): string[] {

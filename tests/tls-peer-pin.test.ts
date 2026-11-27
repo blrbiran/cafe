@@ -7,13 +7,7 @@ import { stringify } from "yaml";
 import { startDaemon, waitFor } from "./helpers.ts";
 import { enrollTestChild } from "./tls-helpers.ts";
 
-/**
- * v4-6 §5 A: the CA pin authenticates the trust anchor, but rejecting an unexpected leaf *issued
- * under that CA* needs a separate per-peer leaf pin. The pure check existed (`checkPeerPin`) with no
- * caller, so a compromised CA key or the wrong machine on an address was accepted silently.
- *
- * The Daemon-to-Daemon link is where the pins live (`security.tls.pins`, keyed `host:port`).
- */
+/** Authenticated links bind the CA, signed Host ID, and the Root's current key binding. */
 
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -93,10 +87,44 @@ describe("daemon-to-daemon Host identity", () => {
     const after = readFileSync(join(rootHome, "tls", "pinrenewroot.crt"), "utf8");
     expect(after).not.toBe(before);
 
-    // Force a fresh dial: re-point at the same Root, which drops the uplink and reconnects through the pin.
-    child.daemon.setRoot(rootAddr);
+    // Dial the same Root through its main discovery address after renewal.
+    child.daemon.setRoot(root.addr);
     await waitFor(() => child.daemon.rootOnline, 10_000);
-    expect(child.daemon.rootOnline).toBe(true);
+    expect((child.daemon as any).uplink?.hostIdentity?.hostId).toBe(root.daemon.hostId);
+  }, 40_000);
+
+  it("closes a connected direct link when the Root replaces the remote key", async () => {
+    const root = await startDaemon("rekeyroot", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const firstHome = mkdtempSync(join(tmpdir(), "cafe-rekey-first-"));
+    const secondHome = mkdtempSync(join(tmpdir(), "cafe-rekey-second-"));
+    cleanup.push(() => rmSync(firstHome, { recursive: true, force: true }), () => rmSync(secondHome, { recursive: true, force: true }));
+    const enroll = (home: string, host: string) => enrollTestChild(root, root.daemon.hostId, home, host);
+    const firstId = await enroll(firstHome, "rekey-first");
+    const secondId = await enroll(secondHome, "rekey-second");
+    const start = (home: string, host: string, identity: typeof firstId) => startDaemon(host, {
+      home, config: { root: root.addr, security: { mode: "tls", tls: { port: 0, caFingerprint: identity.caFingerprint, rootHostId: identity.rootHostId } } },
+    });
+    const first = await start(firstHome, "rekey-first", firstId);
+    cleanup.push(first.stop);
+    const second = await start(secondHome, "rekey-second", secondId);
+    cleanup.push(second.stop);
+    await waitFor(() => first.daemon.rootOnline && second.daemon.rootOnline && !!first.daemon.peerUrlFor("rekey-second"), 10_000);
+    const direct = await (first.daemon as any).link("rekey-second");
+    expect(direct.hostIdentity.hostId).toBe(secondId.hostId);
+
+    // The Root requires its child to be offline for replacement. The peer connection can still exist.
+    const secondUplink = (second.daemon as any).uplinkSocket;
+    (second.daemon as any).scheduleReconnect = () => {};
+    secondUplink.close();
+    await waitFor(() => root.daemon.daemons().some((entry) => entry.host === "rekey-second" && !entry.online), 10_000);
+    expect(direct.isClosed).toBe(false);
+    const invite = root.daemon.createHostInvite({ replaceHost: "rekey-second" });
+    const { generateHostKeyPair } = await import("../packages/daemon/src/tls/certs.ts");
+    const pair = await generateHostKeyPair();
+    const replaced = await root.daemon.redeemHostInvite({ inviteCode: invite.inviteCode, requestId: "rekey-fixture", publicKey: pair.publicKey, sans: ["127.0.0.1"] });
+    expect(replaced.hostId).toBe(secondId.hostId);
+    await waitFor(() => direct.isClosed, 5_000);
   }, 40_000);
 
   it("clears a legacy address pin without affecting the authenticated Host binding", async () => {

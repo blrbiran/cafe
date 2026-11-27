@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import type { AgentRecord, Attachment, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
@@ -15,6 +16,7 @@ export interface McpOptions {
   ensure?: () => Promise<void>;
   /** Customer name shown to others; default: the MCP client's name (e.g. claude-code, codex-mcp-client). */
   as?: string;
+  ownerKey?: string;
   version: string;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
@@ -70,7 +72,7 @@ const TOOLS = [
   {
     name: "cafe_cancel",
     description: "Cancel a question you asked that is still being worked on.",
-    inputSchema: { type: "object", properties: { threadId: { type: "string" } }, required: ["threadId"], additionalProperties: false },
+    inputSchema: { type: "object", properties: { threadId: { type: "string" }, orderId: { type: "string" } }, required: ["threadId"], additionalProperties: false },
   },
   {
     name: "cafe_reply",
@@ -102,6 +104,8 @@ export function runMcp(opts: McpOptions): Promise<void> {
   const output = opts.output ?? process.stdout;
   const maxWait = Math.min(opts.maxWaitS ?? MAX_WAIT_S, MAX_WAIT_S);
   let customer = opts.as;
+  // Embedded MCP servers keep a session-scoped identity when no persistent key was provided.
+  const ownerKey = opts.ownerKey ?? randomBytes(32).toString("hex");
   let ensured: Promise<void> | undefined;
 
   const headers = (): Record<string, string> => ({
@@ -114,7 +118,9 @@ export function runMcp(opts: McpOptions): Promise<void> {
       throw e;
     });
     await ensured;
-    const res = await fetch(`${opts.base}${path}`, { ...init, headers: headers() });
+    const allHeaders = new Headers(headers());
+    new Headers(init.headers).forEach((value, name) => allHeaders.set(name, value));
+    const res = await fetch(`${opts.base}${path}`, { ...init, headers: allHeaders });
     const body = (await res.json().catch(() => ({}))) as any;
     if (!res.ok) throw new ToolError(`${body.error ?? res.status}: ${body.message ?? ""}`.trim());
     return body as T;
@@ -236,8 +242,12 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
         const attachments: Attachment[] = [];
         for (const file of files) attachments.push(await upload(file));
+        const target = new URL(opts.base);
+        if (target.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)) throw new ToolError("remote orders require HTTPS");
         const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[]; failure?: string; router?: string } }>("/api/orders", {
           method: "POST",
+          headers: { "x-cafe-order-owner": ownerKey },
+          redirect: "error",
           body: JSON.stringify({
             body,
             to,
@@ -267,7 +277,14 @@ export function runMcp(opts: McpOptions): Promise<void> {
       }
       case "cafe_cancel": {
         const threadId = str(args.threadId, "threadId", true)!;
-        await api(`/api/threads/${encodeURIComponent(threadId)}/cancel`, { method: "POST" });
+        const target = new URL(opts.base);
+        if (target.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)) throw new ToolError("remote cancellation requires HTTPS");
+        const orderId = str(args.orderId, "orderId") ?? (await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`)).meta.orderId;
+        await api(`/api/threads/${encodeURIComponent(threadId)}/orders/${encodeURIComponent(orderId)}/cancel`, {
+          method: "POST",
+          headers: { "x-cafe-order-owner": ownerKey },
+          redirect: "error",
+        });
         return { text: `cancelled ${threadId}` };
       }
       case "cafe_reply": {

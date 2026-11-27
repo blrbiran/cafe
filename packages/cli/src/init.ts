@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CafeFile } from "@cafe/protocol";
@@ -114,7 +114,8 @@ concurrency: ${id.concurrency}
       writeFileSync(file, content, { mode: 0o644, flag: "wx" });
     }
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    if (existsSync(candidate)) unlinkSync(candidate);
+    rmdirSync(scratch);
   }
 
   const next =

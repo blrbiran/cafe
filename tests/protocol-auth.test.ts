@@ -19,9 +19,11 @@ describe("Host and caller authorization protocol", () => {
     });
   });
 
-  it("advertises the security capabilities without changing the protocol version", () => {
+  it("only advertises the implemented authorization capabilities", () => {
     expect(protocol.CURRENT_FEATURES).toContain("host-auth-v1");
-    expect(protocol.CURRENT_FEATURES).toContain("caller-auth-v1");
+    expect(protocol.FEATURES).toContain("caller-auth-v1");
+    expect(protocol.CURRENT_FEATURES).not.toContain("caller-auth-v1");
+    expect(protocol.CURRENT_FEATURES).not.toContain("team-roster-ack-v1");
     expect(protocol.PROTOCOL_VERSION).toBe(1);
   });
 

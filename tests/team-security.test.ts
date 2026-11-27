@@ -367,6 +367,36 @@ describe("late delivered replies", () => {
   });
 });
 
+describe("exact HTTP cancellation", () => {
+  it("requires the original owner key and cannot cancel a later turn with the prior ID", async () => {
+    const d = await startDaemon("cancel-http", { mode: "root" });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("worker"), async (handle) => { await handle.ack(); });
+    cleanup.push(() => worker.client.close());
+    const owner = "a".repeat(64);
+    const ask = async (body: string, threadId?: string) => {
+      const response = await fetch(`http://${d.addr}/api/orders`, {
+        method: "POST", headers: { "content-type": "application/json", "x-cafe-order-owner": owner },
+        body: JSON.stringify({ body, to: "worker", threadId }),
+      });
+      expect(response.status).toBe(200);
+      return await response.json() as { threadId: string; orderId: string };
+    };
+    const cancel = async (order: { threadId: string; orderId: string }, key: string) => {
+      const response = await fetch(`http://${d.addr}/api/threads/${order.threadId}/orders/${order.orderId}/cancel`, {
+        method: "POST", headers: { "x-cafe-order-owner": key },
+      });
+      return { status: response.status, ...(await response.json() as { error?: string }) };
+    };
+    const first = await ask("first turn");
+    expect(await cancel(first, "b".repeat(64))).toMatchObject({ error: "not_order_owner" });
+    expect(await cancel(first, owner)).toEqual({ status: 200 });
+    const second = await ask("second turn", first.threadId);
+    expect(await cancel(first, owner)).toMatchObject({ error: "stale_order" });
+    expect(await cancel(second, owner)).toEqual({ status: 200 });
+  });
+});
+
 describe("active Order identity", () => {
   it("keeps a late reply from clearing the same Thread's newer Order", async () => {
     const d = await startDaemon("active-order", { mode: "root", timing: { ...(await import("./helpers.ts")).FAST, ackTimeoutMs: 1000, heartbeatIntervalMs: 1000 } });
@@ -384,7 +414,8 @@ describe("active Order identity", () => {
 
     const first = await c.ask({ body: "first turn", to: "worker" });
     await waitFor(() => handles.has(first.orderId));
-    await c.cancel(first.threadId);
+    await expect(worker.cancel(first.threadId, first.orderId)).rejects.toMatchObject({ code: "not_order_owner" });
+    await c.cancel(first.threadId, first.orderId);
     await waitFor(() => d.daemon.thread(first.threadId)?.meta.status === "cancelled");
     const beforeLateNoise = d.daemon.thread(first.threadId)!.events.length;
     d.daemon.recordEvent({ eventId: "late-relayed-heartbeat", threadId: first.threadId, orderId: first.orderId, host: "remote", at: Date.now() + 1, event: { type: "order.heartbeat", agentId: record!.agentId } } as any);
@@ -395,6 +426,7 @@ describe("active Order identity", () => {
     expect(d.daemon.thread(first.threadId)!.events.slice(beforeLateNoise)).toEqual([]);
     const second = await c.ask({ body: "second turn", to: "worker", threadId: first.threadId, replace: true });
     await waitFor(() => handles.has(second.orderId));
+    await expect(c.cancel(first.threadId, first.orderId)).rejects.toMatchObject({ code: "stale_order" });
     expect((d.daemon.registry.get(record!.agentId) as any)?.activeOrderId).toBe(second.orderId);
 
     await handles.get(first.orderId).reply("late first result");

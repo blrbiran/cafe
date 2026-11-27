@@ -895,8 +895,18 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     await daemon.catchUpClarification(match[1]!, match[2]!);
     return send(res, 200, daemon.answerClarification(match[1]!, match[2]!, input, typeof ownerKey === "string" ? ownerKey : undefined));
   }
-  if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/cancel$/.exec(path))) {
-    return send(res, 200, daemon.cancel(match[1]!, "cli"));
+  if (m === "POST" && (match = /^\/api\/threads\/([^/]+)(?:\/orders\/([^/]+))?\/cancel$/.exec(path))) {
+    const loopback = isLoopback(req);
+    if (!loopback && !(req.socket instanceof TLSSocket)) throw new RpcError("tls_required", "remote cancellation requires HTTPS");
+    const input = match[2] ? undefined : await readJson(req);
+    const orderId = match[2] ?? input?.orderId;
+    const ownerKey = req.headers["x-cafe-order-owner"];
+    const operatorKey = req.headers["x-cafe-operator-key"];
+    return send(res, 200, daemon.cancel(match[1]!, orderId, {
+      loopback,
+      ownerKey: typeof ownerKey === "string" ? ownerKey : undefined,
+      operatorKey: typeof operatorKey === "string" ? operatorKey : undefined,
+    }));
   }
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/reply$/.exec(path))) {
     const p = await readJson(req);

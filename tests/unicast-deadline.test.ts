@@ -175,6 +175,8 @@ describe("thread_busy gives a way out (#60)", () => {
       code: "thread_busy",
       message: expect.stringContaining(`cafe cancel ${first.threadId}`),
     });
+    await expect(c.ask({ body: "invalid replacement", to: "unknown-address", threadId: first.threadId, replace: true })).rejects.toMatchObject({ code: "replacement_unroutable" });
+    expect(d.daemon.thread(first.threadId)?.meta).toMatchObject({ orderId: first.orderId, status: "working" });
     const replaced = await c.ask({ body: "replacement", threadId: first.threadId, replace: true });
     expect(replaced.threadId).toBe(first.threadId);
     expect(replaced.decision).toBeTruthy();

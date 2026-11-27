@@ -211,7 +211,12 @@ export const api = {
     call<{ orderId: string; threadId: string; decision: RoutingDecision }>("POST", "/api/orders", { ...p, as: "web", origin: "human" }, undefined, orderOwnerKey()),
   answerClarification: (parent: string, child: string, clarificationOrderId: string, text: string) =>
     call<{ orderId: string }>("POST", `/api/threads/${encodeURIComponent(parent)}/clarifications/${encodeURIComponent(child)}/answer`, { clarificationOrderId, text }, undefined, orderOwnerKey()),
-  cancel: (threadId: string) => call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/cancel`),
+  cancel: (threadId: string, orderId: string) => {
+    if (location.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
+      throw new Error("Open Cafe over HTTPS to cancel this Order.");
+    }
+    return call<{}>("POST", `/api/threads/${encodeURIComponent(threadId)}/orders/${encodeURIComponent(orderId)}/cancel`, undefined, undefined, orderOwnerKey());
+  },
   kick: (agentId: string) => call<{}>("DELETE", `/api/agents/${encodeURIComponent(agentId)}`),
   agentStats: (since: number) => call<Record<string, AgentStats>>("GET", `/api/agents/stats?since=${since}`),
   /** Last 7 days per Barista identity (`name@host`); survives Barista restarts. */

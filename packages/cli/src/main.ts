@@ -69,6 +69,20 @@ function orderOwnerKey(): string {
   return key;
 }
 
+function isLocalDaemon(): boolean {
+  const host = new URL(base()).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
+
+async function cancelOrder(threadId: string, orderId: string | undefined, operator = false): Promise<{}> {
+  if (!isLocalDaemon()) throw new Error("run cafe cancel on the Host that owns this Order");
+  const thread = encodeURIComponent(threadId);
+  const target = orderId ?? (await api<{ meta: ThreadMeta }>(`/api/threads/${thread}`)).meta.orderId;
+  if (!target) throw new Error("an exact Order ID is required");
+  const headers: Record<string, string> = operator ? { "x-cafe-operator-key": localOperatorKey() } : { "x-cafe-order-owner": orderOwnerKey() };
+  return api(`/api/threads/${thread}/orders/${encodeURIComponent(target)}/cancel`, { method: "POST", headers, redirect: "error" });
+}
+
 function localOperatorKey(): string {
   const target = new URL(base());
   const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -428,7 +442,7 @@ async function follow(threadId: string, opts: { quiet?: boolean; orderId?: strin
     // The daemon already closed the Order on its own deadline, so this is often just the local
     // stream ending late; say what happened and never leave the person without the thread id. A
     // cancel that fails must be reported as such: claiming "cancelled" hides a question still open.
-    const cancelled = await api(`/api/threads/${threadId}/cancel`, { method: "POST" }).then(
+    const cancelled = await cancelOrder(threadId, opts.orderId).then(
       () => true,
       (e: Error) => e,
     );
@@ -1079,7 +1093,12 @@ program
   .command("cancel")
   .description("cancel an active thread you started")
   .argument("<threadId>")
-  .action(async (id: string) => out(`cancelled ${id}`, await api(`/api/threads/${id}/cancel`, { method: "POST" })));
+  .option("--order <orderId>", "cancel this exact Order")
+  .option("--operator", "cancel as the local operator (requires --order)")
+  .action(async (id: string, flags: { order?: string; operator?: boolean }) => {
+    if (flags.operator && !flags.order) throw new Error("--operator requires --order <orderId>");
+    out(`cancelled ${id}`, await cancelOrder(id, flags.order, flags.operator));
+  });
 
 /** User-added aliases only (legacy names and the stable id are not display candidates). */
 function explicitAliases(aliases: string[] | undefined, hide: Array<string | undefined>): string[] {

@@ -134,6 +134,10 @@ describe("Daemon addresses carry TLS on an enrolled network (#80)", () => {
     // A direct link authenticates the Host known from the Root, independent of address.
     const link = await (c1.daemon as any).link("achild2");
     expect(link.hostIdentity?.hostId).toBe(e2.hostId);
+
+    link.close();
+    (c1.daemon as any).peerUrls.set("achild2", c1.daemon.url());
+    await expect((c1.daemon as any).link("achild2")).rejects.toThrow();
   }, 50_000);
 
   it("upgrades a plaintext address (a hand-set pin, an older Daemon) instead of dialling it in plaintext", async () => {

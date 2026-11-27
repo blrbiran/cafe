@@ -130,7 +130,7 @@ describe("direct links while the Root is offline (ADR-0004)", () => {
     slow.client.onCancel(() => (cancelled = true));
     const job = await c.ask({ body: "long job", to: "slow" });
     await waitFor(() => a.daemon.thread(job.threadId)?.meta.status === "working", 3000);
-    await fetch(`http://${a.addr}/api/threads/${job.threadId}/cancel`, { method: "POST" });
+    await c.cancel(job.threadId, job.orderId);
     await waitFor(() => cancelled, 3000);
     release();
   });

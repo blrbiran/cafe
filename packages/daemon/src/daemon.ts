@@ -150,6 +150,8 @@ const HINTS_MAX_AGE_MS = 3600_000;
 /** Live delivery state of one Order on its origin Daemon. */
 interface Tracking {
   order: Order;
+  /** Anonymous protocol customers own their Orders for the lifetime of their connection. */
+  customerPeer?: Peer;
   status: "open" | "done" | "failed" | "cancelled";
   /** Any final reply received for this Order. */
   replied: boolean;
@@ -1188,7 +1190,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       return {};
     });
-    peer.on(Methods.orderCancel, (p: { threadId: string }) => this.cancel(p.threadId, peer.meta.party?.address ?? "customer"));
+    const cancel = (p: { threadId: string; orderId: string }) => this.cancel(p?.threadId, p?.orderId, { peer });
+    peer.on(Methods.orderCancel, cancel);
+    peer.on("order/cancel-exact", cancel);
     // Bridged Baristas (Codex / Claude) remember which external session continues a Thread (v3-1 Q79).
     const sessionKey = (p: { threadId?: unknown; kind?: unknown }) => {
       const rec = peer.meta.agentId ? this.local.get(peer.meta.agentId as string) : undefined;
@@ -2264,14 +2268,21 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (linkedTask && !parentAgentDelivery && !parentCreator && !priorChildDelivery && !ownerLinkedParent) {
       throw new RpcError(p.origin === "agent" || peer ? "not_a_target" : "not_owner", "linked work requires the parent recipient or its human owner");
     }
+    let replacing: Tracking | undefined;
+    if (p.replaceOrderId && (!prior || prior.orderId !== p.replaceOrderId)) throw new RpcError("stale_order", "the Order selected for replacement is no longer current");
     if (prior) {
-      const open = [...this.tracking.values()].find((x) => x.order.threadId === prior!.threadId && x.status === "open");
-      if (open && !p.replace) {
-        throw new RpcError("thread_busy", `the previous question in this thread is still open; wait, run \`cafe cancel ${prior.threadId}\`, or pass replace: true to ask anyway`);
+      const tracked = this.tracking.get(prior.orderId);
+      const open = tracked?.status === "open" && tracked.order.threadId === prior.threadId ? tracked : undefined;
+      if (p.replaceOrderId && !open) throw new RpcError("stale_order", "the Order selected for replacement is no longer open");
+      if (open && !p.replace && !p.replaceOrderId) {
+        throw new RpcError("thread_busy", `the previous question in this thread is still open; wait or run \`cafe cancel ${prior.threadId}\``);
       }
-      if (open && p.replace) {
-        this.emitEvent(open.order, { type: "order.cancelled", by: "replaced" });
-        this.close(open, "cancelled");
+      if (open) {
+        const ownsOpen = peer
+          ? open.customerPeer === peer || (!!agentId && this.agents.get(agentId) === peer && open.order.from.id === agentId)
+          : this.ownsCancellation(open.order, ownerKey);
+        if (!ownsOpen || open.order.from.host !== this.host) throw new RpcError("not_order_owner", "only the requester can replace this Order");
+        replacing = open;
       } else if ((prior.status === "routing" || prior.status === "delivering" || prior.status === "working") && !this.closingEvent(prior.threadId, prior.orderId)) {
         throw new RpcError("thread_busy", `the previous Order may still be open on its originating Host; verify or cancel it there before following up`);
       }
@@ -2340,21 +2351,35 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const targetChannel = target ? this.registry.get(target)?.teamChannel : undefined;
     if (targetChannel) order.channel = targetChannel;
     if (owner?.success) this.store.setKv(`human-owner:${order.orderId}`, ownershipDigest(owner.data));
+    const cancellationOwner = !peer ? OwnershipKey.safeParse(ownerKey) : undefined;
+    if (cancellationOwner?.success) this.store.setKv(`cancel-owner:${order.orderId}`, ownershipDigest(cancellationOwner.data));
     this.knownOrders.set(order.orderId, order);
-    if (peer) this.subscribe(order.threadId, peer);
-
-    // Capture who answered before the new turn resets the Thread's reply list. `targetStates` is
-// also per-turn (reset at every `order.created`), so it is the previous Order's target set;
-// `meta.targets` is cumulative and only a fallback for old Threads.
+    // Capture the preceding turn before creating the new turn resets this metadata.
     const answeredBefore = prior ? [...new Set(prior.replies.filter((reply) => reply.at < (prior!.closedAt ?? Number.POSITIVE_INFINITY)).map((r) => r.agentId))] : [];
     const priorTargets = prior ? (prior.targetStates?.length ? prior.targetStates.map((s) => s.agentId) : prior.targets) : [];
-    const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
+    const routeNew = () => this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
+    let acceptedReplacement: RoutingDecision | undefined;
+    if (replacing) {
+      acceptedReplacement = await routeNew();
+      if (replacing.status !== "open" || (this.metas.get(threadId) ?? this.store.getThread(threadId))?.orderId !== replacing.order.orderId) {
+        throw new RpcError("stale_order", "the previous Order changed while routing the replacement");
+      }
+      if (!acceptedReplacement.targets.length || Date.now() >= order.createdAt + (order.deadlineMs ?? this.timing.unicastDeadlineMs)) {
+        throw new RpcError("replacement_unroutable", acceptedReplacement.reason || "no eligible target for the replacement");
+      }
+      this.emitEvent(replacing.order, { type: "order.cancelled", by: "replaced" });
+      this.close(replacing, "cancelled");
+    }
+    if (peer) this.subscribe(order.threadId, peer);
+    const customerPeer = peer && !peer.meta.party ? peer : undefined;
+    const t: Tracking = { order, customerPeer, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
     this.tracking.set(order.orderId, t);
     this.emitEvent(order, { type: "order.created", order });
 
     const decision: RoutingDecision = needsHuman
       ? { targets: [], mode: "unicast", reason: "escalate to the person in the original conversation", router: "explicit", candidates: [], needsHuman: true }
-      : explicit ?? await this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
+      : acceptedReplacement ?? explicit ?? await routeNew();
+    if (t.status !== "open") return { orderId: order.orderId, threadId: order.threadId, decision };
     t.decision = decision;
     t.candidates = [...decision.candidates];
     this.emitEvent(order, { type: "order.routed", decision });
@@ -3106,10 +3131,32 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     setTimeout(() => this.tracking.delete(t.order.orderId), 60_000).unref?.();
   }
 
-  cancel(threadId: string, by: string): {} {
-    const t = [...this.tracking.values()].find((x) => x.order.threadId === threadId && x.status === "open");
-    if (!t) throw new RpcError("not_found", `no open question on thread ${threadId} at this daemon`);
-    this.emitEvent(t.order, { type: "order.cancelled", by });
+  cancel(threadId: string, orderId: string, auth: { peer?: Peer; ownerKey?: string; operatorKey?: string; loopback?: boolean }): {} {
+    if (typeof threadId !== "string" || !threadId || typeof orderId !== "string" || !orderId) {
+      throw new RpcError("bad_request", "threadId and orderId are required to cancel an Order");
+    }
+    const t = this.tracking.get(orderId);
+    const current = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!t || current?.orderId !== orderId || t.status !== "open" || t.order.threadId !== threadId || t.order.from.host !== this.host) {
+      throw new RpcError("stale_order", "that Order is no longer open on this Host");
+    }
+    const peer = auth.peer;
+    const agentId = peer?.meta.agentId as string | undefined;
+    const registeredCreator = agentId && this.agents.get(agentId) === peer && t.order.from.id === agentId;
+    let actor: ThreadEnvelope["actor"];
+    if (registeredCreator) {
+      actor = { kind: "agent", principalId: agentId };
+    } else if (peer && t.customerPeer === peer) {
+      // Anonymous protocol customers can cancel only from their original connection.
+    } else if (auth.operatorKey !== undefined) {
+      if (!auth.loopback || !this.verifyOperatorCredential(auth.operatorKey)) throw new RpcError("unauthorized", "cancellation requires the local operator credential on the Order's Host");
+      actor = { kind: "operator", principalId: this.store.putCallerPrincipal({ kind: "operator", credentialDigest: this.operatorKeyDigest, principalId: ulid() }) };
+    } else if (this.ownsCancellation(t.order, auth.ownerKey)) {
+      actor = { kind: "human", principalId: this.store.putCallerPrincipal({ kind: "human", credentialDigest: ownershipDigest(auth.ownerKey!), principalId: ulid() }) };
+    } else {
+      throw new RpcError("not_order_owner", "only the requester or a local operator can cancel this Order");
+    }
+    this.emitEvent(t.order, { type: "order.cancelled", by: actor?.kind === "operator" ? "operator" : t.order.from.address }, { actor });
     this.close(t, "cancelled");
     return {};
   }
@@ -3158,10 +3205,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // Events: record locally, update metadata, fan out.
   // -------------------------------------------------------------------------
 
-  private emitEvent(order: Order, event: ThreadEventBody, opts: { skipTrack?: boolean } = {}): void {
+  private emitEvent(order: Order, event: ThreadEventBody, opts: { skipTrack?: boolean; actor?: ThreadEnvelope["actor"] } = {}): void {
     const env: ThreadEnvelope = {
       eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(), event,
       ...(this.tlsContext?.network ? { eventHostId: this.hostId } : {}),
+      ...(opts.actor ? { actor: opts.actor } : {}),
     };
     this.recordEvent(env, opts);
   }
@@ -3536,6 +3584,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return !!meta && !!this.store.findLastEvent(meta.file, (env) =>
       env.orderId === order.orderId && env.host === host && env.event.type === "order.delivered" && env.event.agentId === agentId &&
       (!protectedIdentity || env.event.protectedIdentity === true));
+  }
+
+  private ownsCancellation(order: Order, ownerKey?: string): boolean {
+    const parsed = OwnershipKey.safeParse(ownerKey);
+    if (!parsed.success) return false;
+    const digest = this.store.getKv<string>(`cancel-owner:${order.orderId}`) ?? this.store.getKv<string>(`human-owner:${order.orderId}`);
+    return digest === ownershipDigest(parsed.data);
   }
 
   private ownsHumanOrder(order: Order, ownerKey?: string): boolean {
@@ -4774,6 +4829,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
     checks.push(this.tlsCheck());
     if (this.tlsContext) {
+      if (this.isRoot) {
+        const legacy = [...new Set([...Object.keys(this.config.knownDaemons), ...this.daemonRecords.keys()])]
+          .filter((host) => host !== this.host && !this.store.getHostIdentityByHost(host));
+        if (legacy.length) checks.push({
+          name: "host-auth",
+          level: "warn",
+          detail: `these machines need Host enrollment: ${legacy.join(", ")}`,
+          next: "upgrade them and create a one-use invitation on this Root for each Host",
+        });
+        else checks.push({ name: "host-auth", level: "ok", detail: "Host connections require an enrolled certificate" });
+      } else if (this.config.root && this.tlsContext.network && !this.rootOnline) {
+        checks.push({
+          name: "host-auth",
+          level: "warn",
+          detail: "Root is offline. Direct links can use cached Host bindings until the peer certificate expires.",
+          next: "restore the Root connection to refresh Host bindings and revocations",
+        });
+      }
       const refused = this.refusals();
       const trying = refused.filter((r) => r.recent);
       const stopped = refused.filter((r) => !r.recent);

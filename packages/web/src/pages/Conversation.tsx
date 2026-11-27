@@ -196,11 +196,11 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
   const participants = [...new Set([meta.from.address, ...turns.flatMap((turn) => turn.replies.map((r) => whoAddress(r.agentId, agents, meta)))])];
   const routerText = last?.decision ? (t.router[last.decision.router] ?? last.decision.router) : "—";
 
-  const stop = async () => {
+  const stop = async (orderId: string) => {
     setBusy(true);
     setErr(undefined);
     try {
-      await api.cancel(meta.threadId);
+      await api.cancel(meta.threadId, orderId);
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -277,8 +277,8 @@ export function ConversationPage({ threadId, drawer = false, onClose }: { thread
                 <Pill tone={o.tone}>
                   <OutcomeText turn={turn} active={active} agents={agents} meta={meta} />
                 </Pill>
-                {active && (
-                  <button type="button" className="btn-sm btn-danger" aria-busy={busy} onClick={() => void stop()}>
+                {active && turn.orderId === meta.orderId && (
+                  <button type="button" className="btn-sm btn-danger" aria-busy={busy} onClick={() => void stop(turn.orderId)}>
                     {t.stopWaiting}
                   </button>
                 )}

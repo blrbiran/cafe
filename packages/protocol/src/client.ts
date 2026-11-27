@@ -494,6 +494,9 @@ export class CafeClient {
     const ownTeam = !!params.to && (params.to === this.identity?.team || params.to === this.record?.team);
     need("team-sessions", ownTeam, `to: ${params.to} would reach every member instead of the orchestrator`);
     const res = await this.peer.request<{ orderId: string; threadId: string; decision: RoutingDecision }>(Methods.orderCreate, { kind: "order", ...params }, 120_000);
+    this.askedOrders.delete(res.threadId);
+    this.askedOrders.set(res.threadId, res.orderId);
+    if (this.askedOrders.size > 1024) this.askedOrders.delete(this.askedOrders.keys().next().value!);
     if (params.escalate) {
       // The daemon advertised escalate; if the decision still did not reach the parent, say so.
       const reachedParent = res.decision.router === "explicit" && /escalate/i.test(res.decision.reason);
@@ -511,8 +514,11 @@ export class CafeClient {
     return this.peer.request("order/resume-results", { threadId, orderId });
   }
 
-  async cancel(threadId: string): Promise<void> {
-    await this.req(Methods.orderCancel, { threadId });
+  private readonly askedOrders = new Map<string, string>();
+
+  async cancel(threadId: string, orderId = this.askedOrders.get(threadId)): Promise<void> {
+    if (!orderId) throw new RpcError("bad_request", "give the exact Order ID to cancel");
+    await this.req("order/cancel-exact", { threadId, orderId });
   }
 
   close(): void {
