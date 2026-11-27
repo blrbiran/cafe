@@ -1039,7 +1039,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
       if (agent !== undefined && !AGENT_NAMES.includes(agent)) throw new RpcError("bad_request", `agent must be one of ${AGENT_NAMES.join(", ")}`);
       if (access !== undefined && access !== "read-only" && access !== "workspace-write") throw new RpcError("bad_request", "access must be read-only or workspace-write");
-      if (access !== undefined && agent !== "codex" && agent !== "claude") throw new RpcError("bad_request", "access is for agent codex or claude");
+      if (access === "workspace-write" && !isLoopback(req)) throw new RpcError("operator_required", "start a write-enabled worker from the local Host");
       if (model !== undefined && (typeof model !== "string" || !/^[\w./:@-]+$/.test(model))) throw new RpcError("bad_request", "bad model name");
       if (model !== undefined && agent !== "codex" && agent !== "claude") throw new RpcError("bad_request", "model is for agent codex or claude");
       if (tui !== undefined && (tui !== true || agent !== "codex")) throw new RpcError("bad_request", "tui is for agent codex");

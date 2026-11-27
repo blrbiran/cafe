@@ -199,7 +199,9 @@ const env = { ...process.env, HOME: fakeHome, CAFE_HOME: home, CAFE_DISCOVERY: "
     const piDir = join(work, "pidir");
     mkdirSync(piDir);
     writeFileSync(join(piDir, ".cafe"), "name: pib\ndescription: headless pi for the release test\nrole: barista\n");
-    cafe("barista", "start", "--dir", piDir);
+    // This smoke exercises packaged extension loading in an isolated directory. Runtime
+    // tool isolation has a separate release gate. Keep the default read-only policy intact.
+    cafe("barista", "start", "--dir", piDir, "--write");
     let ok = false;
     for (let i = 0; i < 100 && !ok; i++) {
       await sleep(200);
