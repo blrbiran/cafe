@@ -75,6 +75,7 @@ function validateTeam(doc: CafeDocument, path: string): void {
   for (const m of team.members) {
     if (seen.has(m.name)) fail(`team member '${m.name}' is listed twice`);
     seen.add(m.name);
+    if (m.mode === "tui" && m.access !== undefined) fail(`TUI member '${m.name}' cannot declare access; Cafe cannot restrict tools inside a user-owned terminal`);
     if (m.name === teamName) fail(`team member '${m.name}' may not have the same name as the team; \`to: ${m.name}\` would be ambiguous`);
     m.channels = m.channels?.length ? m.channels : [channel];
     if (!m.channels.includes(channel)) fail(`team member '${m.name}' must include the team channel '${channel}' in channels`);

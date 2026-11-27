@@ -53,7 +53,7 @@ export const TeamMember = z.object({
   tags: z.array(z.string()).default([]),
   scope: z.array(z.string()).default([]),
   mode: z.enum(["headless", "tui"]).default("headless"),
-  dir: z.string().default("."),
+  dir: z.string().min(1, "member directory path must not be empty").refine((value) => !value.includes("\0"), "member directory path must not contain NUL").refine((value) => !value.startsWith("/") && !value.startsWith("\\") && !/^[a-zA-Z]:[\\\\/]/.test(value), "member directory path must be relative to the roster root").default("."),
   channels: z.array(ChannelName).optional(),
   observer: z.boolean().optional(),
   collect: z.enum(["any", "all"]).optional(),
