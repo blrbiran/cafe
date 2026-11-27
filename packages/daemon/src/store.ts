@@ -562,6 +562,12 @@ export class Store {
     return found;
   }
 
+  removeCallerPrincipal(kind: CallerPrincipalRecord["kind"], credentialDigest: string): boolean {
+    const result = this.db.prepare("DELETE FROM caller_principals WHERE kind = ? AND credential_digest = ?")
+      .run(kind, credentialDigest);
+    return result.changes > 0;
+  }
+
   threadFile(threadId: string, createdAt: number): string {
     const day = new Date(createdAt).toISOString().slice(0, 10);
     const dir = join(this.home, "sessions", day);
