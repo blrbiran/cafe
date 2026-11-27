@@ -1721,13 +1721,13 @@ barista
   .option("--member <name>", "start this roster member (reads the team .cafe)")
   .option("--team-dir <dir>", "directory holding the roster .cafe (with --member)")
   .option("--agent <name>", "pi (default), omp (oh-my-pi), codex (codex app-server) or claude (claude -p)")
-  .option("--write", "codex / claude only: allow editing files in --dir (default: read-only)")
+  .option("--write", "allow editing files in --dir (default: read-only)")
   .option("--model <model>", "codex / claude only: model to use")
   .option("--tui", "codex only: attach to the Codex TUI session already running in --dir (this command does not open a UI)")
   .option("--thread <id>", "with --tui: the Codex thread to use (required when --dir has more than one idle session)")
   .action(async (o) => {
     const native = BRIDGED_AGENTS.includes(o.agent);
-    if ((o.write || o.model) && !native) throw new Error("--write and --model are for --agent codex or claude");
+    if (o.model && !native) throw new Error("--model is for --agent codex or claude");
     if (o.tui && o.agent !== "codex") throw new Error("--tui is for --agent codex; for Claude Code run `cafe claude install`");
     if (o.thread && !o.tui) throw new Error("--thread needs --tui");
     if (o.tui && (o.write || o.model)) throw new Error("--tui uses the session's own model and permissions; drop --write / --model");

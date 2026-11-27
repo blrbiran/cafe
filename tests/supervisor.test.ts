@@ -154,16 +154,17 @@ describe("supervisor", () => {
     expect(alive(other.pid!)).toBe(true);
   });
 
-  it("a missing pi binary backs off instead of hot-looping", async () => {
+  it("a missing pi binary is refused by the read-only probe instead of hot-looping", async () => {
     const { home, dir } = setup();
     const sup = new Supervisor({ home, daemonAddr: "127.0.0.1:1", token: "t", piBin: "/nonexistent/pi", graceMs: 200, backoffBaseMs: 300 });
     cleanup.push(() => sup.shutdown());
     sup.start({ dir });
-    const log = sup.list()[0]!.log;
-    await waitFor(() => existsSync(log) && readFileSync(log, "utf8").includes("not found"), 5000);
+    // The isolation probe fails closed before process creation: the worker never spawns, so it cannot
+    // restart forever; it reports the same "not found" reason the old spawn path did.
+    await waitFor(() => sup.list()[0]?.state === "failed", 5000);
     await new Promise((r) => setTimeout(r, 700));
-    // base 300ms doubling: at most ~2 restarts in ~1s.
-    expect(sup.list()[0]!.restarts).toBeLessThanOrEqual(3);
+    expect(sup.list()[0]!.lastError).toMatch(/not found/i);
+    expect(sup.list()[0]!.restarts).toBe(0);
   });
 });
 
