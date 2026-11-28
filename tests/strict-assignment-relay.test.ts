@@ -75,6 +75,25 @@ describe("fixture-gated assignment relay", () => {
     expect(events.some((event) => event.event.type === "order.replied" && event.event.text === "worker says: strict root delivery")).toBe(true);
   });
 
+  it("keeps the original Order active when strict replacement cannot use the new Agent", async () => {
+    const root = await startDaemon("relay-replacement", { config: { mode: "root", security: { mode: "tls", tls: { port: 0 } } }, assignmentRelayFixture: true, timing });
+    cleanup.push(root.stop);
+    const worker = new CafeClient({ daemon: root.addr, resumeStore: managedAgentResumeStore(join(root.home, "agent-identities", "held-worker.json")) });
+    cleanup.push(() => worker.close());
+    worker.onOrder((h) => { void h.ack().catch(() => {}); });
+    await worker.connect(identity("original-worker"));
+    const incompatible = await barista(root.addr, identity("legacy-worker"));
+    cleanup.push(() => incompatible.client.close());
+    const caller = await customer(root.addr);
+    cleanup.push(() => caller.close());
+    const first = await caller.ask({ body: "hold the original Order", to: "original-worker" });
+    await waitFor(() => root.daemon.thread(first.threadId)?.meta.status === "working");
+    await expect(caller.ask({ body: "try a replacement", threadId: first.threadId, replaceOrderId: first.orderId, to: "legacy-worker" }))
+      .rejects.toMatchObject({ code: "unsupported_capability" });
+    expect(root.daemon.thread(first.threadId)?.meta).toMatchObject({ orderId: first.orderId, status: "working" });
+    expect(root.daemon.thread(first.threadId)?.events.some(({ event }) => event.type === "order.replaced")).toBe(false);
+  });
+
   it("uses acknowledged strict relay over an authenticated direct route", async () => {
     const root = await startDaemon("direct-root", { config: { mode: "root", security: { mode: "tls", tls: { port: 0 } } }, assignmentRelayFixture: true, timing });
     cleanup.push(root.stop);
