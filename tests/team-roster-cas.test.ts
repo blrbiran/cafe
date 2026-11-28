@@ -46,6 +46,8 @@ describe("durable Root roster compare-and-swap", () => {
     const uplink = () => (child.daemon as unknown as { uplink: Peer }).uplink;
     const base = record("cas-child", "roster-root-stable-1", 1, hash1);
     const request = { rosterRootId: base.rosterRootId, baseRevision: 0, baseContentHash: null, revision: 1, contentHash: hash1, roster: base, tombstones: [] };
+    const readCursor = () => uplink().request("team/rosterState", { rosterRootId: base.rosterRootId });
+    expect(await readCursor()).toMatchObject({ revision: 0, contentHash: null });
 
     const persist = vi.spyOn(root.daemon as any, "persistTeams").mockImplementation(() => { throw new Error("disk full"); });
     await expect(uplink().request("team/rosterAck", request)).rejects.toThrow("disk full");
@@ -82,6 +84,7 @@ describe("durable Root roster compare-and-swap", () => {
     await waitFor(() => child.daemon.rootOnline && uplink() !== originalUplink && !uplink().isClosed, 10_000);
     const afterRestart = await uplink().request("team/rosterAck", renamedRequest);
     expect(afterRestart).toEqual(renameAck);
+    expect(await readCursor()).toMatchObject({ revision: 2, contentHash: hash2 });
     expect(root.daemon.teams()).toContainEqual(expect.objectContaining({ host: "cas-child", team: "shop-renamed", revision: 2, contentHash: hash2 }));
   }, 30_000);
 });
