@@ -1,10 +1,12 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { generateCa } from "../packages/daemon/src/tls/certs.ts";
 import { readTlsConfig } from "../packages/daemon/src/tls/trust.ts";
+import { startDaemon, waitFor } from "./helpers.ts";
 import { parse } from "yaml";
 
 /**
@@ -12,7 +14,7 @@ import { parse } from "yaml";
  * enrol another Host; `cafe connect --ca-fingerprint` validates before writing; `cafe daemon
  * renew-cert` issues a fresh leaf.
  *
- * These spawn the CLI without a live daemon (config-file paths only), like the other CLI tests.
+ * The file-only checks below spawn the CLI without a daemon. The invite journey uses a scratch Root.
  */
 
 const homes: string[] = [];
@@ -72,6 +74,41 @@ describe("cafe root show", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/no.*CA|plaintext/i);
   });
+});
+
+describe("cafe connect --invite", () => {
+  it("enrolls a separate CLI process and starts the child with the pinned Root identity", async () => {
+    const root = await startDaemon("invite-cli-root", { home: home(), mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    const childHome = home();
+    let child: Awaited<ReturnType<typeof startDaemon>> | undefined;
+    const run = async (cafeHome: string, addr: string, ...args: string[]) => {
+      const bin = join(import.meta.dirname, "..", "packages", "cli", "bin", "cafe.js");
+      try {
+        const { stdout } = await promisify(execFile)(process.execPath, [bin, ...args, "--json"], {
+          env: { ...process.env, CAFE_HOME: cafeHome, CAFE_DAEMON: addr, CAFE_DISCOVERY: "0", CAFE_TOKEN: "t0k" }, timeout: 15_000,
+        });
+        return JSON.parse(stdout);
+      } catch (error) {
+        // execFile errors contain the command line, including the disposable invitation.
+        const failure = error as { code?: unknown; stderr?: string };
+        throw new Error(`fixture CLI ${args[0]} failed (${String(failure.code)})`);
+      }
+    };
+    try {
+      const invite = await run(root.home, root.addr, "host", "invite", "--name", "invite-cli-child");
+      const ca = readFileSync(join(root.home, "tls", "ca.crt"), "utf8");
+      const { fingerprintOf } = await import("../packages/daemon/src/tls/certs.ts");
+      const result = await run(childHome, "127.0.0.1:1", "connect", root.addr, "--token", "t0k", "--invite", invite.inviteCode, "--ca-fingerprint", fingerprintOf(ca));
+      expect(result).toMatchObject({ hostId: invite.hostId, rootHostId: root.daemon.hostId, restartRequired: true });
+      const config = parse(readFileSync(join(childHome, "config.yml"), "utf8"));
+      child = await startDaemon("invite-cli-child", { home: childHome, config: { ...config, port: 0, security: { ...config.security, tls: { ...config.security.tls, port: 0 } } } });
+      await waitFor(() => child?.daemon.rootOnline === true, 10_000);
+      expect(child.daemon.hostId).toBe(invite.hostId);
+    } finally {
+      await child?.stop();
+      await root.stop();
+    }
+  }, 30_000);
 });
 
 describe("cafe connect --ca-fingerprint", () => {
