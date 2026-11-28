@@ -88,6 +88,14 @@ export const TeamRecord = z.object({
   members: z.array(TeamMember),
   revision: z.number().int().optional(),
   hostOnline: z.boolean().optional(),
+  /** Host-local stable identity for the roster root that owns this record. */
+  rosterRootId: z.string().min(1).max(200).optional(),
+  /** Root-authenticated Host ID bound to rosterRootId on acknowledged publication. */
+  rosterOwnerHostId: z.string().min(1).optional(),
+  /** Durable CAS cursor, copied onto owned records so tombstones retain their acknowledgment state. */
+  rosterCasRevision: z.number().int().nonnegative().optional(),
+  rosterCasContentHash: z.string().regex(/^[0-9a-f]{64}$/).nullable().optional(),
+  rosterCasRequestHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   /** The roster came from a `.cafe` file: `teams()` must not grow it from live registrations. */
   authoritative: z.boolean().optional(),
   /** Hash of team/channel/members; an identical re-publish is a no-op (no revision bump, no push). */
@@ -96,6 +104,33 @@ export const TeamRecord = z.object({
   removed: z.boolean().optional(),
 });
 export type TeamRecord = z.infer<typeof TeamRecord>;
+
+/** Durable Host→Root roster CAS request (v4-14). */
+export const TeamRosterAckRequest = z.object({
+  rosterRootId: z.string().min(1).max(200),
+  baseRevision: z.number().int().nonnegative(),
+  baseContentHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  revision: z.number().int().positive(),
+  contentHash: z.string().regex(/^[0-9a-f]{64}$/),
+  roster: TeamRecord,
+  tombstones: z.array(TeamRecord).default([]),
+});
+export type TeamRosterAckRequest = z.infer<typeof TeamRosterAckRequest>;
+
+export const TeamRosterAckResult = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ack"), rosterRootId: z.string(), revision: z.number().int(), contentHash: z.string() }),
+  z.object({ status: z.literal("conflict"), reason: z.enum(["stale_base", "destination_owned"]), rosterRootId: z.string(), revision: z.number().int(), contentHash: z.string().regex(/^[0-9a-f]{64}$/).nullable() }),
+]);
+export type TeamRosterAckResult = z.infer<typeof TeamRosterAckResult>;
+
+export const TeamRosterStateRequest = z.object({ rosterRootId: z.string().min(1).max(200) });
+export type TeamRosterStateRequest = z.infer<typeof TeamRosterStateRequest>;
+export const TeamRosterStateResult = z.object({
+  rosterRootId: z.string(),
+  revision: z.number().int().nonnegative(),
+  contentHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+});
+export type TeamRosterStateResult = z.infer<typeof TeamRosterStateResult>;
 
 /** One entry of a team's live roster (v4-13). */
 export const TeamRosterEntry = z.object({
@@ -821,6 +856,10 @@ export const Methods = {
   /** v4-11: a daemon publishes a full team roster (revision-guarded) to the Root / children. */
   teamUpsert: "team/upsert",
   teamRemove: "team/remove",
+  /** Host → Root: durable compare-and-swap of one roster root, acknowledged after persistence. */
+  teamRosterAck: "team/rosterAck",
+  /** Host → Root: read the durable cursor for this authenticated Host's stable roster root. */
+  teamRosterState: "team/rosterState",
   /** v4-13: Daemon→Agent, a changed roster (not an Order; never triggers a turn). */
   teamRoster: "team/roster",
   /** v4-11: a channel digest for an observer (not an Order). */

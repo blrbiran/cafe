@@ -71,6 +71,8 @@ export interface RunOptions {
   routerFactory?: DaemonOptions["routerFactory"];
   /** Enable reserved strict relay capabilities only in isolated acceptance fixtures. */
   assignmentRelayFixture?: boolean;
+  /** Enable the reserved roster CAS handlers in isolated Root fixtures. */
+  rosterAckFixture?: boolean;
   timing?: DaemonOptions["timing"];
   log?: (m: string) => void;
   /** Skip the single-instance lock (tests run several daemons with distinct homes anyway). */
@@ -100,7 +102,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   // which cannot add timestamps or stop the file growing.
   const logFile = opts.log ? undefined : daemonLog(config.host, home, { version: opts.version ?? "dev", pid: process.pid, mode: config.mode });
   const log = opts.log ?? ((m: string) => logFile!(m));
-  const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, assignmentRelayFixture: opts.assignmentRelayFixture, timing: opts.timing, log, version: opts.version });
+  const daemon = new Daemon({ config, home, router: opts.router, routerFactory: opts.routerFactory, assignmentRelayFixture: opts.assignmentRelayFixture, rosterAckFixture: opts.rosterAckFixture, timing: opts.timing, log, version: opts.version });
   // Load the router in the background: loading pi's model runtime has taken tens of seconds, and the
   // Web, the Agents and the CLI must not wait for it. An Order that arrives meanwhile waits for it.
   daemon.startRouter();

@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { Agent as HttpsAgent } from "node:https";
 import { createHash, randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { ulid } from "ulid";
@@ -60,6 +60,10 @@ import {
   type TeamRosterEntry,
   type TeamRosterUpdate,
   TeamLaunchSpec,
+  TeamRosterAckRequest,
+  type TeamRosterAckResult,
+  TeamRosterStateRequest,
+  type TeamRosterStateResult,
   renderTeamPlaybook,
 } from "@cafe/protocol";
 import { Peer, RpcError } from "@cafe/protocol/peer";
@@ -122,6 +126,8 @@ export interface DaemonOptions {
   routerFactory?: (model: string) => Promise<Router>;
   /** Enable reserved strict relay capabilities only in isolated acceptance fixtures. */
   assignmentRelayFixture?: boolean;
+  /** Enable the reserved Root roster CAS API in isolated acceptance tests. */
+  rosterAckFixture?: boolean;
   /** Override the timing constants (tests). */
   timing?: Partial<Timing>;
   log?: (msg: string) => void;
@@ -347,6 +353,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private rootFeatures: string[] = [];
   /** Reserved assignment relay protocol is available only to explicit fixture instances. */
   private readonly assignmentRelayFixture: boolean;
+  private readonly rosterAckFixture: boolean;
   /** One log line while a roster cannot be published to an old Root (v4-12 D8). */
   private teamLocalLogged = false;
 
@@ -389,6 +396,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.config = opts.config;
     this.version = opts.version ?? "dev";
     this.assignmentRelayFixture = opts.assignmentRelayFixture === true;
+    this.rosterAckFixture = opts.rosterAckFixture === true;
     this.isRoot = opts.config.mode === "root";
     this.host = opts.config.host;
     this.displayName = opts.config.displayName ?? opts.config.host;
@@ -1705,14 +1713,136 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (this.isRoot) for (const child of this.children.values()) if (child !== from && (child.meta.features as string[] | undefined)?.includes("teams")) child.notify(Methods.teamUpsert, { team: next });
   }
 
+  private persistTeams(records: TeamRecord[]): void {
+    const tmp = `${this.teamsFile}.tmp`;
+    writeFileSync(tmp, JSON.stringify(records, null, 2), { mode: 0o600, flush: true });
+    const fileFd = openSync(tmp, "r");
+    try { fsyncSync(fileFd); } finally { closeSync(fileFd); }
+    renameSync(tmp, this.teamsFile);
+    const directoryFd = openSync(dirname(this.teamsFile), "r");
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  }
+
   private saveTeams(): void {
     try {
-      const tmp = `${this.teamsFile}.tmp`;
-      writeFileSync(tmp, JSON.stringify([...this.teamRecords.values()], null, 2));
-      renameSync(tmp, this.teamsFile);
+      this.persistTeams([...this.teamRecords.values()]);
     } catch (err) {
       this.log(`cannot save teams.json: ${(err as Error).message}`);
     }
+  }
+
+  private rosterState(peer: Peer, raw: unknown): TeamRosterStateResult {
+    if (!this.isRoot) throw new RpcError("not_root", "this daemon is not the Root");
+    if (peer.meta.kind !== "daemon" || !peer.hostIdentity || !peer.meta.host || peer.isClosed ||
+        !peer.meta.hostReady || this.children.get(peer.meta.host) !== peer) {
+      throw new RpcError("bad_identity", "roster state requires an authenticated Host connection");
+    }
+    const parsed = TeamRosterStateRequest.safeParse(raw);
+    if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
+    const owned = [...this.teamRecords.values()].filter((record) =>
+      record.rosterRootId === parsed.data.rosterRootId && record.rosterOwnerHostId === peer.hostIdentity!.hostId);
+    const cursor = owned.sort((a, b) => (b.rosterCasRevision ?? 0) - (a.rosterCasRevision ?? 0))[0];
+    return {
+      rosterRootId: parsed.data.rosterRootId,
+      revision: cursor?.rosterCasRevision ?? 0,
+      contentHash: cursor?.rosterCasContentHash ?? null,
+    };
+  }
+
+  /** Root-side durable compare-and-swap. The authenticated peer identity, never request data, owns the roster. */
+  private acknowledgeRoster(peer: Peer, raw: unknown): TeamRosterAckResult {
+    if (!this.isRoot) throw new RpcError("not_root", "this daemon is not the Root");
+    if (peer.meta.kind !== "daemon" || !peer.hostIdentity || !peer.meta.host || peer.isClosed ||
+        !peer.meta.hostReady || this.children.get(peer.meta.host) !== peer) {
+      throw new RpcError("bad_identity", "roster acknowledgment requires an authenticated Host connection");
+    }
+    const parsed = TeamRosterAckRequest.safeParse(raw);
+    if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
+    const request = parsed.data;
+    const host = peer.meta.host as string;
+    if (request.roster.host !== host || request.roster.rosterRootId !== request.rosterRootId ||
+        request.roster.revision !== request.revision || request.roster.contentHash !== request.contentHash) {
+      throw new RpcError("bad_identity", "roster identity, Host, revision, or content hash does not match the authenticated request");
+    }
+    if (request.tombstones.some((record) => record.host !== host || record.rosterRootId !== request.rosterRootId)) {
+      throw new RpcError("bad_identity", "roster tombstones must belong to this authenticated Host and rosterRootId");
+    }
+
+    const owned = [...this.teamRecords.values()].filter((record) =>
+      record.rosterRootId === request.rosterRootId && record.rosterOwnerHostId === peer.hostIdentity!.hostId);
+    const cursor = owned.sort((a, b) => (b.rosterCasRevision ?? 0) - (a.rosterCasRevision ?? 0))[0];
+    const currentRevision = cursor?.rosterCasRevision ?? 0;
+    const currentHash = cursor?.rosterCasContentHash ?? null;
+    const requestHash = createHash("sha256").update(canonicalJson(request)).digest("hex");
+    if (currentRevision === request.revision && currentHash === request.contentHash && cursor?.rosterCasRequestHash === requestHash) {
+      return { status: "ack", rosterRootId: request.rosterRootId, revision: request.revision, contentHash: request.contentHash };
+    }
+
+    const occupied = this.teamRecords.get(rosterKey(request.roster));
+    if (occupied?.rosterRootId && occupied.rosterRootId !== request.rosterRootId) {
+      return { status: "conflict", reason: "destination_owned", rosterRootId: request.rosterRootId, revision: currentRevision, contentHash: currentHash };
+    }
+    if (currentRevision !== request.baseRevision || currentHash !== request.baseContentHash || request.revision !== request.baseRevision + 1) {
+      return { status: "conflict", reason: "stale_base", rosterRootId: request.rosterRootId, revision: currentRevision, contentHash: currentHash };
+    }
+
+    const next = new Map(this.teamRecords);
+    const changed: Array<{ previous?: TeamRecord; next: TeamRecord }> = [];
+    const tombstone = (previous: TeamRecord): TeamRecord => ({
+      ...previous,
+      members: [],
+      revision: request.revision,
+      contentHash: this.teamHash({ ...previous, members: [], removed: true }),
+      removed: true,
+      rosterOwnerHostId: peer.hostIdentity!.hostId,
+      rosterCasRevision: request.revision,
+      rosterCasContentHash: request.contentHash,
+      rosterCasRequestHash: requestHash,
+    });
+    for (const previous of owned) {
+      const renamed = !request.roster.removed && !previous.removed &&
+        (previous.team !== request.roster.team || previous.channel !== request.roster.channel);
+      if (renamed) {
+        const removed = tombstone(previous);
+        next.set(rosterKey(removed), removed);
+        changed.push({ previous, next: removed });
+      }
+    }
+    for (const requestedTombstone of request.tombstones) {
+      const previous = owned.find((record) => rosterKey(record) === rosterKey(requestedTombstone));
+      if (!previous) throw new RpcError("bad_request", "a roster tombstone must refer to a Root record owned by this rosterRootId");
+      const removed = tombstone(previous);
+      next.set(rosterKey(removed), removed);
+      changed.push({ previous, next: removed });
+    }
+    const priorAtKey = next.get(rosterKey(request.roster));
+    const committed: TeamRecord = {
+      ...request.roster,
+      rosterOwnerHostId: peer.hostIdentity.hostId,
+      contentHash: request.contentHash,
+      revision: request.revision,
+      rosterCasRevision: request.revision,
+      rosterCasContentHash: request.contentHash,
+      rosterCasRequestHash: requestHash,
+    };
+    next.set(rosterKey(committed), committed);
+    changed.push({ previous: priorAtKey, next: committed });
+    for (const [key, record] of next) {
+      if (record.rosterRootId !== request.rosterRootId || record.rosterOwnerHostId !== peer.hostIdentity.hostId) continue;
+      next.set(key, { ...record, rosterCasRevision: request.revision, rosterCasContentHash: request.contentHash, rosterCasRequestHash: requestHash });
+    }
+
+    // Persist the complete upsert+tombstone set before mutating memory or returning an acknowledgment.
+    this.persistTeams([...next.values()]);
+    this.teamRecords = next;
+    for (const item of changed) {
+      this.noteChannelConflict(item.next);
+      this.notifyRosterChange(item.previous, item.next);
+      for (const child of this.children.values()) {
+        if ((child.meta.features as string[] | undefined)?.includes("teams")) child.notify(Methods.teamUpsert, { team: item.next });
+      }
+    }
+    return { status: "ack", rosterRootId: request.rosterRootId, revision: request.revision, contentHash: request.contentHash };
   }
 
   revokeTeamPath(grantId: string): PathGrant {
@@ -4982,13 +5112,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.registryUpsert, (x: { records: AgentRecord[] }) => {
       this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
     });
+    if (this.rosterAckFixture) {
+      peer.on(Methods.teamRosterState, (x: unknown) => this.rosterState(peer, x));
+      peer.on(Methods.teamRosterAck, (x: unknown) => this.acknowledgeRoster(peer, x));
+    }
     peer.on(Methods.teamUpsert, (x: { team: TeamRecord }) => {
-      this.storeTeam({ ...x.team, host }, peer);
+      const { rosterRootId: _rootId, rosterOwnerHostId: _owner, rosterCasRevision: _casRevision, rosterCasContentHash: _casHash, rosterCasRequestHash: _requestHash, ...legacyTeam } = x.team;
+      const existing = this.teamRecords.get(rosterKey({ ...legacyTeam, host }));
+      if (existing?.rosterRootId) throw new RpcError("conflict", "this roster is managed by durable roster CAS; legacy team/upsert is refused");
+      this.storeTeam({ ...legacyTeam, host }, peer);
       return {};
     });
     peer.on(Methods.teamRemove, (x: { team?: unknown; host?: unknown }) => {
       if (typeof x?.team !== "string" || !x.team) throw new RpcError("bad_request", "team is required");
-      this.removeTeam(x.team, typeof x.host === "string" && x.host ? x.host : host, peer);
+      if (typeof x.host === "string" && x.host && x.host !== host) throw new RpcError("bad_identity", "a Host can remove only its own team rosters");
+      if ([...this.teamRecords.values()].some((record) => record.host === host && record.team === x.team && record.rosterRootId)) {
+        throw new RpcError("conflict", "this roster is managed by durable roster CAS; remove it with a CAS tombstone");
+      }
+      this.removeTeam(x.team, host, peer);
       return {};
     });
     peer.on(Methods.channelDigest, (x: { agentId?: string; digest: ChannelDigest }) => {
