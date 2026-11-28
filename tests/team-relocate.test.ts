@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stringify } from "yaml";
 import { readCafeFile } from "../packages/protocol/src/cafeFile.ts";
+import { CafeClient } from "../packages/protocol/src/client.ts";
 import { readPathGrants } from "../packages/daemon/src/team-paths.ts";
 import { Supervisor } from "../packages/daemon/src/supervisor.ts";
 import { runDaemon, type Running } from "../packages/daemon/src/index.ts";
@@ -107,6 +108,46 @@ describe("local team relocation", () => {
       expect(() => restored.daemon.supervisor!.startTeam(source, readCafeFile(join(source, ".cafe")).team!)).toThrow(/fenced by a roster relocation/);
     } finally {
       await restored.stop();
+    }
+  });
+
+  it("removes a source TUI from routing before relocation stops workers", async () => {
+    const { home, source, destination } = fixture();
+    const daemon = await startDaemon("relocate-quarantine", home);
+    try {
+      daemon.daemon.publishRoster(source, readCafeFile(join(source, ".cafe")).team!);
+      const c = new CafeClient({ daemon: daemon.addr });
+      const spec = readCafeFile(join(source, ".cafe")).team!;
+      const member = spec.members.find((m) => m.mode === "tui")!;
+      const { memberLaunchHash } = await import("../packages/protocol/src/cafeFile.ts");
+      await c.connect({ name: member.name, member: member.name, team: spec.name, teamChannel: spec.channel!,
+        channels: [spec.channel!], role: "barista", mode: "tui", cwd: join(source, member.dir),
+        memberLaunchHash: memberLaunchHash(source, spec, member), description: "", tags: [], scope: [], concurrency: 1 });
+      expect(daemon.daemon.registry.all().some((r) => r.member === member.name && r.status !== "offline")).toBe(true);
+      const response = await relocate(daemon, source, destination);
+      expect(response.status, await response.text()).toBe(200);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(daemon.daemon.registry.all().some((r) => r.member === member.name && r.status !== "offline")).toBe(false);
+      c.close();
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("refuses relocation when a destination read-only member has an invalid path", async () => {
+    const { home, source, destination } = fixture();
+    const daemon = await startDaemon("relocate-preflight", home);
+    try {
+      daemon.daemon.publishRoster(source, readCafeFile(join(source, ".cafe")).team!);
+      const bad = readCafeFile(join(destination, ".cafe"));
+      bad.team!.members.push({ name: "broken", dir: "../outside", mode: "headless", access: "read-only" } as never);
+      writeFileSync(join(destination, ".cafe"), stringify(bad));
+      const response = await relocate(daemon, source, destination);
+      expect(response.status).toBe(409);
+      expect(daemon.daemon.store.getKv<Record<string, string>>("rosterOwners")?.["relocate-preflight/same-team/dev"]).toBe(realpathSync(source));
+      expect(daemon.daemon.supervisor?.pendingTeamRelocation()).toBeUndefined();
+    } finally {
+      await daemon.stop();
     }
   });
 
