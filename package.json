@@ -12,7 +12,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "test": "node scripts/test.mjs",
     "daemon": "node packages/cli/src/main.ts daemon run",
     "cafe": "node packages/cli/src/main.ts",
     "build:web": "npm run build --workspace @cafe/web",
