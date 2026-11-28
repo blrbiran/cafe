@@ -52,7 +52,65 @@ const team: TeamSpec = {
   ],
 };
 
+function nestedTerminals(roster: string): TeamSpec {
+  mkdirSync(join(roster, "worktrees/dev/deeper"), { recursive: true });
+  mkdirSync(join(roster, "worktrees/rev"));
+  const terminal = team.members[3]!;
+  return { ...team, members: [
+    { ...terminal, name: "orch", duty: "orchestrator" },
+    { ...terminal, name: "dev", dir: "worktrees/dev" },
+    { ...terminal, name: "rev", dir: "worktrees/rev" },
+  ] };
+}
+
 describe("supervisor teams (v4-11)", () => {
+  it.each([false, true])("allows the root front door with separate TUI worktrees (members reversed: %s)", (reverse) => {
+    const { home, roster } = setup();
+    const spec = nestedTerminals(roster);
+    const sup = supervisor(home);
+    sup.commitRosterWriteScopes(roster, { ...spec, members: reverse ? [...spec.members].reverse() : spec.members });
+    expect(() => sup.start({ dir: join(roster, "worktrees/dev"), access: "workspace-write" })).toThrow(/reserved by/);
+  });
+
+  it("still rejects same-directory TUI aliases, overlapping non-front-door terminals, and managed writers", () => {
+    const { home, roster } = setup();
+    const spec = nestedTerminals(roster);
+    const sup = supervisor(home);
+    const [orch, dev] = spec.members;
+    symlinkSync(roster, join(roster, "alias"), "junction");
+    for (const members of [
+      [orch!, { ...dev!, dir: "alias" }],
+      [orch!, dev!, { ...spec.members[2]!, dir: "worktrees/dev/deeper" }],
+      [orch!, { ...dev!, mode: "headless" as const, access: "write" as const }],
+      [{ ...orch!, duty: "reviewer" }, { ...dev!, duty: "orchestrator" }],
+    ]) {
+      expect(() => sup.commitRosterWriteScopes(roster, { ...spec, members })).toThrow(/overlap/);
+    }
+  });
+
+  it("continues reserving nested terminal directories against other rosters", () => {
+    const { home, roster } = setup();
+    const spec = nestedTerminals(roster);
+    const sup = supervisor(home);
+    sup.commitRosterWriteScopes(roster, spec);
+    const other = join(roster, "worktrees/dev/deeper");
+    expect(() => sup.commitRosterWriteScopes(other, { ...spec, name: "other", members: [spec.members[0]!] })).toThrow(/overlap/);
+  });
+
+  it("lets a team remove a nested TUI member while reserving its former worktree until released", () => {
+    const { home, roster } = setup();
+    const spec = nestedTerminals(roster);
+    const sup = supervisor(home);
+    sup.commitRosterWriteScopes(roster, spec);
+    const remaining = { ...spec, members: spec.members.filter((member) => member.name !== "dev") };
+    sup.commitRosterWriteScopes(roster, remaining);
+    sup.commitRosterWriteScopes(roster, remaining);
+    const [retired] = sup.staleTuiReservations();
+    expect(retired).toMatchObject({ member: "dev", path: realpathSync(join(roster, "worktrees/dev")) });
+    expect(() => sup.commitRosterWriteScopes(roster, spec)).toThrow(/overlap/);
+    expect(sup.releaseTuiReservation(retired!.reservationId)).toBe(true);
+    sup.commitRosterWriteScopes(roster, spec);
+  });
   it("starts one worker per headless member with its own cwd, and stops only supervised members", async () => {
     const { home, roster, pidfile } = setup();
     const sup = supervisor(home);

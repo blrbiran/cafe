@@ -41,6 +41,15 @@ describe("team path authorization", () => {
     expect(readFileSync(file, "utf8")).toBe(source);
   });
 
+  it("keeps the TUI launch hash stable even when a caller supplies ignored access", () => {
+    const root = dir();
+    const spec = readCafeFile(roster(root, ".", "tui")).team!;
+    const member = spec.members[1]!;
+    const original = memberLaunchHash(root, spec, member);
+    expect(memberLaunchHash(root, spec, { ...member, access: "read-only" })).toBe(original);
+    expect(memberLaunchHash(root, spec, { ...member, access: "write" })).toBe(original);
+  });
+
   it("resolves internal paths canonically and rejects unsafe or missing targets", () => {
     const root = dir();
     mkdirSync(join(root, "inside"));

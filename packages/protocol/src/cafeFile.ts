@@ -204,7 +204,8 @@ export function memberLaunchHash(rosterDir: string, team: TeamSpec, member: Team
   const path = memberDir ?? realpathSync(resolve(root, member.dir));
   return createHash("sha256").update(JSON.stringify([
     root, team.name, team.channel, member.name, member.mode, member.agent ?? team.agent ?? "pi",
-    member.bin ?? null, path, member.access ?? null, member.channels ?? [team.channel], Boolean(member.observer), member.collect ?? "any",
+    member.bin ?? null, path, member.mode === "tui" ? null : (member.access ?? null),
+    member.channels ?? [team.channel], Boolean(member.observer), member.collect ?? "any",
   ])).digest("hex");
 }
 

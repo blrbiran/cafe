@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CafeClient } from "@cafe/protocol/client";
-import { readCafeFile } from "@cafe/protocol/cafe-file";
+import { memberLaunchHash, readCafeFile } from "@cafe/protocol/cafe-file";
 import { FAST, barista, identity, startDaemon, waitFor } from "./helpers.ts";
 
 // v4-11 review: a roster read from an authoritative `.cafe` must replace membership (removing a
@@ -23,6 +24,57 @@ const member = (name: string, teamDir: string) =>
   identity(name, { team: "repo", teamChannel: "repo-dev", member: name, teamDir, channels: ["repo-dev"] });
 
 describe("team roster updates", () => {
+  it("migrates a saved nested TUI roster at boot and can sync and start a selected worker", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-tui-migration-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    const dir = join(home, "repo");
+    const dev = join(dir, "worktrees/dev");
+    mkdirSync(dev, { recursive: true });
+    const file = join(dir, ".cafe");
+    const source = `name: repo
+team:
+  channel: repo-dev
+  members:
+    - { name: orch, duty: orchestrator, mode: tui, dir: ., access: read-only }
+    - { name: dev, mode: tui, dir: worktrees/dev }
+    - { name: mon, agent: codex, observer: true, access: read-only }
+`;
+    writeFileSync(file, source);
+    const spec = readCafeFile(file).team!;
+    // Simulate a roster saved before the supervisor persisted reservations.
+    const old = await startDaemon("tui-migration", { home, mode: "root" });
+    cleanup.push(old.stop);
+    old.daemon.publishRoster(dir, spec);
+    await old.stop();
+    expect(existsSync(join(home, "team-write-scopes.json"))).toBe(false);
+
+    vi.stubEnv("CAFE_CODEX_BIN", fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url)));
+    cleanup.push(() => { vi.unstubAllEnvs(); });
+    const d = await startDaemon("tui-migration", { home, mode: "root", noSupervisor: false });
+    cleanup.push(d.stop);
+    expect(d.daemon.supervisor).toBeDefined();
+    const post = (sync: boolean) => fetch(`http://${d.addr}/api/baristas`, {
+      method: "POST",
+      headers: { authorization: "Bearer t0k", "content-type": "application/json" },
+      body: JSON.stringify({ dir, team: { members: [{ name: "mon" }] }, sync }),
+    });
+    const sync = await post(true);
+    expect(await sync.json()).toMatchObject({ published: true, team: "repo" });
+    expect(sync.status).toBe(200);
+    for (const [name, cwd] of [["orch", dir], ["dev", dev]] as const) {
+      const c = new CafeClient({ daemon: d.addr, token: "t0k" });
+      cleanup.push(() => c.close());
+      const hash = memberLaunchHash(dir, spec, spec.members.find((m) => m.name === name)!);
+      expect(await c.connect({ ...member(name, dir), mode: "tui", cwd, memberLaunchHash: hash })).toMatchObject({ member: name, status: "idle" });
+    }
+    const start = await post(false);
+    expect(await start.json()).toMatchObject([{ member: "mon" }]);
+    expect(start.status).toBe(200);
+    await waitFor(() => d.daemon.registry.all().some((agent) => agent.team === "repo" && agent.member === "mon" && agent.status === "idle"), 5000);
+    expect(d.daemon.teams()[0]!.roster.find((m) => m.name === "orch")).not.toHaveProperty("access");
+    expect(readFileSync(file, "utf8")).toBe(source);
+  });
+
   it("binds TUI registration to the committed launch configuration and cwd", async () => {
     const d = await startDaemon("tui-roster", { mode: "root" });
     cleanup.push(d.stop);
@@ -30,9 +82,8 @@ describe("team roster updates", () => {
     const second = join(d.home, "second");
     mkdirSync(first);
     mkdirSync(second);
-    const write = (dir: string, description: string) => writeFileSync(join(d.home, ".cafe"), `name: repo\nteam:\n  channel: repo-dev\n  members:\n    - { name: orch, duty: orchestrator, mode: tui, dir: ${dir}, description: ${description} }\n`);
+    const write = (dir: string, description: string, access = "") => writeFileSync(join(d.home, ".cafe"), `name: repo\nteam:\n  channel: repo-dev\n  members:\n    - { name: orch, duty: orchestrator, mode: tui, dir: ${dir}, description: ${description}${access} }\n`);
     const publish = () => d.daemon.publishRoster(d.home, readCafeFile(join(d.home, ".cafe")).team!);
-    const { memberLaunchHash } = await import("@cafe/protocol/cafe-file");
     const launch = (registeredCwd: string) => {
       const spec = readCafeFile(join(d.home, ".cafe")).team!;
       return { ...member("orch", d.home), mode: "tui" as const, cwd: registeredCwd, memberLaunchHash: memberLaunchHash(d.home, spec, spec.members[0]!) };
@@ -49,12 +100,15 @@ describe("team roster updates", () => {
     await expect(make().connect(launch(second))).rejects.toMatchObject({ code: "team_launch_mismatch" });
     const worker = make();
     await worker.connect(old);
-    write("first", "updated");
+    write("first", "updated", ", access: read-only");
     publish();
     expect(worker.connected).toBe(true);
+    worker.close();
+    const reconnected = make();
+    expect(await reconnected.connect(old)).toMatchObject({ member: "orch", status: "idle" });
     write("second", "updated");
     publish();
-    await waitFor(() => !worker.connected);
+    await waitFor(() => !reconnected.connected);
     await expect(make().connect(old)).rejects.toMatchObject({ code: "team_launch_mismatch" });
     expect(await make().connect(launch(second))).toMatchObject({ member: "orch", status: "idle" });
   });

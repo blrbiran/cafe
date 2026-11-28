@@ -345,27 +345,43 @@ export class Supervisor {
     const root = realpathSync(rosterDir);
     const otherRosters = current.filter((entry) => entry.rosterDir !== root || entry.tui?.stale);
     const scopes: RosterWriteScope[] = [];
+    const retainedTerminals = new Set<string>();
+    const frontDoor = team.members.find((member) => member.duty?.trim().toLowerCase() === "orchestrator")?.name;
+    const allowedTuiNesting = (a: RosterWriteScope, b: RosterWriteScope): boolean => {
+      if (!a.tui || !b.tui) return false;
+      const [front, child] = a.member === frontDoor ? [a, b] : [b, a];
+      return front.member === frontDoor && front.scope.path === root &&
+        child.scope.ancestors.slice(1).includes(front.scope.ancestors[0]!);
+    };
     for (const member of team.members) {
       if (member.mode !== "tui" && effectiveMemberAccess(member) !== "write") continue;
       const scope = captureWriteScope(validateMemberPath(this.home, root, member.name, member.dir).realPath);
-      const conflict = [...otherRosters, ...scopes].find((entry) => writeScopesOverlap(entry.scope, scope));
-      if (conflict) throw new Error(`${member.name} would overlap a write scope reserved by ${conflict.member} in ${conflict.scope.path}`);
+      const prior = member.mode === "tui" ? current.find((entry) => entry.rosterDir === root && entry.member === member.name &&
+        entry.tui && !entry.tui.stale && entry.scope.path === scope.path && entry.scope.ancestors[0] === scope.ancestors[0])?.tui : undefined;
+      const tui = member.mode === "tui" ? prior ?? { reservationId: randomUUID(), stale: false } : undefined;
+      const candidate = { rosterDir: root, member: member.name, scope, ...(tui ? { tui } : {}) };
+      const conflict = otherRosters.find((entry) => writeScopesOverlap(entry.scope, scope) &&
+        !(prior && entry.rosterDir === root && entry.tui?.stale)) ??
+        scopes.find((entry) => writeScopesOverlap(entry.scope, scope) && !allowedTuiNesting(entry, candidate));
+      if (conflict) throw new Error(`${member.name} would overlap a ${conflict.tui ? "terminal directory" : "write scope"} reserved by ${conflict.member} in ${conflict.scope.path}`);
       const retiring = this.reservedWriter(scope);
       if (retiring) throw new Error(`${member.name} would overlap a write-enabled worker still stopping in ${retiring.path}`);
       const active = this.workers.find((worker) => !(worker.rosterDir === root && worker.member === member.name) &&
         worker.writeScope && writeScopesOverlap(worker.writeScope, scope));
       if (active) throw new Error(`${member.name} would overlap an existing write-enabled worker in ${active.writeScope!.path}`);
-      const prior = current.find((entry) => entry.rosterDir === root && entry.member === member.name && entry.tui && !entry.tui.stale && entry.scope.path === scope.path && entry.scope.ancestors[0] === scope.ancestors[0]);
-      const tui = member.mode === "tui" ? prior?.tui ?? { reservationId: randomUUID(), stale: false } : undefined;
-      scopes.push({ rosterDir: root, member: member.name, scope, ...(tui ? { tui } : {}) });
+      if (prior) retainedTerminals.add(prior.reservationId);
+      scopes.push(candidate);
     }
     const stale = current.flatMap((entry) => {
       if (entry.rosterDir !== root || !entry.tui || entry.tui.stale) return [];
       if (scopes.some((scope) => scope.tui?.reservationId === entry.tui!.reservationId)) return [];
       return [{ ...entry, tui: { ...entry.tui, stale: true } }];
     });
+    // Removing a terminal preserves its reservation. An unchanged TUI scope can
+    // keep an overlap that was already committed, so the removal itself can succeed.
     for (const entry of stale) {
-      const conflict = scopes.find((scope) => !(scope.tui && scope.member === entry.member) && writeScopesOverlap(scope.scope, entry.scope));
+      const conflict = scopes.find((scope) => !(scope.tui && retainedTerminals.has(scope.tui.reservationId)) &&
+        writeScopesOverlap(scope.scope, entry.scope));
       if (conflict) throw new Error(`${conflict.member} overlaps a terminal reserved by ${entry.member} in ${entry.scope.path}`);
     }
     return [...otherRosters, ...scopes, ...stale];
