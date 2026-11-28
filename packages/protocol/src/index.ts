@@ -658,6 +658,14 @@ export const ChannelDigest = z.object({
     }),
   ),
   omitted: z.number().int().default(0),
+  /** Terminal failures past the visible 20-thread cap, within the bounded query window. */
+  omittedFailures: z.array(z.object({
+    threadId: z.string(),
+    orderId: z.string(),
+    status: z.literal("failed"),
+    summary: z.string(),
+    closedAt: z.number(),
+  })).optional(),
   partial: z.boolean().optional(),
 });
 export type ChannelDigest = z.infer<typeof ChannelDigest>;

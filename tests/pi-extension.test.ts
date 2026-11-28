@@ -261,6 +261,26 @@ describe("pi extension", () => {
     expect(root.daemon.thread(failures[0]!.threadId)?.meta.status).toBe("failed");
   });
 
+  it("observes failures omitted from the visible digest while busy", async () => {
+    writeFileSync(join(dir, ".cafe"), "name: demo\nteam:\n  members:\n    - { name: orch, duty: orchestrator }\n    - { name: widgets, observer: true }\n");
+    process.env.CAFE_TEAM_DIR = dir;
+    process.env.CAFE_TEAM_MEMBER = "widgets";
+    const { pi, c, root } = await setup(60_000);
+    pi.setIdle(false);
+    const failures = await Promise.all(Array.from({ length: 100 }, (_, i) => c.ask({ body: `failure ${i}`, to: "offline-worker", channel: "demo" })));
+    (root.daemon as any).emitDigests();
+    await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-digest" && s.message.details.digest.omittedFailures?.length === 80), 5000);
+    const digest = pi.sent.find((s) => s.message.customType === "cafe-digest")!.message.details.digest;
+
+    expect(pi.sent.filter((s) => s.options.triggerTurn)).toHaveLength(0);
+    pi.setIdle(true);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    const wake = pi.sent.find((s) => s.options.triggerTurn)!;
+    expect(wake.message.details.orders).toHaveLength(64);
+    for (const entry of digest.threads) expect(wake.message.content).toContain(entry.orderId);
+    expect(failures).toHaveLength(100);
+  });
+
   it("passes explicit broadcast through to every eligible Barista", async () => {
     const { pi, root } = await setup();
     for (const name of ["alpha", "beta", "gamma", "delta"]) {

@@ -236,7 +236,7 @@ export default function cafe(pi: ExtensionAPI) {
   const early = new Map<string, ThreadEnvelope[]>();
   let registry: AgentRecord[] = [];
   const observationInterval = 60_000;
-  const failedOrders = new Map<string, ChannelDigest["threads"][number]>();
+  const failedOrders = new Map<string, Pick<ChannelDigest["threads"][number], "threadId" | "summary">>();
   const observedOrders = new Set<string>();
   let lastObservation = -Infinity;
   let observationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -453,7 +453,8 @@ export default function cafe(pi: ExtensionAPI) {
           },
           { triggerTurn: false },
         );
-        for (const entry of d.threads) {
+        // The queue stays capped at 64; add overflow first so visible failures are retained.
+        for (const entry of [...(d.omittedFailures ?? []).slice().reverse(), ...d.threads]) {
           const { orderId } = entry;
           if (entry.status !== "failed" || entry.closedAt === undefined || !orderId || observedOrders.has(orderId)) continue;
           failedOrders.set(orderId, entry);

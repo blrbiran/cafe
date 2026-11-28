@@ -1610,6 +1610,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           ...(m.parentThreadId ? { parentThreadId: m.parentThreadId } : {}),
         })),
         omitted: Math.max(0, changed.length - 20),
+        omittedFailures: changed.slice(20).flatMap((m) =>
+          m.status === "failed" && m.closedAt !== undefined && m.orderId
+            ? [{ threadId: m.threadId, orderId: m.orderId, status: "failed" as const, summary: m.summary, closedAt: m.closedAt }]
+            : [],
+        ),
         ...(this.isRoot ? {} : { partial: true }),
       };
       for (const rec of observers) if (channelsOf(rec).includes(channel)) this.notifyAgent(rec.agentId, Methods.channelDigest, { digest });
@@ -3274,6 +3279,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         throw new RpcError("bad_assignment", "direct relay does not match the sending and receiving Hosts");
       }
       this.joinThread(x.order.threadId, peer);
+      this.markBackfill(x.order.threadId, true);
       this.recordRelayProof(proof, peer);
       this.deliverLocal(x.order, x.agentId, proof);
     });
@@ -3369,13 +3375,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private deliverLocal(order: Order, agentId: string, assignment: OrderAssignmentDelivery): void {
     if (order.clarificationRecipient && (agentId !== order.clarificationRecipient.id || this.host !== order.clarificationRecipient.host || !this.store.getKv<string>(`agent-proof:${agentId}`))) {
-      return this.relayFailure(order, agentId, "clarification requester unavailable");
+      return this.relayFailure(order, agentId, "clarification requester unavailable", assignment);
     }
     const peer = this.agents.get(agentId);
     if (!peer) {
       // The issuing Host retries a pending answer to this exact identity until its deadline.
       if (order.clarificationRecipient) return;
-      return this.relayFailure(order, agentId, "agent not connected");
+      return this.relayFailure(order, agentId, "agent not connected", assignment);
     }
     const rec = this.local.get(agentId);
     if (rec && (rec.activeThreadId !== order.threadId || rec.activeOrderId !== order.orderId)) {
@@ -3396,7 +3402,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       await this.pullAttachments(order);
     } catch (err) {
       this.log(`attachment pull failed for ${order.orderId}: ${(err as Error).message}`);
-      this.relayFailure(order, agentId, `attachment_unavailable: ${(err as Error).message}`);
+      this.relayFailure(order, agentId, `attachment_unavailable: ${(err as Error).message}`, assignment);
       return;
     }
     // The pull is async: the peer may have disconnected or the Order closed meanwhile. Recording
@@ -3443,8 +3449,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.emitEvent(order, { type: "order.delivered", agentId, assignmentId, ...(this.store.getKv<string>(`agent-proof:${agentId}`) ? { protectedIdentity: true } : {}) });
   }
 
-  private relayFailure(order: Order, agentId: string, reason: string): void {
-    this.emitEvent(order, { type: "order.failed", agentId, reason });
+  private relayFailure(order: Order, agentId: string, reason: string, proof?: OrderAssignmentDelivery): void {
+    if (!this.tlsContext?.network || order.from.host === this.host) {
+      this.emitEvent(order, { type: "order.failed", agentId, reason });
+    } else if (proof?.assignment.targetHostId === this.hostId && proof.assignment.targetAgentId === agentId) {
+      // Existing relay peers already process order.failed. The assignment binds
+      // this recipient transition to its exact target on upgraded peers.
+      this.emitEvent(order, { type: "order.failed", agentId, assignmentId: proof.assignment.assignmentId, reason });
+    } else {
+      this.log(`relay failed for ${order.orderId}: ${reason}`);
+    }
   }
 
   private resumeReplacementDispatch(t: Tracking, agentId: string): void {
@@ -3566,6 +3580,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           }
         }
         this.maybeClose(t);
+        break;
+      case "order.dispatch-failed":
+        if (t.targets.get(ev.agentId) === "pending" && t.assignments.get(ev.agentId)?.assignment.assignmentId === ev.assignmentId) {
+          this.targetFailed(t, ev.agentId, ev.reason);
+        }
         break;
       case "order.failed":
         if (ev.agentId) this.targetFailed(t, ev.agentId, ev.reason, false);
@@ -3980,22 +3999,58 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private missingOwnerEvidence(env: ThreadEnvelope): MissingEventAuthority | undefined {
     const { event } = env;
-    if (event.type === "order.created") {
+    const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+    const canonicalCreation = (orderId: string) => meta && this.store.findLastEvent(meta.file, (entry) =>
+      entry.threadId === env.threadId && entry.orderId === orderId &&
+      (entry.event.type === "order.created" || entry.event.type === "order.replaced"));
+    if (event.type === "order.created" || event.type === "order.replaced") {
       if (event.order.orderId !== env.orderId || event.order.threadId !== env.threadId || event.order.from.host !== env.host) {
         throw new RpcError("bad_identity", "Order creation does not match its owning Host and Thread");
       }
-      if (env.eventHostId && event.order.clarificationRecipient) return this.missingClarificationEvidence(env, event.order);
-      return;
+      const previous = canonicalCreation(env.orderId);
+      if (previous && canonicalJson(previous) !== canonicalJson(env)) {
+        throw new RpcError("bad_identity", "Order creation conflicts with the journal");
+      }
+      if (event.type === "order.created") {
+        if (env.eventHostId && event.order.clarificationRecipient) return this.missingClarificationEvidence(env, event.order);
+        if (meta && meta.from.host !== env.host) throw new RpcError("bad_identity", "only the Thread owner Host may start another Order");
+        return;
+      }
+      if (event.previousOrderId === env.orderId || event.decision.variants ||
+          event.assignments.some((assignment) => "body" in assignment || !OrderAssignmentReference.safeParse(assignment).success)) {
+        throw new RpcError("bad_assignment", "replacement must commit public assignment references for a new Order");
+      }
+    }
+    if (event.type === "order.closed" && !["done", "failed", "cancelled"].includes(event.status)) {
+      throw new RpcError("bad_request", "Order closure must use a terminal status");
+    }
+    if (event.type === "order.routed" && event.decision.variants) {
+      throw new RpcError("bad_assignment", "shared route cannot contain private routing variants");
     }
     const ownerSkip = event.type === "order.declined" && event.skipped;
-    if (event.type !== "order.assigned" && event.type !== "order.replaced" && event.type !== "order.overridden" && event.type !== "order.final-accepted" && !ownerSkip) return;
+    if (!ownerSkip && event.type !== "order.routed" && event.type !== "order.cancelled" && event.type !== "order.closed" &&
+        event.type !== "order.failed" && event.type !== "order.assigned" && event.type !== "order.replaced" &&
+        event.type !== "order.overridden" && event.type !== "order.final-accepted") return;
     const orderId = event.type === "order.replaced" ? event.previousOrderId : env.orderId;
-    const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
-    const creation = meta && this.store.findLastEvent(meta.file, (entry) => entry.orderId === orderId &&
-      (entry.event.type === "order.created" || entry.event.type === "order.replaced"));
+    const creation = canonicalCreation(orderId);
     if (!creation) return { kind: "order", id: orderId };
     if (!creation.eventHostId || env.eventHostId !== creation.eventHostId || env.host !== creation.host) {
-      throw new RpcError("bad_identity", "only the recorded Order owner Host may change its assignment or replace its result");
+      // Older Host Auth peers use order.failed for a recipient-side dispatch
+      // failure. Accept it only for an exact, public assignment to that Host.
+      if (creation.eventHostId && meta && event.type === "order.failed" && event.agentId && env.eventHostId) {
+        const refs = this.store.readOrderEvents(meta.file, orderId).flatMap(({ event: entry, eventHostId, host }) => {
+          if (eventHostId !== creation.eventHostId || host !== creation.host) return [];
+          return entry.type === "order.assigned" ? [entry.assignment] : entry.type === "order.replaced" ? entry.assignments : [];
+        });
+        const matches = new Set(refs.filter((assignment) => !("body" in assignment) &&
+          assignment.targetAgentId === event.agentId && assignment.targetHostId === env.eventHostId &&
+          (!event.assignmentId || assignment.assignmentId === event.assignmentId)).map(({ assignmentId }) => assignmentId));
+        if (matches.size === 1) return;
+        if (!matches.size && event.assignmentId && !this.store.getOrderAssignment(meta.file, orderId, event.assignmentId)) {
+          return { kind: "assignment", id: event.assignmentId };
+        }
+      }
+      throw new RpcError("bad_identity", "only the recorded Order owner Host may emit this transition");
     }
     if (event.type === "order.assigned" && ("body" in event.assignment || !OrderAssignmentReference.safeParse(event.assignment).success)) {
       throw new RpcError("bad_assignment", "the shared assignment event requires a public reference");
@@ -4063,7 +4118,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     let progress: boolean;
     do {
       progress = false;
-      for (const env of this.store.listPendingEvents(threadId)) {
+      const pending = this.store.listPendingEvents(threadId).sort((a, b) => a.at - b.at ||
+        Number(a.event.type === "order.closed") - Number(b.event.type === "order.closed"));
+      for (const env of pending) {
         try {
           const missing = this.missingAssignmentEvidence(env);
           if (missing) {
@@ -4079,7 +4136,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
         if (!meta || !this.store.findLastEvent(meta.file, ({ eventId }) => eventId === env.eventId)) {
           // The sender was authenticated when the envelope entered the pending journal.
-          this.recordEvent(env, { skipTrack: opts.skipTrack, replaying: true });
+          this.recordEvent(env, { skipTrack: opts.skipTrack && !this.tracking.has(env.orderId), replaying: true });
         }
         this.store.removePendingEvent(env.eventId);
         progress = true;
@@ -4113,7 +4170,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       env = { ...env, event: { ...event, auditOnly: true } };
     }
     const closed = this.closingEvent(env.threadId, env.orderId);
-    if (closed && !(event.type === "order.replied" && event.final) && event.type !== "order.reported") return;
+    const priorFinalDecision = event.type === "order.final-accepted" && closed?.eventHostId === env.eventHostId &&
+      env.eventHostId !== undefined && closed !== undefined && env.at <= closed.at && (opts.from?.hostIdentity || opts.replaying);
+    if (closed && !(event.type === "order.replied" && event.final) && event.type !== "order.reported" && !priorFinalDecision) return;
     const tracking = this.tracking.get(env.orderId);
     if (!opts.skipTrack && tracking?.status === "open" && "agentId" in event && typeof event.agentId === "string" && tracking.targets.get(event.agentId) === "failed" &&
       (event.type === "order.acked" || event.type === "order.heartbeat" || event.type === "order.declined" || event.type === "order.failed")) return;
@@ -4410,11 +4469,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     for (const event of pending.values()) {
+      if (this.closingEvent(creation.threadId, creation.orderId)) {
+        throw new RpcError("stale_order", "the relayed Order closed while its proof was being recorded");
+      }
       this.recordEvent(event, { from, skipTrack: true });
       const current = this.metas.get(event.threadId) ?? this.store.getThread(event.threadId);
       if (!current || !this.store.findLastEvent(current.file, ({ eventId }) => eventId === event.eventId)) {
         throw new RpcError("assignment_pending", "the owner creation and assignment must be journaled before relay");
       }
+    }
+    if (this.closingEvent(creation.threadId, creation.orderId)) {
+      throw new RpcError("stale_order", "the relayed Order closed while its proof was being recorded");
     }
   }
 

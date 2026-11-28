@@ -42,6 +42,28 @@ describe("observer digests and channel history (v4-11)", () => {
     expect(new Set(digests.map((x) => x.digestId)).size).toBe(digests.length);
   });
 
+  it("includes failed Orders beyond the visible digest cap", async () => {
+    const d = await startDaemon("ob-overflow", { mode: "root", timing: { ...FAST, graceMs: 60, digestIntervalMs: 60_000 } });
+    cleanup.push(d.stop);
+    const digests: ChannelDigest[] = [];
+    const watch = await barista(d.addr, identity("watch", { observer: true, channels: ["team"] }));
+    watch.client.onDigest((x) => digests.push(x));
+    cleanup.push(() => watch.client.close());
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+
+    const failures = await Promise.all(Array.from({ length: 25 }, (_, i) => c.ask({ body: `failure ${i}`, to: "offline-worker", channel: "team" })));
+    (d.daemon as any).emitDigests();
+    await waitFor(() => digests.some((digest) => digest.omitted === 5), 5000);
+    const digest = digests.find((entry) => entry.omitted === 5)!;
+    const visible = digest.threads.map((entry) => entry.orderId);
+    const overflow = digest.omittedFailures ?? [];
+
+    expect(digest.threads).toHaveLength(20);
+    expect(overflow.map((entry) => entry.orderId)).toHaveLength(5);
+    expect(new Set([...visible, ...overflow.map((entry) => entry.orderId)])).toEqual(new Set(failures.map((failure) => failure.orderId)));
+  });
+
   it("serves the channel index and an after-cursor page", async () => {
     const d = await startDaemon("ob2", { mode: "root", timing: { ...FAST, graceMs: 60 } });
     cleanup.push(d.stop);

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Peer } from "@cafe/protocol/peer";
 import type { OrderAssignment, ThreadEnvelope } from "@cafe/protocol";
 import { Store } from "../packages/daemon/src/store.ts";
 import { barista, customer, identity, startDaemon } from "./helpers.ts";
@@ -12,6 +13,48 @@ afterEach(async () => {
 });
 
 describe("canonical Order assignments", () => {
+  it("stages a valid owner route and close until its original creation is durable", async () => {
+    const receiver = await startDaemon("owner-events", { mode: "root" });
+    cleanup.push(receiver.stop);
+    const peer = new Peer({ send() {}, close() {} });
+    peer.meta.host = "owner";
+    peer.bindHostIdentity({ hostId: "owner-host-id", keyFingerprint: "fixture" });
+    const routed = envelope({ type: "order.routed", decision: { targets: [], mode: "unicast", reason: "fixture", router: "rules", candidates: [] } }, "routed");
+    const closed = envelope({ type: "order.closed", status: "failed" }, "closed");
+    receiver.daemon.recordEvent(routed, { from: peer });
+    receiver.daemon.recordEvent(closed, { from: peer });
+    expect(receiver.daemon.store.listPendingEvents("thread-1").map((env) => env.eventId)).toEqual(expect.arrayContaining(["routed", "closed"]));
+    const created = envelope({ type: "order.created", order: {
+      orderId: "order-1", threadId: "thread-1", kind: "order", from: { id: "requester", address: "requester", host: "owner" },
+      createdAt: 100, body: "check the parser", chain: [], depth: 0, history: [], turn: 1,
+    } }, "created");
+    receiver.daemon.recordEvent(created, { from: peer });
+    const thread = receiver.daemon.thread("thread-1");
+    expect(thread?.events.map((event) => event.eventId)).toEqual(["created", "routed", "closed"]);
+    expect(thread?.meta.status).toBe("failed");
+    expect(receiver.daemon.store.listPendingEvents("thread-1")).toEqual([]);
+  });
+  it.each([undefined, "delivery-1"])("retains an authenticated recipient failure for its exact assignment (%s)", async (assignmentId) => {
+    const receiver = await startDaemon("recipient-failure", { mode: "root" });
+    cleanup.push(receiver.stop);
+    const owner = new Peer({ send() {}, close() {} });
+    owner.meta.host = "owner";
+    owner.bindHostIdentity({ hostId: "owner-host-id", keyFingerprint: "owner-fixture" });
+    const target = new Peer({ send() {}, close() {} });
+    target.meta.host = "target";
+    target.bindHostIdentity({ hostId: "target-host-id", keyFingerprint: "target-fixture" });
+    receiver.daemon.recordEvent(envelope({ type: "order.created", order: {
+      orderId: "order-1", threadId: "thread-1", kind: "order", from: { id: "requester", address: "requester", host: "owner" },
+      createdAt: 100, body: "check the parser", chain: [], depth: 0, history: [], turn: 1,
+    } }, "created"), { from: owner });
+    receiver.daemon.recordEvent(envelope({ type: "order.assigned", assignment: {
+      assignmentId: "delivery-1", targetAgentId: "worker", targetHostId: "target-host-id", bodyHash: "a".repeat(64),
+    } }), { from: owner });
+    receiver.daemon.recordEvent({ ...envelope({ type: "order.failed", agentId: "worker", assignmentId, reason: "attachment unavailable" }, "failure"),
+      host: "target", eventHostId: "target-host-id" }, { from: target });
+    expect(receiver.daemon.thread("thread-1")?.events.at(-1)?.event).toMatchObject({ type: "order.failed", agentId: "worker" });
+  });
+
   it("journals the target assignment before handing it to delivery with canonical event references", async () => {
     const daemon = await startDaemon("assignment-owner", { mode: "root" });
     cleanup.push(daemon.stop);
