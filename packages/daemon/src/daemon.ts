@@ -1902,7 +1902,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const record of this.local.values()) {
       if (!record.team || !record.teamChannel) continue;
       const key = rosterKey({ host: this.host, team: record.team, channel: record.teamChannel });
-      if (affected.has(key)) this.agents.get(record.agentId)?.close();
+      const peer = affected.has(key) ? this.agents.get(record.agentId) : undefined;
+      if (peer) {
+        peer.close();
+        this.onPeerClosed(peer);
+      }
     }
     for (const key of affected) this.store.setKv(`team-tui-launches:${key}`, []);
     return this.supervisor?.markRosterTuiReservationsStale(canonical) ?? [];

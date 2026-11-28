@@ -126,7 +126,6 @@ describe("local team relocation", () => {
       expect(daemon.daemon.registry.all().some((r) => r.member === member.name && r.status !== "offline")).toBe(true);
       const response = await relocate(daemon, source, destination);
       expect(response.status, await response.text()).toBe(200);
-      await new Promise((r) => setTimeout(r, 50));
       expect(daemon.daemon.registry.all().some((r) => r.member === member.name && r.status !== "offline")).toBe(false);
       c.close();
     } finally {
