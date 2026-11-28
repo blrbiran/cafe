@@ -1,12 +1,13 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { loadIdentity, tuiAccessNotice } from "@cafe/protocol/cafe-file";
 import { CURRENT_FEATURES, missingFeatures } from "@cafe/protocol";
 import { defaultExtensionPath, loadConfig } from "@cafe/daemon";
 import { ompExtensionState, piExtensionState } from "./extension.ts";
 import { claudeCommandState } from "./commands.ts";
+import { quoteShellArg } from "./shell.ts";
 
 export interface DoctorCheck {
   name: string;
@@ -53,8 +54,13 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ ok: boolean; che
   try {
     const ignored: string[] = [];
     const id = loadIdentity(opts.cwd, { onIgnoredTuiAccess: (member) => ignored.push(member) });
-    if (id.file && ignored.length) checks.push({ name: "identity", level: "warn", detail: `${id.file}: ${tuiAccessNotice(ignored)}`, next: "cafe team status" });
-    else if (id.file) checks.push({ name: "identity", level: "ok", detail: `${id.file} (${id.cafe.name}, ${id.cafe.role})` });
+    if (id.file && id.document.team) {
+      const team = id.document.team;
+      const count = team.members.length;
+      const detail = `${id.file} (team ${team.name}, ${count} ${count === 1 ? "member" : "members"})`;
+      checks.push({ name: "identity", level: ignored.length ? "warn" : "ok", detail: ignored.length ? `${detail}: ${tuiAccessNotice(ignored)}` : detail,
+        next: `cafe team status --dir ${quoteShellArg(dirname(id.file))}` });
+    } else if (id.file) checks.push({ name: "identity", level: "ok", detail: `${id.file} (${id.cafe.name}, ${id.cafe.role})` });
     else checks.push({ name: "identity", level: "warn", detail: `${opts.cwd} has no .cafe; this session is an anonymous customer`, next: "cafe init" });
   } catch (err) {
     checks.push({ name: "identity", level: "fail", detail: (err as Error).message, next: "back up the existing .cafe and fix the reported YAML or settings in place" });

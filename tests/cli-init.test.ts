@@ -95,6 +95,19 @@ describe("cafe init", () => {
     expect(readFileSync(file, "utf8")).toBe(contents);
   });
 
+  it("points a team operator to status when init refuses to replace the roster", () => {
+    const dir = join(temp(), "team space's roster");
+    mkdirSync(dir);
+    const file = join(dir, ".cafe");
+    const contents = "name: repo\nteam:\n  members:\n    - { name: lead, duty: orchestrator }\n    - { name: reviewer }\n";
+    writeFileSync(file, contents);
+    const r = cafe(temp(), "init", dir, "--force", "--yes");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/team roster.*2 members/);
+    expect(r.stderr).toContain(`cafe team status --dir '${dir.replace("'", "'\"'\"'")}'`);
+    expect(readFileSync(file, "utf8")).toBe(contents);
+  });
+
   it("never overwrites the ~/.cafe data directory", () => {
     const dir = temp();
     mkdirSync(join(dir, ".cafe"));

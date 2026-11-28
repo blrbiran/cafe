@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -45,6 +45,21 @@ describe("cafe doctor", () => {
     expect(r.stdout).toContain("identity");
     expect(r.stdout).toContain("cafe extension install");
     expect(r.stdout).toContain("all checks passed");
+  });
+
+  it("identifies a valid team roster and points to its status command", async () => {
+    const root = await startDaemon("root", { mode: "root" });
+    cleanup.push(root.stop);
+    const cwd = mkdtempSync(join(tmpdir(), "cafe-team-doc-"));
+    cleanup.push(() => rmSync(cwd, { recursive: true, force: true }));
+    writeFileSync(join(cwd, ".cafe"), "name: widgets\nteam:\n  members:\n    - { name: lead, duty: orchestrator }\n    - { name: reviewer }\n");
+    const nested = join(cwd, "docs");
+    mkdirSync(nested);
+    const r = await doctor(nested, root.home, root.addr, cwd, "--json");
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).checks).toContainEqual(expect.objectContaining({
+      name: "identity", level: "ok", detail: expect.stringMatching(/widgets.*2 members/), next: `cafe team status --dir '${realpathSync(cwd)}'`,
+    }));
   });
 
   it("tells a directory without .cafe to run cafe init", async () => {

@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CafeFile } from "@cafe/protocol";
 import { parseCafeFile, readCafeFile } from "@cafe/protocol/cafe-file";
+import { quoteShellArg } from "./shell.ts";
 
 export interface InitOptions {
   dir?: string;
@@ -45,6 +46,27 @@ export async function runInit(opts: InitOptions = {}): Promise<InitResult> {
   if (existing?.isDirectory()) throw new Error(`${file} is a directory (cafe's data directory); refusing to replace it`);
   if (existing && !opts.force) throw new Error(`${file} already exists; edit it in place, or pass --force to replace a standalone identity`);
   if (existing && !existing.isFile()) throw new Error(`${file} is not a regular file; edit it in place`);
+
+  let original: Buffer | undefined;
+  if (existing) {
+    let current: ReturnType<typeof readCafeFile>;
+    try {
+      const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        if (!sameIdentityFile(fstatSync(fd), existing)) throw new Error(`${file} changed while preparing the replacement`);
+        original = readFileSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      current = parseCafeFile(original.toString("utf8"), file);
+    } catch (err) {
+      throw new Error(`Repair ${file} in place before running init again. Original kept. ${(err as Error).message}`);
+    }
+    if (current.team) {
+      const count = current.team.members.length;
+      throw new Error(`${file} contains a team roster for ${current.team.name} (${count} ${count === 1 ? "member" : "members"}). Original kept. Run cafe team status --dir ${quoteShellArg(dir)} to inspect it, then edit the roster in place.`);
+    }
+  }
 
   let name = opts.name;
   let description = opts.description;
@@ -94,24 +116,6 @@ scope: [${id.scope.map(yamlString).join(", ")}]
 role: ${id.role}
 concurrency: ${id.concurrency}
 `;
-  let original: Buffer | undefined;
-  if (existing) {
-    if (!existsSync(file)) throw new Error(`${file} disappeared while preparing the replacement`);
-    let current: ReturnType<typeof readCafeFile>;
-    try {
-      const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      try {
-        if (!sameIdentityFile(fstatSync(fd), existing)) throw new Error(`${file} changed while preparing the replacement`);
-        original = readFileSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      current = parseCafeFile(original.toString("utf8"), file);
-    } catch (err) {
-      throw new Error(`Repair ${file} in place before running init again. Original kept. ${(err as Error).message}`);
-    }
-    if (current.team) throw new Error(`${file} contains a team roster. Edit it in place. Original kept.`);
-  }
   // Validate the serialized document before it can replace the old file.
   const scratch = mkdtempSync(join(dir, ".cafe-init-"));
   const candidate = join(scratch, ".cafe");
