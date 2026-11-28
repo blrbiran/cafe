@@ -523,9 +523,13 @@ export class Store {
 
   /** Remove only rows whose owner-issued deadline is safely in the past. Legacy rows have no expiry. */
   private deleteExpiredRecipientAssignments(expiredBy: number): number {
-    const rows = this.db.prepare("SELECT assignment_id FROM recipient_assignments WHERE expires_at IS NOT NULL AND expires_at <= ?")
-      .all(expiredBy) as { assignment_id: string }[];
+    const rows = this.db.prepare("SELECT assignment_id, expires_at FROM recipient_assignments WHERE expires_at IS NOT NULL AND expires_at <= ?")
+      .all(expiredBy) as { assignment_id: string; expires_at: number }[];
     if (!rows.length) return 0;
+    // Keep the fence in the same transaction as the deletion so a wall-clock
+    // rollback cannot make a reclaimed assignment eligible for reinsertion.
+    const fencedThrough = this.getKv<number>("recipientInboxReclaimedThrough") ?? 0;
+    this.setKv("recipientInboxReclaimedThrough", Math.max(fencedThrough, ...rows.map(({ expires_at }) => expires_at)));
     const delReceipt = this.db.prepare("DELETE FROM recipient_assignment_receipts WHERE assignment_id = ?");
     const delAssignment = this.db.prepare("DELETE FROM recipient_assignments WHERE assignment_id = ?");
     for (const { assignment_id } of rows) {
@@ -567,6 +571,10 @@ export class Store {
         return raced;
       }
       this.deleteExpiredRecipientAssignments(Date.now() - RECIPIENT_ASSIGNMENT_CLOCK_SKEW_MS);
+      const fencedThrough = this.getKv<number>("recipientInboxReclaimedThrough") ?? 0;
+      if (record.deadlineAt !== undefined && record.deadlineAt <= fencedThrough) {
+        throw new Error("recipient assignment is at or before a reclaimed deadline");
+      }
       const count = (this.db.prepare("SELECT COUNT(*) AS n FROM recipient_assignments").get() as { n: number }).n;
       if (count >= RECIPIENT_ASSIGNMENTS_MAX) throw new Error(`recipient assignment inbox is full (${RECIPIENT_ASSIGNMENTS_MAX})`);
       this.db.prepare(`

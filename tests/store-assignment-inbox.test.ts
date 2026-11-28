@@ -106,6 +106,18 @@ describe("Store recipient assignment inbox", () => {
     expect(store.getRecipientAssignmentReceipt("live")).toEqual({ ...receipt, assignmentId: "live" });
   });
 
+  it("keeps a reclaimed deadline fenced after reopening the inbox", () => {
+    const path = home();
+    const store = new Store(path);
+    const record = { ...recipientRecord, deadlineAt: Date.now() + 60_000 };
+    store.putRecipientAssignment(record);
+    store.putRecipientAssignmentReceipt(receipt);
+    expect(store.reclaimExpiredRecipientAssignments(record.deadlineAt + 5 * 60_000)).toBe(1);
+    const reloaded = new Store(path);
+    expect(() => reloaded.putRecipientAssignment(record)).toThrow(/reclaimed deadline/);
+    expect(reloaded.putRecipientAssignment({ ...record, assignmentId: "new", deadlineAt: record.deadlineAt + 1 }).assignmentId).toBe("new");
+  });
+
   it("keeps the recipient inbox below its fixed capacity", () => {
     const store = new Store(home());
     for (let i = 0; i < 4999; i++) {
