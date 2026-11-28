@@ -2161,6 +2161,28 @@ team
     }
   });
 team
+  .command("relocate <oldRosterDir> <newRosterDir>")
+  .description("move this Host's saved roster owner to another local roster directory")
+  .option("--yes", "confirm the canonical source and destination")
+  .action(async (oldRosterDir: string, newRosterDir: string, options: { yes?: boolean }) => {
+    const source = realpathSync(resolve(oldRosterDir));
+    const destination = realpathSync(resolve(newRosterDir));
+    if (!options.yes) throw new Error(`relocation stops managed workers and moves local ownership from ${source} to ${destination}; repeat with --yes to confirm`);
+    const oldSpec = rosterAt(source).team;
+    const newSpec = rosterAt(destination).team;
+    if (oldSpec.name !== newSpec.name || oldSpec.channel !== newSpec.channel) throw new Error("destination must keep the same saved team name and channel");
+    await ensureDaemon();
+    await requireTeamSessions();
+    const result = await api<{ relocated: boolean; pending: string[]; publishPending: boolean; staleTuiReservations: Array<{ reservationId: string; member: string; path: string }> }>("/api/team-relocate", {
+      method: "POST", headers: { "x-cafe-operator-key": localOperatorKey() }, redirect: "error",
+      body: JSON.stringify({ oldRosterDir: source, newRosterDir: destination }),
+    });
+    const lines = [`relocated ${oldSpec.name} (#${oldSpec.channel}) from ${source} to ${destination}`,
+      ...(result.staleTuiReservations.length ? [`old terminal scopes remain reserved: ${result.staleTuiReservations.map((entry) => `${entry.member} ${entry.path} (${entry.reservationId})`).join(", ")}`] : []),
+      ...(result.publishPending ? ["local relocation is complete; roster publication is pending"] : [])];
+    out(lines.join("\n"), result);
+  });
+team
   .command("context")
   .argument("[member]", "roster member (default: CAFE_TEAM_MEMBER)")
   .description("print the playbook a team member receives at registration")

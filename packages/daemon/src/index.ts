@@ -306,6 +306,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
         daemon.assertRosterOwner(rosterDir, current);
       });
       daemon.supervisor = supervisor;
+      await daemon.recoverTeamRelocation();
       if (reaped) daemon.log(`reaped ${reaped} barista worker group(s) left by a previous daemon`);
       for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);
     } catch (err) {

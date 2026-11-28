@@ -167,6 +167,24 @@ interface TeamSyncResult {
   pending: string[];
 }
 
+export interface TeamRelocation {
+  id: string;
+  rosterRootId: string;
+  ownerKey: string;
+  fromPath: string;
+  toPath: string;
+  committedHash: string;
+  targetHash: string;
+  targetSpec: TeamSpec;
+  affectedGroups: Array<{ member: string; pid: number; startedAt?: string }>;
+  staleTuiReservationIds: string[];
+  phase: "relocating" | "stop-pending" | "committing";
+}
+interface TeamRelocationState {
+  pending?: TeamRelocation;
+  relocatedRoots: Record<string, string>;
+}
+
 function captureWriteScope(path: string): WriteScope {
   const ancestors: string[] = [];
   for (let dir = path; ; dir = dirname(dir)) {
@@ -276,6 +294,8 @@ export class Supervisor {
   private readonly runtimeFile: string;
   private readonly rosterWriteFile: string;
   private readonly teamSyncFile: string;
+  private readonly relocationFile: string;
+  private relocationState: TeamRelocationState;
   private rosterWriteScopes: RosterWriteScope[];
   private readonly logDir: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -296,6 +316,13 @@ export class Supervisor {
     this.runtimeFile = join(opts.home, "baristas.runtime.json");
     this.rosterWriteFile = join(opts.home, "team-write-scopes.json");
     this.teamSyncFile = join(opts.home, "team-sync.json");
+    this.relocationFile = join(opts.home, "team-relocations.json");
+    this.relocationState = existsSync(this.relocationFile)
+      ? JSON.parse(readFileSync(this.relocationFile, "utf8")) as TeamRelocationState
+      : { relocatedRoots: {} };
+    if (!this.relocationState || typeof this.relocationState.relocatedRoots !== "object" || Array.isArray(this.relocationState.relocatedRoots)) {
+      throw new Error(`invalid team relocation state in ${this.relocationFile}`);
+    }
     this.rosterWriteScopes = existsSync(this.rosterWriteFile) ? JSON.parse(readFileSync(this.rosterWriteFile, "utf8")) as RosterWriteScope[] : [];
     if (!Array.isArray(this.rosterWriteScopes) || this.rosterWriteScopes.some((entry) =>
       typeof entry?.rosterDir !== "string" || typeof entry.member !== "string" ||
@@ -329,7 +356,7 @@ export class Supervisor {
     const result = await this.reapStale();
     const states = this.syncStates();
     for (const [dir, state] of Object.entries(states)) {
-      if (!state.intent) continue;
+      if (!state.intent || this.isRelocatedRoot(dir)) continue;
       const remaining = state.intent.affectedGroups.filter((group) => probeGroup(group.pid) !== "gone");
       if (remaining.length) continue;
       const pendingSpec = state.pendingSpec;
@@ -371,6 +398,21 @@ export class Supervisor {
       }
     }
     this.writeSyncStates(states);
+    if (this.relocationState.pending) {
+      const pending = this.relocationState.pending;
+      const live = pending.affectedGroups.filter((group) => probeGroup(group.pid) !== "gone");
+      if (live.length) {
+        for (const group of live) result.skipped.push(`${pending.fromPath}#${group.member}: relocation stop pending`);
+      } else {
+        try {
+          this.finishRelocationScopes(pending);
+          pending.phase = "committing";
+          this.saveRelocationState();
+        } catch (error) {
+          result.skipped.push(`${pending.fromPath}: relocation recovery failed: ${(error as Error).message}`);
+        }
+      }
+    }
     if (existsSync(this.file)) {
       try {
         const savedStates = this.syncStates();
@@ -388,6 +430,7 @@ export class Supervisor {
             if (!wanted.length) continue;
             spec.team.spec = { ...state.spec, members: wanted };
           }
+          if (spec.team && this.isRelocatedRoot(resolve(spec.team.rosterDir))) continue;
           try {
             this.start(spec, false);
           } catch {
@@ -588,6 +631,9 @@ export class Supervisor {
   startTeam(rosterDir: string, team: TeamSpec, persist = true): WorkerInfo[] {
     team = TeamLaunchSpec.parse(team);
     const dir = realpathSync(resolve(rosterDir));
+    if (this.isRelocatedRoot(dir) || this.relocationState.pending?.toPath === dir) {
+      throw new Error(`team directory ${dir} is fenced by a roster relocation`);
+    }
     const syncState = this.syncStates()[dir];
     if (persist && syncState?.intent) throw new Error(`team ${dir} has a pending reconciliation; retry cafe team sync before starting members`);
     const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
@@ -666,6 +712,9 @@ export class Supervisor {
   async syncTeam(rosterDir: string, requested: TeamSpec, validateCommit?: () => void): Promise<TeamSyncResult> {
     const team = TeamLaunchSpec.parse(requested);
     const dir = realpathSync(resolve(rosterDir));
+    if (this.isRelocatedRoot(dir) || this.relocationState.pending?.toPath === dir) {
+      throw new Error(`team directory ${dir} is fenced by a roster relocation`);
+    }
     const states = this.syncStates();
     const prior = states[dir];
     const oldMembers = new Map((prior?.spec.members ?? []).map((member) => [member.name, member]));
@@ -925,6 +974,87 @@ export class Supervisor {
   }
 
   /** Stop supervised workers of one team, optionally one member. Never touches a TUI or plain Barista. */
+  async relocateTeam(input: {
+    rosterRootId: string;
+    ownerKey: string;
+    fromPath: string;
+    toPath: string;
+    committedHash: string;
+    targetHash: string;
+    targetSpec: TeamSpec;
+  }): Promise<{ pending: string[]; relocation: TeamRelocation }> {
+    const fromPath = canonicalPathOrMissing(input.fromPath);
+    const toPath = realpathSync(input.toPath);
+    const targetSpec = TeamLaunchSpec.parse(input.targetSpec);
+    let relocation = this.relocationState.pending;
+    if (relocation) {
+      if (relocation.fromPath !== fromPath || relocation.toPath !== toPath || relocation.rosterRootId !== input.rosterRootId || relocation.ownerKey !== input.ownerKey) {
+        throw new Error("another team relocation is already pending");
+      }
+    } else {
+      if (this.isRelocatedRoot(fromPath)) throw new Error(`roster root ${fromPath} was relocated to ${this.relocationState.relocatedRoots[fromPath]}`);
+      const selected = this.workers.filter((worker) => worker.rosterDir === fromPath);
+      const affectedGroups = selected.flatMap((worker) => worker.child?.pid ? [{ member: worker.member ?? "", pid: worker.child.pid, startedAt: worker.startedAt }] : []);
+      for (const [pid, entry] of this.retiringWriters) {
+        if (entry.dir === fromPath && !affectedGroups.some((group) => group.pid === pid)) affectedGroups.push({ member: "retiring process group", pid, startedAt: entry.startedAt });
+      }
+      const staleTuiReservationIds = this.rosterWriteScopes.filter((entry) => entry.rosterDir === fromPath && entry.tui && !entry.tui.stale).map((entry) => entry.tui!.reservationId);
+      relocation = {
+        id: randomUUID(), rosterRootId: input.rosterRootId, ownerKey: input.ownerKey, fromPath, toPath,
+        committedHash: input.committedHash, targetHash: input.targetHash, targetSpec,
+        affectedGroups, staleTuiReservationIds, phase: "relocating",
+      };
+      this.relocationState.pending = relocation;
+      this.saveRelocationState();
+    }
+    const selected = this.workers.filter((worker) => worker.rosterDir === fromPath);
+    for (const worker of selected) this.kill(worker);
+    this.workers = this.workers.filter((worker) => !selected.includes(worker));
+    this.save();
+    this.saveRuntime();
+    const pending: string[] = [];
+    await Promise.all(relocation.affectedGroups.map(async (group) => {
+      if (!(await waitGone(group.pid, this.graceMs + 500))) pending.push(group.member);
+    }));
+    if (pending.length) {
+      relocation.phase = "stop-pending";
+      this.saveRelocationState();
+      return { pending, relocation };
+    }
+    this.finishRelocationScopes(relocation);
+    relocation.phase = "committing";
+    this.saveRelocationState();
+    return { pending, relocation };
+  }
+
+  pendingTeamRelocation(): TeamRelocation | undefined { return this.relocationState.pending; }
+
+  completeTeamRelocation(id: string): void {
+    const relocation = this.relocationState.pending;
+    if (!relocation || relocation.id !== id || relocation.phase !== "committing") throw new Error("team relocation is not ready to commit");
+    this.relocationState.relocatedRoots[relocation.fromPath] = relocation.toPath;
+    delete this.relocationState.pending;
+    this.saveRelocationState();
+  }
+
+  private isRelocatedRoot(path: string): boolean {
+    return Object.hasOwn(this.relocationState.relocatedRoots, path) || this.relocationState.pending?.fromPath === path;
+  }
+
+  private finishRelocationScopes(relocation: TeamRelocation): void {
+    const stale = this.rosterWriteScopes.flatMap((entry) => {
+      if (entry.rosterDir !== relocation.fromPath) return [entry];
+      return entry.tui ? [{ ...entry, tui: { ...entry.tui, stale: true } }] : [];
+    });
+    const next = this.prepareRosterWriteScopes(relocation.toPath, relocation.targetSpec, stale);
+    writeAtomic(this.rosterWriteFile, JSON.stringify(next, null, 2), true);
+    this.rosterWriteScopes = next;
+  }
+
+  private saveRelocationState(): void {
+    writeAtomic(this.relocationFile, JSON.stringify(this.relocationState, null, 2), true);
+  }
+
   stopTeam(rosterDir: string, member?: string, exactPath?: string): number {
     const target = resolve(rosterDir);
     let canonical = canonicalPathOrMissing(target);

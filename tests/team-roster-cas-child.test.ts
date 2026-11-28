@@ -33,6 +33,7 @@ describe("Child durable roster publication state", () => {
     const enrollment = await enrollTestChild(root, root.daemon.hostId, childHome, "cas-child-host");
     const childOpts = {
       home: childHome,
+      testTeamRosterAckFeature: true,
       config: { root: `127.0.0.1:${root.server.tlsPort}`, security: { mode: "tls", tls: { port: 0, caFingerprint: enrollment.caFingerprint, rootHostId: enrollment.rootHostId } } },
     };
     let child = await startDaemon("cas-child-host", childOpts);
@@ -42,8 +43,6 @@ describe("Child durable roster publication state", () => {
     child.daemon.publishRoster(childHome, spec("builder"));
     await waitFor(() => root.daemon.teams().some((team) => team.host === "cas-child-host" && team.team === "shop"), 10_000);
     const state = () => child.daemon.store.getKv<Record<string, any>>("teamRosterCas") ?? {};
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    console.log("child-cas-state", Object.values(state()));
     await waitFor(() => Object.values(state()).some((entry) => entry.status === "acknowledged" && entry.acknowledged?.revision === 1), 10_000);
     const first = Object.values(state())[0]!;
     const rosterRootId = first.rosterRootId as string;

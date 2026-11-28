@@ -946,6 +946,36 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     daemon.kick(match[1]!);
     return send(res, 200, { ok: true });
   }
+  if (m === "POST" && path === "/api/team-relocate") {
+    const operatorKey = req.headers["x-cafe-operator-key"];
+    if (!isLoopback(req) || typeof operatorKey !== "string" || !daemon.verifyOperatorCredential(operatorKey)) {
+      throw new RpcError("operator_required", "team relocation requires the local operator credential");
+    }
+    const input = await readJson(req);
+    if (typeof input?.oldRosterDir !== "string" || !input.oldRosterDir || typeof input?.newRosterDir !== "string" || !input.newRosterDir) {
+      throw new RpcError("bad_request", "oldRosterDir and newRosterDir are required");
+    }
+    try {
+      const oldRoot = realpathSync(resolve(input.oldRosterDir));
+      const newRoot = realpathSync(resolve(input.newRosterDir));
+      const file = join(newRoot, ".cafe");
+      const sourceFile = join(oldRoot, ".cafe");
+      if (!existsSync(sourceFile)) throw new Error("source roster .cafe is missing");
+      if (!existsSync(file)) throw new Error("destination roster .cafe is missing");
+      const sourceSpec = readCafeFile(sourceFile).team;
+      const targetSpec = readCafeFile(file).team;
+      if (!sourceSpec || !targetSpec || sourceSpec.name !== targetSpec.name || sourceSpec.channel !== targetSpec.channel) {
+        throw new Error("destination must retain the exact saved team and channel identity");
+      }
+      const targetHash = createHash("sha256").update(readFileSync(file)).digest("hex");
+      const result = await daemon.relocateTeam(oldRoot, newRoot, targetSpec, targetHash);
+      if (!result.relocated) return send(res, 409, { error: "stop_pending", pending: result.pending });
+      return send(res, 200, { ...result, staleTuiReservations: daemon.supervisor?.staleTuiReservations().filter((entry) => entry.rosterDir === oldRoot) ?? [] });
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError("conflict", (err as Error).message);
+    }
+  }
   const revokeGrant = m === "DELETE" ? /^\/api\/team-paths\/([a-zA-Z0-9-]+)$/.exec(path) : null;
   const releaseTui = m === "DELETE" ? /^\/api\/team-tui-reservations\/([a-zA-Z0-9-]+)$/.exec(path) : null;
   if (revokeGrant || releaseTui || (m === "GET" && path === "/api/team-tui-reservations") ||
