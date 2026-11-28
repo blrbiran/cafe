@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CafeClient } from "@cafe/protocol/client";
 import { memberLaunchHash, readCafeFile } from "@cafe/protocol/cafe-file";
 import { FAST, barista, identity, startDaemon, waitFor } from "./helpers.ts";
+import { CafeConfig, Daemon } from "@cafe/daemon";
 
 // v4-11 review: a roster read from an authoritative `.cafe` must replace membership (removing a
 // member has to take effect), a forgotten Host must not keep its teams, and a roster must not be
@@ -112,6 +113,23 @@ team:
     await expect(make().connect(old)).rejects.toMatchObject({ code: "team_launch_mismatch" });
     expect(await make().connect(launch(second))).toMatchObject({ member: "orch", status: "idle" });
   });
+  it("migrates a legacy local owner path only when its realpath matches", () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-owner-migrate-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    const daemon = new Daemon({ config: CafeConfig.parse({ host: "owner-migrate", mode: "root", security: { mode: "plaintext" } }), home, log: () => {} });
+    cleanup.push(() => daemon.stop());
+    const root = join(home, "repo");
+    const alias = join(home, "repo-alias");
+    mkdirSync(root);
+    writeFileSync(join(root, ".cafe"), roster([]));
+    symlinkSync(root, alias, "junction");
+    const team = readCafeFile(join(root, ".cafe")).team!;
+    const key = `${daemon.host}/${team.name}/${team.channel}`;
+    daemon.store.setKv("rosterOwners", { [key]: alias });
+    daemon.publishRoster(root, team);
+    expect(daemon.store.getKv<Record<string, string>>("rosterOwners")?.[key]).toBe(realpathSync(root));
+  });
+
   it("drops a member removed from the authoritative .cafe", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cafe-roster-"));
     writeFileSync(join(dir, ".cafe"), roster(["dev1", "dev2"]));

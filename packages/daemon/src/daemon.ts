@@ -1813,8 +1813,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const owners = new Map(Object.entries(this.store.getKv<Record<string, string>>("rosterOwners") ?? {}));
     const owner = owners.get(key);
-    if (owner && owner !== canonical) {
-      throw new RpcError("bad_request", `team ${team.name} uses roster directory ${owner}; run cafe team sync there`);
+    if (owner) {
+      let canonicalOwner: string | undefined;
+      try { canonicalOwner = realpathSync(owner); } catch { /* a missing legacy owner cannot authorize a new path */ }
+      if (canonicalOwner !== canonical) {
+        throw new RpcError("bad_request", `team ${team.name} uses roster directory ${owner}; run cafe team sync there`);
+      }
+      if (owner !== canonical) {
+        owners.set(key, canonical);
+        this.store.setKv("rosterOwners", Object.fromEntries(owners));
+      }
     }
     try {
       this.supervisor?.commitRosterWriteScopes(canonical, team);
