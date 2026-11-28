@@ -182,7 +182,15 @@ export const api = {
   snapshot: (channel?: string) => call<Snapshot>("GET", `/api/snapshot${channel ? `?channel=${encodeURIComponent(channel)}` : ""}`),
   connectors: (signal: AbortSignal) => call<ConnectorStatusRow[]>("GET", "/api/connectors", undefined, signal),
   /** Threads created before `before` (ms), newest first. */
-  threads: (before: number, limit: number, channel?: string) => call<ThreadMeta[]>("GET", `/api/threads?before=${before}&limit=${limit}${channel ? `&channel=${encodeURIComponent(channel)}` : ""}`),
+  threads: (before: { createdAt: number; threadId: string } | undefined, limit: number, channel?: string) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (before) {
+      query.set("before", String(before.createdAt));
+      query.set("beforeId", before.threadId);
+    }
+    if (channel) query.set("channel", channel);
+    return call<ThreadMeta[]>("GET", `/api/threads?${query}`);
+  },
   /** Full-text search over questions and answers (all threads, not only the loaded ones). */
   search: (q: string, limit: number, channel?: string) => call<{ meta: ThreadMeta; hits: SearchHit[] }[]>("GET", `/api/search?q=${encodeURIComponent(q)}&limit=${limit}${channel ? `&channel=${encodeURIComponent(channel)}` : ""}`),
   /** Teams replicated to this daemon (v4-11). */

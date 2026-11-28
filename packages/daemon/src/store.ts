@@ -269,6 +269,8 @@ export class Store {
       this.db.exec("ALTER TABLE threads ADD COLUMN parent_order_id TEXT");
       this.db.exec("UPDATE threads SET parent_order_id = json_extract(meta, '$.parentOrderId')");
     }
+    this.db.exec("CREATE INDEX IF NOT EXISTS threads_created_id ON threads(created_at DESC, thread_id DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_created_id ON threads(channel, created_at DESC, thread_id DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_created ON threads(channel, created_at DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_channel_activity ON threads(channel, last_activity DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS threads_parent ON threads(parent_thread_id, created_at DESC)");
@@ -1111,15 +1113,21 @@ export class Store {
     }
   }
 
-  /** Newest first. `before`: only threads created before this time (paging to older threads). */
-  listThreads(limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER): ThreadMeta[] {
-    // Defensive: SQLite reads LIMIT -1 as "all rows", and NaN binds as a datatype error.
+  /** Newest first. A timestamp-only cursor still excludes the entire boundary timestamp. */
+  listThreads(limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER, beforeId?: string): ThreadMeta[] {
+    return this.listThreadsByCreation(limit, status, before, beforeId);
+  }
+
+  private listThreadsByCreation(limit: number, status: string | undefined, before: number, beforeId?: string, channel?: string): ThreadMeta[] {
     const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 200;
     const at = Number.isFinite(before) ? before : Number.MAX_SAFE_INTEGER;
-    const rows = (status
-      ? this.db.prepare("SELECT meta FROM threads WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(status, at, n)
-      : this.db.prepare("SELECT meta FROM threads WHERE created_at < ? ORDER BY created_at DESC LIMIT ?").all(at, n)) as { meta: string }[];
-    return rows.map((r) => threadMeta(r.meta));
+    const filters = [beforeId === undefined ? "created_at < ?" : "(created_at, thread_id) < (?, ?)"];
+    const params: Array<string | number> = beforeId === undefined ? [at] : [at, beforeId];
+    if (status) { filters.push("status = ?"); params.push(status); }
+    if (channel) { filters.push("channel = ?"); params.push(channel); }
+    const rows = this.db.prepare(`SELECT meta FROM threads WHERE ${filters.join(" AND ")} ORDER BY created_at DESC, thread_id DESC LIMIT ?`)
+      .all(...params, n) as { meta: string }[];
+    return rows.map(({ meta }) => threadMeta(meta));
   }
 
   /** Clarification/assignment sub-Threads of one Thread, newest first (v4-13, #112). */
@@ -1137,13 +1145,8 @@ export class Store {
   }
 
   /** Newest first, restricted to one channel (v4-11). */
-  listThreadsIn(channel: string, limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER): ThreadMeta[] {
-    const n = Number.isInteger(limit) && limit >= 0 ? Math.min(limit, 10_000) : 200;
-    const at = Number.isFinite(before) ? before : Number.MAX_SAFE_INTEGER;
-    const rows = (status
-      ? this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, status, at, n)
-      : this.db.prepare("SELECT meta FROM threads WHERE channel = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?").all(channel, at, n)) as { meta: string }[];
-    return rows.map((r) => threadMeta(r.meta));
+  listThreadsIn(channel: string, limit = 200, status?: string, before = Number.MAX_SAFE_INTEGER, beforeId?: string): ThreadMeta[] {
+    return this.listThreadsByCreation(limit, status, before, beforeId, channel);
   }
 
   /**

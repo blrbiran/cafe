@@ -817,6 +817,10 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     const limit = parseLimit(url.searchParams.get("limit"), 200);
     const status = parseStatus(url.searchParams.get("status"));
     const before = parseBefore(url.searchParams.get("before"));
+    const beforeId = url.searchParams.get("beforeId") ?? undefined;
+    if (beforeId !== undefined && (before === undefined || !/^[a-zA-Z0-9_.-]{1,128}$/.test(beforeId))) {
+      throw new RpcError("bad_request", "beforeId requires a timestamp and a valid Thread ID");
+    }
     const channel = url.searchParams.get("channel");
     const parent = url.searchParams.get("parent");
     // v4-13 (#112): the clarification/assignment sub-Threads of one Thread.
@@ -825,7 +829,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       const children = view.children.filter((r) => (!status || r.status === status) && (!channel || (r.channel ?? "default") === channel));
       return send(res, 200, url.searchParams.get("view") === "1" ? { children, partial: view.partial } : children);
     }
-    const rows = channel ? daemon.store.listThreadsIn(channel, limit, status, before) : daemon.store.listThreads(limit, status, before);
+    const rows = channel ? daemon.store.listThreadsIn(channel, limit, status, before, beforeId) : daemon.store.listThreads(limit, status, before, beforeId);
     return send(res, 200, await daemon.projectTaskMetas(rows));
   }
   if (m === "GET" && path === "/api/search") {

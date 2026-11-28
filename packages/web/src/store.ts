@@ -42,7 +42,7 @@ export interface State {
   /** The "Ask" composer on the feed; `to` prefilled by "Ask it". */
   composer?: { to?: string };
   /** Older threads fetched with "Load older" (beyond the snapshot's newest SNAPSHOT_LIMIT). */
-  older: { loading: boolean; loaded: boolean; done: boolean };
+  older: { loading: boolean; loaded: boolean; done: boolean; cursor?: Pick<ThreadMeta, "createdAt" | "threadId"> };
   /** Feed search; results replace the list while `q` is non-empty. */
   search: { q: string; loading: boolean; results?: SearchResult[]; error?: string };
 }
@@ -123,9 +123,11 @@ function applySnapshot(s: Snapshot, channelsOk: boolean): void {
   const legacy = !channelsSupported;
   // A re-snapshot (reconnect) must not drop older threads the user already loaded.
   const ids = new Set(fresh.map((t) => t.threadId));
-  const oldest = fresh.reduce((m, t) => Math.min(m, t.createdAt), Number.POSITIVE_INFINITY);
-  const kept = state.threads.filter((t) => !ids.has(t.threadId) && t.createdAt < oldest && (t.channel ?? "default") === state.channel);
-  const done = kept.length > 0 ? state.older.done : fresh.length < SNAPSHOT_LIMIT;
+  const boundary = fresh.at(-1);
+  const kept = state.threads.filter((t) => !ids.has(t.threadId) && (!boundary || t.createdAt < boundary.createdAt ||
+    (t.createdAt === boundary.createdAt && t.threadId < boundary.threadId)) && (t.channel ?? "default") === state.channel);
+  const done = state.older.loaded ? state.older.done : fresh.length < SNAPSHOT_LIMIT;
+  const cursor = state.older.loaded ? state.older.cursor : boundary;
   set({
     loaded: true,
     error: undefined,
@@ -141,7 +143,7 @@ function applySnapshot(s: Snapshot, channelsOk: boolean): void {
     agents: Object.fromEntries(s.agents.map((a) => [a.agentId, a])),
     daemons: s.daemons,
     threads: [...fresh, ...kept],
-    older: { ...state.older, done },
+    older: { ...state.older, cursor, done },
     webStale: s.webStale,
   });
 }
@@ -153,14 +155,17 @@ export async function loadOlder(): Promise<void> {
   // A generation that only changes with the channel: a same-channel reconnect/refresh must not
   // strand `loading` forever (and hide pagination) (v4-11 review).
   const gen = channelGen;
-  const before = state.threads.reduce((m, t) => Math.min(m, t.createdAt), Number.MAX_SAFE_INTEGER);
+  const before = state.older.cursor;
   set((s) => ({ older: { ...s.older, loading: true } }));
   try {
     const page = (await api.threads(before, OLDER_PAGE, channel)).map(norm);
     if (gen !== channelGen) return; // the channel changed while this page was in flight
     set((s) => {
       const ids = new Set(s.threads.map((t) => t.threadId));
-      return { threads: [...s.threads, ...page.filter((t) => !ids.has(t.threadId))], older: { loading: false, loaded: true, done: page.length < OLDER_PAGE } };
+      return {
+        threads: [...s.threads, ...page.filter((t) => !ids.has(t.threadId))],
+        older: { loading: false, loaded: true, done: page.length < OLDER_PAGE, cursor: page.at(-1) ?? before },
+      };
     });
   } catch (err) {
     if (gen !== channelGen) return;

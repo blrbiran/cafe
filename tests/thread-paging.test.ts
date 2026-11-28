@@ -43,6 +43,33 @@ describe("thread detail pagination", () => {
   });
 });
 
+describe("Feed pagination", () => {
+  it.each(["", "&channel=default", "&status=failed"])("includes Threads tied at the page boundary (%s)", async (filter) => {
+    const d = await startDaemon("feed-cursor", { mode: "root" });
+    cleanup.push(d.stop);
+    const createdAt = Date.now();
+    for (const threadId of ["older", "tie-a", "tie-b", "tie-c", "tie-d"]) {
+      const at = threadId === "older" ? createdAt - 1 : createdAt;
+      d.daemon.store.putThread({
+        threadId, orderId: `order-${threadId}`, kind: "order", channel: "default", status: "failed",
+        from: { id: "customer", address: "customer", host: "feed-cursor" }, targets: [], summary: threadId,
+        summaryTurn: 1, createdAt: at, file: d.daemon.store.threadFile(threadId, at), turns: 1, replies: [], declines: [],
+      });
+    }
+    const fetchPage = async (cursor = "") => {
+      const response = await fetch(`http://${d.addr}/api/threads?limit=2${filter}${cursor}`);
+      expect(response.status).toBe(200);
+      return await response.json() as Array<{ threadId: string; createdAt: number }>;
+    };
+    const first = await fetchPage();
+    expect((await fetchPage(`&before=${createdAt}`)).map(({ threadId }) => threadId)).toEqual(["older"]);
+    const older = await fetchPage(`&before=${first[1]!.createdAt}&beforeId=${first[1]!.threadId}`);
+    expect(older.map(({ threadId }) => threadId)).toEqual(["tie-b", "tie-a"]);
+    const last = await fetchPage(`&before=${older[1]!.createdAt}&beforeId=${older[1]!.threadId}`);
+    expect([...first, ...older, ...last].map(({ threadId }) => threadId)).toEqual(["tie-d", "tie-c", "tie-b", "tie-a", "older"]);
+  });
+});
+
 describe("limit validation", () => {
   it("rejects negative, zero and non-numeric page sizes instead of leaking SQLite errors", async () => {
     const { d, threadId } = await setup("ok");
@@ -53,6 +80,8 @@ describe("limit validation", () => {
     expect(await code("/api/threads?limit=1001")).toBe(400);
     expect(await code("/api/threads?status=bogus")).toBe(400);
     expect(await code("/api/threads?before=nope")).toBe(400);
+    expect(await code("/api/threads?beforeId=tie-a")).toBe(400);
+    expect(await code("/api/threads?before=1&beforeId=%2Fbad")).toBe(400);
     expect(await code(`/api/threads/${threadId}?limit=-1`)).toBe(400);
     expect(await code("/api/search?q=hello&limit=nope")).toBe(400);
     expect(await code("/api/search?q=hello&limit=-1")).toBe(400);
