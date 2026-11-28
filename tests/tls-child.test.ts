@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ThreadEnvelope } from "@cafe/protocol";
-import { RpcError, type Peer } from "@cafe/protocol/peer";
+import { Peer, RpcError } from "@cafe/protocol/peer";
 import { CafeClient, type OrderHandle } from "@cafe/protocol/client";
 import { managedAgentResumeStore } from "@cafe/protocol/cafe-file";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
@@ -138,7 +138,20 @@ describe("a TLS child daemon reaches a TLS Root", () => {
     const answer = child.daemon.answerClarification(parent.threadId, question.threadId, { clarificationOrderId: question.orderId, text: "yes" }, owner);
     await waitFor(() => root.daemon.thread(question.threadId)?.events.some((env) => env.orderId === answer.orderId && env.event.type === "order.delivered") ?? false);
     const publication = root.daemon.thread(question.threadId)?.events.find((env) => env.orderId === answer.orderId && env.event.type === "order.created");
-    await manual!.reply("syntax checked");
+    const peerRequest = Peer.prototype.request;
+    // An older registered Agent client omits the assignment field on its own local reply RPC.
+    const legacyAgent = vi.spyOn(Peer.prototype, "request").mockImplementation(function (this: Peer, method, params, timeoutMs) {
+      if (method === "order/reply") {
+        const { assignmentId: _omitted, ...rest } = params as { assignmentId?: string };
+        return peerRequest.call(this, method, rest, timeoutMs);
+      }
+      return peerRequest.call(this, method, params, timeoutMs);
+    });
+    try {
+      await manual!.reply("syntax checked");
+    } finally {
+      legacyAgent.mockRestore();
+    }
     await waitFor(() => !!root.daemon.closingEvent(parent.threadId, parent.orderId));
     await held.client.report({ threadId: parent.threadId, orderId: parent.orderId, text: "Syntax review complete." });
     const parentEvents = child.daemon.thread(parent.threadId)?.events ?? [];
