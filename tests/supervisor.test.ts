@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,6 +152,23 @@ describe("supervisor", () => {
     expect(result.reaped).toBe(0);
     expect(result.skipped.join()).toContain(`pid ${other.pid}`);
     expect(alive(other.pid!)).toBe(true);
+  });
+
+  it("holds a persisted write scope when restore cannot verify the process group leader", async () => {
+    const { home, dir, pidfile } = setup();
+    const other = spawn(FAKE_PI, [], { detached: true, stdio: "ignore", env: process.env });
+    other.on("error", () => {});
+    await waitFor(() => pidsIn(pidfile).length === 1);
+    const path = realpathSync(dir);
+    const { dev, ino } = statSync(path, { bigint: true });
+    const runtime = join(home, "baristas.runtime.json");
+    writeFileSync(runtime, JSON.stringify([{ dir, slot: 1, pid: other.pid, startedAt: "not verified", writeScope: { path, ancestors: [`${dev}:${ino}`] } }]));
+    const sup = supervisor(home);
+    const result = await sup.restore();
+    expect(result.reaped).toBe(0);
+    expect(alive(other.pid!)).toBe(true);
+    expect(() => sup.start({ dir, access: "workspace-write" })).toThrow(/still stopping/);
+    expect(JSON.parse(readFileSync(runtime, "utf8"))).toEqual([expect.objectContaining({ pid: other.pid })]);
   });
 
   it("a missing pi binary is refused by the read-only probe instead of hot-looping", async () => {

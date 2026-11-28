@@ -122,13 +122,17 @@ export function readPathGrants(home: string): PathGrant[] {
   return readRaw(home).map((grant) => ({ ...grant, state: grantState(grant) }));
 }
 
-export function revokeMemberPath(home: string, grantId: string): RevokedPathGrant {
+export function revokeMemberPath(home: string, grantId: string): RevokedPathGrant;
+export function revokeMemberPath(home: string, grantId: string, state: "revoked" | "revoked-pending"): PathGrant;
+export function revokeMemberPath(home: string, grantId: string, state: "revoked" | "revoked-pending" = "revoked"): PathGrant {
   const grants = readRaw(home);
   const grant = grants.find((g) => g.grantId === grantId);
   if (!grant) throw new Error(`unknown path grant '${grantId}'`);
-  if (grant.state !== "revoked") grant.state = "revoked";
-  save(home, grants);
-  return { ...grant, state: "revoked" };
+  if (grant.state !== state) {
+    grant.state = state;
+    save(home, grants);
+  }
+  return { ...grant };
 }
 
 export function effectiveMemberAccess(member: { mode?: "headless" | "tui"; access?: "read-only" | "write" }, mode = member.mode ?? "headless"): "read-only" | "write" | "host-managed" {

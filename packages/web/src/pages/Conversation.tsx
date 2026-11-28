@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { AgentRecord, Attachment, Order, RoutingDecision, ThreadEnvelope, ThreadMeta, ThreadStatus } from "@cafe/protocol";
+import { orderReplyView, type AgentRecord, type Attachment, type Order, type RoutingDecision, type ThreadEnvelope, type ThreadMeta, type ThreadStatus } from "@cafe/protocol";
 import { api, ApiError, token } from "../api.ts";
 import { ago, useT, type Dict } from "../i18n.ts";
 import { useNow } from "../format.ts";
@@ -14,7 +14,7 @@ interface Turn {
   order?: Order;
   startedAt: number;
   decision?: RoutingDecision;
-  replies: { agentId: string; text: string; final: boolean; at: number; source?: "agent" | "operator"; attachments?: Attachment[]; report?: boolean }[];
+  replies: { agentId: string; text: string; final: boolean; at: number; source?: "agent" | "operator"; attachments?: Attachment[]; report?: boolean; late?: boolean }[];
   declines: { agentId: string; reason: string; at: number }[];
   /** `collect: all` deadline silences: recorded, but not a refusal (v4-11). */
   skips: { agentId: string; reason: string; at: number }[];
@@ -40,6 +40,14 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
         turn.order = ev.order;
         turn.startedAt = ev.order.createdAt;
         break;
+      case "order.replaced": {
+        const previous = byId.get(ev.previousOrderId);
+        if (previous) previous.closed = { status: "cancelled", at: env.at };
+        turn.order = ev.order;
+        turn.startedAt = ev.order.createdAt;
+        turn.decision = ev.decision;
+        break;
+      }
       case "order.routed":
         turn.decision = ev.decision;
         break;
@@ -50,8 +58,14 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
         turn.replies.push({ agentId: ev.agentId, text: ev.text, final: false, at: env.at, report: true });
         break;
       case "order.replied":
-        turn.replies.push({ agentId: ev.agentId, text: ev.text, final: ev.final, at: env.at, source: ev.source, ...(ev.attachments?.length ? { attachments: ev.attachments } : {}) });
+      case "order.final-accepted":
+      case "order.overridden": {
+        if (ev.type === "order.replied" && ev.awaitingOwner && !ev.auditOnly) break;
+        const reply = ev.type === "order.replied" ? ev : orderReplyView(ev);
+        const late = Boolean(turn.closed || (ev.type === "order.replied" && ev.auditOnly));
+        if (reply) turn.replies.push({ agentId: reply.agentId, text: reply.text, final: reply.final, at: env.at, source: reply.source, late, ...(reply.attachments?.length ? { attachments: reply.attachments } : {}) });
         break;
+      }
       case "order.declined":
         if (ev.skipped) turn.skips.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
         else turn.declines.push({ agentId: ev.agentId, reason: ev.reason, at: env.at });
@@ -69,7 +83,7 @@ function buildTurns(events: ThreadEnvelope[]): Turn[] {
 
 function turnOutcome(t: Dict, turn: Turn, active: boolean, agents: Record<string, AgentRecord>, meta: ThreadMeta, now: number): { tone: Tone; text: string } {
   const names = (ids: string[]) => t.list([...new Set(ids.map((id) => whoName(id, agents, meta)))]);
-  const finals = turn.replies.filter((r) => r.final);
+  const finals = turn.replies.filter((r) => r.final && !r.late);
   if (turn.decision?.needsHuman) return { tone: "warn", text: t.needsHuman };
   if (active) {
     const targets = turn.decision?.targets ?? [];
@@ -79,7 +93,8 @@ function turnOutcome(t: Dict, turn: Turn, active: boolean, agents: Record<string
     return { tone: "info", text: t.working(names(pending.length ? pending : targets), t.dur(now - turn.startedAt)) };
   }
   if (turn.closed?.status === "cancelled") return { tone: undefined, text: t.cancelled };
-  if (finals.some((reply) => reply.source === "operator")) return { tone: "warn", text: t.operatorOverride(names(finals.map((reply) => reply.agentId))) };
+  const operatorFinals = finals.filter((reply) => reply.source === "operator");
+  if (operatorFinals.length) return { tone: "warn", text: t.operatorOverride(names(operatorFinals.map((reply) => reply.agentId))) };
   if (finals.length > 0) return { tone: "ok", text: t.answeredBy(names(finals.map((r) => r.agentId)), t.dur(finals[0]!.at - turn.startedAt)) };
   if (turn.declines.length > 0) return { tone: "warn", text: t.nobody(turn.declines.length) };
   if (finals.length === 0 && turn.skips.length > 0) return { tone: "info", text: t.skipped(turn.skips.length) };
@@ -504,7 +519,7 @@ function Replies({ turn, active, meta }: { turn: Turn; active: boolean; meta: Th
   const t = useT();
   const agents = useStore((s) => s.agents);
   const items = [
-    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.source === "operator" ? "warn" : r.final ? "ok" : "info") as Tone, kind: r.report ? t.resultReport : r.source === "operator" ? t.operatorOverrideLabel : r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
+    ...turn.replies.map((r) => ({ key: `r-${r.at}-${r.agentId}`, who: r.agentId, at: r.at, tone: (r.late ? "info" : r.source === "operator" ? "warn" : r.final ? "ok" : "info") as Tone, kind: r.report ? t.resultReport : r.late ? t.kLateAnswer : r.source === "operator" ? t.operatorOverrideLabel : r.final ? t.kAnswer : t.kPartial, text: r.text, md: true, attachments: r.attachments })),
     ...turn.declines.map((d) => ({ key: `d-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "warn" as Tone, kind: t.kDecline, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
     ...turn.skips.map((d) => ({ key: `s-${d.at}-${d.agentId}`, who: d.agentId, at: d.at, tone: "info" as Tone, kind: t.kSkipped, text: d.reason, md: false, attachments: undefined as Attachment[] | undefined })),
   ].sort((a, b) => a.at - b.at);
@@ -641,7 +656,13 @@ function DeliveryLog({ events, meta }: { events: ThreadEnvelope[]; meta: ThreadM
         text = t.stepAccepted(name(ev.agentId));
         break;
       case "order.replied":
-        text = ev.final ? t.stepReplied(name(ev.agentId)) : t.stepPartial(name(ev.agentId));
+        if (!ev.auditOnly) text = ev.final ? t.stepReplied(name(ev.agentId)) : t.stepPartial(name(ev.agentId));
+        break;
+      case "order.overridden":
+        text = t.operatorOverride(name(ev.targetAgentId));
+        break;
+      case "order.replaced":
+        text = t.stepReplaced;
         break;
       case "order.declined":
         text = ev.skipped ? t.stepSkipped(name(ev.agentId)) : t.stepDeclined(name(ev.agentId));

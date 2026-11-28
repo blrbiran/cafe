@@ -91,7 +91,8 @@ interface RuntimeEntry {
   slot: number;
   /** Guard pid; also the process-group id. */
   pid: number;
-  startedAt: string;
+  startedAt?: string;
+  writeScope?: WriteScope;
 }
 
 export interface SupervisorOptions {
@@ -136,6 +137,7 @@ function hashFile(path: string): string { return createHash("sha256").update(rea
 function isPiRuntime(value: string): boolean { return /^pi[ @]/i.test(value.trim()); }
 function isOmpRuntime(value: string): boolean { return /^omp\//i.test(value.trim()); }
 type WriteScope = { path: string; ancestors: string[] };
+type RosterWriteScope = { rosterDir: string; member: string; scope: WriteScope; tui?: { reservationId: string; stale: boolean } };
 
 function captureWriteScope(path: string): WriteScope {
   const ancestors: string[] = [];
@@ -234,6 +236,8 @@ export class Supervisor {
   private workers: Worker[] = [];
   private readonly file: string;
   private readonly runtimeFile: string;
+  private readonly rosterWriteFile: string;
+  private rosterWriteScopes: RosterWriteScope[];
   private readonly logDir: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly piBin: string;
@@ -250,6 +254,13 @@ export class Supervisor {
   constructor(opts: SupervisorOptions) {
     this.file = join(opts.home, "baristas.json");
     this.runtimeFile = join(opts.home, "baristas.runtime.json");
+    this.rosterWriteFile = join(opts.home, "team-write-scopes.json");
+    this.rosterWriteScopes = existsSync(this.rosterWriteFile) ? JSON.parse(readFileSync(this.rosterWriteFile, "utf8")) as RosterWriteScope[] : [];
+    if (!Array.isArray(this.rosterWriteScopes) || this.rosterWriteScopes.some((entry) =>
+      typeof entry?.rosterDir !== "string" || typeof entry.member !== "string" ||
+      typeof entry.scope?.path !== "string" || !Array.isArray(entry.scope.ancestors) || entry.scope.ancestors.length === 0)) {
+      throw new Error(`invalid committed write scopes in ${this.rosterWriteFile}`);
+    }
     this.logDir = join(opts.home, "logs");
     this.piBin = opts.piBin ?? process.env.CAFE_PI_BIN ?? "pi";
     this.extension = opts.extension ?? defaultExtensionPath();
@@ -290,13 +301,77 @@ export class Supervisor {
     return result;
   }
 
-  private readonly retiringWriters = new Map<number, WriteScope>();
+  private readonly retiringWriters = new Map<number, RuntimeEntry & { writeScope: WriteScope }>();
+
+  private retainWriter(w: Worker, pid: number): void {
+    if (!w.writeScope || probeGroup(pid) === "gone") return;
+    this.retiringWriters.set(pid, { dir: w.spec.dir, slot: w.slot, pid, startedAt: w.startedAt, writeScope: w.writeScope });
+  }
 
   private reservedWriter(scope: WriteScope): WriteScope | undefined {
     for (const [pgid, retiring] of this.retiringWriters) {
       if (probeGroup(pgid) === "gone") this.retiringWriters.delete(pgid);
-      else if (writeScopesOverlap(scope, retiring)) return retiring;
+      else if (writeScopesOverlap(scope, retiring.writeScope)) return retiring.writeScope;
     }
+  }
+
+  /** Migrate all saved authoritative local rosters before restoring or admitting workers. */
+  bootstrapRosterWriteScopes(rosters: Array<{ directory: string; team: TeamSpec }>): void {
+    if (existsSync(this.rosterWriteFile)) return;
+    let scopes: RosterWriteScope[] = [];
+    for (const { directory, team } of rosters) scopes = this.prepareRosterWriteScopes(directory, team, scopes);
+    writeAtomic(this.rosterWriteFile, JSON.stringify(scopes, null, 2), true);
+    this.rosterWriteScopes = scopes;
+  }
+
+  /** Keep all configured managed write scopes, including members omitted from a partial start. */
+  commitRosterWriteScopes(rosterDir: string, team: TeamSpec): void {
+    const next = this.prepareRosterWriteScopes(rosterDir, team, this.rosterWriteScopes);
+    writeAtomic(this.rosterWriteFile, JSON.stringify(next, null, 2), true);
+    this.rosterWriteScopes = next;
+  }
+
+  private prepareRosterWriteScopes(rosterDir: string, team: TeamSpec, current: RosterWriteScope[]): RosterWriteScope[] {
+    const root = realpathSync(rosterDir);
+    const otherRosters = current.filter((entry) => entry.rosterDir !== root || entry.tui?.stale);
+    const scopes: RosterWriteScope[] = [];
+    for (const member of team.members) {
+      if (member.mode !== "tui" && effectiveMemberAccess(member) !== "write") continue;
+      const scope = captureWriteScope(validateMemberPath(this.home, root, member.name, member.dir).realPath);
+      const conflict = [...otherRosters, ...scopes].find((entry) => writeScopesOverlap(entry.scope, scope));
+      if (conflict) throw new Error(`${member.name} would overlap a write scope reserved by ${conflict.member} in ${conflict.scope.path}`);
+      const retiring = this.reservedWriter(scope);
+      if (retiring) throw new Error(`${member.name} would overlap a write-enabled worker still stopping in ${retiring.path}`);
+      const active = this.workers.find((worker) => !(worker.rosterDir === root && worker.member === member.name) &&
+        worker.writeScope && writeScopesOverlap(worker.writeScope, scope));
+      if (active) throw new Error(`${member.name} would overlap an existing write-enabled worker in ${active.writeScope!.path}`);
+      const prior = current.find((entry) => entry.rosterDir === root && entry.member === member.name && entry.tui && !entry.tui.stale && entry.scope.path === scope.path && entry.scope.ancestors[0] === scope.ancestors[0]);
+      const tui = member.mode === "tui" ? prior?.tui ?? { reservationId: randomUUID(), stale: false } : undefined;
+      scopes.push({ rosterDir: root, member: member.name, scope, ...(tui ? { tui } : {}) });
+    }
+    const stale = current.flatMap((entry) => {
+      if (entry.rosterDir !== root || !entry.tui || entry.tui.stale) return [];
+      if (scopes.some((scope) => scope.tui?.reservationId === entry.tui!.reservationId)) return [];
+      return [{ ...entry, tui: { ...entry.tui, stale: true } }];
+    });
+    for (const entry of stale) {
+      const conflict = scopes.find((scope) => !(scope.tui && scope.member === entry.member) && writeScopesOverlap(scope.scope, entry.scope));
+      if (conflict) throw new Error(`${conflict.member} overlaps a terminal reserved by ${entry.member} in ${entry.scope.path}`);
+    }
+    return [...otherRosters, ...scopes, ...stale];
+  }
+
+  staleTuiReservations(): Array<{ reservationId: string; rosterDir: string; member: string; path: string }> {
+    return this.rosterWriteScopes.flatMap(({ rosterDir, member, scope, tui }) =>
+      tui?.stale ? [{ reservationId: tui.reservationId, rosterDir, member, path: scope.path }] : []);
+  }
+
+  releaseTuiReservation(reservationId: string): boolean {
+    const next = this.rosterWriteScopes.filter((entry) => !(entry.tui?.stale && entry.tui.reservationId === reservationId));
+    if (next.length === this.rosterWriteScopes.length) return false;
+    writeAtomic(this.rosterWriteFile, JSON.stringify(next, null, 2), true);
+    this.rosterWriteScopes = next;
+    return true;
   }
 
   start(spec: BaristaSpec, persist = true): WorkerInfo[] {
@@ -306,6 +381,8 @@ export class Supervisor {
     // A Barista that gave up (#82) is replaced by a new start; a live one is not.
     if (existing.length && !existing.every((w) => w.failed)) throw new Error(`barista already running in ${dir}`);
     const writeScope = !spec.tui && spec.access === "workspace-write" ? captureWriteScope(realpathSync(dir)) : undefined;
+    const configured = writeScope && this.rosterWriteScopes.find((entry) => writeScopesOverlap(writeScope, entry.scope));
+    if (configured) throw new Error(`${dir} overlaps a write scope reserved by ${configured.member} in ${configured.scope.path}`);
     const retiring = writeScope && this.reservedWriter(writeScope);
     if (retiring) throw new Error(`${dir} would overlap a write-enabled worker still stopping in ${retiring.path}`);
     const active = writeScope ? this.workers.find((worker) => !existing.includes(worker) && worker.writeScope && writeScopesOverlap(writeScope, worker.writeScope)) : undefined;
@@ -344,6 +421,12 @@ export class Supervisor {
     const writeScopes = new Map(writes.map((member) => [member.name, captureWriteScope(validatedPaths.get(member.name)!)]));
     for (const [index, member] of writes.entries()) {
       const target = writeScopes.get(member.name)!;
+      const committed = this.rosterWriteScopes.find((entry) => entry.rosterDir === dir && entry.member === member.name);
+      if (committed && (committed.scope.path !== target.path || committed.scope.ancestors[0] !== target.ancestors[0])) {
+        throw new Error(`${member.name}'s write directory changed since the roster was committed. Run cafe team sync.`);
+      }
+      const reserved = this.rosterWriteScopes.find((entry) => !(entry.rosterDir === dir && entry.member === member.name) && writeScopesOverlap(target, entry.scope));
+      if (reserved) throw new Error(`${member.name} would overlap a write scope reserved by ${reserved.member} in ${reserved.scope.path}`);
       const conflict = writes.slice(0, index).find((other) => writeScopesOverlap(target, writeScopes.get(other.name)!));
       if (conflict) throw new Error(`${member.name} and ${conflict.name} would write to overlapping directories`);
       const retiring = this.reservedWriter(target);
@@ -395,10 +478,38 @@ export class Supervisor {
     return this.list().filter((w) => w.rosterDir === dir);
   }
 
+  async stopUnsafeTeamWorkers(rosterDir: string, team?: TeamSpec): Promise<{ stopped: string[]; pending: string[] }> {
+    let canonical = resolve(rosterDir);
+    try { canonical = realpathSync(canonical); } catch { /* use the recorded path */ }
+    const unsafe = this.workers.filter((worker) => {
+      if (worker.rosterDir !== canonical) return false;
+      const member = team?.members.find((entry) => entry.name === worker.member);
+      if (!member || member.mode !== "headless") return true;
+      if (worker.writeScope && effectiveMemberAccess(member) !== "write") return true;
+      try {
+        const path = validateMemberPath(this.home, canonical, member.name, member.dir).realPath;
+        if (path !== worker.cwd) return true;
+        return !!worker.writeScope && captureWriteScope(path).ancestors[0] !== worker.writeScope.ancestors[0];
+      } catch { return true; }
+    });
+    const groups = unsafe.flatMap((worker) => worker.child?.pid ? [{ pid: worker.child.pid, member: worker.member! }] : []);
+    for (const worker of unsafe) this.kill(worker);
+    this.workers = this.workers.filter((worker) => !unsafe.includes(worker));
+    if (unsafe.length) this.save();
+    const pending: string[] = [];
+    await Promise.all(groups.map(async ({ pid, member }) => {
+      if (!(await waitGone(pid, this.graceMs + 500))) pending.push(member);
+    }));
+    for (const [pid, entry] of this.retiringWriters) {
+      if (entry.dir === canonical && probeGroup(pid) !== "gone" && !groups.some((group) => group.pid === pid)) pending.push(entry.writeScope.path);
+    }
+    return { stopped: unsafe.map((worker) => worker.member!), pending };
+  }
+
   /** Stop supervised workers of one team, optionally one member. Never touches a TUI or plain Barista. */
-  stopTeam(rosterDir: string, member?: string): number {
+  stopTeam(rosterDir: string, member?: string, exactPath?: string): number {
     const target = resolve(rosterDir);
-    const matching = (dir: string) => this.workers.filter((w) => w.rosterDir === dir && (!member || w.member === member));
+    const matching = (dir: string) => this.workers.filter((w) => w.rosterDir === dir && (!member || w.member === member) && (!exactPath || w.cwd === exactPath));
     let ws = matching(target);
     // A recorded path still identifies the team if the directory is no longer accessible.
     if (ws.length === 0) {
@@ -413,6 +524,14 @@ export class Supervisor {
     this.workers = this.workers.filter((w) => !ws.includes(w));
     this.save();
     return ws.length;
+  }
+
+  isStoppingTeamPath(rosterDir: string, path: string): boolean {
+    for (const [pid, entry] of this.retiringWriters) {
+      if (probeGroup(pid) === "gone") this.retiringWriters.delete(pid);
+      else if (entry.dir === rosterDir && entry.writeScope.path === path) return true;
+    }
+    return false;
   }
 
   stop(dir: string): number {
@@ -557,6 +676,7 @@ export class Supervisor {
     note(`started pid=${child.pid} in ${w.spec.dir}`);
     if (child.pid) {
       const pid = child.pid;
+      if (w.writeScope) this.saveRuntime();
       void readProcessStart(pid).then((lstart) => {
         if (lstart && w.child === child && child.exitCode === null) {
           w.startedAt = lstart;
@@ -572,8 +692,9 @@ export class Supervisor {
       const pgid = child.pid;
       // Grandchildren may still hold the group's pipes: give them a moment, then SIGKILL the group.
       if (pgid) {
-        if (w.writeScope && probeGroup(pgid) !== "gone") this.retiringWriters.set(pgid, w.writeScope);
-        setTimeout(() => signalGroup(pgid, "SIGKILL"), EXIT_DRAIN_MS).unref?.();
+        this.retainWriter(w, pgid);
+        const startedAt = w.startedAt;
+        setTimeout(() => { void killVerifiedGroup(pgid, startedAt); }, EXIT_DRAIN_MS).unref?.();
       }
       setTimeout(() => log?.close(), EXIT_DRAIN_MS + 100).unref?.();
       w.child = undefined;
@@ -611,11 +732,11 @@ export class Supervisor {
     const child = w.child;
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
     const pgid = child.pid;
-    if (w.writeScope && probeGroup(pgid) !== "gone") this.retiringWriters.set(pgid, w.writeScope);
+    this.retainWriter(w, pgid);
+    if (w.writeScope) this.saveRuntime();
     signalGroup(pgid, "SIGTERM");
-    setTimeout(() => {
-      if (probeGroup(pgid) === "present") signalGroup(pgid, "SIGKILL");
-    }, this.graceMs).unref?.();
+    const startedAt = w.startedAt;
+    setTimeout(() => { void killVerifiedGroup(pgid, startedAt); }, this.graceMs).unref?.();
   }
 
   /**
@@ -632,9 +753,20 @@ export class Supervisor {
     } catch {
       skipped.push(`${this.runtimeFile}: unreadable`);
     }
+    for (const entry of entries) {
+      if (Number.isSafeInteger(entry.pid) && entry.pid > 0 && entry.writeScope &&
+          typeof entry.writeScope.path === "string" && Array.isArray(entry.writeScope.ancestors) && probeGroup(entry.pid) !== "gone") {
+        this.retiringWriters.set(entry.pid, { ...entry, writeScope: entry.writeScope });
+      }
+    }
     for (const e of entries) {
-      if (!Number.isSafeInteger(e.pid) || e.pid <= 0 || typeof e.startedAt !== "string") continue;
-      if (probeGroup(e.pid) !== "present") continue;
+      if (!Number.isSafeInteger(e.pid) || e.pid <= 0) continue;
+      const status = probeGroup(e.pid);
+      if (status === "gone") continue;
+      if (status !== "present" || typeof e.startedAt !== "string") {
+        skipped.push(`pid ${e.pid}: process identity unavailable`);
+        continue;
+      }
       const lstart = await readProcessStart(e.pid);
       if (lstart === null || lstart !== e.startedAt.trim()) {
         skipped.push(`pid ${e.pid}: identity changed (${lstart ?? "leader gone"}), not signalled`);
@@ -647,8 +779,11 @@ export class Supervisor {
       }
       signalGroup(e.pid, "SIGTERM");
       if (!(await waitGone(e.pid, this.graceMs))) {
-        signalGroup(e.pid, "SIGKILL");
-        await waitGone(e.pid, 5000);
+        if (await killVerifiedGroup(e.pid, e.startedAt)) await waitGone(e.pid, 5000);
+        if (probeGroup(e.pid) !== "gone") {
+          skipped.push(`pid ${e.pid}: process group still present after stop`);
+          continue;
+        }
       }
       reaped++;
     }
@@ -657,10 +792,17 @@ export class Supervisor {
   }
 
   private saveRuntime(): void {
-    const live: RuntimeEntry[] = this.workers
-      .filter((w) => w.child?.pid && w.startedAt)
-      .map((w) => ({ dir: w.spec.dir, slot: w.slot, pid: w.child!.pid!, startedAt: w.startedAt! }));
-    writeAtomic(this.runtimeFile, JSON.stringify(live, null, 2));
+    const entries = new Map<number, RuntimeEntry>();
+    for (const w of this.workers) {
+      const pid = w.child?.pid;
+      if (!pid || (!w.startedAt && !w.writeScope)) continue;
+      entries.set(pid, { dir: w.spec.dir, slot: w.slot, pid, startedAt: w.startedAt, writeScope: w.writeScope });
+    }
+    for (const [pid, entry] of this.retiringWriters) {
+      if (probeGroup(pid) === "gone") this.retiringWriters.delete(pid);
+      else entries.set(pid, entry);
+    }
+    writeAtomic(this.runtimeFile, JSON.stringify([...entries.values()], null, 2));
   }
 
   private save(): void {
@@ -686,14 +828,14 @@ export class Supervisor {
   }
 }
 
-function writeAtomic(path: string, text: string): void {
+function writeAtomic(path: string, text: string, required = false): void {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.tmp-${process.pid}`;
     writeFileSync(tmp, text, { mode: 0o600 });
     renameSync(tmp, path);
-  } catch {
-    // best effort
+  } catch (err) {
+    if (required) throw err;
   }
 }
 
@@ -710,6 +852,12 @@ function explain(tail: string[], fallback: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function killVerifiedGroup(pid: number, startedAt?: string): Promise<boolean> {
+  if (!startedAt || probeGroup(pid) !== "present" || await readProcessStart(pid) !== startedAt.trim()) return false;
+  signalGroup(pid, "SIGKILL");
+  return true;
 }
 
 async function waitGone(pgid: number, ms: number): Promise<boolean> {

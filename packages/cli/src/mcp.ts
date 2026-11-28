@@ -2,8 +2,9 @@ import { createInterface } from "node:readline";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import type { AgentRecord, Attachment, ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { orderReplyView, type AgentRecord, type Attachment, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { callerCredentialTransport } from "@cafe/protocol/urls";
+import type { DaemonRequest } from "./daemon-http.ts";
 
 /** Below Claude Code's 2-minute auto-background and Codex's 300 s tool timeout (v3-1 Q77). */
 export const MAX_WAIT_S = 100;
@@ -12,6 +13,7 @@ const LATEST_PROTOCOL = "2025-06-18";
 export interface McpOptions {
   /** `http://host:port` of the local Daemon. */
   base: string;
+  request?: DaemonRequest;
   token?: string;
   /** Stable human owner capability for this stdio MCP client. */
   ownerKey?: string;
@@ -111,6 +113,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
   let customer = opts.as;
   const ownerKey = opts.ownerKey ?? randomBytes(32).toString("hex");
   let ensured: Promise<void> | undefined;
+  const request: DaemonRequest = opts.request ?? ((path, init) => fetch(`${opts.base}${path}`, { ...init, redirect: "error" }));
 
   const headers = (owner = false, operator = false): Record<string, string> => ({
     "content-type": "application/json",
@@ -126,12 +129,12 @@ export function runMcp(opts: McpOptions): Promise<void> {
     await ensured;
     const owner = path === "/api/orders" || path.endsWith("/cancel");
     const operator = /^\/api\/threads\/[^/]+(?:\/orders\/[^/]+)?\/reply$/.test(path);
-    if ((owner || operator) && callerCredentialTransport(opts.base) === "remote-plaintext") {
+    if (!opts.request && (owner || operator) && callerCredentialTransport(opts.base) === "remote-plaintext") {
       throw new ToolError("tls_required: caller credentials require loopback HTTP or the configured verified HTTPS endpoint");
     }
     const allHeaders = new Headers(headers(owner, operator));
     new Headers(init.headers).forEach((value, name) => allHeaders.set(name, value));
-    const res = await fetch(`${opts.base}${path}`, { ...init, headers: allHeaders, ...(owner || operator ? { redirect: "error" } : {}) });
+    const res = await request(path, { ...init, headers: allHeaders });
     const body = (await res.json().catch(() => ({}))) as any;
     if (!res.ok) {
       let message = `${body.error ?? res.status}: ${body.message ?? ""}`.trim();
@@ -159,7 +162,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
     const path = resolve(file);
     if (!existsSync(path)) throw new ToolError(`attachment not found: ${file}`);
     const name = basename(path);
-    const res = await fetch(`${opts.base}/api/artifacts?name=${encodeURIComponent(name)}&mime=application/octet-stream`, {
+    const res = await request(`/api/artifacts?name=${encodeURIComponent(name)}&mime=application/octet-stream`, {
       method: "POST",
       body: readFileSync(path),
       headers: opts.token ? { authorization: `Bearer ${opts.token}` } : {},
@@ -180,7 +183,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), Math.max(0, seconds) * 1000);
     try {
-      const res = await fetch(`${opts.base}/api/threads/${encodeURIComponent(threadId)}/stream?orderId=${encodeURIComponent(orderId)}`, { headers: headers(), signal: ctrl.signal });
+      const res = await request(`/api/threads/${encodeURIComponent(threadId)}/stream?orderId=${encodeURIComponent(orderId)}`, { headers: headers(), signal: ctrl.signal });
       if (!res.ok || !res.body) throw new ToolError(`cannot follow thread ${threadId}: ${res.status}`);
       const decoder = new TextDecoder();
       let buf = "";
@@ -194,8 +197,9 @@ export function runMcp(opts: McpOptions): Promise<void> {
           const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
           if (env.orderId !== orderId) continue;
           const e = env.event;
+          const reply = orderReplyView(e);
           if (e.type === "order.acked") received = true;
-          else if (e.type === "order.replied") replies.push({ from: who(e.agentId), text: e.text, final: e.final, ...(e.source ? { source: e.source } : {}) });
+          else if (reply) replies.push({ from: who(reply.agentId), text: reply.text, final: reply.final, ...(reply.source ? { source: reply.source } : {}) });
           else if (e.type === "order.declined") notes.push(e.skipped ? `${who(e.agentId)} did not answer before the deadline` : `${who(e.agentId)} declined: ${e.reason}`);
           else if (e.type === "order.failed") notes.push(`${e.agentId ? who(e.agentId) : "the question"} failed: ${e.reason}`);
           else if (e.type === "order.cancelled") notes.push(`cancelled by ${e.by}`);
@@ -275,8 +279,7 @@ export function runMcp(opts: McpOptions): Promise<void> {
         const files = Array.isArray(args.attachments) ? args.attachments.map((f) => str(f, "attachment", true)!) : [];
         const attachments: Attachment[] = [];
         for (const file of files) attachments.push(await upload(file));
-        const target = new URL(opts.base);
-        if (target.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)) throw new ToolError("remote orders require HTTPS");
+        if (!opts.request && callerCredentialTransport(opts.base) === "remote-plaintext") throw new ToolError("remote orders require HTTPS");
         const res = await api<{ threadId: string; orderId: string; decision: { reason: string; targets: string[]; failure?: string; router?: string } }>("/api/orders", {
           method: "POST",
           headers: { "x-cafe-order-owner": ownerKey },
@@ -310,8 +313,11 @@ export function runMcp(opts: McpOptions): Promise<void> {
       }
       case "cafe_cancel": {
         const threadId = str(args.threadId, "threadId", true)!;
-        const target = new URL(opts.base);
-        if (target.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)) throw new ToolError("remote cancellation requires HTTPS");
+        if (callerCredentialTransport(opts.base) !== "loopback") {
+          if (!opts.request) throw new ToolError("remote cancellation requires the pinned Root TLS endpoint");
+          const health = await api<{ features?: string[] }>("/api/health");
+          if (!health.features?.includes("caller-auth-v1")) throw new ToolError("the Root does not yet support authenticated remote cancellation");
+        }
         const orderId = str(args.orderId, "orderId") ?? (await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(threadId)}`)).meta.orderId;
         await api(`/api/threads/${encodeURIComponent(threadId)}/orders/${encodeURIComponent(orderId)}/cancel`, {
           method: "POST",

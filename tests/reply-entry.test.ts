@@ -52,10 +52,11 @@ describe("reply attachments (v4-1 phase 2)", () => {
     expect(reply.status).toBe(200);
 
     const events = await untilClosed(c, res.threadId, res.orderId);
-    const ev = events.find((e) => e.event.type === "order.replied")!.event as { text: string; source?: string; attachments?: Array<{ name: string }> };
-    expect(ev.text).toBe("here it is");
-    expect(ev.source).toBe("operator");
-    expect(ev.attachments).toMatchObject([{ name: "note.txt" }]);
+    const override = events.find(({ event }) => event.type === "order.overridden");
+    expect(override).toMatchObject({
+      actor: { kind: "operator" },
+      event: { text: "here it is", attachments: [{ name: "note.txt" }] },
+    });
   });
 
   it("rejects a reply to an Order that is not open", async () => {

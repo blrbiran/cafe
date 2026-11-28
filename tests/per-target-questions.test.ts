@@ -72,7 +72,7 @@ describe("delivery uses the per-target text", () => {
           reason: "test split",
           router: "rules",
           candidates: [],
-          variants: { [web]: "the refund page shows a hydration error", [billing]: "the invoice total is wrong" },
+          variants: { [web]: "diagnose hydration on the refund page", [billing]: "the invoice total is wrong" },
         };
       },
     };
@@ -98,7 +98,7 @@ describe("delivery uses the per-target text", () => {
     const res = await c.ask({ body: shared });
     await untilClosed(c, res.threadId, res.orderId);
 
-    expect(seen.get("web")).toBe("the refund page shows a hydration error");
+    expect(seen.get("web")).toBe("diagnose hydration on the refund page");
     expect(seen.get("billing")).toBe("the invoice total is wrong");
     expect(seen.get("web")).not.toContain("invoice total");
     expect(seen.get("billing")).not.toContain("hydration");
@@ -108,6 +108,10 @@ describe("delivery uses the per-target text", () => {
     const created = thread.events.find((e: { event: { type: string } }) => e.event.type === "order.created");
     expect(created.event.order.body).toBe(shared);
     expect(created.event.order.variants).toBeUndefined();
+    expect(res.decision.variants).toBeUndefined();
+    const routed = thread.events.find((e: { event: { type: string } }) => e.event.type === "order.routed");
+    expect(routed.event.decision.variants).toBeUndefined();
+    expect(JSON.stringify(thread.events)).not.toContain("diagnose hydration on the refund page");
   }, 20_000);
 
   it("falls back to the shared body for a target missing from the map", async () => {

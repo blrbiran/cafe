@@ -51,6 +51,36 @@ function cafeAsync(h: string, addr: string, ...args: string[]): Promise<{ status
 }
 
 describe("team setup guidance", () => {
+  it("looks up an offline published team by name and lists published teams without a local roster", async () => {
+    const d = await startDaemon("status-host", { mode: "root", noSupervisor: false });
+    cleanup.push(d.stop);
+    const roster = join(d.home, "roster");
+    mkdirSync(roster);
+    writeFileSync(join(roster, ".cafe"), "name: status-team\nteam:\n  members:\n    - { name: orch, duty: orchestrator, mode: tui, agent: omp }\n");
+    const sync = await cafeAsync(d.home, d.addr, "team", "sync", "--dir", roster);
+    expect(sync.status, sync.stderr).toBe(0);
+    const named = await cafeAsync(d.home, d.addr, "team", "status", "status-team");
+    expect(named.status, named.stderr).toBe(0);
+    expect(named.stdout).toMatch(/status-team.*0\/1 online/);
+    expect(named.stdout).toContain("orch");
+    const all = await cafeAsync(d.home, d.addr, "team", "status", "--all");
+    expect(all.status, all.stderr).toBe(0);
+    expect(all.stdout).toMatch(/status-team.*0\/1 online/);
+    const missing = await cafeAsync(d.home, d.addr, "team", "status", "missing-team");
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain("status-team");
+    const alternate = join(d.home, "alternate");
+    mkdirSync(alternate);
+    writeFileSync(join(alternate, ".cafe"), "name: status-team\nteam:\n  channel: alternate\n  members:\n    - { name: second, duty: orchestrator, mode: tui, agent: omp }\n");
+    const second = await cafeAsync(d.home, d.addr, "team", "sync", "--dir", alternate);
+    expect(second.status, second.stderr).toBe(0);
+    const ambiguous = await cafeAsync(d.home, d.addr, "team", "status", "status-team");
+    expect(ambiguous.status).toBe(1);
+    expect(ambiguous.stderr).toContain("--channel");
+    const selected = await cafeAsync(d.home, d.addr, "team", "status", "status-team", "--channel", "alternate");
+    expect(selected.status, selected.stderr).toBe(0);
+    expect(selected.stdout).toContain("second");
+  });
   it("prints a complete omp launch command for a TUI member", async () => {
     const d = await startDaemon("tui-guide", { mode: "root", noSupervisor: false });
     cleanup.push(d.stop);

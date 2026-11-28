@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,6 +69,8 @@ describe("team start never learns an executable from the request body", () => {
     const calls: Array<{ dir: string; team: { channel?: string; agent?: string; members: Array<Record<string, unknown>> } }> = [];
     d.daemon.supervisor = {
       list: () => [],
+      commitRosterWriteScopes: () => {},
+      stopUnsafeTeamWorkers: async () => ({ stopped: [], pending: [] }),
       startTeam: (dir: string, team: (typeof calls)[number]["team"]) => {
         calls.push({ dir, team });
         return [];
@@ -115,6 +117,8 @@ describe("team start never learns an executable from the request body", () => {
     let started = 0;
     d.daemon.supervisor = {
       list: () => [],
+      commitRosterWriteScopes: () => {},
+      stopUnsafeTeamWorkers: async () => ({ stopped: [], pending: [] }),
       startTeam: () => {
         started++;
         return [];
@@ -144,6 +148,8 @@ describe("team start never learns an executable from the request body", () => {
     const calls: Array<{ team: { members: Array<Record<string, unknown>> } }> = [];
     d.daemon.supervisor = {
       list: () => [],
+      commitRosterWriteScopes: () => {},
+      stopUnsafeTeamWorkers: async () => ({ stopped: [], pending: [] }),
       startTeam: (_dir: string, team: (typeof calls)[number]["team"]) => {
         calls.push({ team });
         return [];
@@ -398,6 +404,40 @@ describe("exact HTTP cancellation", () => {
 });
 
 describe("active Order identity", () => {
+  it("keeps the old Order open if the replacement cannot be committed", async () => {
+    const d = await startDaemon("atomic-replace", { mode: "root", timing: { ackTimeoutMs: 6000 } });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("worker"), async (handle) => { await handle.ack(); });
+    cleanup.push(() => worker.client.close());
+    const caller = await customer(d.addr);
+    cleanup.push(() => caller.close());
+    const first = await caller.ask({ body: "old task", to: "worker" });
+    const request = { body: "new task", to: "worker", threadId: first.threadId, replaceOrderId: first.orderId };
+    const append = d.daemon.store.appendEvent.bind(d.daemon.store);
+    const failure = vi.spyOn(d.daemon.store, "appendEvent").mockImplementation((file, env) => {
+      if (env.event.type === "order.replaced" || (env.event.type === "order.created" && env.event.order.body === "new task")) {
+        throw new Error("replacement write failed");
+      }
+      return append(file, env);
+    });
+    try {
+      await expect(caller.ask(request)).rejects.toThrow("replacement write failed");
+    } finally {
+      failure.mockRestore();
+    }
+    expect(d.daemon.thread(first.threadId)?.meta.orderId).toBe(first.orderId);
+    expect(d.daemon.closingEvent(first.threadId, first.orderId)).toBeUndefined();
+
+    const next = await caller.ask(request);
+    const events = d.daemon.thread(first.threadId)!.events;
+    expect(events.filter(({ event }) => event.type === "order.replaced")).toMatchObject([
+      { orderId: next.orderId, event: { previousOrderId: first.orderId, order: { body: "new task" } } },
+    ]);
+    expect(events.filter(({ orderId, event }) => orderId === first.orderId && event.type === "order.closed")).toHaveLength(0);
+    expect(d.daemon.closingEvent(first.threadId, first.orderId)?.event).toMatchObject({ type: "order.closed", status: "cancelled" });
+    expect(d.daemon.thread(first.threadId)?.meta.orderId).toBe(next.orderId);
+  });
+
   it("keeps a late reply from clearing the same Thread's newer Order", async () => {
     const d = await startDaemon("active-order", { mode: "root", timing: { ...(await import("./helpers.ts")).FAST, ackTimeoutMs: 1000, heartbeatIntervalMs: 1000 } });
     cleanup.push(d.stop);

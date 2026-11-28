@@ -165,7 +165,9 @@ team:
 cafe team start            # 补齐缺的 headless 成员（默认是 headless pi）
 cafe team start dev1       # 只补一个（仍然发布完整名册）
 cafe team sync             # 只发布 .cafe 名册，不启动任何进程
-cafe team status           # 名册、在线成员、当前 Thread、revision、警告
+cafe team status           # 查看本地名册、在线成员、当前 Thread 和版本
+cafe team status <team>    # 在任意目录按名称查已发布的团队
+cafe team status --all     # 列出已发布的团队，包括没有成员在线的团队
 cafe team context <成员>   # 打印成员注册时收到的 playbook
 cafe team stop             # 停掉被托管的成员；你的 TUI 会话不受影响
 cafe team remove <team>    # 删除名册（有成员在线时拒绝）
@@ -312,6 +314,8 @@ open http://127.0.0.1:4777/
 - `cafe ask` 支持 `--timeout <秒>`（默认不限），超时会取消该 Order；Ctrl-C 也会取消，不会留下 `thread_busy`。取消请求本身失败时会如实报告，不再谎称已取消。unicast Order 的目标只发心跳不回答时，10 分钟后自动关单。Thread 忙时追问可加 `--replace` 取消旧问题。对早于 daemon 200 条回放窗口的旧轮次执行 `cafe wait` 也会正常结束（daemon 会从 Thread 文件里读出该轮次的关闭事件）。
 - `POST /api/baristas` 只接受 `pi` / `omp` / `codex` / `claude`，不再接受任意可执行文件与 argv。
 - **传输层安全（TLS，v4-6）。** 默认 `security.mode: tls`。Root 首次生成一次 CA（`~/.cafe/tls/ca.crt` + `ca.key`，0600），每个 Daemon 在 TLS 端口（`security.tls.port`，默认 4778）出示由它签发的叶子证书；Web UI 与本机 loopback 调用仍走明文 4777。`root` 填新机器能访问的 Root 地址。可直接用 TLS 监听地址，也可通过主端口发现 TLS 端口。在 Root 上运行 `cafe host invite` 获取一次性邀请码，再运行 `cafe config get token` 查看共享 token。在新机器上执行 `cafe connect <host:port> --token <token> --invite <code> --ca-fingerprint <pin>`，然后执行 `cafe daemon restart`。`cafe root show` 和 Web 设置会显示候选地址和指纹，两项凭据仅显示占位符。子节点在加入网络之前**完全不连 Root**，`cafe doctor` / `cafe daemon status` 会显示「还没加入网络」及原因，并按 5 秒到 5 分钟退避重试。TLS 网络里 Daemon 的地址是 `wss://<host>:<TLS 端口>`，所以子节点之间的直连也走 TLS；明文地址（手填的，或来自旧版本 Daemon 的）会先向对方查询 TLS 端口再升级，绝不按明文拨号。`GET /api/tls`（CA + TLS 端口）是公开的。校验 fail-closed，不会退回明文；接收方同样 fail-closed：开启 TLS 的 Daemon 会拒绝从明文端口进来的 Daemon 连接（子节点上行、直连），被拒的机器在 Network 页显示「未加密，已拒绝」，`cafe doctor` 的 `tls-links` 也会报出，直到它升级并以 `security.mode: tls` 重启。还在反复尝试的机器报 `fail`；10 分钟没再尝试的降为 `warn` 并写明时间（「29 分钟前被拒」），24 小时后自动忘掉，所以一次性的探测或已下线的机器不会让 `cafe doctor` 一直报红；`cafe daemon status` 给出同样的结论。开启 TLS 时，`cafe doctor` 报告的中心节点状态取自 daemon 自己的视角，不再自己去探测。SAN 与「每台对端的叶子**公钥** pin」（`security.tls.pins`，首次接触时记录）一起检查。叶子到期前会自动续期（剩余 21 天起，运行中每 5 分钟检查一次），**续期保留原密钥**，所以 pin 在轮换后依然有效；`cafe daemon renew-cert` 可手动重签。叶子证书包含本机**所有** IPv4 地址（办公网、VPN、Docker 网桥，而不只是第一个）、`advertise` 以及 `security.tls.sans` 里额外的名字；之后才出现的地址（比如 VPN 后连上）会在 5 分钟内由运行中的 Daemon 自动重签，`cafe doctor` 会点名证书缺了哪个地址。本机发现不了的名字（域名、NAT 地址）用 `cafe daemon renew-cert --san <名字>` 添加：它记进 `security.tls.sans`，不用重启，子节点上也能用（会向 Root 申请）。若某台 Host 被刻意重装、密钥变了，用 `cafe host pin <host:port> --clear` 清掉旧 pin。`security.mode: plaintext` 是显式的本地/隔离逃生口。详见 [`docs/specs/v4-6-tls.md`](docs/specs/v4-6-tls.md)。
+
+**升级现有子节点。** 使用旧证书的子节点需要重新登记。先在 Root 上运行 `cafe host invite`，再在子节点运行 `cafe connect <root> --invite <code>` 和 `cafe daemon restart`。Root 上的 `cafe root show` 会显示可连接地址和 CA 指纹。等待登记期间，子节点仍可处理本地请求，`cafe doctor` 会给出登记步骤。
 
 ## 包结构
 

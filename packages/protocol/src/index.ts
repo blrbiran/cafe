@@ -219,6 +219,7 @@ export const AgentIdentity = CafeFile.extend({
   member: z.string().optional(),
   /** Local directory holding the roster `.cafe` (same Host only; lets the daemon read the full roster). */
   teamDir: z.string().optional(),
+  memberLaunchHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   /** Free-form responsibility label used as a routing signal. */
   duty: z.string().min(1).max(64).optional(),
   /** Channels this Agent receives from; the first entry is its home channel. Absent = ["default"]. */
@@ -381,6 +382,7 @@ export const Order = z.object({
     clarificationOrderId: z.string().min(1),
     recipientAgentId: z.string().min(1),
     recipientHostId: z.string().min(1),
+    parentAssignmentId: z.string().min(1).optional(),
     answerRequestId: z.string().min(1),
     answerHash: z.string().min(1),
   }).optional(),
@@ -483,14 +485,23 @@ export const OrderAssignment = z.object({
 });
 export type OrderAssignment = z.infer<typeof OrderAssignment>;
 
+export const OrderAssignmentReference = OrderAssignment.pick({ assignmentId: true, targetAgentId: true, targetHostId: true }).extend({
+  bodyHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type OrderAssignmentReference = z.infer<typeof OrderAssignmentReference>;
+const JournalAssignment = z.union([OrderAssignmentReference, OrderAssignment]);
+
+export const OrderReplacement = z.object({ type: z.literal("order.replaced"), previousOrderId: z.string(), order: Order, decision: RoutingDecision, assignments: z.array(JournalAssignment) });
+
 export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.created"), order: Order }),
   z.object({ type: z.literal("order.routed"), decision: RoutingDecision }),
-  z.object({ type: z.literal("order.assigned"), assignment: OrderAssignment }),
+  z.object({ type: z.literal("order.assigned"), assignment: JournalAssignment }),
   z.object({ type: z.literal("order.delivered"), agentId: z.string(), assignmentId: z.string().optional(), protectedIdentity: z.literal(true).optional() }),
   z.object({ type: z.literal("order.acked"), agentId: z.string(), assignmentId: z.string().optional() }),
   z.object({ type: z.literal("order.heartbeat"), agentId: z.string(), assignmentId: z.string().optional(), note: z.string().optional() }),
-  z.object({ type: z.literal("order.replied"), agentId: z.string(), assignmentId: z.string().optional(), text: z.string(), final: z.boolean(), source: z.enum(["agent", "operator"]).optional(), attachments: z.array(Attachment).optional() }),
+  z.object({ type: z.literal("order.replied"), agentId: z.string(), assignmentId: z.string().optional(), text: z.string(), final: z.boolean(), source: z.enum(["agent", "operator"]).optional(), auditOnly: z.literal(true).optional(), awaitingOwner: z.literal(true).optional(), attachments: z.array(Attachment).optional() }),
+  z.object({ type: z.literal("order.final-accepted"), agentId: z.string(), assignmentId: z.string(), replyEventId: z.string(), text: z.string(), attachments: z.array(Attachment).optional() }),
   /** A result added by an original recipient after the human Order closed. */
   z.object({ type: z.literal("order.reported"), agentId: z.string(), assignmentId: z.string().optional(), text: z.string() }),
   /** `unavailable`: an operational decline (timeout, shutdown), not "this topic is not mine". */
@@ -498,12 +509,20 @@ export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.dispatch-failed"), agentId: z.string(), assignmentId: z.string(), reason: z.string() }),
   z.object({ type: z.literal("order.failed"), agentId: z.string().optional(), assignmentId: z.string().optional(), reason: z.string(), /** Operational failure (timeout), not "this topic is not mine". */ unavailable: z.boolean().optional() }),
   z.object({ type: z.literal("order.cancelled"), by: z.string() }),
-  z.object({ type: z.literal("order.replaced"), previousOrderId: z.string(), order: Order, decision: RoutingDecision, assignments: z.array(OrderAssignment) }),
-  z.object({ type: z.literal("order.overridden"), targetAgentId: z.string(), text: z.string(), final: z.boolean() }),
+  OrderReplacement,
+  z.object({ type: z.literal("order.overridden"), targetAgentId: z.string(), text: z.string(), final: z.boolean(), attachments: z.array(Attachment).optional() }),
   /** One Order finished. The Thread stays open for Follow-ups. */
   z.object({ type: z.literal("order.closed"), status: ThreadStatus }),
 ]);
 export type ThreadEventBody = z.infer<typeof ThreadEvent>;
+
+/** The result presented to callers. Audit-only replies stay in the journal. */
+export function orderReplyView(event: ThreadEventBody): Extract<ThreadEventBody, { type: "order.replied" }> | undefined {
+  if (event.type === "order.replied") return event.auditOnly || event.awaitingOwner ? undefined : event;
+  if (event.type === "order.final-accepted") return { type: "order.replied", agentId: event.agentId, assignmentId: event.assignmentId, final: true, text: event.text, attachments: event.attachments };
+  if (event.type !== "order.overridden") return undefined;
+  return { type: "order.replied", agentId: event.targetAgentId, text: event.text, final: event.final, source: "operator", attachments: event.attachments };
+}
 
 export const ThreadEnvelope = z.object({
   eventId: z.string(),
@@ -519,6 +538,17 @@ export const ThreadEnvelope = z.object({
   event: ThreadEvent,
 });
 export type ThreadEnvelope = z.infer<typeof ThreadEnvelope>;
+
+export const OrderAssignmentDelivery = z.object({
+  assignment: OrderAssignmentReference,
+  ownerHostId: z.string().min(1),
+  orderCreatedEventId: z.string().min(1),
+  assignmentEventId: z.string().min(1),
+  predecessors: z.array(ThreadEnvelope.extend({ event: z.union([z.object({ type: z.literal("order.created"), order: Order }), OrderReplacement]) })).max(64).optional(),
+  creation: ThreadEnvelope.extend({ event: z.union([z.object({ type: z.literal("order.created"), order: Order }), OrderReplacement]) }),
+  assignmentEvent: ThreadEnvelope.extend({ event: z.union([z.object({ type: z.literal("order.assigned"), assignment: OrderAssignmentReference }), OrderReplacement]) }),
+});
+export type OrderAssignmentDelivery = z.infer<typeof OrderAssignmentDelivery>;
 
 export const TaskStatus = z.enum(["working", "awaiting_report", "done", "failed", "cancelled", "unknown"]);
 export type TaskStatus = z.infer<typeof TaskStatus>;

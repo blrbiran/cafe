@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, resolve } from "node:path";
 import type { Attachment } from "@cafe/protocol";
+import type { DaemonRequest } from "./daemon-http.ts";
 
 const MIME: Record<string, string> = {
   ".png": "image/png",
@@ -16,14 +17,14 @@ const MIME: Record<string, string> = {
 };
 
 /** Upload one file to a daemon; the returned metadata goes on an Order or reply. */
-export async function uploadAttachment(base: string, file: string, token?: string): Promise<Attachment> {
+export async function uploadAttachment(base: string, file: string, token?: string, request: DaemonRequest = (path, init) => fetch(`${base}${path}`, { ...init, redirect: "error" })): Promise<Attachment> {
   const path = resolve(file);
   if (!existsSync(path)) throw new Error(`cannot read ${file}`);
   const name = basename(path);
   const mime = MIME[extname(path).toLowerCase()] ?? "application/octet-stream";
   const headers: Record<string, string> = { "content-type": "application/octet-stream" };
   if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(`${base}/api/artifacts?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, {
+  const res = await request(`/api/artifacts?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, {
     method: "POST",
     body: readFileSync(path),
     headers,

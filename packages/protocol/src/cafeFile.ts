@@ -1,4 +1,5 @@
-import { readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parse } from "yaml";
 import { CafeDocument, type AgentIdentity, type CafeFile, type TeamMember, type TeamSpec } from "./index.ts";
@@ -110,6 +111,16 @@ export function loadTeamMember(teamDir: string, memberName: string): { file: str
  * `teamDir`/`CAFE_TEAM_DIR`) wins over the top-level `.cafe` identity; its roster is authoritative
  * even when the member's own directory has no `.cafe` (v4-11).
  */
+/** Captures launch-critical roster settings for the lifetime of a TUI session. */
+export function memberLaunchHash(rosterDir: string, team: TeamSpec, member: TeamMember, memberDir?: string): string {
+  const root = realpathSync(rosterDir);
+  const path = memberDir ?? realpathSync(resolve(root, member.dir));
+  return createHash("sha256").update(JSON.stringify([
+    root, team.name, team.channel, member.name, member.mode, member.agent ?? team.agent ?? "pi",
+    member.bin ?? null, path, member.access ?? null, member.channels ?? [team.channel], Boolean(member.observer), member.collect ?? "any",
+  ])).digest("hex");
+}
+
 export function loadAgentIdentity(cwd: string): { file?: string; cafe: CafeDocument; team?: TeamSpec; member?: TeamMember; identity: Omit<AgentIdentity, "mode" | "cwd"> } {
   const memberName = process.env.CAFE_TEAM_MEMBER;
   const teamDir = process.env.CAFE_TEAM_DIR;
@@ -133,6 +144,7 @@ export function loadAgentIdentity(cwd: string): { file?: string; cafe: CafeDocum
         teamChannel: team.channel,
         teamDir: resolve(rosterDir),
         member: member.name,
+        ...(member.mode === "tui" ? { memberLaunchHash: memberLaunchHash(rosterDir, team, member) } : {}),
         ...(member.duty ? { duty: member.duty } : {}),
         channels: member.channels ?? [team.channel!],
         ...(member.observer ? { observer: true } : {}),

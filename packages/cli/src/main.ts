@@ -6,14 +6,15 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, CommanderError } from "commander";
-import { onlineVersions, renderTeamPlaybook, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+import { onlineVersions, orderReplyView, renderTeamPlaybook, type AgentRecord, type DaemonRecord, type RoutingHint, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import { PROTOCOL_VERSION } from "@cafe/protocol/version";
 import { assertDaemonAddress, cafeHome, CONFIG_KEYS, configApplyMode, configKeyPath, isConfigKey, configInitialized, homeId, defaultExtensionPath, diffConfig, discoverRoots, formatRoutingStats, listRouterModels, loadConfig, runDaemon, saveConfig, setConfigValue, type RoutingStats } from "@cafe/daemon";
 import { fingerprintOf, generateHostKeyPair, hostIdFromCertificate, issuedBy, issueLeaf, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, sanList } from "../../daemon/src/tls/certs.ts";
 import { readLeaf, tlsPaths, writeLeaf } from "../../daemon/src/tls/store.ts";
 import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.ts";
 import { discoverTls, enrollHostFromRoot, trustCaForClient, tlsAddressOf } from "../../daemon/src/tls/bootstrap.ts";
-import { daemonHttpUrl, callerCredentialTransport } from "@cafe/protocol/urls";
+import { daemonHttpUrl } from "@cafe/protocol/urls";
+import { isLoopbackDaemon, pinnedRootRequest, type DaemonRequest } from "./daemon-http.ts";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { joinAddresses } from "@cafe/daemon";
 import { joinText } from "./join-text.ts";
@@ -47,7 +48,7 @@ function base(): string {
   if (configured) {
     if (/^https:\/\//i.test(configured)) {
       const caPath = tlsPaths(cafeHome(), "unused").caPath;
-      if (existsSync(caPath)) trustCaForClient(readFileSync(caPath, "utf8"));
+      if (isLoopbackDaemon(new URL(configured)) && existsSync(caPath)) trustCaForClient(readFileSync(caPath, "utf8"));
       return configured.replace(/\/+$/, "");
     }
     if (/^http:\/\//i.test(configured)) return configured.replace(/\/+$/, "");
@@ -56,16 +57,30 @@ function base(): string {
   return daemonHttpUrl(`127.0.0.1:${loadConfig().port}`);
 }
 
-async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
-  const extra = init.headers as Record<string, string> | undefined;
-  Object.assign(headers, extra);
-  if ((headers["x-cafe-order-owner"] || headers["x-cafe-connector-key"] || headers["x-cafe-operator-key"]) &&
-      callerCredentialTransport(base()) === "remote-plaintext") {
-    throw new Error("tls_required: caller credentials require loopback HTTP or the configured verified HTTPS endpoint");
+let remoteRequest: Promise<DaemonRequest> | undefined;
+async function daemonRequest(path: string, init: RequestInit = {}): Promise<Response> {
+  const endpoint = new URL(base());
+  if (isLoopbackDaemon(endpoint)) return fetch(`${endpoint.origin}${path}`, { ...init, redirect: "error" });
+  if (!remoteRequest) {
+    const config = loadConfig();
+    const tls = readTlsConfig(config);
+    remoteRequest = pinnedRootRequest(endpoint, {
+      caPath: tls.ca ?? tlsPaths(cafeHome(), "unused").caPath,
+      caFingerprint: tls.caFingerprint,
+      rootHostId: tls.rootHostId,
+    }).catch((err) => {
+      remoteRequest = undefined;
+      throw err;
+    });
   }
-  const res = await fetch(`${base()}${path}`, { ...init, headers });
+  return (await remoteRequest)(path, init);
+}
+
+async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (process.env.CAFE_TOKEN) headers.set("authorization", `Bearer ${process.env.CAFE_TOKEN}`);
+  new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  const res = await daemonRequest(path, { ...init, headers });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(formatApiError(body, res.status));
   return body as T;
@@ -132,6 +147,7 @@ function localOperatorKey(): string {
 
 /** Why the last `healthy()` check failed, as an error code (ECONNREFUSED = nothing is listening). */
 let lastHealthCode: string | undefined;
+let lastHealthError: string | undefined;
 
 type DaemonHealth = { host: string; version?: string; features?: string[] };
 
@@ -181,10 +197,16 @@ async function requireFeature(feature: string, used: boolean, effect: string): P
 
 async function healthy(): Promise<boolean> {
   try {
-    const r = await fetch(`${base()}/api/health`, { signal: AbortSignal.timeout(800) });
+    const token = process.env.CAFE_TOKEN;
+    const r = await daemonRequest("/api/health", {
+      signal: AbortSignal.timeout(isLocalDaemon() ? 800 : 8000),
+      ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
+    });
     lastHealthCode = r.ok ? undefined : `HTTP_${r.status}`;
+    lastHealthError = r.ok ? undefined : `HTTP ${r.status}`;
     return r.ok;
   } catch (err) {
+    lastHealthError = err instanceof Error ? err.message : String(err);
     const c = (err as any)?.cause;
     lastHealthCode = (err as any)?.name === "TimeoutError" ? "ETIMEDOUT" : (c?.code ?? c?.errors?.[0]?.code ?? (err as any)?.code ?? "UNKNOWN");
     return false;
@@ -255,7 +277,7 @@ async function awaitBarista(dir: string, timeoutMs = Number(process.env.CAFE_BAR
 
 /** Upload one file to the local daemon; the returned metadata goes on the Order. */
 async function uploadAttachment(file: string) {
-  return uploadArtifact(base(), file, process.env.CAFE_TOKEN);
+  return uploadArtifact(base(), file, process.env.CAFE_TOKEN, daemonRequest);
 }
 
 /**
@@ -291,7 +313,7 @@ async function setAndApply(key: string, value: string): Promise<{ human: string;
 /** Start the local daemon in the background if it is not running (lock in the daemon prevents duplicates). */
 async function ensureDaemon(opts: { root?: boolean } = {}): Promise<void> {
   if (await healthy()) return;
-  if (process.env.CAFE_DAEMON) throw new Error(`cafe daemon at ${process.env.CAFE_DAEMON} is not reachable`);
+  if (process.env.CAFE_DAEMON) throw new Error(`cafe daemon at ${process.env.CAFE_DAEMON} is not reachable${lastHealthError ? ` (${lastHealthError})` : ""}`);
   // Only "nothing is listening" means there is no daemon to talk to. Anything else (a sandbox that
   // blocks loopback, a reset, a timeout) means one may well be running: starting a second one would
   // fail confusingly (EPERM on its log inside a read-only sandbox) or fight over the port.
@@ -417,9 +439,12 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
       return `→ routed (${e.decision.router}, ${e.decision.mode}) to ${e.decision.targets.map(who).join(", ") || "nobody"}: ${e.decision.reason}`;
     case "order.acked":
       return `… ${who(e.agentId)} received the request`;
-    case "order.replied": {
-      const speaker = e.source === "operator" ? `operator override for ${who(e.agentId)}` : who(e.agentId);
-      return `\n## ${speaker}${e.final ? "" : " (interim)"}\n${e.text}\n`;
+    case "order.replied":
+    case "order.overridden": {
+      const reply = orderReplyView(e);
+      if (!reply) return undefined;
+      const speaker = reply.source === "operator" ? `operator override for ${who(reply.agentId)}` : who(reply.agentId);
+      return `\n## ${speaker}${reply.final ? "" : " (interim)"}\n${reply.text}\n`;
     }
     case "order.reported":
       return `\n## ${who(e.agentId)} (result report)\n${e.text}\n`;
@@ -432,6 +457,8 @@ function describe(env: ThreadEnvelope, agents: Map<string, AgentRecord>): string
       return `! ${e.agentId ? who(e.agentId) : "order"} failed: ${e.reason}`;
     case "order.cancelled":
       return `✗ cancelled by ${e.by}`;
+    case "order.replaced":
+      return `\n> replacement from ${e.order.from.address}: ${e.order.body}`;
     case "order.created":
       return e.order.turn > 1 ? `\n> follow-up from ${e.order.from.address}: ${e.order.body}` : undefined;
     case "order.closed":
@@ -498,7 +525,7 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
   if (!JSON_OUT && !opts.quiet && detail?.meta.origin === "agent" && detail.meta.provenanceVerified !== true) {
     console.log(`claimed relay (unverified): ${detail.meta.via?.address ?? detail.meta.from.address}`);
   }
-  const res = await fetch(`${base()}/api/threads/${threadId}/stream${opts.orderId ? `?orderId=${opts.orderId}` : ""}`, {
+  const res = await daemonRequest(`/api/threads/${threadId}/stream${opts.orderId ? `?orderId=${opts.orderId}` : ""}`, {
     headers: process.env.CAFE_TOKEN ? { authorization: `Bearer ${process.env.CAFE_TOKEN}` } : {},
     signal,
   });
@@ -519,9 +546,10 @@ async function followStream(threadId: string, opts: { quiet?: boolean; orderId?:
       const env = JSON.parse(data.slice(6)) as ThreadEnvelope;
       // Earlier turns are replayed; only report on the Order being followed.
       if (opts.orderId && env.orderId !== opts.orderId) continue;
-      if (env.event.type === "order.replied") {
+      const result = orderReplyView(env.event);
+      if (result) {
         const replies = repliesByOrder.get(env.orderId) ?? [];
-        const { agentId, text, final, source } = env.event;
+        const { agentId, text, final, source } = result;
         replies.push({ from: agents.get(agentId)?.address ?? agentId, text, final, ...(source ? { source } : {}) });
         repliesByOrder.set(env.orderId, replies);
       }
@@ -971,6 +999,12 @@ program
       const teamHit = !agentHit && teams.some((t) => t.team === name && (!host || t.host === host));
       await requireFeature("team-sessions", teamHit, `to: ${o.to} would reach every member instead of the orchestrator`);
     }
+    let replaceOrderId: string | undefined;
+    if (o.replace) {
+      if (!o.thread) throw new Error("--replace requires --thread");
+      await requireFeature("caller-auth-v1", !isLocalDaemon(), "remote replacement requires exact Order authorization");
+      replaceOrderId = (await api<{ meta: ThreadMeta }>(`/api/threads/${encodeURIComponent(o.thread)}`)).meta.orderId;
+    }
     const attachments = [];
     for (const file of o.attach as string[]) attachments.push(await uploadAttachment(file));
     const res = await api("/api/orders", {
@@ -988,7 +1022,7 @@ program
         ...(o.collect !== "any" ? { collect: o.collect } : {}),
         kind: o.notice ? "notice" : "order",
         deadlineMs: o.deadline,
-        ...(o.replace ? { replace: true } : {}),
+        ...(replaceOrderId ? { replaceOrderId } : {}),
         as: o.as,
         origin: o.origin,
         ...(o.via ? { via: { address: o.via } } : {}),
@@ -1095,7 +1129,7 @@ program
       if (lastId) headers["last-event-id"] = lastId;
       let res: Response;
       try {
-        res = await fetch(`${base()}/api/events?${params}`, { headers });
+        res = await daemonRequest(`/api/events?${params}`, { headers });
       } catch {
         await new Promise((r) => setTimeout(r, 800));
         continue;
@@ -1314,7 +1348,7 @@ program
     if (o.download) {
       const headers: Record<string, string> = {};
       if (process.env.CAFE_TOKEN) headers.authorization = `Bearer ${process.env.CAFE_TOKEN}`;
-      const res = await fetch(`${base()}/api/artifacts/${encodeURIComponent(o.download)}`, { headers });
+      const res = await daemonRequest(`/api/artifacts/${encodeURIComponent(o.download)}`, { headers });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(`download failed: ${formatApiError(body, res.status)}`);
@@ -1918,10 +1952,39 @@ team
     out(`allowed ${member} to use ${grant.realPath} (grant ${grant.grantId})`, grant);
   });
 team
+  .command("revoke-path <grantId>")
+  .description("revoke a local team directory grant and stop its managed member")
+  .action(async (grantId: string) => {
+    const key = localOperatorKey();
+    const revoked = await api<{ state: string; member: string; target: string }>(`/api/team-paths/${encodeURIComponent(grantId)}`, {
+      method: "DELETE", headers: { "x-cafe-operator-key": key }, redirect: "error",
+    });
+    out(`${revoked.member}: ${revoked.target} (${revoked.state})`, revoked);
+  });
+team
+  .command("release-tui <reservationId>")
+  .description("release a stale directory reservation after closing its terminal")
+  .requiredOption("--closed", "confirm the old terminal is closed")
+  .action(async (reservationId: string) => {
+    const key = localOperatorKey();
+    const result = await api(`/api/team-tui-reservations/${encodeURIComponent(reservationId)}`, {
+      method: "DELETE", headers: { "x-cafe-operator-key": key }, redirect: "error",
+    });
+    out(`released terminal reservation ${reservationId}`, result);
+  });
+team
   .command("paths [rosterDir]")
   .description("list this Host's external team directory grants")
-  .action(async (rosterDir?: string) => {
+  .option("--stale", "list stale terminal directory reservations")
+  .action(async (rosterDir: string | undefined, options: { stale?: boolean }) => {
     const key = localOperatorKey();
+    if (options.stale) {
+      if (rosterDir) throw new Error("use cafe team paths --stale without a directory");
+      const reservations = await api<Array<{ reservationId: string; member: string; path: string }>>("/api/team-tui-reservations", {
+        headers: { "x-cafe-operator-key": key },
+      });
+      return out(reservations.map((entry) => `${entry.member}: ${entry.path} (${entry.reservationId})`).join("\n") || "no stale terminal reservations", reservations);
+    }
     const query = rosterDir ? `?rosterDir=${encodeURIComponent(resolve(rosterDir))}` : "";
     const grants = await api<Array<{ grantId: string; team: string; member: string; target: string; state: string }>>(`/api/team-paths${query}`, {
       headers: { "x-cafe-operator-key": key }, redirect: "error",
@@ -1986,17 +2049,48 @@ team
     out(lines.join("\n"), plan);
   });
 team
-  .command("status")
-  .option("--dir <dir>", "directory holding the roster .cafe", process.cwd())
+  .command("status [team]")
+  .description("show team status by published name or local roster")
+  .option("--all", "list all published teams")
+  .option("--host <host>", "select a published team on this Host")
+  .option("--channel <channel>", "select a published team in this channel")
+  .option("--dir <dir>", "directory holding the roster .cafe")
   .option("--team-dir <dir>", "same as --dir (explicit roster)")
-  .action(async (o) => {
+  .action(async (name: string | undefined, o) => {
+    const explicitDir = o.teamDir ?? o.dir;
+    if ((name && (o.all || explicitDir)) || (o.all && explicitDir) || (!name && (o.host || o.channel))) {
+      throw new Error("use team status <team> [--host <host>] [--channel <channel>], team status --all, or team status [--dir <dir>]");
+    }
     await ensureDaemon();
     await requireTeamSessions();
-    const { team: spec } = rosterAt(o.dir, o.teamDir);
     const all = await api<any[]>("/api/teams");
-    const local = (await api<{ host: string }>("/api/health")).host;
-    const t = all.find((x) => x.team === spec.name && x.host === local) ?? all.find((x) => x.team === spec.name);
-    if (!t) return out(`team ${spec.name}: no roster published yet (start a member or run cafe team start)`, null);
+    const published = all.filter((t) => t.authoritative);
+    const heading = (t: typeof all[number]) =>
+      `team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: this Host's view)" : ""}${t.authoritative ? " · authoritative .cafe roster" : ""}${t.revision ? ` · revision ${t.revision}` : ""}`;
+    if (o.all) return out(published.map(heading).join("\n") || "(no published teams)", published);
+
+    let t: typeof all[number];
+    if (name) {
+      const matches = published.filter((entry) => entry.team === name && (!o.host || entry.host === o.host) && (!o.channel || entry.channel === o.channel));
+      if (!matches.length) {
+        const known = [...new Set(published.map((entry) => entry.team))].sort();
+        throw new Error(`team '${name}' is not published${o.host ? ` on ${o.host}` : ""}${known.length ? `; known teams: ${known.join(", ")}` : ""}. See cafe team status --all.`);
+      }
+      if (matches.length > 1) {
+        const choices = matches.map((entry) => `${entry.host} (#${entry.channel})`).join(", ");
+        throw new Error(`team '${name}' matches ${choices}. Narrow the lookup with --host or --channel, or use --dir for a local roster.`);
+      }
+      t = matches[0];
+    } else {
+      const dir = o.teamDir ?? o.dir ?? process.cwd();
+      const file = join(resolve(dir), ".cafe");
+      const spec = o.dir || o.teamDir ? rosterAt(dir).team : existsSync(file) ? readCafeFile(file).team : undefined;
+      if (!spec) throw new Error("no team roster in this directory. Use cafe team status <team> or cafe team status --all.");
+      const local = (await api<{ host: string }>("/api/health")).host;
+      const matchingRoster = all.filter((entry) => entry.team === spec.name && entry.channel === spec.channel);
+      t = matchingRoster.find((entry) => entry.host === local) ?? matchingRoster[0];
+      if (!t) return out(`team ${spec.name}: no roster published yet (run cafe team sync or cafe team start)`, null);
+    }
     const rows = t.roster.map((m: any) => ({
       member: m.name,
       duty: m.duty ?? "-",
@@ -2010,7 +2104,7 @@ team
     const lines = rows.map((r: any) => `${r.status.padEnd(8)} ${r.member.padEnd(16)} ${r.duty.padEnd(14)} ${r.mode.padEnd(8)} ${r.address}${r.observer ? " (observer)" : ""}${r.currentThread ? `  thread ${r.currentThread}` : ""}`);
     out(
       [
-        `team ${t.team} (#${t.channel}) on ${t.host}: ${t.online}/${t.total} online, ${t.openThreads} open${t.partial ? " (partial: this Host's view)" : ""}${t.authoritative ? " · authoritative .cafe roster" : ""}${t.revision ? ` · revision ${t.revision}` : ""}`,
+        heading(t),
         ...lines,
       ].join("\n"),
       t,
@@ -2179,7 +2273,7 @@ const mcp = program
   .option("--as <name>", "customer name shown to others (default: the MCP client's name)")
   .option("--operator", "enable local cafe_reply operator overrides")
   .action(async (o) => {
-    await runMcp({ base: base(), token: process.env.CAFE_TOKEN, ownerKey: mcpOwnerKey(), ...(o.operator ? { operatorKey: localOperatorKey() } : {}), ensure: ensureDaemon, as: o.as, version: cafeVersion() });
+    await runMcp({ base: base(), request: daemonRequest, token: process.env.CAFE_TOKEN, ownerKey: mcpOwnerKey(), ...(o.operator ? { operatorKey: localOperatorKey() } : {}), ensure: ensureDaemon, as: o.as, version: cafeVersion() });
   });
 mcp
   .command("install")

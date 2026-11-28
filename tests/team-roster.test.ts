@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CafeClient } from "@cafe/protocol/client";
@@ -23,6 +23,41 @@ const member = (name: string, teamDir: string) =>
   identity(name, { team: "repo", teamChannel: "repo-dev", member: name, teamDir, channels: ["repo-dev"] });
 
 describe("team roster updates", () => {
+  it("binds TUI registration to the committed launch configuration and cwd", async () => {
+    const d = await startDaemon("tui-roster", { mode: "root" });
+    cleanup.push(d.stop);
+    const first = join(d.home, "first");
+    const second = join(d.home, "second");
+    mkdirSync(first);
+    mkdirSync(second);
+    const write = (dir: string, description: string) => writeFileSync(join(d.home, ".cafe"), `name: repo\nteam:\n  channel: repo-dev\n  members:\n    - { name: orch, duty: orchestrator, mode: tui, dir: ${dir}, description: ${description} }\n`);
+    const publish = () => d.daemon.publishRoster(d.home, readCafeFile(join(d.home, ".cafe")).team!);
+    const { memberLaunchHash } = await import("@cafe/protocol/cafe-file");
+    const launch = (registeredCwd: string) => {
+      const spec = readCafeFile(join(d.home, ".cafe")).team!;
+      return { ...member("orch", d.home), mode: "tui" as const, cwd: registeredCwd, memberLaunchHash: memberLaunchHash(d.home, spec, spec.members[0]!) };
+    };
+    const make = () => {
+      const c = new CafeClient({ daemon: d.addr });
+      cleanup.push(() => c.close());
+      return c;
+    };
+    write("first", "initial");
+    const old = launch(first);
+    await expect(make().connect(old)).rejects.toMatchObject({ code: "team_not_published" });
+    publish();
+    await expect(make().connect(launch(second))).rejects.toMatchObject({ code: "team_launch_mismatch" });
+    const worker = make();
+    await worker.connect(old);
+    write("first", "updated");
+    publish();
+    expect(worker.connected).toBe(true);
+    write("second", "updated");
+    publish();
+    await waitFor(() => !worker.connected);
+    await expect(make().connect(old)).rejects.toMatchObject({ code: "team_launch_mismatch" });
+    expect(await make().connect(launch(second))).toMatchObject({ member: "orch", status: "idle" });
+  });
   it("drops a member removed from the authoritative .cafe", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cafe-roster-"));
     writeFileSync(join(dir, ".cafe"), roster(["dev1", "dev2"]));

@@ -253,7 +253,7 @@ describe("explicit escalation (v4-11)", () => {
     await waitFor(() => restored.daemon.thread(question.threadId)?.meta.status === "done");
   });
 
-  it("recovers a journaled answer when a crash leaves its SQLite metadata behind", async () => {
+  it.each([false, true])("recovers a journaled answer when a crash leaves its SQLite metadata behind (transient assignment write failure: %s)", async (failAssignmentWrite) => {
     const home = mkdtempSync(join(tmpdir(), "cafe-clarification-journal-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));
     const first = await startDaemon("answer-journal", { mode: "root", home });
@@ -278,10 +278,79 @@ describe("explicit escalation (v4-11)", () => {
     await first.stop();
     const restored = await startDaemon("answer-journal", { mode: "root", home, port: first.server.port });
     cleanup.push(restored.stop);
+    let failures = 0;
+    const append = restored.daemon.store.appendEvent.bind(restored.daemon.store);
+    const interrupted = vi.spyOn(restored.daemon.store, "appendEvent").mockImplementation((file, env) => {
+      if (failAssignmentWrite && env.orderId === original && env.event.type === "order.assigned" && failures === 0) {
+        failures++;
+        throw new Error("simulated assignment write failure");
+      }
+      return append(file, env);
+    });
+    cleanup.push(() => { interrupted.mockRestore(); });
     expect(restored.daemon.answerClarification(parent.threadId, question.threadId, input, owner).orderId).toBe(original);
     await waitFor(() => received.length === 1);
+    expect(failures).toBe(failAssignmentWrite ? 1 : 0);
     expect(received).toEqual([original]);
     expect(restored.daemon.thread(question.threadId)?.meta.turns).toBe(2);
+  });
+
+  it.each(["order.assigned", "order.routed"] as const)("closes an accepted clarification at its deadline when %s persistence fails and the member goes offline", async (failedEvent) => {
+    const d = await startDaemon("answer-deadline", { mode: "root", timing: { ...FAST, unicastDeadlineMs: 1000 } });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("tester"));
+    cleanup.push(() => worker.client.close());
+    const owner = "9".repeat(64);
+    const parent = await d.daemon.createOrder({ body: "check parsing", kind: "order", to: "tester" }, undefined, owner);
+    await waitFor(() => d.daemon.thread(parent.threadId)?.meta.status === "done");
+    const question = await worker.client.ask({ body: "cover older syntax?", escalate: true, parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    const input = { clarificationOrderId: question.orderId, text: "yes" };
+    const append = d.daemon.store.appendEvent.bind(d.daemon.store);
+    const interrupted = vi.spyOn(d.daemon.store, "appendEvent").mockImplementation((file, env) => {
+      const bytes = append(file, env);
+      if (env.threadId === question.threadId && env.event.type === failedEvent) throw new Error("simulated journal interruption");
+      return bytes;
+    });
+    try {
+      expect(() => d.daemon.answerClarification(parent.threadId, question.threadId, input, owner)).toThrow("simulated journal interruption");
+    } finally {
+      interrupted.mockRestore();
+      worker.client.close();
+    }
+    const answer = d.daemon.answerClarification(parent.threadId, question.threadId, input, owner);
+    await waitFor(() => d.daemon.thread(question.threadId)?.events.some(({ orderId, event }) =>
+      orderId === answer.orderId && event.type === "order.closed" && event.status === "failed") ?? false);
+  });
+
+  it("does not assign a clarification answer once its deadline elapsed during routing", async () => {
+    const d = await startDaemon("answer-expired", { mode: "root", timing: { ...FAST, unicastDeadlineMs: 1000 } });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("tester"));
+    cleanup.push(() => worker.client.close());
+    const owner = "9".repeat(64);
+    const parent = await d.daemon.createOrder({ body: "check parsing", kind: "order", to: "tester" }, undefined, owner);
+    await waitFor(() => d.daemon.thread(parent.threadId)?.meta.status === "done");
+    const question = await worker.client.ask({ body: "cover older syntax?", escalate: true, parentOrderId: parent.orderId, parentThreadId: parent.threadId });
+    const now = Date.now.bind(Date);
+    let offset = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + offset);
+    const append = d.daemon.store.appendEvent.bind(d.daemon.store);
+    const routing = vi.spyOn(d.daemon.store, "appendEvent").mockImplementation((file, env) => {
+      const bytes = append(file, env);
+      if (env.threadId === question.threadId && env.event.type === "order.routed") offset = 2000;
+      return bytes;
+    });
+    const answer = (() => {
+      try {
+        return d.daemon.answerClarification(parent.threadId, question.threadId, { clarificationOrderId: question.orderId, text: "yes" }, owner);
+      } finally {
+        routing.mockRestore();
+        clock.mockRestore();
+      }
+    })();
+    const events = d.daemon.thread(question.threadId)!.events.filter(({ orderId }) => orderId === answer.orderId);
+    expect(events.some(({ event }) => event.type === "order.assigned")).toBe(false);
+    expect(events.some(({ event }) => event.type === "order.closed" && event.status === "failed")).toBe(true);
   });
 
   it("lets a front door relay the person's scope decision back to the assigned member", async () => {

@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { CafeClient } from "@cafe/protocol/client";
+import { memberLaunchHash } from "@cafe/protocol/cafe-file";
+import { identity, startDaemon, waitFor } from "./helpers.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCafeFile } from "../packages/protocol/src/cafeFile.ts";
@@ -81,6 +84,34 @@ describe("team path authorization", () => {
     revokeMemberPath(home, first.grantId);
     expect(readPathGrants(home).find((g) => g.grantId === first.grantId)?.state).toBe("revoked");
     expect(readCafeFile(roster(root, "../outside")).team?.members[1]?.dir).toBe("../outside");
+  });
+
+  it("revokes an external terminal grant by operator request and rejects re-registration", async () => {
+    const home = dir("cafe-grant-home-");
+    const root = dir("cafe-grant-roster-");
+    const target = dir("cafe-grant-worker-");
+    symlinkSync(target, join(root, "external"));
+    const path = roster(root, "external", "tui");
+    const spec = readCafeFile(path).team!;
+    const member = spec.members[1]!;
+    const grant = trustMemberPath(home, root, "team", member.name, "external");
+    const d = await startDaemon("grant-control", { home, mode: "root" });
+    const worker = new CafeClient({ daemon: d.addr });
+    const workerIdentity = identity(member.name, { team: "team", teamChannel: "team-dev", member: member.name, mode: "tui", cwd: target, memberLaunchHash: memberLaunchHash(root, spec, member) });
+    try {
+      d.daemon.publishRoster(root, spec);
+      await worker.connect(workerIdentity);
+      const url = `http://${d.addr}/api/team-paths/${grant.grantId}`;
+      expect((await fetch(url, { method: "DELETE" })).status).toBe(403);
+      const response = await fetch(url, { method: "DELETE", headers: { "x-cafe-operator-key": readFileSync(join(home, "operator.key"), "utf8") } });
+      expect(response.status).toBe(200);
+      await waitFor(() => !worker.connected);
+      expect(readPathGrants(home)).toContainEqual(expect.objectContaining({ grantId: grant.grantId, state: "revoked" }));
+      await expect(worker.connect(workerIdentity)).rejects.toMatchObject({ code: "team_launch_mismatch" });
+    } finally {
+      worker.close();
+      await d.stop();
+    }
   });
 
   it("defaults headless members to read-only and labels TUI host-managed", () => {

@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import type { ThreadEnvelope, ThreadMeta } from "@cafe/protocol";
+import { orderReplyView, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 import type { Store } from "./store.ts";
 
 export type HistoricalAnswer = NonNullable<ThreadMeta["followupOutcome"]>["answer"];
@@ -27,14 +27,15 @@ export function applyFollowupEvent(state: FollowupProjectionState, env: ThreadEn
   const active = state.active;
   if (!active || env.orderId !== active.orderId || active.closed) return state;
   if (ev.type === "order.routed") return { ...state, active: { ...active, emptyRoute: ev.decision.targets.length === 0 } };
-  if (ev.type === "order.replied" && ev.final) {
-    const text = capPreview(ev.text);
+  const reply = orderReplyView(ev);
+  if (reply?.final) {
+    const text = capPreview(reply.text);
     const answer: HistoricalAnswer = {
       orderId: env.orderId,
       turn: active.turn,
-      agentId: ev.agentId,
-      ...(addressOf?.(ev.agentId) ? { address: addressOf(ev.agentId) } : {}),
-      ...(ev.source ? { source: ev.source } : {}),
+      agentId: reply.agentId,
+      ...(addressOf?.(reply.agentId) ? { address: addressOf(reply.agentId) } : {}),
+      ...(reply.source ? { source: reply.source } : {}),
       text: text.text,
       truncated: text.truncated,
     };

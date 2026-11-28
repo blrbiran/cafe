@@ -19,7 +19,7 @@ import { homeId, loadConfig, saveConfig } from "./config.ts";
 import { eventMatches, parseEventFilter, replayAfter } from "./events.ts";
 import { listRouterModels } from "./router.ts";
 import { connectorStatuses } from "./connector-status.ts";
-import { readPathGrants, trustMemberPath } from "./team-paths.ts";
+import { trustMemberPath } from "./team-paths.ts";
 
 /** pi's model catalogue is expensive to build; settings can ask for it repeatedly. */
 let modelCache: { at: number; models: string[] } | undefined;
@@ -906,6 +906,7 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     ));
   }
   if (m === "POST" && (match = /^\/api\/threads\/([^/]+)\/clarifications\/([^/]+)\/answer$/.exec(path))) {
+    if (!isLoopback(req) && !(req.socket instanceof TLSSocket)) throw new RpcError("tls_required", "remote clarification answers require HTTPS");
     const input = await readJson(req);
     const ownerKey = req.headers["x-cafe-order-owner"];
     await daemon.catchUpClarification(match[1]!, match[2]!);
@@ -941,16 +942,29 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
     daemon.kick(match[1]!);
     return send(res, 200, { ok: true });
   }
-  if ((m === "GET" || m === "POST") && path === "/api/team-paths") {
+  const revokeGrant = m === "DELETE" ? /^\/api\/team-paths\/([a-zA-Z0-9-]+)$/.exec(path) : null;
+  const releaseTui = m === "DELETE" ? /^\/api\/team-tui-reservations\/([a-zA-Z0-9-]+)$/.exec(path) : null;
+  if (revokeGrant || releaseTui || (m === "GET" && path === "/api/team-tui-reservations") ||
+      ((m === "GET" || m === "POST") && path === "/api/team-paths")) {
     const operatorKey = req.headers["x-cafe-operator-key"];
     if (!isLoopback(req) || typeof operatorKey !== "string" || !daemon.verifyOperatorCredential(operatorKey)) {
       throw new RpcError("operator_required", "team path grants require the local operator credential");
     }
     try {
+      if (releaseTui || path === "/api/team-tui-reservations") {
+        const supervisor = daemon.supervisor;
+        if (!supervisor) throw new RpcError("unavailable", "barista supervisor disabled");
+        if (releaseTui) {
+          if (!supervisor.releaseTuiReservation(releaseTui[1]!)) throw new RpcError("not_found", "no matching stale terminal reservation");
+          return send(res, 200, { released: true });
+        }
+        return send(res, 200, supervisor.staleTuiReservations());
+      }
+      if (revokeGrant) return send(res, 200, daemon.revokeTeamPath(revokeGrant[1]!));
       if (m === "GET") {
         const dir = url.searchParams.get("rosterDir");
         const root = dir ? realpathSync(resolve(dir)) : undefined;
-        return send(res, 200, readPathGrants(daemon.store.home).filter((grant) => !root || grant.rosterRoot === root));
+        return send(res, 200, daemon.localTeamPathGrants().filter((grant) => !root || grant.rosterRoot === root));
       }
       const input = await readJson(req);
       if (typeof input?.rosterDir !== "string" || !input.rosterDir || typeof input.member !== "string" || !input.member || typeof input.path !== "string" || !input.path) {
@@ -998,23 +1012,30 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
         // which executable this Host runs (#65; v4-11 review).
         if (typeof dir !== "string" || !dir) throw new RpcError("bad_request", "dir is required");
         if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
+        if (body.sync === true && !isLoopback(req)) throw new RpcError("operator_required", "sync a team from its own Host");
         const rosterDir = resolve(dir);
         const file = join(rosterDir, ".cafe");
         let doc;
         try {
           doc = readCafeFile(file);
+          if (!doc.team) throw new Error(`${file} has no team block`);
         } catch (err) {
+          if (body.sync === true) await sup.stopUnsafeTeamWorkers(rosterDir);
           throw new RpcError("bad_request", (err as Error).message);
         }
-        if (!doc.team) throw new RpcError("bad_request", `${file} has no team block`);
         const selection = TeamSpec.parse(team);
         const names = selection.members.map((m) => m.name);
         const known = doc.team.members.map((m) => m.name);
         const unknown = names.filter((n) => !known.includes(n));
         if (unknown.length) throw new RpcError("bad_request", `unknown member(s): ${unknown.join(", ")}; roster: ${known.join(", ")}`);
+        let safety: { stopped: string[]; pending: string[] } | undefined;
+        if (body.sync === true) {
+          safety = await sup.stopUnsafeTeamWorkers(rosterDir, doc.team);
+          if (safety.pending.length) throw new RpcError("revocation_pending", `waiting for these workers to stop: ${safety.pending.join(", ")}`);
+          if (JSON.stringify(readCafeFile(file).team) !== JSON.stringify(doc.team)) throw new RpcError("conflict", "the roster changed during sync; retry with the current file");
+        }
         daemon.publishRoster(rosterDir, doc.team);
-        // v4-13: `team sync` only publishes the roster; it must not start a process.
-        if (body.sync === true) return send(res, 200, { published: true, team: doc.team.name });
+        if (safety) return send(res, 200, { published: true, team: doc.team.name, stopped: safety.stopped });
         return send(res, 200, sup.startTeam(rosterDir, { ...doc.team, members: doc.team.members.filter((m) => names.includes(m.name)) }));
       }
       if (member !== undefined) {
@@ -1114,6 +1135,10 @@ function stream(daemon: Daemon, threadId: string, orderId: string | undefined, r
   const onEvent = (env: ThreadEnvelope) => {
     if (env.threadId !== threadId || seen.has(env.eventId)) return;
     seen.add(env.eventId);
+    if (env.event.type === "order.replaced" && until === env.event.previousOrderId) {
+      write({ ...env, eventId: `${env.eventId}:previous`, orderId: until, event: { type: "order.closed", status: "cancelled" } });
+      return;
+    }
     write(env);
   };
   // Only journaled events can serve as resume cursors. Replay still includes historical heartbeats.

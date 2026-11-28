@@ -170,6 +170,61 @@ describe("supervisor teams (v4-11)", () => {
     expect(sup.list()).toHaveLength(1);
   });
 
+  it("reserves an unstarted member's write scope across supervisor restart", async () => {
+    const { home, roster } = setup();
+    const sup = supervisor(home);
+    const committed = { ...team, members: [{ ...team.members[0]!, duty: "orchestrator", access: "write" as const }] };
+    sup.commitRosterWriteScopes(roster, committed);
+    expect(sup.list()).toHaveLength(0);
+    const restored = supervisor(home);
+    await restored.restore();
+    expect(() => restored.start({ dir: roster, access: "workspace-write" })).toThrow(/reserved by dev1/);
+    expect(restored.list()).toHaveLength(0);
+  });
+
+  it("holds an old TUI directory until the operator releases its exact reservation", async () => {
+    const { home, roster } = setup();
+    const original = join(roster, "old");
+    const replacement = join(roster, "new");
+    for (const path of [original, replacement]) {
+      mkdirSync(path);
+      writeFileSync(join(path, ".cafe"), "name: standalone\n");
+    }
+    const sup = supervisor(home);
+    const terminal = (dir: string) => ({ ...team, members: [{ ...team.members[3]!, duty: "orchestrator", dir }] });
+    sup.commitRosterWriteScopes(roster, terminal("old"));
+    expect(() => sup.start({ dir: original, access: "workspace-write" })).toThrow(/reserved by human/);
+    sup.commitRosterWriteScopes(roster, terminal("new"));
+    const restored = supervisor(home);
+    await restored.restore();
+    const [stale] = restored.staleTuiReservations();
+    expect(stale).toMatchObject({ member: "human", path: realpathSync(original) });
+    expect(() => restored.start({ dir: original, access: "workspace-write" })).toThrow(/reserved by human/);
+    expect(restored.releaseTuiReservation(stale!.reservationId)).toBe(true);
+    expect(restored.start({ dir: original, access: "workspace-write" })).toHaveLength(1);
+    expect(() => restored.start({ dir: replacement, access: "workspace-write" })).toThrow(/reserved by human/);
+  });
+
+  it("stops removed and narrowed workers during sync without starting new members", async () => {
+    const { home, roster } = setup();
+    for (const dir of ["dev1", "dev2", "new"]) mkdirSync(join(roster, dir));
+    const sup = supervisor(home);
+    const configured = { ...team, members: [
+      { ...team.members[0]!, dir: "dev1", duty: "orchestrator", access: "write" as const },
+      { ...team.members[1]!, dir: "dev2", access: "write" as const },
+    ] };
+    sup.startTeam(roster, configured);
+    await waitFor(() => sup.list().every((worker) => worker.running));
+    const next = { ...configured, members: [
+      { ...configured.members[0]!, access: "read-only" as const },
+      { ...configured.members[1]!, name: "new", dir: "new" },
+    ] };
+    const result = await sup.stopUnsafeTeamWorkers(roster, next);
+    expect(result.stopped.sort()).toEqual(["dev1", "dev2"]);
+    expect(result.pending).toEqual([]);
+    expect(sup.list()).toEqual([]);
+  });
+
   it("holds the write directory while the stopped worker group is still exiting", async () => {
     const { home, roster, pidfile } = setup();
     const sup = supervisor(home);

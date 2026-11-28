@@ -13,7 +13,8 @@ import { checkServerIdentity, type PeerCertificate } from "node:tls";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
 import { hostIdFromCertificate, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, missingSans, sanCovers, sanList, verifyHostRenewal } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
-import { validateMemberPath } from "./team-paths.ts";
+import { readPathGrants, revokeMemberPath, validateMemberPath, type PathGrant } from "./team-paths.ts";
+import { memberLaunchHash } from "@cafe/protocol/cafe-file";
 import { hintsFromSummary } from "./hints.ts";
 import {
   ACK_TIMEOUT_MS,
@@ -34,6 +35,7 @@ import {
   compactHistoryText,
   formatAddress,
   parseAddress,
+  orderReplyView,
   projectTaskStatus,
   type AgentRecord,
   type AgentStatus,
@@ -42,6 +44,8 @@ import {
   HostIdentity,
   type DaemonRecord,
   type Order,
+  OrderAssignmentDelivery,
+  OrderAssignmentReference,
   type Party,
   type RoutingDecision,
   type RoutingHint,
@@ -62,7 +66,7 @@ import { type CafeConfig, diffConfig, loadConfig, saveConfig } from "./config.ts
 import { HINT_WINDOW_MS, computeHints, identityOf, orderKeywords } from "./hints.ts";
 import { Registry } from "./registry.ts";
 import { LlmRouter, RulesRouter, piComplete, type Router } from "./router.ts";
-import { Store, type HostInviteRecord } from "./store.ts";
+import { Store, type HostInviteRecord, type MissingEventAuthority } from "./store.ts";
 import { projectFollowupEvent, recoverFollowupBatch } from "./followup-outcome.ts";
 import { summarize } from "./summary.ts";
 import { describeFetchError } from "./net-errors.ts";
@@ -78,6 +82,12 @@ function canonicalJson(value: unknown): string {
     return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function assignmentHash(order: Order, targetAgentId: string, targetHostId: string): string {
+  // Hash the JSON wire shape so omitted optional properties match on reload and at the recipient.
+  const wire = JSON.parse(JSON.stringify({ order, targetAgentId, targetHostId }));
+  return createHash("sha256").update(canonicalJson(wire)).digest("hex");
 }
 
 function loadOperatorDigest(home: string, store: Store): string {
@@ -161,6 +171,9 @@ const HINTS_MAX_AGE_MS = 3600_000;
 /** Live delivery state of one Order on its origin Daemon. */
 interface Tracking {
   order: Order;
+  creation: OrderAssignmentDelivery["creation"];
+  /** Durable, target-specific assignment records, reused for every transport retry. */
+  assignments: Map<string, OrderAssignmentDelivery>;
   /** Anonymous protocol customers own their Orders for the lifetime of their connection. */
   customerPeer?: Peer;
   status: "open" | "done" | "failed" | "cancelled";
@@ -731,6 +744,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   tlsPort?: number;
   /** Why this child has not joined the TLS network yet (v4-6 §10.3); cleared once it has. */
   tlsWaiting?: string;
+  tlsNeedsEnrollment = false;
 
   /**
    * Hosts whose Daemon link arrived on the plaintext port while TLS is on, and was refused (#89).
@@ -1118,6 +1132,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.on(Methods.agentRegister, (raw) => {
       if (peer.meta.agentId) throw new RpcError("conflict", "connection is already registered");
       const { resumeAgentId, resumeProof, ...identity } = AgentIdentity.extend({ resumeProof: OwnershipKey.optional() }).parse(raw);
+      if (identity.team && identity.teamChannel) this.checkTuiLaunch(identity);
       const proof = resumeProof ? ownershipDigest(resumeProof) : undefined;
       const priorProof = resumeAgentId ? this.store.getKv<string>(`agent-proof:${resumeAgentId}`) : undefined;
       if (priorProof && priorProof !== proof) throw new RpcError("bad_identity", "agent resume proof does not match");
@@ -1246,9 +1261,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         throw new RpcError("not_found", "no matching Order for this agent");
       }
       this.subscribe(p.threadId, peer);
-      return this.store.readOrderEvents(meta.file, p.orderId)
-        .filter(({ event }) => event.type === "order.closed" || event.type === "order.declined" || (event.type === "order.replied" && event.final))
-        .slice(-21).map((env) => env.event.type === "order.replied" ? { ...env, event: { ...env.event, text: env.event.text.slice(0, 1500), attachments: undefined } } : env);
+      return this.store.readOrderEvents(meta.file, p.orderId).flatMap((env) => {
+        const reply = orderReplyView(env.event);
+        if (reply?.final) return [{ ...env, event: { ...env.event, text: reply.text.slice(0, 1500), attachments: undefined } } as ThreadEnvelope];
+        if (env.event.type === "order.replaced" && env.event.previousOrderId === p.orderId) {
+          return [{ ...env, orderId: p.orderId, event: { type: "order.closed", status: "cancelled" } } satisfies ThreadEnvelope];
+        }
+        return env.event.type === "order.closed" || env.event.type === "order.declined" ? [env] : [];
+      }).slice(-21);
     });
     peer.on("thread/subscribe", (p: { threadId: string }) => {
       this.subscribe(p.threadId, peer);
@@ -1256,7 +1276,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
   }
 
-  private agentEvent(peer: Peer, p: { orderId: string; threadId: string }, event: ThreadEventBody): {} {
+  private agentEvent(peer: Peer, p: { orderId: string; threadId: string; assignmentId?: string }, event: ThreadEventBody): {} {
     const agentId = peer.meta.agentId as string | undefined;
     if (!agentId || this.agents.get(agentId) !== peer) throw new RpcError("not_registered", "agent/register first");
     if (typeof p?.orderId !== "string" || !p.orderId || typeof p.threadId !== "string" || !p.threadId) {
@@ -1265,7 +1285,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const meta = this.metas.get(p.threadId) ?? this.store.getThread(p.threadId);
     const order = meta ? this.findParentOrder(p.orderId, p.threadId) : undefined;
     if (!order || order.threadId !== p.threadId) throw new RpcError("not_found", "no matching Order on this Thread");
-    if (!this.wasDelivered(order, agentId, this.host)) throw new RpcError("not_a_target", "this Agent was not delivered the Order");
+    const delivery = this.findDelivery(order, agentId, this.host);
+    if (!delivery) throw new RpcError("not_a_target", "this Agent was not delivered the Order");
+    if (p.assignmentId !== undefined && p.assignmentId !== delivery.assignmentId) {
+      throw new RpcError("bad_assignment", "Agent event does not match its delivery assignment");
+    }
 
     const tracking = this.tracking.get(order.orderId);
     const closed = tracking ? tracking.status !== "open" : !!this.closingEvent(p.threadId, p.orderId);
@@ -1276,6 +1300,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     let accepted = event;
     if (event.type === "order.replied" && event.attachments?.length) {
       accepted = { ...event, attachments: this.commitAttachments(event.attachments, p.threadId) };
+    }
+    if (p.assignmentId && (accepted.type === "order.acked" || accepted.type === "order.heartbeat" || accepted.type === "order.replied" || accepted.type === "order.declined")) {
+      accepted = { ...accepted, assignmentId: p.assignmentId };
     }
     if (!closed && ((accepted.type === "order.replied" && accepted.final) || accepted.type === "order.declined")) {
       this.clearActiveOrder(agentId, p.threadId, p.orderId);
@@ -1603,6 +1630,51 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
+  revokeTeamPath(grantId: string): PathGrant {
+    const grant = revokeMemberPath(this.store.home, grantId, "revoked-pending");
+    const owners = this.store.getKv<Record<string, string>>("rosterOwners") ?? {};
+    for (const record of this.local.values()) {
+      if (record.team !== grant.team || (record.member ?? record.name) !== grant.member || !record.teamChannel) continue;
+      const key = rosterKey({ host: this.host, team: record.team, channel: record.teamChannel });
+      if (owners[key] !== grant.rosterRoot) continue;
+      let cwd: string | undefined;
+      try { cwd = realpathSync(record.cwd); } catch { /* a removed directory still lacks authority */ }
+      if (cwd === undefined || cwd === grant.target) this.agents.get(record.agentId)?.close();
+    }
+    this.supervisor?.stopTeam(grant.rosterRoot, grant.member, grant.target);
+    return this.localTeamPathGrants().find((entry) => entry.grantId === grantId)!;
+  }
+
+  localTeamPathGrants(): PathGrant[] {
+    return readPathGrants(this.store.home).map((grant) => {
+      if (grant.state !== "revoked-pending" || this.supervisor?.isStoppingTeamPath(grant.rosterRoot, grant.target)) return grant;
+      return revokeMemberPath(this.store.home, grant.grantId);
+    });
+  }
+
+  private checkTuiLaunch(identity: AgentIdentity): void {
+    const key = rosterKey({ host: this.host, team: identity.team!, channel: identity.teamChannel! });
+    const roster = this.teamRecords.get(key);
+    const memberName = identity.member ?? identity.name;
+    const member = roster?.members.find((entry) => entry.name === memberName);
+    if (identity.mode !== "tui" && member?.mode !== "tui") return;
+    if (!roster?.authoritative || roster.removed) {
+      throw new RpcError("team_not_published", "publish this team with cafe team sync before opening its terminal session");
+    }
+    const launches = this.store.getKv<Array<{ name: string; cwd: string; hash: string }>>(`team-tui-launches:${key}`);
+    const launch = launches?.find((entry) => entry.name === memberName);
+    const owner = this.store.getKv<Record<string, string>>("rosterOwners")?.[key];
+    let cwd: string | undefined;
+    let allowed: string | undefined;
+    try {
+      cwd = realpathSync(identity.cwd);
+      if (owner && member) allowed = validateMemberPath(this.store.home, owner, memberName, member.dir).realPath;
+    } catch { /* fail closed on a stale or revoked path */ }
+    if (identity.mode !== "tui" || !launch || identity.memberLaunchHash !== launch.hash || cwd !== launch.cwd || allowed !== launch.cwd) {
+      throw new RpcError("team_launch_mismatch", "open this member's terminal in its committed roster directory and reload Cafe after team changes");
+    }
+  }
+
   /** A registering member teaches this daemon its roster (from teamDir when readable) and publishes it. */
   private learnTeam(rec: AgentRecord): void {
     if (!rec.team || !rec.teamChannel) return;
@@ -1641,6 +1713,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
    * page and `to: <team>` do not have to wait for the first registration (v4-11 review). v4-13:
    * this is the only operation that clears a tombstone, and it always publishes the full roster.
    */
+  restoreLocalRosterWriteScopes(supervisor: NonNullable<Daemon["supervisor"]>): void {
+    const owners = this.store.getKv<Record<string, string>>("rosterOwners") ?? {};
+    const rosters: Array<{ directory: string; team: TeamSpec }> = [];
+    for (const [key, record] of this.teamRecords) {
+      if (record.host !== this.host || !record.authoritative || record.removed || !owners[key]) continue;
+      if (!record.members.some((member) => member.mode === "tui" || member.access === "write")) continue;
+      rosters.push({ directory: owners[key], team: { name: record.team, channel: record.channel, members: record.members } });
+    }
+    supervisor.bootstrapRosterWriteScopes(rosters);
+  }
+
   publishRoster(rosterDir: string, team: TeamSpec): void {
     const parsed = TeamLaunchSpec.safeParse(team);
     if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
@@ -1649,8 +1732,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const key = rosterKey({ host: this.host, team: team.name, channel: team.channel });
     const previous = this.teamRecords.get(key);
     const canonical = realpathSync(rosterDir);
+    const launches: Array<{ name: string; cwd: string; hash: string }> = [];
     try {
-      for (const member of team.members) validateMemberPath(this.store.home, canonical, member.name, member.dir);
+      for (const member of team.members) {
+        const { realPath } = validateMemberPath(this.store.home, canonical, member.name, member.dir);
+        if (member.mode === "tui") launches.push({ name: member.name, cwd: realPath, hash: memberLaunchHash(canonical, team, member, realPath) });
+      }
     } catch (err) {
       throw new RpcError("bad_request", (err as Error).message);
     }
@@ -1659,12 +1746,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (owner && owner !== canonical) {
       throw new RpcError("bad_request", `team ${team.name} uses roster directory ${owner}; run cafe team sync there`);
     }
+    try {
+      this.supervisor?.commitRosterWriteScopes(canonical, team);
+    } catch (err) {
+      throw new RpcError("bad_request", (err as Error).message);
+    }
     if (!owner) {
       owners.set(key, canonical);
       this.store.setKv("rosterOwners", Object.fromEntries(owners));
     }
+    this.store.setKv(`team-tui-launches:${key}`, launches);
     const members = team.members.map((m) => ({ ...m, channels: m.channels?.length ? m.channels : [team.channel!] }));
     this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1), authoritative: true, removed: false });
+    for (const record of this.local.values()) {
+      if (record.mode !== "tui" || record.team !== team.name || record.teamChannel !== team.channel) continue;
+      try { this.checkTuiLaunch(record); } catch { this.agents.get(record.agentId)?.close(); }
+    }
     if (!this.isRoot && this.rootOnline && this.rootSupports("teams")) {
       const saved = this.teamRecords.get(key);
       if (saved) this.uplink!.notify(Methods.teamUpsert, { team: saved });
@@ -2440,43 +2537,72 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (!acceptedReplacement.targets.length || Date.now() >= order.createdAt + (order.deadlineMs ?? this.timing.unicastDeadlineMs)) {
         throw new RpcError("replacement_unroutable", acceptedReplacement.reason || "no eligible target for the replacement");
       }
-      this.emitEvent(replacing.order, { type: "order.cancelled", by: "replaced" });
-      this.close(replacing, "cancelled");
     }
     if (peer) this.subscribe(order.threadId, peer);
     const customerPeer = peer && !peer.meta.party ? peer : undefined;
-    const t: Tracking = { order, customerPeer, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
-    this.tracking.set(order.orderId, t);
     const actor: EventActor | undefined = principal ? { kind: principal.kind, principalId: principal.principalId } : undefined;
-    this.emitEvent(order, { type: "order.created", order }, { actor });
+    let created: OrderAssignmentDelivery["creation"];
+    const assignments = new Map<string, OrderAssignmentDelivery>();
+    if (replacing && acceptedReplacement) {
+      const { variants, ...decision } = acceptedReplacement;
+      if (variants) this.store.putOwnerDeliveryData("variants", order.orderId, order.threadId, variants);
+      const references = decision.targets.map((agentId) => this.prepareAssignment(order, agentId, variants));
+      const predecessors = this.replacementPredecessors(order.threadId, replacing.order.orderId);
+      const replacement = this.emitEvent(order, {
+        type: "order.replaced", previousOrderId: replacing.order.orderId, order, decision, assignments: references,
+      }, { actor });
+      created = replacement;
+      for (const assignment of references) {
+        assignments.set(assignment.targetAgentId, { ...this.assignmentProof(assignment, replacement, replacement), predecessors });
+      }
+    } else {
+      created = this.emitEvent(order, { type: "order.created", order }, { actor });
+    }
+    const t: Tracking = {
+      order,
+      creation: created,
+      assignments,
+      customerPeer,
+      status: "open",
+      replied: false,
+      targets: new Map(),
+      candidates: [],
+      timers: new Map(),
+    };
+    this.tracking.set(order.orderId, t);
 
     const decision: RoutingDecision = needsHuman
       ? { targets: [], mode: "unicast", reason: "escalate to the person in the original conversation", router: "explicit", candidates: [], needsHuman: true }
       : acceptedReplacement ?? explicit ?? await routeNew();
-    if (t.status !== "open") return { orderId: order.orderId, threadId: order.threadId, decision };
+    const { variants, ...publicDecision } = decision;
+    const result = { orderId: order.orderId, threadId: order.threadId, decision: publicDecision };
+    if (t.status !== "open") return result;
     t.decision = decision;
     t.candidates = [...decision.candidates];
-    this.emitEvent(order, { type: "order.routed", decision });
+    if (!acceptedReplacement) {
+      if (variants) this.store.putOwnerDeliveryData("variants", order.orderId, order.threadId, variants);
+      this.emitEvent(order, { type: "order.routed", decision: publicDecision });
+    }
     if (needsHuman) {
       this.close(t, "done");
-      return { orderId: order.orderId, threadId: order.threadId, decision };
+      return result;
     }
     if (decision.targets.length === 0) {
       this.emitEvent(order, { type: "order.failed", reason: decision.failure ?? "no barista available" });
       this.close(t, "failed");
-      return { orderId: order.orderId, threadId: order.threadId, decision };
+      return result;
     }
     const defaultMs = order.kind === "notice" || decision.mode !== "unicast" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
     const deadlineAt = order.createdAt + (order.deadlineMs ?? defaultMs);
     if (Date.now() >= deadlineAt) {
       for (const id of decision.targets) t.targets.set(id, "pending");
       this.finishOnDeadline(t);
-      return { orderId: order.orderId, threadId: order.threadId, decision };
+      return result;
     }
     // Route time consumes the same absolute hard lifetime as execution and recovery.
     t.deadline = setTimeout(() => this.finishOnDeadline(t), deadlineAt - Date.now());
     for (const id of decision.targets) this.dispatch(t, id);
-    return { orderId: order.orderId, threadId: order.threadId, decision };
+    return result;
   }
 
   /** Hydrate only the publishing turn when serving a missed clarification on its original Host. */
@@ -2523,19 +2649,44 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       (rec.host === this.host ? !this.agents.has(rec.agentId) : !this.rootOnline)) {
       throw new RpcError("requester_offline", "the member who asked is offline; your answer has not been accepted");
     }
+    const orderId = ulid();
+    const parentAssignmentId = this.findDelivery(parent, meta.from.id, meta.from.host, true)?.assignmentId;
+    const recipientHostId = this.assignmentTargetHostId(meta.from.host);
+    if (this.tlsContext?.network && (!parentAssignmentId || !recipientHostId)) {
+      throw new RpcError("assignment_pending", "the original assignment must be available before answering this clarification");
+    }
+    const actor = { kind: "human" as const, principalId: this.store.putCallerPrincipal({ kind: "human", credentialDigest: digest, principalId: ulid() }) };
     const order: Order = {
-      orderId: ulid(), threadId, kind: "order", from: parent.from, channel: meta.channel, origin: "human", body: text,
+      orderId, threadId, kind: "order", from: parent.from, channel: meta.channel, origin: "human", body: text,
+      ...(parentAssignmentId && recipientHostId ? { parentOwnerAttestation: {
+        attestationId: ulid(), parentOrderId: parent.orderId, parentThreadId, clarificationOrderId: input.clarificationOrderId,
+        recipientAgentId: meta.from.id, recipientHostId, parentAssignmentId, answerRequestId: orderId,
+        answerHash: createHash("sha256").update(text).digest("hex"),
+      } } : {}),
       clarificationRecipient: meta.from, parentThreadId, parentOrderId: parent.orderId, parentContext: summarize(parent.body, 639),
       chain: [], depth: parent.depth + 1, createdAt: Date.now(), turn: 2, deadlineMs: this.timing.unicastDeadlineMs,
       history: [{ from: meta.from.address, agentId: meta.from.id, role: "barista", text: compactHistoryText(meta.clarification.question) }],
     };
     if (!this.isRoot && !this.rootOnline) this.markBackfill(threadId);
-    const tracking: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map(), decision };
+    const created = this.emitEvent(order, { type: "order.created", order }, { actor });
+    const tracking: Tracking = {
+      order,
+      creation: created,
+      assignments: new Map(),
+      status: "open",
+      replied: false,
+      targets: new Map(),
+      candidates: [],
+      timers: new Map(),
+      decision,
+    };
     this.tracking.set(order.orderId, tracking);
-    this.emitEvent(order, { type: "order.created", order });
+    const remainingMs = Math.max(0, order.createdAt + this.timing.unicastDeadlineMs - Date.now());
+    tracking.deadline = setTimeout(() => this.finishOnDeadline(tracking), remainingMs);
+    tracking.targets.set(meta.from.id, "pending");
+    this.armAck(tracking, meta.from.id);
     this.emitEvent(order, { type: "order.routed", decision });
     this.dispatch(tracking, meta.from.id);
-    tracking.deadline = setTimeout(() => this.finishOnDeadline(tracking), this.timing.unicastDeadlineMs);
     return { orderId: order.orderId, threadId, decision };
   }
 
@@ -2572,15 +2723,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private history(meta: ThreadMeta): Order["history"] {
     const out: Order["history"] = [];
     const events = this.store.readMatchingEvents(meta.file, 12, ({ event }) =>
-      event.type === "order.created" || (event.type === "order.replied" && event.final),
+      event.type === "order.created" || event.type === "order.replaced" || orderReplyView(event)?.final === true,
     );
     for (const env of events) {
       const ev = env.event;
-      if (ev.type === "order.created") out.push({ from: ev.order.from.address, role: "customer", text: compactHistoryText(ev.order.body) });
-      else if (ev.type === "order.replied" && ev.final) {
-        const speaker = this.registry.get(ev.agentId)?.address ?? ev.agentId;
-        const text = ev.source === "operator" ? `[operator override for ${speaker} — not the Barista's own words] ${ev.text}` : ev.text;
-        out.push({ agentId: ev.agentId, from: speaker, role: "barista", text: compactHistoryText(text) });
+      if (ev.type === "order.created" || ev.type === "order.replaced") {
+        out.push({ from: ev.order.from.address, role: "customer", text: compactHistoryText(ev.order.body) });
+      } else {
+        const reply = orderReplyView(ev);
+        if (!reply?.final) continue;
+        const speaker = this.registry.get(reply.agentId)?.address ?? reply.agentId;
+        const text = reply.source === "operator" ? `[operator override for ${speaker} — not the Barista's own words] ${reply.text}` : reply.text;
+        out.push({ agentId: reply.agentId, from: speaker, role: "barista", text: compactHistoryText(text) });
       }
     }
     return out;
@@ -2596,8 +2750,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!parentThreadId) return undefined;
     const meta = this.metas.get(parentThreadId) ?? this.store.getThread(parentThreadId);
     if (!meta) return undefined;
-    const found = this.store.findLastEvent(meta.file, (env) => env.event.type === "order.created" && env.orderId === orderId);
-    return found?.event.type === "order.created" ? found.event.order : undefined;
+    const found = this.store.findLastEvent(meta.file, (env) => (env.event.type === "order.created" || env.event.type === "order.replaced") && env.orderId === orderId);
+    return found?.event.type === "order.created" || found?.event.type === "order.replaced" ? found.event.order : undefined;
   }
 
   private async route(order: Order, followUp: { isFollowUp?: boolean; responders?: string[]; priorTargets?: string[] } = {}, broadcast = false): Promise<RoutingDecision> {
@@ -2792,12 +2946,96 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       });
   }
 
+  private assignmentTargetHostId(host: string): string | undefined {
+    if (!this.tlsContext?.network) return host;
+    if (host === this.host) return this.hostId;
+    if (host === this.rootHost) return this.rootHostId;
+    const binding = this.isRoot
+      ? this.store.getHostIdentityByHost(host)
+      : [...this.rootBindings.values()].find((candidate) => candidate.host === host);
+    return binding?.state === "enrolled" ? binding.hostId : undefined;
+  }
+
+  private prepareAssignment(order: Order, agentId: string, variants?: Record<string, string>): OrderAssignmentReference {
+    const recipient = this.registry.get(agentId);
+    const targetHostId = recipient && this.assignmentTargetHostId(recipient.host);
+    if (!targetHostId) throw new RpcError("assignment_unavailable", "no Host binding for the assignment target");
+    const targetOrder = this.forTarget(order, agentId, variants ?? order.variants);
+    const assignment = {
+      assignmentId: ulid(), targetAgentId: agentId, targetHostId,
+      bodyHash: assignmentHash(targetOrder, agentId, targetHostId),
+    };
+    this.store.putOwnerDeliveryData("assignment", assignment.assignmentId, order.threadId, targetOrder);
+    return assignment;
+  }
+
+  private replacementPredecessors(threadId: string, previousOrderId: string): NonNullable<OrderAssignmentDelivery["predecessors"]> {
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    if (!meta) throw new RpcError("assignment_pending", "replacement lineage is unavailable");
+    const lineage: NonNullable<OrderAssignmentDelivery["predecessors"]> = [];
+    let orderId = previousOrderId;
+    while (lineage.length < 64) {
+      const previous = this.store.findLastEvent(meta.file, (env) => env.orderId === orderId &&
+        (env.event.type === "order.created" || env.event.type === "order.replaced"));
+      if (!previous) break;
+      const { event } = previous;
+      if (event.type !== "order.created" && event.type !== "order.replaced") break;
+      lineage.push({ ...previous, event });
+      if (event.type === "order.created") return lineage.reverse();
+      orderId = event.previousOrderId;
+    }
+    throw new RpcError("assignment_pending", "replacement lineage is incomplete or too long");
+  }
+
+  private assignmentProof(assignment: OrderAssignmentReference, creation: OrderAssignmentDelivery["creation"], assignmentEvent: OrderAssignmentDelivery["assignmentEvent"]): OrderAssignmentDelivery {
+    return { assignment, ownerHostId: creation.eventHostId ?? this.hostId, creation, assignmentEvent,
+      orderCreatedEventId: creation.eventId, assignmentEventId: assignmentEvent.eventId };
+  }
+
   private dispatch(t: Tracking, agentId: string): void {
     t.targets.set(agentId, "pending");
+    if (t.order.clarificationRecipient && Date.now() >= t.order.createdAt + (t.order.deadlineMs ?? this.timing.unicastDeadlineMs)) {
+      this.finishOnDeadline(t);
+      return;
+    }
     const rec = this.registry.get(agentId);
     if (!rec) return this.targetFailed(t, agentId, "unknown agent");
     if (t.order.kind === "order") this.armAck(t, agentId);
-    this.deliver(this.forTarget(t.order, agentId, t.decision?.variants ?? t.order.variants), agentId);
+    let delivery = t.assignments.get(agentId);
+    if (delivery) {
+      const order = this.store.getOwnerDeliveryData<Order>("assignment", delivery.assignment.assignmentId, t.order.threadId);
+      if (!order || assignmentHash(order, agentId, delivery.assignment.targetHostId) !== delivery.assignment.bodyHash) {
+        return this.targetFailed(t, agentId, "canonical assignment payload is unavailable");
+      }
+      this.deliver(order, agentId, delivery);
+      return;
+    }
+    const order = this.forTarget(t.order, agentId, t.decision?.variants ?? t.order.variants);
+    const targetHostId = this.assignmentTargetHostId(rec.host);
+    if (!targetHostId) return this.targetFailed(t, agentId, "no authenticated Host binding for assignment target");
+    const assignment: OrderAssignmentReference = {
+      assignmentId: ulid(), targetAgentId: agentId, targetHostId,
+      bodyHash: assignmentHash(order, agentId, targetHostId),
+    };
+    this.store.putOwnerDeliveryData("assignment", assignment.assignmentId, t.order.threadId, order);
+    const remember = (assignmentEvent: OrderAssignmentDelivery["assignmentEvent"]): OrderAssignmentDelivery => {
+      const recorded: OrderAssignmentDelivery = {
+        assignment, ownerHostId: this.hostId, orderCreatedEventId: t.creation.eventId,
+        assignmentEventId: assignmentEvent.eventId, creation: t.creation, assignmentEvent,
+      };
+      t.assignments.set(agentId, recorded);
+      return recorded;
+    };
+    try {
+      delivery = remember(this.emitEvent(t.order, { type: "order.assigned", assignment }));
+    } catch (error) {
+      const meta = this.metas.get(t.order.threadId);
+      const committed = meta && this.store.findLastEvent(meta.file, ({ orderId, event }) =>
+        orderId === t.order.orderId && event.type === "order.assigned" && event.assignment.assignmentId === assignment.assignmentId);
+      if (committed) remember({ ...committed, event: { type: "order.assigned", assignment } });
+      throw error;
+    }
+    this.deliver(order, agentId, delivery);
   }
 
   /**
@@ -2816,38 +3054,44 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally or directly (ADR-0004). */
-  private deliver(order: Order, agentId: string): void {
+  private deliver(order: Order, agentId: string, proof?: OrderAssignmentDelivery): void {
     const rec = this.registry.get(agentId);
     if (!rec) return;
-    if (order.clarificationRecipient && (rec.host !== order.clarificationRecipient.host || agentId !== order.clarificationRecipient.id)) {
-      return this.relayFailure(order, agentId, "clarification requester unavailable");
+    const assignment = proof ?? this.tracking.get(order.orderId)?.assignments.get(agentId);
+    if (!assignment) return this.relayFailure(order, agentId, "canonical assignment is missing");
+    if (assignment.assignment.targetAgentId !== agentId || assignment.assignment.targetHostId !== this.assignmentTargetHostId(rec.host)) {
+      return this.relayFailure(order, agentId, "canonical assignment target changed");
+    }
+    const targetOrder = order;
+    if (targetOrder.clarificationRecipient && (rec.host !== targetOrder.clarificationRecipient.host || agentId !== targetOrder.clarificationRecipient.id)) {
+      return this.relayFailure(targetOrder, agentId, "clarification requester unavailable");
     }
     if (this.isRoot) {
-      if (rec.host === this.host) return this.deliverLocal(order, agentId);
+      if (rec.host === this.host) return this.deliverLocal(targetOrder, agentId, assignment);
       const child = this.children.get(rec.host);
-      if (!child) return this.relayFailure(order, agentId, `daemon ${rec.host} offline`);
-      child.notify(Methods.orderRelay, { order, agentId });
+      if (!child) return this.relayFailure(targetOrder, agentId, `daemon ${rec.host} offline`);
+      child.notify(Methods.orderRelay, { order: targetOrder, agentId, assignment });
       return;
     }
     if (this.rootOnline) {
-      this.uplink!.notify(Methods.orderRelay, { order, agentId });
+      this.uplink!.notify(Methods.orderRelay, { order: targetOrder, agentId, assignment });
       return;
     }
-    if (rec.host === this.host) return this.deliverLocal(order, agentId);
-    if (this.peerUrls.has(rec.host)) return void this.deliverDirect(order, agentId, rec.host);
-    this.relayFailure(order, agentId, "root_unreachable");
+    if (rec.host === this.host) return this.deliverLocal(targetOrder, agentId, assignment);
+    if (this.peerUrls.has(rec.host)) return void this.deliverDirect(targetOrder, agentId, rec.host, assignment);
+    this.relayFailure(targetOrder, agentId, "root_unreachable");
   }
 
   // -------------------------------------------------------------------------
   // Direct links (Root offline only, ADR-0004)
   // -------------------------------------------------------------------------
 
-  private async deliverDirect(order: Order, agentId: string, host: string): Promise<void> {
+  private async deliverDirect(order: Order, agentId: string, host: string, assignment: OrderAssignmentDelivery): Promise<void> {
     try {
       const link = await this.link(host);
       this.joinThread(order.threadId, link);
       this.markBackfill(order.threadId);
-      link.notify(Methods.orderRelay, { order, agentId });
+      link.notify(Methods.orderRelay, { order, agentId, assignment });
     } catch (err) {
       this.log(`direct link to ${host} failed: ${(err as Error).message}`);
       this.relayFailure(order, agentId, "root_unreachable");
@@ -2914,12 +3158,58 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return attempt;
   }
 
+  private verifyRelay(order: Order, agentId: string, raw: unknown): OrderAssignmentDelivery {
+    const result = OrderAssignmentDelivery.safeParse(raw);
+    if (!result.success) throw new RpcError("assignment_required", "relay requires a canonical assignment reference");
+    const proof = result.data;
+    const reference = proof.assignment;
+    const creation = proof.creation;
+    const ancestors = proof.predecessors ?? [];
+    if (ancestors.length) {
+      let previousId: string | undefined;
+      const orderIds = new Set([order.orderId]);
+      for (const ancestor of ancestors) {
+        const prior = ancestor.event;
+        if (orderIds.has(ancestor.orderId) || ancestor.threadId !== order.threadId || prior.order.threadId !== order.threadId ||
+            ancestor.host !== creation.host || ancestor.eventHostId !== creation.eventHostId || prior.order.from.host !== creation.host ||
+            ancestor.orderId !== prior.order.orderId || (prior.type === "order.replaced" ? prior.previousOrderId !== previousId : previousId !== undefined)) {
+          throw new RpcError("bad_assignment", "replacement lineage does not match the owning Host or preceding Order");
+        }
+        orderIds.add(ancestor.orderId);
+        previousId = ancestor.orderId;
+      }
+      if (creation.event.type !== "order.replaced" || creation.event.previousOrderId !== previousId) {
+        throw new RpcError("bad_assignment", "replacement lineage does not end at the preceding Order");
+      }
+    }
+    const assigned = proof.assignmentEvent;
+    const assignmentRef = assigned.event.type === "order.assigned"
+      ? assigned.event.assignment
+      : assigned.event.assignments.find((item) => item.assignmentId === reference.assignmentId);
+    if (!assignmentRef || assigned.eventId !== proof.assignmentEventId || assigned.orderId !== order.orderId || assigned.threadId !== order.threadId ||
+        assigned.host !== creation.host || assigned.eventHostId !== creation.eventHostId ||
+        canonicalJson(assignmentRef) !== canonicalJson(reference) ||
+        creation.eventId !== proof.orderCreatedEventId || creation.orderId !== order.orderId || creation.threadId !== order.threadId ||
+        creation.event.order.orderId !== order.orderId || creation.event.order.threadId !== order.threadId ||
+        creation.host !== order.from.host || creation.event.order.from.host !== creation.host ||
+        (creation.eventHostId !== undefined && creation.eventHostId !== proof.ownerHostId) || reference.targetAgentId !== agentId ||
+        reference.bodyHash !== assignmentHash(order, agentId, reference.targetHostId)) {
+      throw new RpcError("bad_assignment", "relayed Order does not match its assignment");
+    }
+    return proof;
+  }
+
   /** Handlers shared by both ends of a direct link. */
   private bindLink(peer: Peer): void {
-    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string }) => {
+    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
+      const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host) ||
+          (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== peer.meta.host))) {
+        throw new RpcError("bad_assignment", "direct relay does not match the sending and receiving Hosts");
+      }
       this.joinThread(x.order.threadId, peer);
-      this.adoptOrder(x.order);
-      this.deliverLocal(x.order, x.agentId);
+      this.recordRelayProof(proof, peer);
+      this.deliverLocal(x.order, x.agentId, proof);
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
       this.touchLink(peer);
@@ -3002,7 +3292,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  private deliverLocal(order: Order, agentId: string): void {
+  private deliverLocal(order: Order, agentId: string, assignment: OrderAssignmentDelivery): void {
     if (order.clarificationRecipient && (agentId !== order.clarificationRecipient.id || this.host !== order.clarificationRecipient.host || !this.store.getKv<string>(`agent-proof:${agentId}`))) {
       return this.relayFailure(order, agentId, "clarification requester unavailable");
     }
@@ -3019,14 +3309,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.publishAgents([next]);
     }
     const foreign = (order.attachments ?? []).some((a) => a.host && a.host !== this.host);
-    if (!foreign) return this.notifyLocal(order, agentId, peer);
+    if (!foreign) return this.notifyLocal(order, agentId, peer, assignment);
     // The origin may be another Host: fetch the blobs before the Barista starts.
     const t = this.tracking.get(order.orderId);
     if (t) this.clearTimer(t, agentId);
-    void this.pullAndDeliver(order, agentId, peer);
+    void this.pullAndDeliver(order, agentId, peer, assignment);
   }
 
-  private async pullAndDeliver(order: Order, agentId: string, peer: Peer): Promise<void> {
+  private async pullAndDeliver(order: Order, agentId: string, peer: Peer, assignment: OrderAssignmentDelivery): Promise<void> {
     try {
       await this.pullAttachments(order);
     } catch (err) {
@@ -3036,22 +3326,68 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // The pull is async: the peer may have disconnected or the Order closed meanwhile. Recording
     // `order.delivered` for a peer that never received it would grant a later connection its authority.
-    if (peer.isClosed || this.agents.get(agentId) !== peer) return;
-    const t = this.tracking.get(order.orderId);
-    if (t && t.status !== "open") return;
-    this.notifyLocal(order, agentId, peer);
-    if (t && order.kind === "order") this.armAck(t, agentId);
+    if (!this.canDeliverLocal(order, agentId, peer)) return;
+    try {
+      this.notifyLocal(order, agentId, peer, assignment);
+      const tracking = this.tracking.get(order.orderId);
+      if (tracking && order.kind === "order") this.armAck(tracking, agentId);
+    } catch (err) {
+      this.log(`could not deliver ${order.orderId} after downloading attachments: ${(err as Error).message}`);
+    }
   }
 
-  private notifyLocal(order: Order, agentId: string, peer: Peer): void {
-    peer.notify(Methods.orderDeliver, { order, attachmentPaths: this.attachmentPaths(order) });
-    this.deliveredParentBodies.set(`${order.orderId}:${agentId}`, summarize(order.body, 639));
+  private canDeliverLocal(order: Order, agentId: string, peer: Peer): boolean {
+    if (peer.isClosed || this.agents.get(agentId) !== peer) return false;
+    if (order.deadlineMs !== undefined && Date.now() >= order.createdAt + order.deadlineMs) return false;
+    const tracking = this.tracking.get(order.orderId);
+    return tracking ? tracking.status === "open" : !this.closingEvent(order.threadId, order.orderId);
+  }
+
+  private notifyLocal(order: Order, agentId: string, peer: Peer, assignment: OrderAssignmentDelivery): void {
+    if (!this.canDeliverLocal(order, agentId, peer)) return;
+    if (this.tlsContext?.network) {
+      const reference = assignment.assignment;
+      const existing = this.store.getRecipientAssignment(reference.assignmentId);
+      this.store.putRecipientAssignment({
+        ...reference,
+        orderId: order.orderId,
+        threadId: order.threadId,
+        body: order.body,
+        history: order.history,
+        receivedAt: existing?.receivedAt ?? Date.now(),
+      });
+    }
+    peer.notify(Methods.orderDeliver, { order, assignmentId: assignment.assignment.assignmentId, attachmentPaths: this.attachmentPaths(order) });
+    this.deliveredParentBodies.set(`${order.orderId}:${agentId}`, summarize(assignment.creation.event.order.body, 639));
     if (this.deliveredParentBodies.size > 2048) this.deliveredParentBodies.delete(this.deliveredParentBodies.keys().next().value!);
-    this.emitEvent(order, { type: "order.delivered", agentId, ...(this.store.getKv<string>(`agent-proof:${agentId}`) ? { protectedIdentity: true } : {}) });
+    this.emitEvent(order, { type: "order.delivered", agentId, assignmentId: assignment.assignment.assignmentId, ...(this.store.getKv<string>(`agent-proof:${agentId}`) ? { protectedIdentity: true } : {}) });
   }
 
   private relayFailure(order: Order, agentId: string, reason: string): void {
     this.emitEvent(order, { type: "order.failed", agentId, reason });
+  }
+
+  private resumeReplacementDispatch(t: Tracking, agentId: string): void {
+    this.clearTimer(t, agentId);
+    t.timers.set(agentId, setTimeout(() => {
+      if (t.status !== "open" || t.targets.get(agentId) !== "pending") return;
+      const recipient = this.registry.get(agentId);
+      const reachable = recipient && recipient.status !== "offline" &&
+        (recipient.host === this.host ? this.agents.has(agentId) : this.rootOnline || this.peerUrls.has(recipient.host));
+      if (!reachable) {
+        this.resumeReplacementDispatch(t, agentId);
+        return;
+      }
+      if (this.wasDelivered(t.order, agentId, recipient.host)) {
+        this.armAck(t, agentId);
+        return;
+      }
+      try {
+        this.dispatch(t, agentId);
+      } catch (err) {
+        this.log(`replacement retry failed for ${t.order.orderId}: ${(err as Error).message}`);
+      }
+    }, this.timing.ackTimeoutMs));
   }
 
   private armAck(t: Tracking, agentId: string): void {
@@ -3059,9 +3395,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     t.timers.set(agentId, setTimeout(() => {
       if (!t.order.clarificationRecipient) return this.targetFailed(t, agentId, "no ack");
       if (t.status !== "open" || t.targets.get(agentId) !== "pending") return;
-      this.armAck(t, agentId);
       const rec = this.registry.get(agentId);
-      if (rec && rec.status !== "offline" && (rec.host === this.host ? this.agents.has(agentId) : this.rootOnline)) this.deliver(t.order, agentId);
+      if (!rec || rec.status === "offline" || !(rec.host === this.host ? this.agents.has(agentId) : this.rootOnline)) {
+        this.armAck(t, agentId);
+        return;
+      }
+      try {
+        // A recovered answer may still need its first durable assignment.
+        this.dispatch(t, agentId);
+      } catch (err) {
+        this.log(`clarification retry failed for ${t.order.orderId}: ${(err as Error).message}`);
+        if (t.status === "open" && t.targets.get(agentId) === "pending") this.armAck(t, agentId);
+      }
     }, this.timing.ackTimeoutMs));
   }
 
@@ -3111,10 +3456,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         if (t.targets.get(ev.agentId) === "acked") this.armHeartbeat(t, ev.agentId);
         break;
       case "order.replied":
-        if (ev.final) {
+      case "order.overridden":
+      case "order.final-accepted": {
+        const reply = orderReplyView(ev);
+        if (!reply) break;
+        if (reply.final) {
           t.replied = true;
-          this.clearTimer(t, ev.agentId);
-          t.targets.set(ev.agentId, "done");
+          this.clearTimer(t, reply.agentId);
+          t.targets.set(reply.agentId, "done");
           // In a fan-out, one good answer is enough: give the others a short
           // grace window instead of holding the Thread to the deadline (#39).
           // `collect: all` deliberately has no grace: silence is not success (v4-11).
@@ -3122,8 +3471,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
             t.grace = setTimeout(() => this.finishGrace(t), this.timing.graceMs);
           }
           this.maybeClose(t);
-        } else this.armHeartbeat(t, ev.agentId);
+        } else if (ev.type === "order.replied") this.armHeartbeat(t, reply.agentId);
         break;
+      }
       case "order.declined":
         if (t.targets.get(ev.agentId) !== "pending" && t.targets.get(ev.agentId) !== "acked") break;
         this.clearTimer(t, ev.agentId);
@@ -3192,17 +3542,20 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.maybeClose(t);
   }
 
-  private close(t: Tracking, status: "done" | "failed" | "cancelled"): void {
-    if (t.status !== "open") return;
+  private finishTracking(t: Tracking, status: "done" | "failed" | "cancelled"): void {
     t.status = status;
     for (const timer of t.timers.values()) clearTimeout(timer);
     t.timers.clear();
     if (t.deadline) clearTimeout(t.deadline);
     if (t.grace) clearTimeout(t.grace);
     t.grace = undefined;
-    this.emitEvent(t.order, { type: "order.closed", status });
-    // Keep closed Orders briefly for late events, then drop them.
     setTimeout(() => this.tracking.delete(t.order.orderId), 60_000).unref?.();
+  }
+
+  private close(t: Tracking, status: "done" | "failed" | "cancelled"): void {
+    if (t.status !== "open") return;
+    this.finishTracking(t, status);
+    this.emitEvent(t.order, { type: "order.closed", status });
   }
 
   cancel(threadId: string, orderId: string, auth: { peer?: Peer; ownerKey?: string; connectorKey?: string; operatorKey?: string; loopback?: boolean }): {} {
@@ -3277,11 +3630,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const attachments = p.attachments?.length ? this.commitAttachments(p.attachments, threadId) : undefined;
     const actor = { kind: "operator" as const, principalId: this.store.putCallerPrincipal({ kind: "operator", credentialDigest: this.operatorKeyDigest, principalId: ulid() }) };
     this.emitEvent(t.order, {
-      type: "order.replied",
-      agentId: targetId,
+      type: "order.overridden",
+      targetAgentId: targetId,
       text: p.text,
       final: p.final ?? true,
-      source: "operator",
       ...(attachments?.length ? { attachments } : {}),
     }, { actor });
     return {};
@@ -3291,13 +3643,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   // Events: record locally, update metadata, fan out.
   // -------------------------------------------------------------------------
 
-  private emitEvent(order: Order, event: ThreadEventBody, opts: { skipTrack?: boolean; actor?: ThreadEnvelope["actor"] } = {}): void {
-    const env: ThreadEnvelope = {
+  private emitEvent<E extends ThreadEventBody>(order: Order, event: E, opts: { skipTrack?: boolean; actor?: ThreadEnvelope["actor"] } = {}): ThreadEnvelope & { event: E } {
+    const env: ThreadEnvelope & { event: E } = {
       eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(), event,
       ...(this.tlsContext?.network ? { eventHostId: this.hostId } : {}),
       ...(opts.actor ? { actor: opts.actor } : {}),
     };
     this.recordEvent(env, opts);
+    return env;
   }
 
   /** Entry point for every event, local or relayed. Idempotent on eventId. */
@@ -3509,22 +3862,176 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
+  private rememberEvent(eventId: string): void {
+    this.seen.add(eventId);
+    if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
+  }
+
+  private missingClarificationEvidence(env: ThreadEnvelope, answer: Order): MissingEventAuthority | undefined {
+    const proof = answer.parentOwnerAttestation;
+    const recipient = answer.clarificationRecipient;
+    if (!proof?.parentAssignmentId || !recipient || env.actor?.kind !== "human" || proof.answerRequestId !== env.orderId ||
+        proof.parentOrderId !== answer.parentOrderId || proof.parentThreadId !== answer.parentThreadId ||
+        proof.recipientAgentId !== recipient.id || proof.answerHash !== createHash("sha256").update(answer.body).digest("hex")) {
+      throw new RpcError("bad_identity", "clarification answer does not match the owner attestation");
+    }
+    const parentMeta = this.metas.get(proof.parentThreadId) ?? this.store.getThread(proof.parentThreadId);
+    const parent = parentMeta && this.store.findLastEvent(parentMeta.file, (entry) => entry.orderId === proof.parentOrderId &&
+      (entry.event.type === "order.created" || entry.event.type === "order.replaced"));
+    if (!parent || (parent.event.type !== "order.created" && parent.event.type !== "order.replaced")) {
+      return { kind: "order", id: proof.parentOrderId };
+    }
+    if (parent.eventHostId !== env.eventHostId || parent.host !== env.host || parent.actor?.kind !== "human" ||
+        parent.actor.principalId !== env.actor.principalId || parent.event.order.from.id !== answer.from.id) {
+      throw new RpcError("bad_identity", "clarification answer must come from the original human owner Host");
+    }
+    const questionMeta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+    const question = questionMeta && this.store.findLastEvent(questionMeta.file, ({ event, orderId }) =>
+      orderId === proof.clarificationOrderId && event.type === "order.created" && event.order.needsHuman === true);
+    if (!question || question.event.type !== "order.created") return { kind: "order", id: proof.clarificationOrderId };
+    if (question.event.order.from.id !== recipient.id || question.host !== recipient.host || question.eventHostId !== proof.recipientHostId ||
+        question.event.order.parentOrderId !== proof.parentOrderId || question.event.order.parentThreadId !== proof.parentThreadId) {
+      throw new RpcError("bad_identity", "clarification requester and parent do not match the attestation");
+    }
+    const delivered = this.findDelivery(parent.event.order, recipient.id, recipient.host, true);
+    if (!delivered) return { kind: "delivery", id: proof.parentAssignmentId };
+    if (delivered.assignmentId !== proof.parentAssignmentId) throw new RpcError("bad_assignment", "clarification parent assignment does not match");
+  }
+
+  private missingOwnerEvidence(env: ThreadEnvelope): MissingEventAuthority | undefined {
+    const { event } = env;
+    if (event.type === "order.created") {
+      if (event.order.orderId !== env.orderId || event.order.threadId !== env.threadId || event.order.from.host !== env.host) {
+        throw new RpcError("bad_identity", "Order creation does not match its owning Host and Thread");
+      }
+      if (env.eventHostId && event.order.clarificationRecipient) return this.missingClarificationEvidence(env, event.order);
+      return;
+    }
+    if (event.type !== "order.assigned" && event.type !== "order.replaced" && event.type !== "order.overridden" && event.type !== "order.final-accepted") return;
+    const orderId = event.type === "order.replaced" ? event.previousOrderId : env.orderId;
+    const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+    const creation = meta && this.store.findLastEvent(meta.file, (entry) => entry.orderId === orderId &&
+      (entry.event.type === "order.created" || entry.event.type === "order.replaced"));
+    if (!creation) return { kind: "order", id: orderId };
+    if (!creation.eventHostId || env.eventHostId !== creation.eventHostId || env.host !== creation.host) {
+      throw new RpcError("bad_identity", "only the recorded Order owner Host may change its assignment or replace its result");
+    }
+    if (event.type === "order.assigned" && ("body" in event.assignment || !OrderAssignmentReference.safeParse(event.assignment).success)) {
+      throw new RpcError("bad_assignment", "the shared assignment event requires a public reference");
+    }
+    if (event.type === "order.overridden" && env.actor?.kind !== "operator") {
+      throw new RpcError("bad_identity", "operator override requires an operator actor");
+    }
+  }
+
+  private missingAssignmentEvidence(env: ThreadEnvelope): MissingEventAuthority | undefined {
+    const missingOwner = this.missingOwnerEvidence(env);
+    if (missingOwner) return missingOwner;
+    const event = env.event;
+    if (event.type === "order.final-accepted") {
+      const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+      const source = meta && this.store.findLastEvent(meta.file, ({ eventId }) => eventId === event.replyEventId);
+      if (!source) return { kind: "reply", id: event.replyEventId };
+      const reply = source.event;
+      if (source.orderId !== env.orderId || source.threadId !== env.threadId || reply.type !== "order.replied" ||
+          !reply.final || !reply.awaitingOwner || reply.auditOnly || reply.agentId !== event.agentId ||
+          reply.assignmentId !== event.assignmentId || reply.text !== event.text ||
+          canonicalJson(reply.attachments) !== canonicalJson(event.attachments)) {
+        throw new RpcError("bad_assignment", "owner decision does not match its source reply");
+      }
+      return this.missingAssignmentEvidence(source);
+    }
+    if (!("assignmentId" in event) || !event.assignmentId || !("agentId" in event) || !event.agentId ||
+        event.type === "order.failed") return;
+    const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+    if (!meta) return { kind: "order", id: env.orderId };
+    const assignment = this.store.getOrderAssignment(meta.file, env.orderId, event.assignmentId);
+    if (!assignment) return { kind: "assignment", id: event.assignmentId };
+    if (assignment.threadId !== env.threadId || assignment.assignment.targetAgentId !== event.agentId ||
+        assignment.assignment.targetHostId !== env.eventHostId) {
+      throw new RpcError("bad_assignment", "event does not match its assigned Agent and Host");
+    }
+    if (event.type === "order.delivered" || event.type === "order.dispatch-failed") return;
+    if (env.actor?.kind !== "agent" || env.actor.principalId !== event.agentId) {
+      throw new RpcError("bad_assignment", "event actor does not match the assigned Agent");
+    }
+    const delivered = this.store.findLastEvent(meta.file, (entry) =>
+      entry.orderId === env.orderId && entry.eventHostId === env.eventHostId && entry.event.type === "order.delivered" &&
+      entry.event.assignmentId === event.assignmentId && entry.event.agentId === event.agentId);
+    if (!delivered) return { kind: "delivery", id: event.assignmentId };
+  }
+
+  private replayAssignmentEvents(threadId: string, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
+    let progress: boolean;
+    do {
+      progress = false;
+      for (const env of this.store.listPendingEvents(threadId)) {
+        try {
+          const missing = this.missingAssignmentEvidence(env);
+          if (missing) {
+            this.store.stagePendingEvent(env, missing);
+            continue;
+          }
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          this.log(`discarded pending event ${env.eventId}: ${err.message}`);
+          this.store.removePendingEvent(env.eventId);
+          continue;
+        }
+        const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+        if (!meta || !this.store.findLastEvent(meta.file, ({ eventId }) => eventId === env.eventId)) {
+          // The sender was authenticated when the envelope entered the pending journal.
+          this.recordEvent(env, { skipTrack: opts.skipTrack, replaying: true });
+        }
+        this.store.removePendingEvent(env.eventId);
+        progress = true;
+      }
+    } while (progress);
+  }
+
+  recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer; replaying?: boolean } = {}): void {
     if (opts.from?.hostIdentity && (this.isRoot || opts.from.meta.kind === "peer")) {
       if (env.eventHostId !== opts.from.hostIdentity.hostId || env.host !== opts.from.meta.host) {
         throw new RpcError("bad_identity", "event source differs from the authenticated Host");
       }
     }
     if (this.stopped || this.seen.has(env.eventId)) return;
-    const event = env.event;
+    let event = env.event;
+    if (event.type === "order.replied" && event.final && event.assignmentId && env.eventHostId && env.actor?.kind === "agent" && !event.awaitingOwner) {
+      event = { ...event, awaitingOwner: true };
+      env = { ...env, event };
+    }
+    if (opts.from?.hostIdentity) {
+      const missing = this.missingAssignmentEvidence(env);
+      if (missing) {
+        if (event.type !== "order.heartbeat") this.store.stagePendingEvent(env, missing);
+        return;
+      }
+    }
+    if (event.type === "order.replied" && event.final && this.hasFinalOverride(env.threadId, env.orderId, event.agentId)) {
+      env = { ...env, event: { ...event, auditOnly: true } };
+    }
     const closed = this.closingEvent(env.threadId, env.orderId);
     if (closed && !(event.type === "order.replied" && event.final) && event.type !== "order.reported") return;
     const tracking = this.tracking.get(env.orderId);
     if (!opts.skipTrack && tracking?.status === "open" && "agentId" in event && typeof event.agentId === "string" && tracking.targets.get(event.agentId) === "failed" &&
       (event.type === "order.acked" || event.type === "order.heartbeat" || event.type === "order.declined" || event.type === "order.failed")) return;
-    this.seen.add(env.eventId);
-    if (this.seen.size > 50_000) this.seen = new Set([...this.seen].slice(-25_000));
+    const rememberAfterAppend = event.type === "order.created" || event.type === "order.assigned" || event.type === "order.replaced";
+    if (!rememberAfterAppend) this.rememberEvent(env.eventId);
 
+    let replacementAppend: { offset: number; bytes: number } | undefined;
+    if (event.type === "order.replaced") {
+      if (event.order.threadId !== env.threadId || event.order.orderId !== env.orderId || event.previousOrderId === env.orderId) {
+        throw new RpcError("bad_request", "replacement must name the previous and new Orders on one Thread");
+      }
+      const prior = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+      const file = prior?.file ?? this.store.threadFile(env.threadId, event.order.createdAt);
+      const offset = this.store.journalSize(file);
+      const bytes = this.appendEvent(file, env);
+      replacementAppend = { offset, bytes };
+      const previous = this.tracking.get(event.previousOrderId);
+      if (previous) this.finishTracking(previous, "cancelled");
+    }
     let meta = this.updateMeta(env);
     let projectionPersisted = false;
     // Keep `cafe search` current without rescanning JSONL (#34); the index is best-effort.
@@ -3535,7 +4042,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // Attachments live on their origin Host. Elsewhere they are metadata only,
     // but the row is needed so the local Web/CLI can proxy the download.
-    const carried = env.event.type === "order.created" ? env.event.order.attachments : env.event.type === "order.replied" ? env.event.attachments : undefined;
+    const carried = env.event.type === "order.created" || env.event.type === "order.replaced"
+      ? env.event.order.attachments : orderReplyView(env.event)?.attachments;
     for (const a of carried ?? []) {
       if (!a.host || a.host === this.host || this.store.getArtifact(a.id)) continue;
       this.store.putArtifact({ id: a.id, threadId: env.threadId, host: a.host, name: a.name, mime: a.mime, size: a.size, sha256: a.sha256, createdAt: env.at });
@@ -3546,8 +4054,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (meta) {
       // Heartbeats renew leases and remain visible live. Recovery only needs durable acks.
       if (event.type !== "order.heartbeat") {
-        const bytesBefore = this.store.journalSize(meta.file);
-        const bytesWritten = this.appendEvent(meta.file, env);
+        const bytesBefore = replacementAppend?.offset ?? this.store.journalSize(meta.file);
+        const bytesWritten = replacementAppend?.bytes ?? this.appendEvent(meta.file, env);
+        if (rememberAfterAppend) this.rememberEvent(env.eventId);
         try {
           const projected = projectFollowupEvent(this.store, meta, env, bytesBefore, bytesWritten, (agentId) => this.registry.get(agentId)?.address);
           if (projected) {
@@ -3562,7 +4071,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         }
       }
       // Thread creation and closure are durable immediately; activity updates can wait.
-      if (env.event.type === "order.created" || env.event.type === "order.closed") {
+      if (env.event.type === "order.created" || env.event.type === "order.closed" || env.event.type === "order.replaced") {
         const pending = this.metaFlush.get(meta.threadId);
         if (pending) clearTimeout(pending);
         this.metaFlush.delete(meta.threadId);
@@ -3589,12 +4098,41 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     this.emit("thread", env, meta);
     if (env.event.type === "order.cancelled") this.notifyCancelled(env);
+    if (env.event.type === "order.replaced") {
+      const previousId = env.event.previousOrderId;
+      this.notifyCancelled({ ...env, orderId: previousId, event: { type: "order.cancelled", by: "replaced" } });
+      for (const id of meta?.targets ?? []) this.clearActiveOrder(id, env.threadId, previousId);
+    }
     if (env.event.type === "order.failed" && env.event.agentId) this.clearActiveOrder(env.event.agentId, env.threadId, env.orderId);
     if (env.event.type === "order.closed") for (const id of meta?.targets ?? []) this.clearActiveOrder(id, env.threadId, env.orderId);
-    if (env.event.type === "order.replied" && env.event.final && env.event.source !== "operator") this.recordOutcome(env, env.event.agentId, "answered");
+    if (env.event.type === "order.overridden" && env.event.final) {
+      this.clearActiveOrder(env.event.targetAgentId, env.threadId, env.orderId);
+      this.agents.get(env.event.targetAgentId)?.notify(Methods.orderCancelled, { orderId: env.orderId, threadId: env.threadId, by: "operator" });
+    }
+    if (env.event.type === "order.final-accepted") this.recordOutcome(env, env.event.agentId, "answered");
+    else if (env.event.type === "order.replied" && env.event.final && orderReplyView(env.event) && env.event.source !== "operator") this.recordOutcome(env, env.event.agentId, "answered");
     else if (env.event.type === "order.declined" && !env.event.skipped) this.recordOutcome(env, env.event.agentId, "declined", env.event.unavailable);
     else if (env.event.type === "order.failed" && env.event.agentId) this.recordOutcome(env, env.event.agentId, "failed");
     if (!opts.skipTrack) this.track(env);
+    if (tracking && env.event.type === "order.replied") this.acceptAgentFinal(tracking, env);
+    if (!opts.replaying && (event.type === "order.created" || event.type === "order.replaced" || event.type === "order.assigned" || event.type === "order.delivered" || event.type === "order.replied")) {
+      const assignmentId = event.type === "order.assigned" ? event.assignment.assignmentId
+        : event.type === "order.delivered" ? event.assignmentId : undefined;
+      const threads = new Set([env.threadId, ...this.store.pendingDependentThreads(env.eventId, env.orderId, assignmentId)]);
+      for (const threadId of threads) this.replayAssignmentEvents(threadId, opts);
+    }
+  }
+
+  private acceptAgentFinal(t: Tracking, env: ThreadEnvelope): void {
+    const reply = env.event;
+    if (reply.type !== "order.replied" || !reply.final || !reply.awaitingOwner || reply.auditOnly || !reply.assignmentId ||
+        t.status !== "open" || t.order.from.host !== this.host) return;
+    const state = t.targets.get(reply.agentId);
+    if (!state || state === "done" || this.missingAssignmentEvidence(env)) return;
+    this.emitEvent(t.order, {
+      type: "order.final-accepted", agentId: reply.agentId, assignmentId: reply.assignmentId,
+      replyEventId: env.eventId, text: reply.text, ...(reply.attachments?.length ? { attachments: reply.attachments } : {}),
+    });
   }
 
   /** `noTopic`: count the outcome but do not tie it to the Order's keywords (operational declines). */
@@ -3603,6 +4141,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const order = this.knownOrders.get(env.orderId);
     this.store.recordAgentEvent(agentId, kind, env.at, env.threadId, {
       identity: rec ? identityOf(rec) : undefined,
+      ...(env.event.type === "order.final-accepted" ? { resultId: env.event.replyEventId } : {}),
       tokens: order && !noTopic ? orderKeywords(order.body) : undefined,
     });
     this.hintsDirty = true;
@@ -3683,11 +4222,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   /** An exact delivery, from the Order log rather than the Thread's cumulative targets. */
-  private wasDelivered(order: Order, agentId: string, host: string, protectedIdentity = false): boolean {
+  private hasFinalOverride(threadId: string, orderId: string, agentId: string): boolean {
+    const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
+    return !!meta && !!this.store.findLastEvent(meta.file, ({ orderId: sourceOrderId, event }) =>
+      sourceOrderId === orderId && event.type === "order.overridden" && event.final && event.targetAgentId === agentId);
+  }
+
+  private findDelivery(order: Order, agentId: string, host: string, protectedIdentity = false) {
     const meta = this.metas.get(order.threadId) ?? this.store.getThread(order.threadId);
-    return !!meta && !!this.store.findLastEvent(meta.file, (env) =>
+    const found = meta && this.store.findLastEvent(meta.file, (env) =>
       env.orderId === order.orderId && env.host === host && env.event.type === "order.delivered" && env.event.agentId === agentId &&
       (!protectedIdentity || env.event.protectedIdentity === true));
+    if (found?.event.type === "order.delivered") return found.event;
+  }
+
+  private wasDelivered(order: Order, agentId: string, host: string, protectedIdentity = false): boolean {
+    return !!this.findDelivery(order, agentId, host, protectedIdentity);
   }
 
   private ownsCancellation(order: Order, ownerKey?: string): boolean {
@@ -3738,26 +4288,40 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  /**
-   * A relayed Order arrived for a Thread this Daemon has not seen yet (its
-   * `order.created` was fanned out before the targets were known). Start the
-   * local Thread copy from the Order itself.
-   */
-  private adoptOrder(order: Order): void {
-    this.knownOrders.set(order.orderId, order);
-    if (this.metas.has(order.threadId) || this.store.getThread(order.threadId)) return;
-    const env: ThreadEnvelope = { eventId: `${order.orderId}:created`, threadId: order.threadId, orderId: order.orderId, host: order.from.host, at: order.createdAt, event: { type: "order.created", order } };
-    const meta = this.updateMeta(env)!;
-    this.appendEvent(meta.file, env);
-    this.writeMeta(meta);
-    for (const ui of this.uis) ui.notify(Methods.threadEvent, { env, meta });
+  private recordRelayProof(proof: OrderAssignmentDelivery, from: Peer): void {
+    const { creation, assignmentEvent } = proof;
+    const meta = this.metas.get(creation.threadId) ?? this.store.getThread(creation.threadId);
+    if (this.closingEvent(creation.threadId, creation.orderId)) {
+      throw new RpcError("stale_order", "the relayed Order has already closed");
+    }
+    const priorCreation = meta && this.store.findLastEvent(meta.file, (env) =>
+      env.orderId === creation.orderId && (env.event.type === "order.created" || env.event.type === "order.replaced"));
+    if (priorCreation && priorCreation.eventId !== creation.eventId) {
+      throw new RpcError("bad_assignment", "relay creation does not match the recorded Order");
+    }
+    const pending = new Map<string, ThreadEnvelope>();
+    for (const event of [...(proof.predecessors ?? []), creation, assignmentEvent]) {
+      const existing = meta && this.store.findLastEvent(meta.file, ({ eventId }) => eventId === event.eventId);
+      if (existing) {
+        if (canonicalJson(existing) !== canonicalJson(event)) throw new RpcError("bad_assignment", "relay proof conflicts with the journal");
+      } else {
+        pending.set(event.eventId, event);
+      }
+    }
+    for (const event of pending.values()) {
+      this.recordEvent(event, { from, skipTrack: true });
+      const current = this.metas.get(event.threadId) ?? this.store.getThread(event.threadId);
+      if (!current || !this.store.findLastEvent(current.file, ({ eventId }) => eventId === event.eventId)) {
+        throw new RpcError("assignment_pending", "the owner creation and assignment must be journaled before relay");
+      }
+    }
   }
 
   private updateMeta(env: ThreadEnvelope): ThreadMeta | undefined {
     const ev = env.event;
     let meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
     if (!meta) {
-      if (ev.type !== "order.created") return undefined;
+      if (ev.type !== "order.created" && ev.type !== "order.replaced") return undefined;
       meta = {
         threadId: env.threadId,
         orderId: env.orderId,
@@ -3786,14 +4350,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     meta.lastActivityAt = env.at;
     this.evictCaches();
     const addr = (id: string) => this.registry.get(id)?.address;
-    type TargetState = "pending" | "acked" | "replied" | "declined" | "failed" | "skipped";
+    type TargetState = "pending" | "acked" | "replied" | "declined" | "failed" | "skipped" | "overridden";
     const setTargetState = (agentId: string, state: TargetState, onlyUpgrade = false) => {
       const list = (meta.targetStates ??= []);
       const entry = list.find((x) => x.agentId === agentId);
       if (!entry) list.push({ agentId, state });
       else if (!onlyUpgrade || entry.state === "pending") entry.state = state;
     };
-    if (ev.type === "order.created") {
+    if (ev.type === "order.created" || ev.type === "order.replaced") {
       this.knownOrders.set(ev.order.orderId, ev.order);
       // A new turn: the Thread now reflects this Order. The title stays on the
       // first question so a multi-turn Thread is still recognisable in list views.
@@ -3821,6 +4385,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         meta.declines = [];
         meta.targetStates = [];
         meta.closedAt = undefined;
+        if (ev.type === "order.replaced") {
+          meta.mode = ev.decision.mode;
+          meta.reason = ev.decision.reason;
+          meta.router = ev.decision.router;
+          meta.status = "delivering";
+          for (const id of ev.decision.targets) {
+            if (!meta.targets.includes(id)) meta.targets.push(id);
+            setTargetState(id, "pending");
+          }
+        }
       }
       return meta;
     }
@@ -3845,12 +4419,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         setTargetState(ev.agentId, "acked", true);
         break;
       case "order.replied":
+      case "order.overridden":
+      case "order.final-accepted": {
+        const reply = orderReplyView(ev);
+        if (!reply) break;
         meta.firstReplyAt ??= env.at;
-        if (ev.final) {
-          pushBounded(meta.replies, { agentId: ev.agentId, address: addr(ev.agentId), text: ev.text.slice(0, 600), at: env.at, ...(ev.source ? { source: ev.source } : {}) }, MAX_META_REPLIES);
-          if (meta.closedAt === undefined) setTargetState(ev.agentId, "replied");
+        if (reply.final) {
+          pushBounded(meta.replies, { agentId: reply.agentId, address: addr(reply.agentId), text: reply.text.slice(0, 600), at: env.at, ...(reply.source ? { source: reply.source } : {}) }, MAX_META_REPLIES);
+          if (meta.closedAt === undefined) setTargetState(reply.agentId, ev.type === "order.overridden" ? "overridden" : "replied");
         }
         break;
+      }
       case "order.declined":
         // A grace skip is not a decline: with a late reply the same agent would sit in both lists (#101).
         if (!ev.skipped) pushBounded(meta.declines, { agentId: ev.agentId, address: addr(ev.agentId), reason: ev.reason.slice(0, 300), at: env.at }, MAX_META_DECLINES);
@@ -3897,24 +4476,68 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     while (true) {
       const page = this.store.openThreadsPage(1000, cursor);
       if (!page.length) break;
-      for (const meta of page) {
+      for (const listed of page) {
+        let meta = listed;
         if (meta.status === "done" || meta.status === "failed" || meta.status === "cancelled") continue;
       // The latest Order only, read from the end of the Thread (#31).
-      const events = this.store.readOrderEvents(meta.file, meta.orderId);
-      const created = events.find((e) => e.event.type === "order.created")?.event;
-      if (!created || created.type !== "order.created") continue;
+      let events = this.store.readOrderEvents(meta.file, meta.orderId);
+      const replacement = events.findLast((env) => env.event.type === "order.replaced" && env.event.previousOrderId === meta.orderId);
+      if (replacement?.event.type === "order.replaced") {
+        events = this.store.readOrderEvents(meta.file, replacement.orderId);
+        for (const env of events) this.updateMeta(env);
+        meta = this.metas.get(meta.threadId) ?? meta;
+        this.writeMeta(meta);
+        if (meta.closedAt !== undefined) continue;
+      }
+      const createdEnv = events.find((e) => e.orderId === meta.orderId && (e.event.type === "order.created" || e.event.type === "order.replaced"));
+      const created = createdEnv?.event;
+      if (!createdEnv || !created || (created.type !== "order.created" && created.type !== "order.replaced")) continue;
       const order = created.order;
       if (order.from.host !== this.host) continue;
       this.metas.set(meta.threadId, meta);
       this.knownOrders.set(order.orderId, order);
       for (const e of events) this.seen.add(e.eventId);
-      const t: Tracking = { order, status: "open", replied: false, targets: new Map(), candidates: [], timers: new Map() };
+      const assignments = new Map<string, OrderAssignmentDelivery>();
+      for (const env of events) {
+        const recorded = env.event.type === "order.assigned"
+          ? [env.event.assignment]
+          : env.event.type === "order.replaced" && env.event.order.orderId === order.orderId && env.event.order.threadId === order.threadId
+            ? env.event.assignments ?? []
+            : [];
+        for (const assignment of recorded) {
+          const reference = OrderAssignmentReference.safeParse(assignment);
+          if (!reference.success || "body" in assignment || env.host !== this.host || (this.tlsContext?.network && env.eventHostId !== this.hostId)) continue;
+          assignments.set(assignment.targetAgentId, {
+            assignment: reference.data,
+            ownerHostId: env.eventHostId ?? this.hostId,
+            orderCreatedEventId: createdEnv.eventId,
+            assignmentEventId: env.eventId,
+            creation: { ...createdEnv, event: created },
+            ...(created.type === "order.replaced" ? { predecessors: this.replacementPredecessors(order.threadId, created.previousOrderId) } : {}),
+            assignmentEvent: env.event.type === "order.replaced"
+              ? { ...env, event: env.event }
+              : { ...env, event: { type: "order.assigned", assignment: reference.data } },
+          });
+        }
+      }
+      const t: Tracking = {
+        order,
+        creation: { ...createdEnv, event: created },
+        assignments,
+        status: "open",
+        replied: false,
+        targets: new Map(),
+        candidates: [],
+        timers: new Map(),
+      };
       this.tracking.set(order.orderId, t);
       n++;
       const savedRoute = events.find((e) => e.event.type === "order.routed")?.event;
-      const routed = savedRoute ?? (order.clarificationRecipient
-        ? { type: "order.routed" as const, decision: this.clarificationAnswerRoute(order.clarificationRecipient) }
-        : undefined);
+      const routed = savedRoute ?? (created.type === "order.replaced"
+        ? { type: "order.routed" as const, decision: created.decision }
+        : order.clarificationRecipient
+          ? { type: "order.routed" as const, decision: this.clarificationAnswerRoute(order.clarificationRecipient) }
+          : undefined);
       if (order.needsHuman) {
         this.close(t, "done");
         continue;
@@ -3924,20 +4547,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.close(t, "failed");
         continue;
       }
-      t.decision = routed.decision;
+      const variants = this.store.getOwnerDeliveryData<Record<string, string>>("variants", order.orderId, order.threadId);
+      t.decision = variants ? { ...routed.decision, variants } : routed.decision;
       for (const id of routed.decision.targets) t.targets.set(id, "pending");
+      for (const id of assignments.keys()) t.targets.set(id, "pending");
       for (const { event: ev } of events) {
         if (ev.type === "order.delivered" && !t.targets.has(ev.agentId)) t.targets.set(ev.agentId, "pending");
         else if (ev.type === "order.acked" && t.targets.get(ev.agentId) === "pending") t.targets.set(ev.agentId, "acked");
-        else if (ev.type === "order.replied" && ev.final) {
-          t.targets.set(ev.agentId, "done");
+        else if (orderReplyView(ev)?.final) {
+          t.targets.set(orderReplyView(ev)!.agentId, "done");
           t.replied = true;
         } else if (ev.type === "order.declined") t.targets.set(ev.agentId, "done");
         else if (ev.type === "order.failed" && ev.agentId) t.targets.set(ev.agentId, "failed");
       }
       t.candidates = routed.decision.candidates.filter((id) => !t.targets.has(id));
       for (const [id, st] of t.targets) {
-        if (st === "pending") this.armAck(t, id);
+        if (st === "pending" && created.type === "order.replaced" && assignments.has(id) && !this.wasDelivered(order, id, this.registry.get(id)?.host ?? this.host)) {
+          this.resumeReplacementDispatch(t, id);
+        } else if (st === "pending") this.armAck(t, id);
         else if (st === "acked") this.armHeartbeat(t, id);
       }
       // A recovered Order gets the same upper bound as a fresh one: a barista that acked before the
@@ -3945,10 +4572,22 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const defaultMs = routed.decision.mode !== "unicast" || order.kind === "notice" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
       const remaining = order.createdAt + (order.deadlineMs ?? defaultMs) - Date.now();
       t.deadline = setTimeout(() => this.finishOnDeadline(t), Math.max(0, remaining));
+      for (const env of events) {
+        if (env.event.type === "order.replied" && env.event.awaitingOwner) this.acceptAgentFinal(t, env);
+        if (env.event.type === "order.final-accepted") this.recordOutcome(env, env.event.agentId, "answered");
+      }
       this.maybeClose(t);
       }
       const last = page.at(-1)!;
       cursor = { createdAt: last.createdAt, threadId: last.threadId };
+    }
+    const pendingThreads = new Set(this.store.listPendingEvents().map(({ threadId }) => threadId));
+    for (const threadId of pendingThreads) {
+      try {
+        this.replayAssignmentEvents(threadId);
+      } catch (err) {
+        this.log(`pending assignment recovery failed for ${threadId}: ${(err as Error).message}`);
+      }
     }
     if (n) this.log(`recovered ${n} open order(s)`);
     return n;
@@ -4017,9 +4656,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (x.records.length) this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
       return {};
     });
-    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string }) => {
-      this.knownOrders.set(x.order.orderId, x.order);
-      this.deliver(x.order, x.agentId);
+    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
+      const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== host || proof.creation.eventHostId !== peer.hostIdentity.hostId)) {
+        throw new RpcError("bad_assignment", "relay owner does not match the authenticated Host");
+      }
+      this.recordRelayProof(proof, peer);
+      this.deliver(x.order, x.agentId, proof);
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
     peer.on("agent/kick", (x: { agentId: string }) => this.kick(x.agentId));
@@ -4465,9 +5108,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         ws.close();
       }
     });
-    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string }) => {
-      this.adoptOrder(x.order);
-      this.deliverLocal(x.order, x.agentId);
+    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
+      const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host)) {
+        throw new RpcError("bad_assignment", "relay targets a different Host");
+      }
+      this.recordRelayProof(proof, peer);
+      this.deliverLocal(x.order, x.agentId, proof);
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
     peer.on("agent/kick", (x: { agentId: string }) => this.agents.get(x.agentId)?.close());
@@ -5010,12 +5657,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const port = st.port ? `:${st.port}` : "(no TLS port)";
     if (!st.network) {
-      return {
-        name: "tls",
-        level: "fail",
-        detail: `TLS on ${port}, but not on the network yet — not connecting to the hub until it is: ${st.waiting}`,
-        next: /fingerprint/i.test(st.waiting ?? "") ? "cafe root show (on the hub) and compare the CA fingerprint" : "cafe root test",
-      };
+      const detail = `TLS on ${port}, but not on the network yet — not connecting to the hub until it is: ${st.waiting}`;
+      if (/fingerprint/i.test(st.waiting ?? "")) {
+        return { name: "tls", level: "fail", detail, next: "cafe root show (on the hub) and compare the CA fingerprint" };
+      }
+      if (this.tlsNeedsEnrollment) {
+        return {
+          name: "tls", level: "fail", detail,
+          next: "On the Root, run `cafe host invite`. Here, run `cafe connect <root> --invite <code>`, then `cafe daemon restart`.",
+        };
+      }
+      return { name: "tls", level: "fail", detail, next: "cafe root test" };
     }
     try {
       const leaf = new X509Certificate(this.tlsContext!.current().cert);
@@ -5251,8 +5903,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (live && live.status === "open") return undefined;
     const meta = this.metas.get(threadId) ?? this.store.getThread(threadId);
     if (!meta) return undefined;
-    const last = this.store.findLastEvent(meta.file, (env) => env.orderId === orderId && env.event.type === "order.closed");
-    return last;
+    const last = this.store.findLastEvent(meta.file, (env) =>
+      (env.orderId === orderId && env.event.type === "order.closed") ||
+      (env.event.type === "order.replaced" && env.event.previousOrderId === orderId));
+    return last?.event.type === "order.replaced"
+      ? { ...last, eventId: `${last.eventId}:previous`, orderId, event: { type: "order.closed", status: "cancelled" } }
+      : last;
   }
 
   /** Disconnect an Agent (web UI "kick"). Remote Agents are kicked via the Root. */

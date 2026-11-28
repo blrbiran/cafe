@@ -1,8 +1,12 @@
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { join, resolve } from "node:path";
 import { request as httpRequest } from "node:http";
 import { Agent, request } from "node:https";
 import { afterEach, describe, expect, it } from "vitest";
 import { localAddresses } from "../packages/daemon/src/tls/certs.ts";
-import { startDaemon } from "./helpers.ts";
+import { barista, identity, startDaemon } from "./helpers.ts";
 
 /**
  * v4-9: the TLS port already serves the Web UI; the daemon publishes the CA as an installable file
@@ -85,6 +89,70 @@ describe("encrypted Web for other devices (v4-9)", () => {
     expect((await write(`https://${lan}:${tlsPort}`)).status).not.toBe(403);
     expect((await write(`http://${lan}:${tlsPort}`)).status).toBe(403);
   }, 30_000);
+
+  it("discovers the pinned Root TLS endpoint before CLI sends an Order", async () => {
+    const lan = localAddresses()[0];
+    if (!lan) return;
+    const d = await startDaemon("lan-cli-pin", { mode: "root", config: TLS({ advertise: lan }) });
+    cleanup.push(d.stop);
+    const worker = await barista(d.addr, identity("pinned-worker"));
+    cleanup.push(() => worker.client.close());
+    const { caFingerprint, hostId } = await fetch(`http://${d.addr}/api/health`).then((r) => r.json()) as { caFingerprint?: string; hostId: string };
+    const fingerprint = caFingerprint ?? d.daemon.tlsStatus().caFingerprint;
+    const config = (rootHostId: string) => writeFileSync(join(d.home, "config.yml"), JSON.stringify({ host: "lan-cli-pin", mode: "root", token: "t0k", security: { mode: "tls", tls: { caFingerprint: fingerprint, rootHostId } } }));
+    const bin = resolve(import.meta.dirname, "../packages/cli/bin/cafe.js");
+    const ask = () => new Promise<{ code: number | null; stderr: string }>((done, reject) => {
+      const p = spawn(process.execPath, [bin, "ask", "--async", "--to", "pinned-worker", "check the totals"], {
+        env: { ...process.env, CAFE_HOME: d.home, CAFE_DAEMON: `${lan}:${d.server.port}`, CAFE_TOKEN: "t0k" },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      p.stderr.on("data", (chunk) => { stderr += chunk; });
+      p.on("error", reject);
+      p.on("close", (code) => done({ code, stderr }));
+    });
+    config(hostId);
+    const result = await ask();
+    expect(result.code, result.stderr).toBe(0);
+    const mcp = spawn(process.execPath, [bin, "mcp"], {
+      env: { ...process.env, CAFE_HOME: d.home, CAFE_DAEMON: `${lan}:${d.server.port}`, CAFE_TOKEN: "t0k" },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    cleanup.push(() => { mcp.kill(); });
+    const lines = createInterface({ input: mcp.stdout });
+    const answer = new Promise<string>((done, reject) => {
+      mcp.once("error", reject);
+      mcp.once("exit", (code) => reject(new Error(`MCP exited before replying (${code})`)));
+      lines.once("line", (line) => done(line));
+    });
+    mcp.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "cafe_ask", arguments: { question: "check the MCP totals", to: "pinned-worker", wait_seconds: 3 },
+    } })}\n`);
+    const response = JSON.parse(await answer);
+    expect(response.result.content[0].text).toContain("pinned-worker says: check the MCP totals");
+    const total = d.daemon.store.listThreads(10).length;
+    expect(total).toBe(2);
+    config("01J00000000000000000000000");
+    const rejected = await ask();
+    expect(rejected.code).toBe(1);
+    expect(rejected.stderr).toContain("pinned Root Host ID");
+    expect(d.daemon.store.listThreads(10)).toHaveLength(total);
+  });
+
+  it("checks remote clarification answer transport before processing the request", async () => {
+    const lan = localAddresses()[0];
+    if (!lan) return;
+    const d = await startDaemon("lan-clarification", { mode: "root", config: TLS() });
+    cleanup.push(d.stop);
+    const path = "/api/threads/unknown/clarifications/unknown/answer";
+    const headers = { authorization: "Bearer t0k", "content-type": "application/json" };
+    const plain = await fetch(`http://${lan}:${d.server.port}${path}`, { method: "POST", headers, body: "{}" });
+    expect(plain.status).toBe(403);
+    expect(await plain.json()).toMatchObject({ error: "tls_required" });
+    const { ca, tlsPort } = await fetch(`http://${d.addr}/api/tls`).then((r) => r.json() as Promise<{ ca: string; tlsPort: number }>);
+    const encrypted = await httpsGet(tlsPort, path, ca, headers, { host: lan, method: "POST", body: "{}" });
+    expect(JSON.parse(encrypted.body)).toMatchObject({ error: "bad_request" });
+  });
 
   it("a loopback request with a foreign Host cannot fetch /ca.crt either (#65)", async () => {
     const d = await startDaemon("lanhost", { mode: "root", config: TLS() });

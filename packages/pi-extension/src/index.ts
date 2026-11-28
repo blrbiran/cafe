@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { compactHistoryText, DEFAULT_PORT, type AgentRecord, type Attachment, type ChannelDigest, type Order, type ThreadEnvelope } from "@cafe/protocol";
+import { compactHistoryText, DEFAULT_PORT, orderReplyView, type AgentRecord, type Attachment, type ChannelDigest, type Order, type ThreadEnvelope } from "@cafe/protocol";
 import { loadAgentIdentity, loadTeamMember, readCafeFile } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 
@@ -146,9 +146,12 @@ export function orderPrompt(order: Order, self?: AgentRecord, attachments?: Arra
 function describeEvent(env: ThreadEnvelope, addr: (id: string) => string): string | undefined {
   const ev = env.event;
   switch (ev.type) {
-    case "order.replied": {
-      const speaker = ev.source === "operator" ? `an operator override for ${addr(ev.agentId)}` : addr(ev.agentId);
-      return `☕ ${ev.final ? "Reply" : "Interim reply"} from ${speaker} (threadId ${env.threadId}):\n\n${ev.text}`;
+    case "order.replied":
+    case "order.overridden": {
+      const reply = orderReplyView(ev);
+      if (!reply) return undefined;
+      const speaker = reply.source === "operator" ? `an operator override for ${addr(reply.agentId)}` : addr(reply.agentId);
+      return `☕ ${reply.final ? "Reply" : "Interim reply"} from ${speaker} (threadId ${env.threadId}):\n\n${reply.text}`;
     }
     case "order.declined":
       return `☕ ${addr(ev.agentId)} declined (threadId ${env.threadId}): ${ev.reason}`;
@@ -262,7 +265,7 @@ export default function cafe(pi: ExtensionAPI) {
     const closed = env.event.type === "order.closed";
     if (entry.collected) {
       if (!closed) {
-        if (text && (env.event.type === "order.declined" || (env.event.type === "order.replied" && env.event.final))) {
+        if (text && (env.event.type === "order.declined" || orderReplyView(env.event)?.final === true)) {
           entry.collected.set(env.eventId, text.slice(0, COLLECTED_RESULT_CHARS));
           if (entry.collected.size > 20) entry.collected.delete(entry.collected.keys().next().value!);
         }

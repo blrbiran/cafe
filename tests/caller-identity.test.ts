@@ -94,7 +94,8 @@ describe("HTTP caller identity and idempotency", () => {
   it("requires a local operator credential for HTTP replyAs", async () => {
     const d = await startDaemon("operator-reply", { mode: "root" });
     cleanups.push(d.stop);
-    const target = await barista(d.addr, identity("target"), async () => new Promise<void>(() => {}));
+    let agentOrder: import("@cafe/protocol/client").OrderHandle | undefined;
+    const target = await barista(d.addr, identity("target"), async (handle) => { agentOrder = handle; await handle.ack(); });
     cleanups.push(() => target.client.close());
     const order = await d.daemon.createOrder({ body: "operator test", kind: "order", to: target.rec.address }, undefined, "f".repeat(64));
     const path = `/api/threads/${order.threadId}/orders/${order.orderId}/reply`;
@@ -109,6 +110,13 @@ describe("HTTP caller identity and idempotency", () => {
     expect((await post("0".repeat(64))).status).toBe(403);
     const key = readFileSync(`${d.home}/operator.key`, "utf8");
     expect((await post(key)).status).toBe(200);
+    await agentOrder!.reply("late Agent result");
+    const thread = d.daemon.thread(order.threadId)!;
+    expect(thread.events.find(({ event }) => event.type === "order.overridden")).toMatchObject({
+      actor: { kind: "operator" }, event: { targetAgentId: target.rec.agentId, text: "operator answer", final: true },
+    });
+    expect(thread.events.find(({ event }) => event.type === "order.replied" && event.text === "late Agent result")?.event).toMatchObject({ auditOnly: true });
+    expect(thread.meta.replies.map((reply) => reply.text)).toEqual(["operator answer"]);
   });
 
   it("requires an authenticated caller for HTTP order creation", async () => {

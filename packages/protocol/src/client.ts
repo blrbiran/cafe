@@ -239,8 +239,8 @@ export class CafeClient {
       peer.on(Methods.orderCancelled, (x: { orderId: string; threadId: string; by: string }) => {
         for (const fn of this.cancelListeners) fn(x);
       });
-      peer.on(Methods.orderDeliver, ({ order, attachmentPaths }: { order: Order; attachmentPaths?: Record<string, string> }) => {
-        const h = this.handle(order, attachmentPaths);
+      peer.on(Methods.orderDeliver, ({ order, attachmentPaths, assignmentId }: { order: Order; attachmentPaths?: Record<string, string>; assignmentId?: string }) => {
+        const h = this.handle(order, attachmentPaths, assignmentId);
         if (order.clarificationRecipient) {
           const prior = this.clarificationDeliveries.get(order.orderId);
           if (prior !== undefined) {
@@ -399,8 +399,8 @@ export class CafeClient {
     });
   }
 
-  private handle(order: Order, attachmentPaths?: Record<string, string>): OrderHandle {
-    const base = { orderId: order.orderId, threadId: order.threadId };
+  private handle(order: Order, attachmentPaths?: Record<string, string>, assignmentId?: string): OrderHandle {
+    const base = { orderId: order.orderId, threadId: order.threadId, ...(assignmentId ? { assignmentId } : {}) };
     return {
       order,
       ...(order.attachments?.length
@@ -408,7 +408,7 @@ export class CafeClient {
         : {}),
       ack: async () => {
         if (!order.clarificationRecipient) return this.req(Methods.orderAck, base);
-        await this.ackClarification(order);
+        await this.ackClarification(order, base);
         this.clarificationDeliveries.set(order.orderId, true);
       },
       heartbeat: (note) => this.req(Methods.orderHeartbeat, { ...base, note }),
@@ -418,8 +418,7 @@ export class CafeClient {
   }
 
   /** Keep the original handler waiting across a transient disconnect. */
-  private async ackClarification(order: Order): Promise<void> {
-    const params = { orderId: order.orderId, threadId: order.threadId };
+  private async ackClarification(order: Order, params: { orderId: string; threadId: string; assignmentId?: string }): Promise<void> {
     const until = order.createdAt + (order.deadlineMs ?? 300_000);
     for (;;) {
       const peer = this.peer;

@@ -2,7 +2,7 @@ import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, 
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
-import { DEFAULT_CHANNEL, type AgentRecord, type HostIdentity, type OrderAssignment, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
+import { DEFAULT_CHANNEL, orderReplyView, type AgentRecord, type HostIdentity, type OrderAssignment, type OrderAssignmentReference, type ThreadEnvelope, type ThreadMeta } from "@cafe/protocol";
 
 /** Decode a Thread's metadata; a Thread written before channels existed is a default-channel Thread. */
 function threadMeta(raw: string): ThreadMeta {
@@ -43,11 +43,11 @@ export interface FollowupProgress {
 export interface StoredOrderAssignment {
   orderId: string;
   threadId: string;
-  assignment: OrderAssignment;
+  assignment: OrderAssignment | OrderAssignmentReference;
 }
 
 export interface MissingEventAuthority {
-  kind: "order" | "assignment";
+  kind: "order" | "assignment" | "delivery" | "reply";
   id: string;
 }
 
@@ -214,6 +214,14 @@ export class Store {
         PRIMARY KEY(kind, credential_digest),
         UNIQUE(kind, principal_id)
       );
+      CREATE TABLE IF NOT EXISTS owner_delivery_data (
+        kind TEXT NOT NULL,
+        id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY(kind, id)
+      );
+      CREATE INDEX IF NOT EXISTS owner_delivery_data_thread ON owner_delivery_data(thread_id);
       CREATE TABLE IF NOT EXISTS recipient_assignments (
         assignment_id TEXT PRIMARY KEY,
         order_id TEXT NOT NULL,
@@ -235,6 +243,8 @@ export class Store {
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
     if (!cols.has("identity")) this.db.exec("ALTER TABLE agent_events ADD COLUMN identity TEXT");
     if (!cols.has("tokens")) this.db.exec("ALTER TABLE agent_events ADD COLUMN tokens TEXT");
+    if (!cols.has("result_id")) this.db.exec("ALTER TABLE agent_events ADD COLUMN result_id TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS agent_events_result ON agent_events(result_id) WHERE result_id IS NOT NULL");
     // After the migration: an older database gets `identity` just above (#68).
     this.db.exec("CREATE INDEX IF NOT EXISTS agent_events_identity ON agent_events(identity, kind, at DESC)");
     // v4-11: channel is a first-class column so filtering never scans the 200-Thread snapshot
@@ -483,6 +493,24 @@ export class Store {
     return row?.principal_id;
   }
 
+  putOwnerDeliveryData(kind: "assignment" | "variants", id: string, threadId: string, value: unknown): void {
+    const json = JSON.stringify(value);
+    const result = this.db.prepare("INSERT OR IGNORE INTO owner_delivery_data(kind, id, thread_id, value) VALUES (?, ?, ?, ?)")
+      .run(kind, id, threadId, json);
+    if (result.changes) return;
+    const prior = this.db.prepare("SELECT thread_id, value FROM owner_delivery_data WHERE kind = ? AND id = ?")
+      .get(kind, id) as { thread_id: string; value: string };
+    if (prior.thread_id !== threadId || !isDeepStrictEqual(JSON.parse(prior.value), JSON.parse(json))) {
+      throw new Error(`conflicting owner delivery record: ${id}`);
+    }
+  }
+
+  getOwnerDeliveryData<T>(kind: "assignment" | "variants", id: string, threadId: string): T | undefined {
+    const row = this.db.prepare("SELECT value FROM owner_delivery_data WHERE kind = ? AND id = ? AND thread_id = ?")
+      .get(kind, id, threadId) as { value: string } | undefined;
+    return row ? JSON.parse(row.value) as T : undefined;
+  }
+
   putRecipientAssignment(record: RecipientAssignmentRecord): RecipientAssignmentRecord {
     if (!record.assignmentId || !record.orderId || !record.threadId || !record.targetAgentId || !record.targetHostId || !record.bodyHash) {
       throw new Error("recipient assignment requires exact IDs and body hash");
@@ -560,7 +588,7 @@ export class Store {
       const assignments = event.type === "order.assigned"
         ? [event.assignment]
         : event.type === "order.replaced" && event.order.orderId === orderId && event.order.threadId === env.threadId
-          ? event.assignments
+          ? event.assignments ?? []
           : [];
       for (const assignment of assignments) {
         if (assignment.assignmentId !== assignmentId) continue;
@@ -589,6 +617,17 @@ export class Store {
 
   /** Append one event line; returns the bytes written (for /api/health counters). */
   appendEvent(file: string, env: ThreadEnvelope): number {
+    const assignments = env.event.type === "order.assigned"
+      ? [env.event.assignment]
+      : env.event.type === "order.replaced" && env.event.order.orderId === env.orderId && env.event.order.threadId === env.threadId
+        ? env.event.assignments ?? []
+        : [];
+    for (const assignment of assignments) {
+      const existing = this.getOrderAssignment(file, env.orderId, assignment.assignmentId);
+      if (existing && !isDeepStrictEqual(existing.assignment, assignment)) {
+        throw new Error(`assignment ID conflict: ${assignment.assignmentId}`);
+      }
+    }
     const fd = openSync(file, "a+");
     try {
       const size = fstatSync(fd).size;
@@ -668,7 +707,10 @@ export class Store {
     const eventJson = JSON.stringify(env);
     const existing = this.db.prepare("SELECT event_json FROM pending_events WHERE event_id = ?").get(env.eventId) as { event_json: string } | undefined;
     if (existing) {
-      if (existing.event_json !== eventJson) throw new Error(`pending event id conflict: ${env.eventId}`);
+      if (existing.event_json !== eventJson && !isDeepStrictEqual(JSON.parse(existing.event_json), JSON.parse(eventJson))) {
+        throw new Error(`pending event id conflict: ${env.eventId}`);
+      }
+      this.db.prepare("UPDATE pending_events SET missing_authority = ? WHERE event_id = ?").run(JSON.stringify(missing), env.eventId);
       return;
     }
     const count = (this.db.prepare("SELECT COUNT(*) AS n FROM pending_events").get() as { n: number }).n;
@@ -684,6 +726,17 @@ export class Store {
       ? this.db.prepare("SELECT event_json FROM pending_events WHERE thread_id = ? ORDER BY at, event_id").all(threadId) as { event_json: string }[]
       : this.db.prepare("SELECT event_json FROM pending_events ORDER BY at, event_id").all() as { event_json: string }[];
     return rows.map((row) => JSON.parse(row.event_json) as ThreadEnvelope);
+  }
+
+  pendingDependentThreads(eventId: string, orderId: string, assignmentId?: string): string[] {
+    const rows = this.db.prepare(`SELECT DISTINCT thread_id FROM pending_events
+      WHERE json_extract(missing_authority, '$.id') IN (?, ?, ?)`)
+      .all(eventId, orderId, assignmentId ?? null) as { thread_id: string }[];
+    return rows.map((row) => row.thread_id);
+  }
+
+  removePendingEvent(eventId: string): void {
+    this.db.prepare("DELETE FROM pending_events WHERE event_id = ?").run(eventId);
   }
 
   /**
@@ -722,9 +775,10 @@ export class Store {
   /** The searchable text of an event: the question, a Barista reply, or a result report; undefined otherwise. */
   private static searchable(env: ThreadEnvelope, who: (agentId: string) => string): { who: string; text: string } | undefined {
     const ev = env.event;
-    if (ev.type === "order.created") return { who: ev.order.from.address, text: ev.order.body };
-    if (ev.type === "order.replied" || ev.type === "order.reported") return { who: who(ev.agentId), text: ev.text };
-    return undefined;
+    if (ev.type === "order.created" || ev.type === "order.replaced") return { who: ev.order.from.address, text: ev.order.body };
+    if (ev.type === "order.reported") return { who: who(ev.agentId), text: ev.text };
+    const reply = orderReplyView(ev);
+    return reply ? { who: who(reply.agentId), text: reply.text } : undefined;
   }
 
   /**
@@ -1135,12 +1189,14 @@ export class Store {
     const dirs = new Set<string>();
     const del = this.db.prepare("DELETE FROM threads WHERE thread_id = ?");
     const delFollowupProgress = this.db.prepare("DELETE FROM followup_projection_progress WHERE thread_id = ?");
+    const delOwnerDeliveryData = this.db.prepare("DELETE FROM owner_delivery_data WHERE thread_id = ?");
     // One transaction for the row deletes (#34); the files go afterwards, outside the transaction.
     this.db.exec("BEGIN");
     try {
       for (const m of metas) {
         del.run(m.threadId);
         delFollowupProgress.run(m.threadId);
+        delOwnerDeliveryData.run(m.threadId);
         // Never touch files outside this home's sessions/ directory, whatever the metadata says.
         const sessions = resolve(this.home, "sessions") + sep;
         if (resolve(m.file).startsWith(sessions) && existsSync(m.file)) {
@@ -1306,11 +1362,11 @@ export class Store {
     kind: "answered" | "declined" | "failed",
     at: number,
     threadId: string,
-    extra: { identity?: string; tokens?: string[] } = {},
+    extra: { identity?: string; tokens?: string[]; resultId?: string } = {},
   ): void {
     this.db
-      .prepare("INSERT INTO agent_events(agent_id, kind, at, thread_id, identity, tokens) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(agentId, kind, at, threadId, extra.identity ?? null, extra.tokens?.length ? extra.tokens.join(" ") : null);
+      .prepare("INSERT OR IGNORE INTO agent_events(agent_id, kind, at, thread_id, identity, tokens, result_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(agentId, kind, at, threadId, extra.identity ?? null, extra.tokens?.length ? extra.tokens.join(" ") : null, extra.resultId ?? null);
   }
 
   /** Outcomes since `since`, for routing hints. `identity` is null on rows written before v2. */

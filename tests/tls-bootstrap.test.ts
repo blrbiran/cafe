@@ -2,7 +2,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpsPostRequest } from "node:https";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ThreadEnvelope } from "@cafe/protocol";
+import type { Peer } from "@cafe/protocol/peer";
 import { fingerprintOf } from "../packages/daemon/src/tls/certs.ts";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
@@ -94,7 +96,82 @@ describe("CA bootstrap", () => {
     const res = await c.ask({ body: "the invoice total is wrong" });
     const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ agentId: b.rec.agentId });
+
+    const queuedBeforeDelivery: Array<string | undefined> = [];
+    const worker = await barista(child.addr, identity("cold-recipient"), async (h) => {
+      const assignment = child.daemon.thread(h.order.threadId)?.events.find(({ event }) => event.type === "order.assigned")?.event;
+      const inbox = assignment?.type === "order.assigned" && child.daemon.store.getRecipientAssignment(assignment.assignment.assignmentId);
+      queuedBeforeDelivery.push(inbox ? inbox.body : undefined);
+      await h.ack();
+      await h.reply(`checked: ${h.order.body}`);
+    });
+    cleanup.push(() => worker.client.close());
+    await waitFor(() => root.daemon.registry.get(worker.rec.agentId)?.status === "idle");
+    const rootCaller = await customer(root.addr);
+    cleanup.push(() => rootCaller.close());
+    const outbound = await rootCaller.ask({ body: "check the totals", to: "cold-recipient" });
+    const outboundEvents = await untilClosed(rootCaller, outbound.threadId, outbound.orderId);
+    const issued = outboundEvents.find(({ event }) => event.type === "order.assigned");
+    expect(issued).toBeDefined();
+    const recipientEvents = child.daemon.thread(outbound.threadId)?.events ?? [];
+    expect(recipientEvents.find(({ event }) => event.type === "order.assigned")?.eventId).toBe(issued?.eventId);
+    expect(queuedBeforeDelivery).toEqual(["check the totals"]);
+
+    const uplink = (child.daemon as unknown as { uplink: Peer }).uplink;
+    const notify = uplink.notify.bind(uplink);
+    let delayed: ThreadEnvelope | undefined;
+    const hold = vi.spyOn(uplink, "notify").mockImplementation((method, params) => {
+      const env = params as ThreadEnvelope | undefined;
+      if (method === "thread/event" && env?.event.type === "order.delivered") delayed = env;
+      else notify(method, params);
+    });
+    cleanup.push(() => { hold.mockRestore(); });
+    const reordered = await rootCaller.ask({ body: "check a delayed receipt", to: "cold-recipient" });
+    await waitFor(() => root.daemon.store.listPendingEvents(reordered.threadId).some(({ event }) => event.type === "order.replied"));
+    expect(root.daemon.thread(reordered.threadId)?.meta.replies).toEqual([]);
+    expect(delayed).toBeDefined();
+    hold.mockRestore();
+    notify("thread/event", delayed);
+    const replayed = await untilClosed(rootCaller, reordered.threadId, reordered.orderId);
+    expect(replayed.filter(({ event }) => event.type === "order.replied")).toHaveLength(1);
+    expect(root.daemon.store.listPendingEvents(reordered.threadId)).toEqual([]);
+
+    const firstTarget = await barista(root.addr, identity("replace-first"), async (h) => { await h.ack(); });
+    cleanup.push(() => firstTarget.client.close());
+    const previous = await rootCaller.ask({ body: "old task", to: "replace-first" });
+    expect(child.daemon.thread(previous.threadId)).toBeUndefined();
+    const replacement = await rootCaller.ask({ body: "new task", to: "cold-recipient", threadId: previous.threadId, replaceOrderId: previous.orderId });
+    const replacementEvents = await untilClosed(rootCaller, replacement.threadId, replacement.orderId);
+    expect(replacementEvents.find(({ event }) => event.type === "order.replied")?.event).toMatchObject({ text: "checked: new task" });
+    expect(child.daemon.thread(previous.threadId)?.meta.orderId).toBe(replacement.orderId);
   }, 40_000);
+
+  it("keeps an old child certificate local and gives both re-enrollment steps in Doctor", async () => {
+    const root = await startDaemon("legacy-root", { mode: "root", config: { security: { mode: "tls", tls: { port: 0 } } } });
+    cleanup.push(root.stop);
+    const childHome = mkdtempSync(join(tmpdir(), "cafe-ca-legacy-child-"));
+    cleanup.push(() => rmSync(childHome, { recursive: true, force: true }));
+    const ca = readFileSync(join(root.home, "tls", "ca.crt"), "utf8");
+    const leaf = await root.daemon.tlsContext!.issue!(["legacy-child", "127.0.0.1", "localhost"]);
+    const { mkdirSync } = await import("node:fs");
+    const tlsDir = join(childHome, "tls");
+    mkdirSync(tlsDir);
+    writeFileSync(join(tlsDir, "ca.crt"), ca);
+    writeFileSync(join(tlsDir, "legacy-child.crt"), leaf.cert);
+    writeFileSync(join(tlsDir, "legacy-child.key"), leaf.key, { mode: 0o600 });
+    const child = await startDaemon("legacy-child", {
+      home: childHome,
+      config: { root: `127.0.0.1:${root.server.tlsPort}`, security: { mode: "tls", tls: { port: 0, caFingerprint: fingerprintOf(ca) } } },
+    });
+    cleanup.push(child.stop);
+    expect(child.daemon.rootOnline).toBe(false);
+    expect(readFileSync(join(tlsDir, "legacy-child.crt"), "utf8")).toBe(leaf.cert);
+    const doctor = await fetch(`http://${child.addr}/api/doctor`).then((r) => r.json() as Promise<{ checks: { name: string; next?: string; detail: string }[] }>);
+    const tls = doctor.checks.find(({ name }) => name === "tls");
+    expect(tls?.detail).toContain("needs enrollment");
+    expect(tls?.next).toContain("cafe host invite");
+    expect(tls?.next).toContain("cafe connect <root> --invite <code>");
+  }, 30_000);
 
   it("a child without an invite does not silently join a Root that appears later", async () => {
     // The pre-invite contract let a child enrol by itself as soon as its Root came up. Host identity

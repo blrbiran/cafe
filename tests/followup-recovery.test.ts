@@ -1,7 +1,8 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ThreadEnvelope } from "@cafe/protocol";
 import { stringify } from "yaml";
 import { CafeClient, keepAlive } from "@cafe/protocol/client";
 import type { Order, ThreadMeta } from "@cafe/protocol";
@@ -196,6 +197,115 @@ describe("restart & reconnect", () => {
     await waitFor(() => d.daemon.thread(res.threadId)?.meta.status === "failed", 5000);
   });
 
+  it.each([false, true])("recovers a committed fallback before delivery and replays ready replies (ready reply: %s)", async (readyReply) => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-fallback-recovery-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    const store = new Store(home);
+    const order: Order = {
+      orderId: "fallback-order", threadId: "fallback-thread", kind: "order",
+      from: { id: "cli:seed", address: "cli@fallback", host: "fallback" },
+      body: "check the parser", createdAt: Date.now(), turn: 1, chain: [], depth: 0, history: [],
+    };
+    const file = store.threadFile(order.threadId, order.createdAt);
+    const append = (eventId: string, event: import("@cafe/protocol").ThreadEnvelope["event"]) =>
+      store.appendEvent(file, { eventId, orderId: order.orderId, threadId: order.threadId, host: "fallback", at: order.createdAt, event });
+    append("created", { type: "order.created", order });
+    append("routed", { type: "order.routed", decision: { targets: ["primary"], candidates: ["backup"], mode: "unicast", reason: "test", router: "rules" } });
+    append("failed", { type: "order.failed", agentId: "primary", reason: "no ack" });
+    append("assigned", { type: "order.assigned", assignment: { assignmentId: "backup-assignment", targetAgentId: "backup", targetHostId: "fallback", bodyHash: "a".repeat(64) } });
+    store.putThread({
+      threadId: order.threadId, orderId: order.orderId, kind: "order", from: order.from, targets: ["primary"],
+      status: "delivering", summary: order.body, summaryTurn: 1, createdAt: order.createdAt, file, turns: 1, replies: [], declines: [],
+    });
+    if (readyReply) {
+      const identity = { orderId: order.orderId, threadId: order.threadId, host: "backup-host", eventHostId: "fallback", at: order.createdAt + 1 };
+      store.appendEvent(file, { ...identity, eventId: "delivered", event: { type: "order.delivered", agentId: "backup", assignmentId: "backup-assignment" } });
+      store.stagePendingEvent({ ...identity, eventId: "pending-reply", actor: { kind: "agent", principalId: "backup" },
+        event: { type: "order.replied", agentId: "backup", assignmentId: "backup-assignment", text: "finished before restart", final: true },
+      }, { kind: "delivery", id: "backup-assignment" });
+    }
+    const d = await startDaemon("fallback", { home, mode: "root", timing: { ...FAST, ackTimeoutMs: 60_000 } });
+    cleanup.push(d.stop);
+    if (readyReply) {
+      expect(d.daemon.thread(order.threadId)?.meta.status).toBe("done");
+      expect(d.daemon.thread(order.threadId)?.meta.replies[0]?.text).toBe("finished before restart");
+      expect(d.daemon.store.listPendingEvents(order.threadId)).toEqual([]);
+    } else {
+      expect(d.daemon.thread(order.threadId)?.meta.status).toBe("delivering");
+    }
+  });
+
+  it("recovers a committed replacement when the SQLite index still names the old Order", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-replace-recovery-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    const store = new Store(home);
+    const old: Order = {
+      orderId: "previous-order", threadId: "replace-thread", kind: "order",
+      from: { id: "cli:seed", address: "cli@replacing", host: "replacing" },
+      body: "old task", createdAt: Date.now(), turn: 1, chain: [], depth: 0, history: [],
+    };
+    const next: Order = { ...old, orderId: "replacement-order", body: "new task", turn: 2 };
+    const file = store.threadFile(old.threadId, old.createdAt);
+    const common = { threadId: old.threadId, host: "replacing", at: old.createdAt };
+    store.appendEvent(file, { ...common, eventId: "created", orderId: old.orderId, event: { type: "order.created", order: old } });
+    store.putThread({
+      threadId: old.threadId, orderId: old.orderId, kind: "order", from: old.from, targets: ["worker"],
+      status: "working", summary: old.body, summaryTurn: 1, createdAt: old.createdAt, file, turns: 1, replies: [], declines: [],
+    });
+    store.appendEvent(file, { ...common, eventId: "replacement", orderId: next.orderId, event: {
+      type: "order.replaced", previousOrderId: old.orderId, order: next,
+      decision: { targets: ["worker"], candidates: [], mode: "unicast", reason: "test", router: "explicit" },
+      assignments: [{ assignmentId: "replacement-assignment", targetAgentId: "worker", targetHostId: "replacing", bodyHash: "a".repeat(64) }],
+    } });
+    store.close();
+    const d = await startDaemon("replacing", { home, mode: "root", timing: { ...FAST, ackTimeoutMs: 60_000 } });
+    cleanup.push(d.stop);
+    expect(d.daemon.thread(old.threadId)?.meta).toMatchObject({ orderId: next.orderId, status: "delivering", turns: 2 });
+    expect(d.daemon.closingEvent(old.threadId, old.orderId)?.event).toEqual({ type: "order.closed", status: "cancelled" });
+    expect(d.daemon.hasOrder(old.threadId, next.orderId)).toBe(true);
+  });
+
+  it("delivers a committed replacement after a restart before dispatch", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cafe-replace-redelivery-"));
+    cleanup.push(() => rmSync(home, { recursive: true, force: true }));
+    const first = await startDaemon("replace-resume", { home, mode: "root" });
+    cleanup.push(first.stop);
+    const worker = new CafeClient({ daemon: first.addr, reconnect: true });
+    cleanup.push(() => worker.close());
+    let received: string | undefined;
+    worker.onOrder((h) => {
+      if (h.order.body === "replacement task") {
+        received = h.order.orderId;
+        void h.ack().then(() => h.reply("replacement complete")).catch(() => {});
+      }
+    });
+    await worker.connect(identity("worker"));
+    const owner = "b".repeat(64);
+    const previous = await first.daemon.createOrder({ kind: "order", body: "original task", to: "worker" }, undefined, owner);
+    const append = first.daemon.store.appendEvent.bind(first.daemon.store);
+    let committed: ThreadEnvelope | undefined;
+    const interruption = vi.spyOn(first.daemon.store, "appendEvent").mockImplementation((file, env) => {
+      const bytes = append(file, env);
+      if (env.event.type === "order.replaced") {
+        committed = env;
+        throw new Error("interrupted after replacement append");
+      }
+      return bytes;
+    });
+    try {
+      await expect(first.daemon.createOrder({ kind: "order", body: "replacement task", to: "worker", threadId: previous.threadId, replaceOrderId: previous.orderId }, undefined, owner))
+        .rejects.toThrow("interrupted after replacement append");
+    } finally {
+      interruption.mockRestore();
+    }
+    expect(committed).toBeDefined();
+    await first.stop();
+    const restored = await startDaemon("replace-resume", { home, mode: "root", port: first.server.port });
+    cleanup.push(restored.stop);
+    await waitFor(() => restored.daemon.thread(previous.threadId)?.meta.status === "done");
+    expect(received).toBe(committed?.orderId);
+  });
+
   it("recovers an open Order older than the first 1,000 Threads", async () => {
     const home = mkdtempSync(join(tmpdir(), "cafe-recover-many-"));
     cleanup.push(() => rmSync(home, { recursive: true, force: true }));
@@ -237,6 +347,6 @@ describe("restart & reconnect", () => {
     d.daemon.replyAs("thread-0000", { orderId: "order-0000", agent: registered!.address, text: "recovered oldest Order" });
     const result = d.daemon.thread("thread-0000")!;
     expect(result.meta.status).toBe("done");
-    expect(result.events.find((env) => env.event.type === "order.replied")?.orderId).toBe("order-0000");
+    expect(result.events.find((env) => env.event.type === "order.overridden")?.orderId).toBe("order-0000");
   });
 });

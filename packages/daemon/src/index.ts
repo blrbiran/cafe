@@ -126,6 +126,8 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
           const hostId = (remote ? enrolledHostId : storedHostIdentity?.hostId ?? enrolledHostId) ?? ulid();
           let active: { cert: string; key: string };
           const rootHostId = config.security.tls.rootHostId ?? daemon.rootHostId;
+          daemon.tlsNeedsEnrollment = remote && (!enrolledHostId || !rootHostId);
+          const enrollmentRequired = "this Host needs enrollment with a one-use Root invitation";
           const renewFromRoot = async (sans: string[], key: string, rootCa = ca.cert) => {
             if (!config.root || !rootHostId || !enrolledHostId) throw new Error("run `cafe connect <root> --invite <code>` to enroll this Host");
             const publicKey = createPublicKey(key).export({ format: "pem", type: "spki" }).toString();
@@ -145,7 +147,7 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
             });
           if (!pendingRoot) {
             try {
-              if (remote && (!enrolledHostId || !rootHostId)) throw new Error("run `cafe connect <root> --invite <code>` to enroll this Host");
+              if (daemon.tlsNeedsEnrollment) throw new Error(enrollmentRequired);
               const leaf = await issueNetworkLeaf();
               active = { cert: leaf.cert, key: leaf.key };
             } catch (err) {
@@ -278,10 +280,16 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   // it moves onto the real CA and its `wss://` links come on, without a restart (v4-6 §3.3).
   if (daemon.tlsContext?.enrol && !daemon.tlsContext.network) daemon.startEnrolmentRetry();
   if (!opts.noSupervisor) {
-    daemon.supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token, log: (m) => daemon.log(m) });
-    const { reaped, skipped } = await daemon.supervisor.restore();
-    if (reaped) daemon.log(`reaped ${reaped} barista worker group(s) left by a previous daemon`);
-    for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);
+    try {
+      const supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token, log: (m) => daemon.log(m) });
+      daemon.restoreLocalRosterWriteScopes(supervisor);
+      const { reaped, skipped } = await supervisor.restore();
+      daemon.supervisor = supervisor;
+      if (reaped) daemon.log(`reaped ${reaped} barista worker group(s) left by a previous daemon`);
+      for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);
+    } catch (err) {
+      daemon.log(`barista supervisor unavailable: ${(err as Error).message}`);
+    }
   }
   daemon.recover();
   daemon.backfillSearchIndex();

@@ -59,7 +59,7 @@ async function network() {
 
 describe("direct links while the Root is offline (ADR-0004)", () => {
   it("delivers across hosts directly, then backfills the Root when it returns", async () => {
-    const { root, a, worker } = await network();
+    const { root, a, b, worker } = await network();
     await root.stop();
     await waitFor(() => !a.daemon.rootOnline, 3000);
 
@@ -70,6 +70,13 @@ describe("direct links while the Root is offline (ADR-0004)", () => {
     const events = await untilClosed(c, res.threadId, res.orderId);
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ agentId: worker.rec.agentId, text: "worker says: do the work please" });
     expect(events.at(-1)?.event).toEqual({ type: "order.closed", status: "done" });
+    const sourceCreation = events.find(({ event }) => event.type === "order.created");
+    const recipientCreation = b.daemon.thread(res.threadId)?.events.find(({ event }) => event.type === "order.created");
+    expect(recipientCreation?.eventId).toBe(sourceCreation?.eventId);
+    const sourceAssignment = events.find(({ event }) => event.type === "order.assigned");
+    expect(sourceAssignment).toBeDefined();
+    const recipientAssignment = b.daemon.thread(res.threadId)?.events.find(({ event }) => event.type === "order.assigned");
+    expect(recipientAssignment?.eventId).toBe(sourceAssignment?.eventId);
 
     await root.start();
     await waitFor(() => a.daemon.rootOnline, 5000);
