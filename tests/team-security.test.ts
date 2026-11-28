@@ -70,6 +70,7 @@ describe("team start never learns an executable from the request body", () => {
     d.daemon.supervisor = {
       list: () => [],
       commitRosterWriteScopes: () => {},
+      pendingTeamRelocation: () => undefined,
       stopUnsafeTeamWorkers: async () => ({ stopped: [], pending: [] }),
       startTeam: (dir: string, team: (typeof calls)[number]["team"]) => {
         calls.push({ dir, team });
@@ -118,6 +119,7 @@ describe("team start never learns an executable from the request body", () => {
     d.daemon.supervisor = {
       list: () => [],
       commitRosterWriteScopes: () => {},
+      pendingTeamRelocation: () => undefined,
       syncTeam: async () => ({ committedHash: "fixture", stopped: [], pending: [], restarted: [], started: [] }),
       startTeam: () => {
         started++;
@@ -149,6 +151,7 @@ describe("team start never learns an executable from the request body", () => {
     d.daemon.supervisor = {
       list: () => [],
       commitRosterWriteScopes: () => {},
+      pendingTeamRelocation: () => undefined,
       stopUnsafeTeamWorkers: async () => ({ stopped: [], pending: [] }),
       startTeam: (_dir: string, team: (typeof calls)[number]["team"]) => {
         calls.push({ team });
