@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { loadAgentIdentity } from "@cafe/protocol/cafe-file";
+import { loadAgentIdentity, managedAgentResumeStore } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 import { buildFollowup, buildPrompt, DECLINE_MARKER } from "../serve.ts";
 import { extractAttachments } from "../artifacts.ts";
@@ -54,7 +54,7 @@ export async function runBridge(opts: BridgeOptions): Promise<{ client: CafeClie
       ? new CodexEngine(engineOpts)
       : new ClaudeEngine(engineOpts);
 
-  const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log });
+  const client = new CafeClient({ daemon: opts.daemon, token: opts.token, reconnect: true, log, resumeStore: managedAgentResumeStore() });
   // An Order is acknowledged on arrival, so it needs heartbeats while it waits behind a long turn.
   const queue: Array<{ h: OrderHandle; stopBeat: () => void }> = [];
   let current: { orderId: string; abort: AbortController } | undefined;

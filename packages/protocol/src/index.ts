@@ -220,6 +220,7 @@ export const AgentIdentity = CafeFile.extend({
   /** Local directory holding the roster `.cafe` (same Host only; lets the daemon read the full roster). */
   teamDir: z.string().optional(),
   memberLaunchHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  durableAssignments: z.literal(true).optional(),
   /** Free-form responsibility label used as a routing signal. */
   duty: z.string().min(1).max(64).optional(),
   /** Channels this Agent receives from; the first entry is its home channel. Absent = ["default"]. */
@@ -779,6 +780,8 @@ export const Methods = {
   /** D→A: an Order you were working on was cancelled by its Customer. */
   orderCancelled: "order/cancelled",
   orderAck: "order/ack",
+  orderReceive: "order/receive",
+  assignmentStatus: "order/assignment-status",
   orderHeartbeat: "order/heartbeat",
   orderReply: "order/reply",
   orderDecline: "order/decline",

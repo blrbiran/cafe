@@ -651,7 +651,12 @@ export class Supervisor {
             ? ["-e", this.extension]
             : readonlyToolArgs(agentKind(bin)!, this.extension)
         ), ...(w.spec.args ?? [])];
-    const env = w.member ? { ...this.env, CAFE_TEAM_MEMBER: w.member, CAFE_TEAM_DIR: w.rosterDir! } : this.env;
+    const scope = createHash("sha256").update(JSON.stringify([w.rosterDir ?? null, w.member ?? null, workDir, w.slot, w.spec.agent ?? w.spec.bin ?? this.piBin, w.spec.access ?? "read-only", Boolean(w.spec.tui)])).digest("hex");
+    const env = {
+      ...this.env,
+      ...(w.member ? { CAFE_TEAM_MEMBER: w.member, CAFE_TEAM_DIR: w.rosterDir! } : {}),
+      CAFE_AGENT_RESUME_FILE: join(this.home, "agent-identities", `${scope}.json`),
+    };
     // fd 3 is the guard's parent-death pipe: we keep our end open and never write to it.
     const child = spawn(process.execPath, args, { cwd: workDir, env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
     w.child = child;

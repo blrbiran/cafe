@@ -1,10 +1,79 @@
-import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import type { AgentAssignment, AgentResumeState, AgentResumeStore } from "./client.ts";
 import { dirname, join, resolve } from "node:path";
 import { parse } from "yaml";
 import { CafeDocument, type AgentIdentity, type CafeFile, type TeamMember, type TeamSpec } from "./index.ts";
 
 export const CAFE_FILE_NAME = ".cafe";
+
+function loadAgentState<T>(file: string, maxBytes: number): T | undefined {
+  let fd: number;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || (stat.mode & 0o077) || stat.size > maxBytes) throw new Error("invalid managed Agent state file");
+    return JSON.parse(readFileSync(fd, "utf8")) as T;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function saveAgentState(file: string, state: unknown): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify(state), { flag: "wx", mode: 0o600 });
+  renameSync(temporary, file);
+}
+
+/** The supervisor supplies a dedicated state file for each managed Worker. */
+export function managedAgentResumeStore(file = process.env.CAFE_AGENT_RESUME_FILE): AgentResumeStore | undefined {
+  if (!file) return undefined;
+  const queueFile = `${file}.queue`;
+  type Entry = { item: AgentAssignment; claimed: boolean };
+  const readQueue = () => loadAgentState<Entry[]>(queueFile, 64 * 1024 * 1024) ?? [];
+  const storeQueue = (entries: Entry[]) => {
+    if (Buffer.byteLength(JSON.stringify(entries)) > 64 * 1024 * 1024) throw new Error("managed Agent queue is full");
+    saveAgentState(queueFile, entries);
+  };
+  return {
+    daemonScope: file,
+    load: () => loadAgentState<AgentResumeState>(file, 8192),
+    save: (state) => saveAgentState(file, state),
+    queue: {
+      put(item) {
+        const entries = readQueue();
+        const existing = entries.find((entry) => entry.item.assignmentId === item.assignmentId);
+        if (existing) {
+          if (existing.item.order.orderId !== item.order.orderId || existing.item.order.threadId !== item.order.threadId) throw new Error("conflicting managed Agent assignment");
+          return;
+        }
+        if (entries.length >= 500) throw new Error("managed Agent queue is full");
+        storeQueue([...entries, { item, claimed: false }]);
+      },
+      list: () => readQueue().map(({ item }) => item),
+      isClaimed: (assignmentId) => readQueue().find(({ item }) => item.assignmentId === assignmentId)?.claimed ?? false,
+      claim(assignmentId) {
+        const entries = readQueue();
+        const entry = entries.find(({ item }) => item.assignmentId === assignmentId);
+        if (!entry || entry.claimed) return false;
+        entry.claimed = true;
+        storeQueue(entries);
+        return true;
+      },
+      forgetOrder(orderId, threadId) {
+        const entries = readQueue();
+        const remaining = entries.filter(({ item }) => item.order.orderId !== orderId || item.order.threadId !== threadId);
+        if (remaining.length < entries.length) storeQueue(remaining);
+      },
+    },
+  };
+}
 
 /** Walk from `start` up to the filesystem root and return the nearest `.cafe` regular file. */
 export function findCafeFile(start: string): string | undefined {

@@ -1115,13 +1115,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const agentId = peer.meta.agentId as string | undefined;
     if (agentId && this.agents.get(agentId) === peer) {
+      const durable = this.local.get(agentId)?.durableAssignments === true;
       this.agents.delete(agentId);
       this.local.delete(agentId);
       this.unregister(agentId);
       // Fail anything that agent was working on.
       for (const t of this.tracking.values()) {
         const s = t.targets.get(agentId);
-        if ((s === "pending" || s === "acked") && !(s === "pending" && t.order.clarificationRecipient)) {
+        if ((s === "pending" || s === "acked") && !(s === "pending" && (t.order.clarificationRecipient || durable))) {
           this.targetFailed(t, agentId, "agent disconnected");
         }
       }
@@ -1191,6 +1192,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
       return this.createOrder(parsed.data, peer);
     });
+    peer.on(Methods.orderReceive, (p: { orderId: string; threadId: string; assignmentId: string }) => this.acceptRecipientAssignment(peer, p));
     peer.on(Methods.orderAck, (p: { orderId: string; threadId: string }) => this.agentEvent(peer, p, { type: "order.acked", agentId: peer.meta.agentId }));
     peer.on(Methods.orderHeartbeat, (p: { orderId: string; threadId: string; note?: string }) =>
       this.agentEvent(peer, p, { type: "order.heartbeat", agentId: peer.meta.agentId, note: p.note }),
@@ -1274,6 +1276,66 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.subscribe(p.threadId, peer);
       return {};
     });
+  }
+
+  private assignmentIsActive(order: Order, assignmentId: string, targetHostId: string): boolean {
+    const tracking = this.tracking.get(order.orderId);
+    if (order.from.host !== this.host || tracking?.status !== "open") return false;
+    const assignment = [...tracking.assignments.values()].find(({ assignment }) => assignment.assignmentId === assignmentId)?.assignment;
+    if (!assignment || assignment.targetHostId !== targetHostId) return false;
+    const state = tracking.targets.get(assignment.targetAgentId);
+    return state === "pending" || state === "acked";
+  }
+
+  private async remoteAssignmentStatus(order: Order, assignmentId: string): Promise<boolean> {
+    const direct = [...(this.threadLinks.get(order.threadId) ?? [])].find((peer) => !peer.isClosed && peer.meta.host === order.from.host);
+    const route = direct ?? (this.isRoot ? this.children.get(order.from.host) : this.uplink);
+    if (!route || route.isClosed) throw new RpcError("assignment_pending", "waiting for the assignment's owner Host");
+    const result = await route.request<{ active: boolean }>(Methods.assignmentStatus, {
+      threadId: order.threadId, orderId: order.orderId, assignmentId,
+      ...(this.isRoot ? { targetHostId: this.assignmentTargetHostId(this.host) } : {}),
+    }, 2000);
+    return result.active === true;
+  }
+
+  private async answerAssignmentStatus(peer: Peer, p: { threadId: string; orderId: string; assignmentId: string; targetHostId?: string }): Promise<{ active: boolean }> {
+    const allowedRootRelay = !this.isRoot && peer === this.uplink;
+    const targetHostId = allowedRootRelay ? p.targetHostId ?? peer.hostIdentity?.hostId ?? this.rootHost
+      : peer.hostIdentity?.hostId ?? peer.meta.host;
+    const order = this.findParentOrder(p.orderId, p.threadId);
+    if (typeof p.assignmentId !== "string" || !targetHostId) return { active: false };
+    if (!order) throw new RpcError("assignment_pending", "waiting for the Order's assignment evidence");
+    if (order.threadId !== p.threadId) return { active: false };
+    if (order.from.host === this.host) return { active: this.assignmentIsActive(order, p.assignmentId, targetHostId) };
+    if (!this.isRoot) return { active: false };
+    const owner = this.children.get(order.from.host);
+    if (!owner || owner.isClosed) throw new RpcError("assignment_pending", "waiting for the assignment's owner Host");
+    return owner.request(Methods.assignmentStatus, { threadId: p.threadId, orderId: p.orderId, assignmentId: p.assignmentId, targetHostId }, 1500);
+  }
+
+  private async acceptRecipientAssignment(peer: Peer, p: { orderId: string; threadId: string; assignmentId: string }): Promise<{ active: boolean }> {
+    const agentId = peer.meta.agentId as string | undefined;
+    if (!agentId || this.agents.get(agentId) !== peer || !this.local.get(agentId)?.durableAssignments) {
+      throw new RpcError("not_registered", "durable Agent registration is required");
+    }
+    const assignment = this.store.getRecipientAssignment(p.assignmentId);
+    if (!assignment || assignment.orderId !== p.orderId || assignment.threadId !== p.threadId || assignment.targetAgentId !== agentId) {
+      return { active: false };
+    }
+    const order = this.findParentOrder(p.orderId, p.threadId);
+    if (!order || order.threadId !== p.threadId || !this.canDeliverLocal(order, agentId, peer)) return { active: false };
+    const active = order.from.host === this.host
+      ? this.assignmentIsActive(order, p.assignmentId, assignment.targetHostId)
+      : await this.remoteAssignmentStatus(order, p.assignmentId);
+    if (!active || !this.canDeliverLocal(order, agentId, peer)) return { active: false };
+    this.subscribe(order.threadId, peer);
+    if (!this.store.getRecipientAssignmentReceipt(p.assignmentId)) {
+      this.store.putRecipientAssignmentReceipt({ assignmentId: p.assignmentId, agentId, acceptedAt: Date.now() });
+    }
+    if (this.findDelivery(order, agentId, this.host)?.assignmentId !== p.assignmentId) {
+      this.recordAgentDelivery(order, agentId, p.assignmentId);
+    }
+    return { active: true };
   }
 
   private agentEvent(peer: Peer, p: { orderId: string; threadId: string; assignmentId?: string }, event: ThreadEventBody): {} {
@@ -3201,6 +3263,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   /** Handlers shared by both ends of a direct link. */
   private bindLink(peer: Peer): void {
+    peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
     peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
       if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host) ||
@@ -3345,7 +3408,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private notifyLocal(order: Order, agentId: string, peer: Peer, assignment: OrderAssignmentDelivery): void {
     if (!this.canDeliverLocal(order, agentId, peer)) return;
-    if (this.tlsContext?.network) {
+    const durable = this.local.get(agentId)?.durableAssignments === true;
+    if (this.tlsContext?.network || durable) {
       const reference = assignment.assignment;
       const existing = this.store.getRecipientAssignment(reference.assignmentId);
       this.store.putRecipientAssignment({
@@ -3360,7 +3424,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     peer.notify(Methods.orderDeliver, { order, assignmentId: assignment.assignment.assignmentId, attachmentPaths: this.attachmentPaths(order) });
     this.deliveredParentBodies.set(`${order.orderId}:${agentId}`, summarize(assignment.creation.event.order.body, 639));
     if (this.deliveredParentBodies.size > 2048) this.deliveredParentBodies.delete(this.deliveredParentBodies.keys().next().value!);
-    this.emitEvent(order, { type: "order.delivered", agentId, assignmentId: assignment.assignment.assignmentId, ...(this.store.getKv<string>(`agent-proof:${agentId}`) ? { protectedIdentity: true } : {}) });
+    if (!durable) this.recordAgentDelivery(order, agentId, assignment.assignment.assignmentId);
+  }
+
+  private recordAgentDelivery(order: Order, agentId: string, assignmentId: string): void {
+    this.emitEvent(order, { type: "order.delivered", agentId, assignmentId, ...(this.store.getKv<string>(`agent-proof:${agentId}`) ? { protectedIdentity: true } : {}) });
   }
 
   private relayFailure(order: Order, agentId: string, reason: string): void {
@@ -4656,6 +4724,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (x.records.length) this.broadcastDelta(this.registry.upsert(x.records.map((r) => ({ ...r, host }))));
       return {};
     });
+    peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
     peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
       if (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== host || proof.creation.eventHostId !== peer.hostIdentity.hostId)) {
@@ -5108,6 +5177,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         ws.close();
       }
     });
+    peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
     peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
       if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host)) {

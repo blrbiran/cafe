@@ -21,10 +21,37 @@ import {
 } from "./index.ts";
 import { Peer, RpcError } from "./peer.ts";
 
+export interface AgentResumeState {
+  agentId: string;
+  proof: string;
+  scope: string;
+}
+
+export interface AgentAssignment {
+  assignmentId: string;
+  order: Order;
+  attachmentPaths?: Record<string, string>;
+}
+
+export interface AgentResumeStore {
+  daemonScope?: string;
+  load(): AgentResumeState | undefined;
+  save(state: AgentResumeState): void;
+  queue?: {
+    put(assignment: AgentAssignment): void;
+    list(): AgentAssignment[];
+    claim(assignmentId: string): boolean;
+    isClaimed(assignmentId: string): boolean;
+    forgetOrder(orderId: string, threadId: string): void;
+  };
+}
+
 export interface ClientOptions {
   /** `host:port` of the Daemon; defaults to the local one. */
   daemon?: string;
   token?: string;
+  /** Local storage for an explicitly managed Agent identity. */
+  resumeStore?: AgentResumeStore;
   /** Reconnect automatically and re-register (long-lived agents). */
   reconnect?: boolean;
   /** cafe release of this client, for the daemon's mismatch message. */
@@ -68,10 +95,14 @@ export class CafeClient {
   private peer?: Peer;
   private ws?: WebSocket;
   private identity?: AgentIdentity;
-  private readonly resumeProof = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+  private resumeProof = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+  private resumeState?: AgentResumeState;
+  private resumeScope?: string;
   private closedByUser = false;
   private retry = 0;
   private readonly clarificationDeliveries = new Map<string, boolean>();
+  private readonly dispatchedAssignments = new Map<string, string>();
+  private readonly acceptingAssignments = new Map<string, Peer>();
   private orderListeners = new Set<Listener<OrderHandle>>();
   private cancelListeners = new Set<Listener<{ orderId: string; threadId: string; by: string }>>();
   private eventListeners = new Set<Listener<ThreadEnvelope>>();
@@ -208,6 +239,15 @@ export class CafeClient {
   /** Connect and (optionally) register. Resolves once registered. */
   async connect(identity?: AgentIdentity): Promise<AgentRecord | undefined> {
     this.identity = identity;
+    if (identity && this.opts.resumeStore) {
+      this.resumeScope = JSON.stringify([this.opts.resumeStore.daemonScope ?? this.opts.daemon, identity.name, identity.team, identity.teamChannel, identity.member, identity.mode, identity.cwd]);
+      const saved = this.opts.resumeStore.load();
+      if (saved) {
+        if (saved.scope !== this.resumeScope || !/^[a-f0-9]{64}$/.test(saved.proof) || !saved.agentId) throw new Error("saved Agent identity does not match this worker");
+        this.resumeState = saved;
+        this.resumeProof = saved.proof;
+      }
+    }
     this.closedByUser = false;
     return this.open();
   }
@@ -237,9 +277,16 @@ export class CafeClient {
       const peer = new Peer(ws);
       let settled = false;
       peer.on(Methods.orderCancelled, (x: { orderId: string; threadId: string; by: string }) => {
+        this.forgetQueuedOrder(x.orderId, x.threadId);
         for (const fn of this.cancelListeners) fn(x);
       });
       peer.on(Methods.orderDeliver, ({ order, attachmentPaths, assignmentId }: { order: Order; attachmentPaths?: Record<string, string>; assignmentId?: string }) => {
+        const queue = this.opts.resumeStore?.queue;
+        if (queue && assignmentId && this.record?.durableAssignments) {
+          const item = { order, attachmentPaths, assignmentId };
+          queue.put(item);
+          return this.acceptQueuedAssignment(peer, item);
+        }
         const h = this.handle(order, attachmentPaths, assignmentId);
         if (order.clarificationRecipient) {
           const prior = this.clarificationDeliveries.get(order.orderId);
@@ -253,6 +300,7 @@ export class CafeClient {
         for (const fn of this.orderListeners) fn(h);
       });
       peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
+        if (env.event.type === "order.closed") this.forgetQueuedOrder(env.orderId, env.threadId);
         this.recent.push(env);
         if (this.recent.length > 500) this.recent.splice(0, this.recent.length - 500);
         for (const fn of this.eventListeners) fn(env);
@@ -315,7 +363,7 @@ export class CafeClient {
           this.peer = peer;
           this.retry = 0;
           // Keep the same agentId across reconnects so in-flight Orders stay attributable.
-          const identity = this.identity ? { ...this.identity, resumeAgentId: this.record?.agentId ?? this.identity.resumeAgentId } : undefined;
+          const identity = this.identity ? { ...this.identity, resumeAgentId: this.record?.agentId ?? this.resumeState?.agentId ?? this.identity.resumeAgentId } : undefined;
           if (identity) {
             // A confirmed-incapable Daemon is refused before publishing the identity (v4-12 D3).
             if (identity.observer && this.supports("digests") === false) {
@@ -334,9 +382,24 @@ export class CafeClient {
               }
               throw new RpcError("unsupported_capability", this.upgradeHint(`${this.who()} does not support team-sessions; team registration was refused`));
             }
-            const registered = await peer.request<AgentRecord & { teamContext?: TeamContext }>(Methods.agentRegister, { ...identity, resumeProof: this.resumeProof });
+            const registered = await peer.request<AgentRecord & { teamContext?: TeamContext }>(Methods.agentRegister, {
+              ...identity, resumeProof: this.resumeProof,
+              ...(this.opts.resumeStore?.queue ? { durableAssignments: true } : {}),
+            });
+            if (this.resumeScope && this.opts.resumeStore) {
+              if (this.resumeState && registered.agentId !== this.resumeState.agentId) throw new RpcError("bad_identity", "daemon did not restore the saved Agent ID");
+              this.resumeState = { agentId: registered.agentId, proof: this.resumeProof, scope: this.resumeScope };
+              this.opts.resumeStore.save(this.resumeState);
+            }
             this.teamRosterRevision = registered.teamContext?.revision;
             this.record = registered;
+            if (registered.durableAssignments) {
+              for (const item of this.opts.resumeStore?.queue?.list() ?? []) {
+                void this.acceptQueuedAssignment(peer, item).catch((err: unknown) => {
+                  this.warn(`could not restore queued Cafe assignment: ${(err as Error).message}`);
+                });
+              }
+            }
             this.setTeamContext(registered.teamContext);
             // With no advertisement, the echo still proves support: an old Daemon strips these.
             const lost: string[] = [];
@@ -397,6 +460,54 @@ export class CafeClient {
         } catch {}
       });
     });
+  }
+
+  private forgetQueuedOrder(orderId: string, threadId: string): void {
+    for (const [assignmentId, queuedOrderId] of this.dispatchedAssignments) {
+      if (queuedOrderId === orderId) this.dispatchedAssignments.delete(assignmentId);
+    }
+    this.opts.resumeStore?.queue?.forgetOrder(orderId, threadId);
+  }
+
+  private async acceptQueuedAssignment(peer: Peer, item: AgentAssignment): Promise<void> {
+    const queue = this.opts.resumeStore?.queue;
+    if (!queue) return;
+    const { order, assignmentId, attachmentPaths } = item;
+    if (this.acceptingAssignments.get(assignmentId) === peer) return;
+    this.acceptingAssignments.set(assignmentId, peer);
+    try {
+      const deadline = order.createdAt + (order.deadlineMs ?? 7_200_000);
+      while (!peer.isClosed && this.peer === peer && Date.now() < deadline) {
+        let receipt: { active: boolean };
+        try {
+          receipt = await peer.request(Methods.orderReceive, { assignmentId, orderId: order.orderId, threadId: order.threadId }, 3000);
+        } catch (err) {
+          if (!(err instanceof RpcError) || !["assignment_pending", "timeout", "closed"].includes(err.code)) throw err;
+          if (peer.isClosed) return;
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 100);
+            if (typeof timer === "object") timer.unref?.();
+          });
+          continue;
+        }
+        if (!receipt.active) {
+          queue.forgetOrder(order.orderId, order.threadId);
+          return;
+        }
+        if (peer.isClosed || this.peer !== peer || queue.isClaimed(assignmentId) || this.dispatchedAssignments.has(assignmentId)) return;
+        this.dispatchedAssignments.set(assignmentId, order.orderId);
+        const handle = this.handle(order, attachmentPaths, assignmentId);
+        const ack = handle.ack;
+        handle.ack = async () => {
+          queue.claim(assignmentId);
+          await ack();
+        };
+        for (const listener of this.orderListeners) listener(handle);
+        return;
+      }
+    } finally {
+      if (this.acceptingAssignments.get(assignmentId) === peer) this.acceptingAssignments.delete(assignmentId);
+    }
   }
 
   private handle(order: Order, attachmentPaths?: Record<string, string>, assignmentId?: string): OrderHandle {

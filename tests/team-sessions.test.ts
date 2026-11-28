@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { TeamSpec } from "@cafe/protocol";
-import type { CafeClient } from "@cafe/protocol/client";
+import { CafeClient } from "@cafe/protocol/client";
+import { managedAgentResumeStore } from "@cafe/protocol/cafe-file";
 import { FAST, barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
 // v4-13: a team has one front door. `to: <team>` and a fresh message in the team channel reach
@@ -300,6 +301,74 @@ describe("team sessions (v4-13)", () => {
     expect(result.events.filter((e) => e.event.type === "order.reported")).toEqual([
       expect.objectContaining({ orderId: first.orderId, event: { type: "order.reported", agentId: lead.rec.agentId, text: report.text } }),
     ]);
+  });
+
+  it("resumes a Barista and reports on its original Order from a fresh client", async () => {
+    const d = await startDaemon("report-resume", { mode: "root" });
+    cleanup.push(d.stop);
+    const stateFile = join(d.home, "agent-identities", "lead.json");
+    const resume = managedAgentResumeStore(stateFile)!;
+    const lead = new CafeClient({ daemon: d.addr, resumeStore: resume });
+    cleanup.push(() => lead.close());
+    lead.onOrder((h) => { void h.ack().then(() => h.reply("assigned")).catch(() => {}); });
+    const first = await lead.connect(identity("lead"));
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const order = await c.ask({ body: "review release", to: "lead" });
+    await untilClosed(c, order.threadId, order.orderId);
+    const delivered = d.daemon.thread(order.threadId)?.events.find(({ event }) => event.type === "order.delivered")?.event;
+    expect(delivered?.type).toBe("order.delivered");
+    if (delivered?.type !== "order.delivered" || !delivered.assignmentId) throw new Error("missing durable assignment");
+    expect(d.daemon.store.getRecipientAssignmentReceipt(delivered.assignmentId)?.agentId).toBe(first!.agentId);
+    lead.close();
+    await waitFor(() => (d.daemon.registry.get(first!.agentId)?.status ?? "offline") === "offline");
+    const restored = new CafeClient({ daemon: d.addr, resumeStore: managedAgentResumeStore(stateFile) });
+    cleanup.push(() => restored.close());
+    expect((await restored.connect(identity("lead")))?.agentId).toBe(first!.agentId);
+    await restored.report({ ...order, text: "finished after resume" });
+    expect(d.daemon.thread(order.threadId)?.events.some(({ event }) => event.type === "order.reported")).toBe(true);
+  });
+
+  it.each(["receipt lost", "before acknowledgement"] as const)("resumes a queued assignment after interruption (%s)", async (interruption) => {
+    const d = await startDaemon("receipt-resume", { mode: "root", timing: { ...FAST, ackTimeoutMs: 3000 } });
+    cleanup.push(d.stop);
+    const file = join(d.home, "agent-identities", "worker.json");
+    const resume = managedAgentResumeStore(file)!;
+    const first = new CafeClient({ daemon: d.addr, resumeStore: resume });
+    cleanup.push(() => first.close());
+    let injected = 0;
+    first.onOrder(() => {
+      if (interruption === "before acknowledgement") first.close();
+      else injected++;
+    });
+    const agent = await first.connect(identity("worker"));
+    const c = await customer(d.addr);
+    cleanup.push(() => c.close());
+    const target = d.daemon as unknown as { acceptRecipientAssignment: (...args: unknown[]) => Promise<{ active: boolean }> };
+    const accept = target.acceptRecipientAssignment.bind(target);
+    if (interruption === "receipt lost") {
+      const drop = vi.spyOn(target, "acceptRecipientAssignment").mockImplementationOnce(async (...args) => {
+        await accept(...args);
+        first.close();
+        throw new Error("simulated dropped receipt response");
+      });
+      cleanup.push(() => { drop.mockRestore(); });
+    }
+    const created = await c.ask({ body: "run the assigned task", to: "worker" });
+    await waitFor(() => (d.daemon.registry.get(agent!.agentId)?.status ?? "offline") === "offline");
+    expect(resume.queue!.list()).toHaveLength(1);
+    expect(injected).toBe(0);
+    const restarted = new CafeClient({ daemon: d.addr, resumeStore: managedAgentResumeStore(file) });
+    cleanup.push(() => restarted.close());
+    restarted.onOrder((h) => {
+      injected++;
+      void h.ack().then(() => h.reply("done after receipt retry")).catch(() => {});
+    });
+    expect((await restarted.connect(identity("worker")))?.agentId).toBe(agent!.agentId);
+    const events = await untilClosed(c, created.threadId, created.orderId);
+    expect(events.filter(({ event }) => event.type === "order.delivered")).toHaveLength(1);
+    expect(events.filter(({ event }) => event.type === "order.replied")).toHaveLength(1);
+    expect(injected).toBe(1);
   });
 
   it("recovers a late result report after the reporting and requester Hosts reconnect", async () => {

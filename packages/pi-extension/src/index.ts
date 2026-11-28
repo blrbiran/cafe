@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { compactHistoryText, DEFAULT_PORT, orderReplyView, type AgentRecord, type Attachment, type ChannelDigest, type Order, type ThreadEnvelope } from "@cafe/protocol";
-import { loadAgentIdentity, loadTeamMember, readCafeFile } from "@cafe/protocol/cafe-file";
+import { loadAgentIdentity, loadTeamMember, managedAgentResumeStore, readCafeFile } from "@cafe/protocol/cafe-file";
 import { CafeClient, keepAlive, type OrderHandle } from "@cafe/protocol/client";
 
 const STATUS_KEY = "cafe";
@@ -395,7 +395,7 @@ export default function cafe(pi: ExtensionAPI) {
         setUiStatus("☕ cafe: daemon unreachable");
         return;
       }
-      const c = new CafeClient({ daemon: addr, token: process.env.CAFE_TOKEN, reconnect: true });
+      const c = new CafeClient({ daemon: addr, token: process.env.CAFE_TOKEN, reconnect: true, resumeStore: managedAgentResumeStore() });
       c.onOrder((h) => {
         if (known.has(h.order.orderId)) return;
         known.add(h.order.orderId);

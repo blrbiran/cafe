@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ThreadEnvelope } from "@cafe/protocol";
-import type { Peer } from "@cafe/protocol/peer";
-import type { OrderHandle } from "@cafe/protocol/client";
+import { RpcError, type Peer } from "@cafe/protocol/peer";
+import { CafeClient, type OrderHandle } from "@cafe/protocol/client";
+import { managedAgentResumeStore } from "@cafe/protocol/cafe-file";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 import { enrollTestChild } from "./tls-helpers.ts";
 
@@ -107,6 +108,26 @@ describe("a TLS child daemon reaches a TLS Root", () => {
     for (const d of [root, child]) {
       expect(d.daemon.thread(contested.threadId)?.meta.replies.map(({ text }) => text)).toEqual(["operator result"]);
       expect(d.daemon.store.outcomes(0).filter((entry) => entry.agentId === held.rec.agentId && entry.kind === "answered")).toEqual([]);
+    }
+
+    const durable = new CafeClient({ daemon: root.addr, resumeStore: managedAgentResumeStore(join(rootHome, "agent-identities", "receipt.json")) });
+    cleanup.push(() => durable.close());
+    let executions = 0;
+    durable.onOrder((h) => {
+      executions++;
+      void h.ack().then(() => h.reply("receipt checkpoint recovered")).catch(() => {});
+    });
+    await durable.connect(identity("receipt-worker"));
+    const ownerStatus = child.daemon as unknown as { answerAssignmentStatus(...args: unknown[]): Promise<{ active: boolean }> };
+    const status = vi.spyOn(ownerStatus, "answerAssignmentStatus").mockRejectedValueOnce(new RpcError("assignment_pending", "simulated temporary owner status failure"));
+    try {
+      const queued = await c.ask({ body: "check the receipt", to: "receipt-worker", deadlineMs: 3000 });
+      const result = await untilClosed(c, queued.threadId, queued.orderId);
+      expect(result.filter(({ event }) => event.type === "order.delivered")).toHaveLength(1);
+      expect(result.find(({ event }) => event.type === "order.final-accepted")?.event).toMatchObject({ text: "receipt checkpoint recovered" });
+      expect(executions).toBe(1);
+    } finally {
+      status.mockRestore();
     }
 
     const owner = "c".repeat(64);
