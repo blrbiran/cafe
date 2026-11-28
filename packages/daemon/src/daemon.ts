@@ -1944,6 +1944,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private checkTuiLaunch(identity: AgentIdentity): void {
     const key = rosterKey({ host: this.host, team: identity.team!, channel: identity.teamChannel! });
+    const relocation = this.supervisor?.pendingTeamRelocation();
+    if (relocation?.ownerKey === key || this.supervisor?.relocationFenceBlocks(canonicalPathOrMissing(identity.cwd))) {
+      throw new RpcError("team_relocating", "this team is relocating; retry after cafe team relocate completes");
+    }
     const roster = this.teamRecords.get(key);
     const memberName = identity.member ?? identity.name;
     const member = roster?.members.find((entry) => entry.name === memberName);
@@ -2190,9 +2194,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const ownerKey = rosterKey({ host: this.host, team: name, channel });
     const owners = this.store.getKv<Record<string, string>>("rosterOwners") ?? {};
     const pending = this.supervisor.pendingTeamRelocation();
-    if (pending) {
-      if (pending.ownerKey !== ownerKey || pending.fromPath !== source || pending.toPath !== destination) throw new RpcError("conflict", "another team relocation is pending");
-    } else if (owners[ownerKey] !== source) {
+    if (pending && (pending.ownerKey !== ownerKey || pending.fromPath !== source || pending.toPath !== destination ||
+        pending.targetHash !== targetHash || canonicalJson(pending.targetSpec) !== canonicalJson(team))) {
+      throw new RpcError("conflict", "retry the pending relocation with its original destination roster");
+    }
+    if (owners[ownerKey] !== source && !(pending && owners[ownerKey] === destination)) {
       throw new RpcError("conflict", `this Host does not own ${team.name} from ${source}`);
     }
     const destinationOwner = Object.entries(owners).find(([key, path]) => key !== ownerKey && path === destination);
@@ -2209,11 +2215,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!existsSync(newFile) || createHash("sha256").update(readFileSync(newFile)).digest("hex") !== targetHash) {
       throw new RpcError("conflict", "destination roster changed during relocation; retry with the current file");
     }
+    for (const member of team.members) validateMemberPath(this.store.home, destination, member.name, member.dir);
     let result: Awaited<ReturnType<NonNullable<Daemon["supervisor"]>["relocateTeam"]>>;
     try {
       result = await this.supervisor.relocateTeam({
         rosterRootId: pending?.rosterRootId ?? this.rosterRootIdFor(source),
         ownerKey, fromPath: source, toPath: destination, committedHash, targetHash, targetSpec: team,
+        quarantineSource: () => this.quarantineTeamRoster(source),
       });
     } catch (error) {
       throw new RpcError("conflict", (error as Error).message);
@@ -2231,6 +2239,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (!existsSync(file) || createHash("sha256").update(readFileSync(file)).digest("hex") !== relocation.targetHash) {
       throw new RpcError("conflict", "destination roster changed while relocation was pending");
     }
+    const destinationTeam = TeamLaunchSpec.safeParse(relocation.targetSpec);
+    if (!destinationTeam.success) throw new RpcError("bad_request", destinationTeam.error.message);
+    for (const member of destinationTeam.data.members) validateMemberPath(this.store.home, relocation.toPath, member.name, member.dir);
     if (Object.entries(owners).some(([key, path]) => key !== relocation.ownerKey && canonicalPathOrMissing(path) === relocation.toPath)) {
       throw new RpcError("conflict", "destination acquired a different roster owner during relocation");
     }
@@ -2248,11 +2259,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       casState.rosterDir = relocation.toPath;
       this.persistTeamRosterCas();
     }
-    this.publishRoster(relocation.toPath, relocation.targetSpec);
+    this.publishRoster(relocation.toPath, relocation.targetSpec, relocation.id);
     this.supervisor!.completeTeamRelocation(relocation.id);
   }
 
-  publishRoster(rosterDir: string, team: TeamSpec): void {
+  publishRoster(rosterDir: string, team: TeamSpec, relocationId?: string): void {
     const parsed = TeamLaunchSpec.safeParse(team);
     if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
     team = parsed.data;
@@ -2261,7 +2272,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const previous = this.teamRecords.get(key);
     const canonical = realpathSync(rosterDir);
     const relocation = this.supervisor?.pendingTeamRelocation();
-    if (relocation?.fromPath === canonical) throw new RpcError("conflict", `roster ownership is relocating to ${relocation.toPath}; do not start or publish the source roster`);
+    if ((relocation?.fromPath === canonical || relocation?.toPath === canonical) && relocation.id !== relocationId) {
+      throw new RpcError("conflict", `team directory ${canonical} is fenced by a roster relocation`);
+    }
     const launches: Array<{ name: string; cwd: string; hash: string }> = [];
     try {
       for (const member of team.members) {

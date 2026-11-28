@@ -982,10 +982,13 @@ export class Supervisor {
     committedHash: string;
     targetHash: string;
     targetSpec: TeamSpec;
+    quarantineSource?: () => void;
   }): Promise<{ pending: string[]; relocation: TeamRelocation }> {
     const fromPath = canonicalPathOrMissing(input.fromPath);
     const toPath = realpathSync(input.toPath);
     const targetSpec = TeamLaunchSpec.parse(input.targetSpec);
+    const sync = this.syncStates();
+    if (sync[fromPath]?.intent || sync[toPath]?.intent) throw new Error("retry cafe team sync before relocating either roster root");
     let relocation = this.relocationState.pending;
     if (relocation) {
       if (relocation.fromPath !== fromPath || relocation.toPath !== toPath || relocation.rosterRootId !== input.rosterRootId || relocation.ownerKey !== input.ownerKey) {
@@ -1007,6 +1010,7 @@ export class Supervisor {
       this.relocationState.pending = relocation;
       this.saveRelocationState();
     }
+    input.quarantineSource?.();
     const selected = this.workers.filter((worker) => worker.rosterDir === fromPath);
     for (const worker of selected) this.kill(worker);
     this.workers = this.workers.filter((worker) => !selected.includes(worker));
@@ -1035,6 +1039,10 @@ export class Supervisor {
     this.relocationState.relocatedRoots[relocation.fromPath] = relocation.toPath;
     delete this.relocationState.pending;
     this.saveRelocationState();
+  }
+
+  relocationFenceBlocks(path: string): boolean {
+    return this.isRelocatedRoot(path) || this.relocationState.pending?.toPath === path;
   }
 
   private isRelocatedRoot(path: string): boolean {
