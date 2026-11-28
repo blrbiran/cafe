@@ -105,7 +105,7 @@ export async function enrollTestChild(
 export async function startEnrolledChild(
   root: { home: string; addr: string; server: { tlsPort?: number }; daemon: { hostId: string } },
   host: string,
-  opts: { home?: string; config?: Record<string, any>; timing?: Record<string, number>; log?: (line: string) => void } = {},
+  opts: { home?: string; config?: Record<string, any>; timing?: Record<string, number>; log?: (line: string) => void; assignmentRelayFixture?: boolean } = {},
 ): Promise<Awaited<ReturnType<typeof import("./helpers.ts")["startDaemon"]>>> {
   const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -122,6 +122,7 @@ export async function startEnrolledChild(
   return startDaemon(host, {
     ...(opts.timing ? { timing: opts.timing } : {}),
     ...(opts.log ? { log: opts.log } : {}),
+    ...(opts.assignmentRelayFixture ? { assignmentRelayFixture: true } : {}),
     home,
     config: { ...(opts.config ?? {}), root: root.addr, security },
   });

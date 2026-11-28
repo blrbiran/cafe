@@ -23,6 +23,7 @@ import {
   CreateOrderParams,
   DEFAULT_CHANNEL,
   CURRENT_FEATURES,
+  RESERVED_ASSIGNMENT_FEATURES,
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MISSES,
   InitializeParams,
@@ -119,6 +120,8 @@ export interface DaemonOptions {
   router?: Router;
   /** Build the LLM router for a configured model (tests inject a fake). */
   routerFactory?: (model: string) => Promise<Router>;
+  /** Enable reserved strict relay capabilities only in isolated acceptance fixtures. */
+  assignmentRelayFixture?: boolean;
   /** Override the timing constants (tests). */
   timing?: Partial<Timing>;
   log?: (msg: string) => void;
@@ -341,6 +344,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private rootDisplayName?: string;
   /** Features the connected Root advertises (v4-12); absent/empty = an older Root. */
   private rootFeatures: string[] = [];
+  /** Reserved assignment relay protocol is available only to explicit fixture instances. */
+  private readonly assignmentRelayFixture: boolean;
   /** One log line while a roster cannot be published to an old Root (v4-12 D8). */
   private teamLocalLogged = false;
 
@@ -382,6 +387,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     super();
     this.config = opts.config;
     this.version = opts.version ?? "dev";
+    this.assignmentRelayFixture = opts.assignmentRelayFixture === true;
     this.isRoot = opts.config.mode === "root";
     this.host = opts.config.host;
     this.displayName = opts.config.displayName ?? opts.config.host;
@@ -437,7 +443,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // Replica restored from disk; the Root will resync on connect.
     const cached = this.store.loadRegistry();
     if (!this.isRoot && cached.records.length) this.registry.applySnapshot(cached.version, cached.records.filter((r) => r.host !== this.host));
-    this.daemonRecords.set(this.host, { host: this.host, hostId: this.hostId, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version, features: [...CURRENT_FEATURES] });
+    this.daemonRecords.set(this.host, { host: this.host, hostId: this.hostId, displayName: this.displayName, aliases: this.hostAliases, legacyAliases: this.hostLegacyAliases, url: this.url(), isRoot: this.isRoot, online: true, connectedAt: Date.now(), lastSeenAt: Date.now(), version: this.version, features: [...this.features()] });
     this.schedulePrune();
     this.schedulePulls();
     this.stagingTimer = setInterval(() => {
@@ -687,12 +693,19 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** What the router is actually doing now (config may differ from it). */
   /** What this Daemon can do on the wire (v4-12). An older peer advertises nothing. */
   features(): readonly string[] {
-    return CURRENT_FEATURES;
+    const features = [...CURRENT_FEATURES];
+    if (this.assignmentRelayFixture) {
+      features.push(RESERVED_ASSIGNMENT_FEATURES[0]);
+      if ([...this.local.values()].some((agent) => agent.durableAssignments === true)) {
+        features.push(RESERVED_ASSIGNMENT_FEATURES[1]);
+      }
+    }
+    return features;
   }
 
   /** Features the connected Root advertises; the Root itself always supports everything (v4-12). */
   rootFeatureList(): string[] {
-    return this.isRoot ? [...CURRENT_FEATURES] : [...this.rootFeatures];
+    return this.isRoot ? [...this.features()] : [...this.rootFeatures];
   }
 
   /** True when the connected Root advertises every feature in `need` (an absent list = none). */
@@ -967,7 +980,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   private hostLinkHello(): Pick<InitializeParams, "hostId" | "hostAuthVersion" | "rootHostId" | "features"> {
-    return { hostId: this.hostId, hostAuthVersion: 1, rootHostId: this.rootHostId, features: [...CURRENT_FEATURES] };
+    return { hostId: this.hostId, hostAuthVersion: 1, rootHostId: this.rootHostId, features: [...this.features()] };
   }
 
   private verifyHostHello(hello: { protocolVersion?: number; features?: string[]; hostId?: string; rootHostId?: string }, certificate: X509Certificate): string {
@@ -1080,7 +1093,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, ...this.hostLinkHello(), host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
       }
       if (p.kind === "ui") this.uis.add(peer);
-      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...CURRENT_FEATURES], host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
+      return { protocolVersion: PROTOCOL_VERSION, cafeVersion: this.version, features: [...this.features()], host: this.host, displayName: this.displayName, aliases: this.hostAliases, isRoot: this.isRoot };
     });
   }
 
@@ -2625,6 +2638,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       const { variants, ...decision } = acceptedReplacement;
       if (variants) this.store.putOwnerDeliveryData("variants", order.orderId, order.threadId, variants);
       const references = decision.targets.map((agentId) => this.prepareAssignment(order, agentId, variants));
+      for (const assignment of references) {
+        if (assignment.relayMode === "strict") {
+          await this.preflightAssignmentRoute({ threadId: order.threadId, orderId: order.orderId, assignmentId: assignment.assignmentId,
+            agentId: assignment.targetAgentId, targetHostId: assignment.targetHostId, ownerHostId: this.hostId });
+        }
+      }
+      const current = this.tracking.get(replacing.order.orderId);
+      const currentThread = this.metas.get(threadId) ?? this.store.getThread(threadId);
+      if (current !== replacing || replacing.status !== "open" || currentThread?.orderId !== replacing.order.orderId) {
+        throw new RpcError("stale_order", "the previous Order changed during replacement preflight");
+      }
       const predecessors = this.replacementPredecessors(order.threadId, replacing.order.orderId);
       const replacement = this.emitEvent(order, {
         type: "order.replaced", previousOrderId: replacing.order.orderId, order, decision, assignments: references,
@@ -2679,6 +2703,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // Route time consumes the same absolute hard lifetime as execution and recovery.
     t.deadline = setTimeout(() => this.finishOnDeadline(t), deadlineAt - Date.now());
+    for (const id of decision.targets) t.targets.set(id, "pending");
     for (const id of decision.targets) this.dispatch(t, id);
     return result;
   }
@@ -3034,14 +3059,19 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return binding?.state === "enrolled" ? binding.hostId : undefined;
   }
 
+  private assignmentRelayMode(_host: string): "compat" | "strict" {
+    return this.assignmentRelayFixture && this.tlsContext?.network ? "strict" : "compat";
+  }
+
   private prepareAssignment(order: Order, agentId: string, variants?: Record<string, string>): OrderAssignmentReference {
     const recipient = this.registry.get(agentId);
     const targetHostId = recipient && this.assignmentTargetHostId(recipient.host);
-    if (!targetHostId) throw new RpcError("assignment_unavailable", "no Host binding for the assignment target");
+    if (!targetHostId || !recipient) throw new RpcError("assignment_unavailable", "no Host binding for the assignment target");
     const targetOrder = this.forTarget(order, agentId, variants ?? order.variants);
     const assignment = {
       assignmentId: ulid(), targetAgentId: agentId, targetHostId,
       bodyHash: assignmentHash(targetOrder, agentId, targetHostId),
+      relayMode: this.assignmentRelayMode(recipient.host),
     };
     this.store.putOwnerDeliveryData("assignment", assignment.assignmentId, order.threadId, targetOrder);
     return assignment;
@@ -3078,9 +3108,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     const rec = this.registry.get(agentId);
     if (!rec) return this.targetFailed(t, agentId, "unknown agent");
-    if (t.order.kind === "order") this.armAck(t, agentId);
-    let delivery = t.assignments.get(agentId);
+    const delivery = t.assignments.get(agentId);
     if (delivery) {
+      if (t.order.kind === "order") this.armAck(t, agentId);
       const order = this.store.getOwnerDeliveryData<Order>("assignment", delivery.assignment.assignmentId, t.order.threadId);
       if (!order || assignmentHash(order, agentId, delivery.assignment.targetHostId) !== delivery.assignment.bodyHash) {
         return this.targetFailed(t, agentId, "canonical assignment payload is unavailable");
@@ -3094,7 +3124,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const assignment: OrderAssignmentReference = {
       assignmentId: ulid(), targetAgentId: agentId, targetHostId,
       bodyHash: assignmentHash(order, agentId, targetHostId),
+      relayMode: this.assignmentRelayMode(rec.host),
     };
+    if (assignment.relayMode === "strict") {
+      void this.preflightAssignmentRoute({ threadId: order.threadId, orderId: order.orderId, assignmentId: assignment.assignmentId,
+        agentId, targetHostId, ownerHostId: this.hostId }).then(() => {
+        if (t.status === "open" && t.targets.get(agentId) === "pending" && !t.assignments.has(agentId)) {
+          this.commitAssignment(t, order, agentId, assignment);
+        }
+      }).catch((error: Error) => {
+        if (t.targets.get(agentId) === "pending") this.targetFailed(t, agentId, error.message);
+      });
+      return;
+    }
+    this.commitAssignment(t, order, agentId, assignment);
+  }
+
+  private commitAssignment(t: Tracking, order: Order, agentId: string, assignment: OrderAssignmentReference): void {
+    if (t.order.kind === "order") this.armAck(t, agentId);
     this.store.putOwnerDeliveryData("assignment", assignment.assignmentId, t.order.threadId, order);
     const remember = (assignmentEvent: OrderAssignmentDelivery["assignmentEvent"]): OrderAssignmentDelivery => {
       const recorded: OrderAssignmentDelivery = {
@@ -3104,6 +3151,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       t.assignments.set(agentId, recorded);
       return recorded;
     };
+    let delivery: OrderAssignmentDelivery;
     try {
       delivery = remember(this.emitEvent(t.order, { type: "order.assigned", assignment }));
     } catch (error) {
@@ -3131,6 +3179,106 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return { ...rest, history, body: variants?.[agentId] ?? order.body };
   }
 
+  /** Body-free check used on every strict hop before the private Order payload is sent. */
+  private async preflightAssignmentRoute(p: { threadId: string; orderId: string; assignmentId: string; agentId: string; targetHostId: string; ownerHostId: string }): Promise<{ ready: true; features: string[] }> {
+    if (!this.assignmentRelayFixture || !this.tlsContext?.network) throw new RpcError("unsupported_capability", "strict assignment relay requires the TLS fixture contract");
+    const rec = this.registry.get(p.agentId);
+    if (!rec || this.assignmentTargetHostId(rec.host) !== p.targetHostId) throw new RpcError("assignment_unavailable", "strict assignment target changed");
+    if (rec.host === this.host) {
+      if (!this.agents.has(p.agentId) || this.local.get(p.agentId)?.durableAssignments !== true) {
+        throw new RpcError("unsupported_capability", "the exact target Agent does not support durable assignment receipts");
+      }
+      return { ready: true, features: [RESERVED_ASSIGNMENT_FEATURES[1]] };
+    }
+    const request = { threadId: p.threadId, orderId: p.orderId, assignmentId: p.assignmentId, agentId: p.agentId, targetHostId: p.targetHostId, ownerHostId: p.ownerHostId };
+    if (this.isRoot) {
+      const child = this.children.get(rec.host);
+      if (!child || !child.meta.features?.includes(RESERVED_ASSIGNMENT_FEATURES[0])) throw new RpcError("unsupported_capability", "target Host does not support strict assignment relay");
+      return await child.request(Methods.assignmentPreflight, request, this.timing.ackTimeoutMs);
+    }
+    if (this.rootOnline) {
+      if (!this.rootFeatures.includes(RESERVED_ASSIGNMENT_FEATURES[0]) || !this.uplink) throw new RpcError("unsupported_capability", "Root does not support strict assignment relay");
+      return await this.uplink.request(Methods.assignmentPreflight, request, this.timing.ackTimeoutMs);
+    }
+    const link = await this.link(rec.host);
+    if (!link.meta.features?.includes(RESERVED_ASSIGNMENT_FEATURES[0])) throw new RpcError("unsupported_capability", "direct Host does not support strict assignment relay");
+    return await link.request(Methods.assignmentPreflight, request, this.timing.ackTimeoutMs);
+  }
+
+  private async answerAssignmentPreflight(peer: Peer, p: { threadId: string; orderId: string; assignmentId: string; agentId: string; targetHostId: string; ownerHostId: string }): Promise<{ ready: true; features: string[] }> {
+    if (peer.meta.kind !== "daemon" && peer.meta.kind !== "peer") throw new RpcError("bad_identity", "assignment preflight requires a Host link");
+    if (!peer.meta.features?.includes(RESERVED_ASSIGNMENT_FEATURES[0]) || !peer.hostIdentity || peer.isClosed) {
+      throw new RpcError("unsupported_capability", "authenticated peer does not support strict assignment relay");
+    }
+    const fromRoot = peer === this.uplink && peer.hostIdentity.hostId === this.rootHostId;
+    if ((!fromRoot && p.ownerHostId !== peer.hostIdentity.hostId) || (!this.isRoot && p.targetHostId !== this.hostId)) {
+      throw new RpcError("bad_assignment", "assignment preflight does not match the sending and receiving Hosts");
+    }
+    return this.preflightAssignmentRoute(p);
+  }
+
+  private bindAssignmentHostMethods(peer: Peer): void {
+    peer.on(Methods.assignmentPreflight, (p) => this.answerAssignmentPreflight(peer, p));
+    peer.on(Methods.assignmentRelay, async (x: { order: Order; agentId: string; assignment?: unknown }) => {
+      if (!peer.hostIdentity || !peer.meta.features?.includes(RESERVED_ASSIGNMENT_FEATURES[0])) throw new RpcError("unsupported_capability", "authenticated peer does not support strict assignment relay");
+      const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (proof.assignment.relayMode !== "strict" || !this.assignmentRelayFixture || !this.tlsContext?.network) throw new RpcError("bad_assignment", "strict relay requires a TLS-bound strict assignment");
+      const fromRoot = peer === this.uplink && peer.hostIdentity.hostId === this.rootHostId;
+      if (!fromRoot && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== peer.meta.host ||
+          proof.creation.eventHostId !== peer.hostIdentity.hostId)) {
+        throw new RpcError("bad_assignment", "strict relay owner does not match the authenticated sending Host");
+      }
+      if (!this.isRoot && proof.assignment.targetHostId !== this.hostId) throw new RpcError("bad_assignment", "strict relay targets a different Host");
+      if (peer.meta.kind === "peer") {
+        this.joinThread(x.order.threadId, peer);
+        this.markBackfill(x.order.threadId, true);
+      }
+      this.recordRelayProof(proof, peer);
+      await this.performStrictTransfer(x.order, x.agentId, proof);
+      return { accepted: true, assignmentId: proof.assignment.assignmentId };
+    });
+  }
+
+  private async performStrictTransfer(order: Order, agentId: string, proof: OrderAssignmentDelivery): Promise<void> {
+    const rec = this.registry.get(agentId);
+    if (!rec || proof.assignment.targetAgentId !== agentId || proof.assignment.targetHostId !== this.assignmentTargetHostId(rec.host)) {
+      throw new RpcError("bad_assignment", "strict assignment target changed");
+    }
+    await this.preflightAssignmentRoute({ threadId: order.threadId, orderId: order.orderId, assignmentId: proof.assignment.assignmentId,
+      agentId, targetHostId: proof.assignment.targetHostId, ownerHostId: proof.ownerHostId });
+    if (rec.host === this.host) {
+      if (!this.agents.has(agentId) || this.local.get(agentId)?.durableAssignments !== true) throw new RpcError("assignment_unavailable", "the exact target Agent changed after preflight");
+      this.deliverLocal(order, agentId, proof);
+      return;
+    }
+    const payload = { order, agentId, assignment: proof };
+    if (this.isRoot) {
+      const child = this.children.get(rec.host);
+      if (!child?.hostIdentity || child.isClosed || !child.meta.hostReady || !child.meta.features?.includes(RESERVED_ASSIGNMENT_FEATURES[0])) {
+        throw new RpcError("unsupported_capability", `daemon ${rec.host} changed after strict preflight`);
+      }
+      await child.request(Methods.assignmentRelay, payload, this.timing.ackTimeoutMs);
+      return;
+    }
+    if (this.rootOnline) {
+      if (!this.uplink) throw new RpcError("assignment_unavailable", "Root disconnected after strict preflight");
+      await this.uplink.request(Methods.assignmentRelay, payload, this.timing.ackTimeoutMs);
+      return;
+    }
+    const link = await this.link(rec.host);
+    if (!link.hostIdentity || !link.meta.features?.includes(RESERVED_ASSIGNMENT_FEATURES[0])) throw new RpcError("unsupported_capability", "direct Host capability changed after strict preflight");
+    this.joinThread(order.threadId, link);
+    this.markBackfill(order.threadId, true);
+    await link.request(Methods.assignmentRelay, payload, this.timing.ackTimeoutMs);
+  }
+
+  private deliverStrict(order: Order, agentId: string, proof: OrderAssignmentDelivery): void {
+    void this.performStrictTransfer(order, agentId, proof).catch((error) => {
+      this.log(`strict assignment relay failed for ${order.orderId}: ${(error as Error).message}`);
+      this.relayFailure(order, agentId, (error as Error).message);
+    });
+  }
+
   /** Send an Order towards an Agent: via the Root when it is online (ADR-0001), else locally or directly (ADR-0004). */
   private deliver(order: Order, agentId: string, proof?: OrderAssignmentDelivery): void {
     const rec = this.registry.get(agentId);
@@ -3144,6 +3292,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (targetOrder.clarificationRecipient && (rec.host !== targetOrder.clarificationRecipient.host || agentId !== targetOrder.clarificationRecipient.id)) {
       return this.relayFailure(targetOrder, agentId, "clarification requester unavailable");
     }
+    if (assignment.assignment.relayMode === "strict") return this.deliverStrict(targetOrder, agentId, assignment);
     if (this.isRoot) {
       if (rec.host === this.host) return this.deliverLocal(targetOrder, agentId, assignment);
       const child = this.children.get(rec.host);
@@ -3220,6 +3369,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
             }
             this.bindHostCertificate(peer, certificate, id);
           }
+          peer.meta.features = hello.features ?? [];
           this.bindLink(peer);
           clearTimeout(timer);
           this.links.set(host, { peer, ws, lastUsed: Date.now() });
@@ -3280,8 +3430,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   /** Handlers shared by both ends of a direct link. */
   private bindLink(peer: Peer): void {
     peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
+    this.bindAssignmentHostMethods(peer);
     peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (proof.assignment.relayMode === "strict") throw new RpcError("strict_relay_required", "strict assignments cannot use the compatibility relay method");
       if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host) ||
           (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== peer.meta.host))) {
         throw new RpcError("bad_assignment", "direct relay does not match the sending and receiving Hosts");
@@ -4836,8 +4988,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       return {};
     });
     peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
+    this.bindAssignmentHostMethods(peer);
     peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (proof.assignment.relayMode === "strict") throw new RpcError("strict_relay_required", "strict assignments cannot use the compatibility relay method");
       if (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== host || proof.creation.eventHostId !== peer.hostIdentity.hostId)) {
         throw new RpcError("bad_assignment", "relay owner does not match the authenticated Host");
       }
@@ -5179,6 +5333,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
           })) throw new RpcError("bad_identity", "Root certificate does not match its advertised binding");
           this.installRootBindings(hello.hostBindings);
           this.bindHostCertificate(peer, certificate, id);
+          peer.meta.kind = "daemon";
+          peer.meta.host = hello.host;
+          peer.meta.features = hello.features ?? [];
           bindUplink();
           await peer.request("host/ready", {}, this.timing.linkConnectTimeoutMs);
           if (peer.isClosed || this.uplinkSocket !== ws) throw new RpcError("closed", "Root link was superseded during initialization");
@@ -5299,8 +5456,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     });
     peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
+    this.bindAssignmentHostMethods(peer);
     peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
+      if (proof.assignment.relayMode === "strict") throw new RpcError("strict_relay_required", "strict assignments cannot use the compatibility relay method");
       if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host)) {
         throw new RpcError("bad_assignment", "relay targets a different Host");
       }

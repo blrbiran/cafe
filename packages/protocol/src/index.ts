@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export { CURRENT_FEATURES, DEFAULT_PORT, FEATURES, missingFeatures, onlineVersions, PROTOCOL_VERSION, type Feature } from "./version.ts";
+export { CURRENT_FEATURES, DEFAULT_PORT, FEATURES, RESERVED_ASSIGNMENT_FEATURES, missingFeatures, onlineVersions, PROTOCOL_VERSION, type Feature } from "./version.ts";
 
 /** Delivery deadlines (ms). See GLOSSARY: Order lifecycle. */
 export const ACK_TIMEOUT_MS = 30_000;
@@ -488,6 +488,8 @@ export type OrderAssignment = z.infer<typeof OrderAssignment>;
 
 export const OrderAssignmentReference = OrderAssignment.pick({ assignmentId: true, targetAgentId: true, targetHostId: true }).extend({
   bodyHash: z.string().regex(/^[a-f0-9]{64}$/),
+  /** Canonical transport choice, fixed when the assignment is journaled. Missing means legacy. */
+  relayMode: z.enum(["compat", "strict"]).optional(),
 });
 export type OrderAssignmentReference = z.infer<typeof OrderAssignmentReference>;
 const JournalAssignment = z.union([OrderAssignmentReference, OrderAssignment]);
@@ -791,6 +793,10 @@ export const Methods = {
   orderAck: "order/ack",
   orderReceive: "order/receive",
   assignmentStatus: "order/assignment-status",
+  /** Body-free check of the exact live route and local Agent before a strict assignment transfer. */
+  assignmentPreflight: "assignment/preflight",
+  /** Acknowledged private payload transfer; never used as a compatibility fallback. */
+  assignmentRelay: "assignment/relay",
   orderHeartbeat: "order/heartbeat",
   orderReply: "order/reply",
   orderDecline: "order/decline",
