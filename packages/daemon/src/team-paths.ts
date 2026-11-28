@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { readCafeFile } from "@cafe/protocol/cafe-file";
 
 export type PathGrantState = "active" | "stale" | "revoked" | "revoked-pending";
@@ -36,6 +36,23 @@ function safeInput(memberDir: string): void {
 function canonicalRoot(rosterRoot: string): string {
   try { return realpathSync(resolve(rosterRoot)); }
   catch { throw new Error(`roster root does not exist: ${rosterRoot}`); }
+}
+
+/** Resolve existing path components while retaining a missing tail for stale owner lookups. */
+export function canonicalPathOrMissing(path: string): string {
+  let cursor = resolve(path);
+  const suffix: string[] = [];
+  for (;;) {
+    try { return resolve(realpathSync(cursor), ...suffix); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      const parent = dirname(cursor);
+      if (parent === cursor) return resolve(path);
+      suffix.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
 }
 function requireSeparator(): string { return process.platform === "win32" ? "\\" : "/"; }
 

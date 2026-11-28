@@ -118,7 +118,7 @@ describe("team start never learns an executable from the request body", () => {
     d.daemon.supervisor = {
       list: () => [],
       commitRosterWriteScopes: () => {},
-      stopUnsafeTeamWorkers: async () => ({ stopped: [], pending: [] }),
+      syncTeam: async () => ({ committedHash: "fixture", stopped: [], pending: [], restarted: [], started: [] }),
       startTeam: () => {
         started++;
         return [];

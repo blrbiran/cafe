@@ -3,7 +3,7 @@ import { Agent as HttpsAgent } from "node:https";
 import { createHash, randomBytes, randomUUID, timingSafeEqual, X509Certificate } from "node:crypto";
 import { closeSync, createReadStream, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ulid } from "ulid";
 import WebSocket from "ws";
 import { pushBounded } from "./bounded.ts";
@@ -13,7 +13,7 @@ import { checkServerIdentity, type PeerCertificate } from "node:tls";
 import { tlsAddressOf } from "./tls/bootstrap.ts";
 import { hostIdFromCertificate, keyFingerprintOf, keyFingerprintOfPublicKey, localAddresses, missingSans, sanCovers, sanList, verifyHostRenewal } from "./tls/certs.ts";
 import { routingStats as computeRoutingStats } from "./routing-stats.ts";
-import { readPathGrants, revokeMemberPath, validateMemberPath, type PathGrant } from "./team-paths.ts";
+import { canonicalPathOrMissing, readPathGrants, revokeMemberPath, validateMemberPath, type PathGrant } from "./team-paths.ts";
 import { memberLaunchHash } from "@cafe/protocol/cafe-file";
 import { hintsFromSummary } from "./hints.ts";
 import {
@@ -1473,6 +1473,14 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return [...byKey.values()].filter((t) => !t.removed);
   }
 
+  /** Root delivery cannot be called complete until the Root acknowledges a revision/hash CAS. */
+  teamPublishPending(rosterDir: string): boolean {
+    if (this.isRoot) return false;
+    const ids = this.store.getKv<Record<string, string>>("rosterRootIds") ?? {};
+    const id = ids[canonicalPathOrMissing(rosterDir)];
+    return !id || this.teamRosterCasStates[id]?.status !== "acknowledged";
+  }
+
   /** The live team view used by /api/teams and the Web. */
   teams() {
     return this.liveRosters()
@@ -1723,7 +1731,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.log(`channel #${rec.channel} is used by ${[...others, rec].map((t) => `${t.team}@${t.host}`).join(", ")}; a message without a target is ambiguous`);
   }
 
-  private storeTeam(rec: TeamRecord, from?: Peer, opts: { skipAgentId?: string } = {}): void {
+  private storeTeam(rec: TeamRecord, from?: Peer, opts: { skipAgentId?: string; requireDurable?: boolean } = {}): void {
     const key = rosterKey(rec);
     const current = this.teamRecords.get(key);
     const contentHash = this.teamHash(rec);
@@ -1734,8 +1742,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     // reopen a window for a stale clock to overwrite a genuine update (v4-11 review).
     if (current?.revision !== undefined && rec.revision !== undefined && current.revision >= rec.revision) return;
     const next: TeamRecord = { ...rec, contentHash };
-    this.teamRecords.set(key, next);
-    this.saveTeams();
+    if (opts.requireDurable) {
+      const records = new Map(this.teamRecords);
+      records.set(key, next);
+      this.persistTeams([...records.values()]);
+      this.teamRecords = records;
+    } else {
+      this.teamRecords.set(key, next);
+      this.saveTeams();
+    }
     this.noteChannelConflict(next);
     this.notifyRosterChange(current, next, opts);
     if (this.isRoot) for (const child of this.children.values()) if (child !== from && (child.meta.features as string[] | undefined)?.includes("teams")) child.notify(Methods.teamUpsert, { team: next });
@@ -1875,6 +1890,34 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
     }
     return { status: "ack", rosterRootId: request.rosterRootId, revision: request.revision, contentHash: request.contentHash };
+  }
+
+  quarantineTeamRoster(rosterDir: string): string[] {
+    const canonical = canonicalPathOrMissing(rosterDir);
+    const owners = this.store.getKv<Record<string, string>>("rosterOwners") ?? {};
+    const affected = new Set<string>();
+    for (const [key, value] of Object.entries(owners)) {
+      if (canonicalPathOrMissing(value) === canonical) affected.add(key);
+    }
+    for (const record of this.local.values()) {
+      if (!record.team || !record.teamChannel) continue;
+      const key = rosterKey({ host: this.host, team: record.team, channel: record.teamChannel });
+      if (affected.has(key)) this.agents.get(record.agentId)?.close();
+    }
+    for (const key of affected) this.store.setKv(`team-tui-launches:${key}`, []);
+    return this.supervisor?.markRosterTuiReservationsStale(canonical) ?? [];
+  }
+
+  quarantineTeamMember(rosterDir: string, memberName: string): void {
+    const canonical = canonicalPathOrMissing(rosterDir);
+    const owners = this.store.getKv<Record<string, string>>("rosterOwners") ?? {};
+    for (const record of this.local.values()) {
+      if (!record.team || !record.teamChannel || (record.member ?? record.name) !== memberName) continue;
+      const key = rosterKey({ host: this.host, team: record.team, channel: record.teamChannel });
+      let owner: string | undefined;
+      try { owner = owners[key] ? realpathSync(owners[key]!) : undefined; } catch { /* stale owner */ }
+      if (owner === canonical) this.agents.get(record.agentId)?.close();
+    }
   }
 
   revokeTeamPath(grantId: string): PathGrant {
@@ -2123,6 +2166,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     for (const rosterRootId of Object.keys(this.teamRosterCasStates)) void this.syncTeamRosterCas(peer, rosterRootId);
   }
 
+  assertRosterOwner(rosterDir: string, team: TeamSpec): void {
+    if (!team.name || !team.channel) return;
+    const key = rosterKey({ host: this.host, team: team.name, channel: team.channel });
+    const canonical = realpathSync(rosterDir);
+    const owner = this.store.getKv<Record<string, string>>("rosterOwners")?.[key];
+    if (!owner) return;
+    let canonicalOwner: string | undefined;
+    try { canonicalOwner = realpathSync(owner); } catch { /* a missing legacy owner cannot authorize a new path */ }
+    if (canonicalOwner !== canonical) throw new RpcError("bad_request", `team ${team.name} uses roster directory ${owner}; run cafe team sync there`);
+  }
+
   publishRoster(rosterDir: string, team: TeamSpec): void {
     const parsed = TeamLaunchSpec.safeParse(team);
     if (!parsed.success) throw new RpcError("bad_request", parsed.error.message);
@@ -2153,8 +2207,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.store.setKv("rosterOwners", Object.fromEntries(owners));
       }
     }
-    const renamedRecords = [...owners].filter(([oldKey, directory]) => oldKey !== key && directory === canonical)
-      .map(([oldKey]) => this.teamRecords.get(oldKey)).filter((record): record is TeamRecord => !!record && !record.removed);
+    const useRosterCas = !this.isRoot && this.testTeamRosterAckFeature;
+    const renamedRecords = useRosterCas
+      ? [...owners].filter(([oldKey, directory]) => oldKey !== key && directory === canonical)
+        .map(([oldKey]) => this.teamRecords.get(oldKey)).filter((record): record is TeamRecord => !!record && !record.removed)
+      : [];
     try {
       this.supervisor?.commitRosterWriteScopes(canonical, team);
     } catch (err) {
@@ -2169,7 +2226,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     this.store.setKv("rosterOwners", Object.fromEntries(owners));
     this.store.setKv(`team-tui-launches:${key}`, launches);
     const members = team.members.map((m) => ({ ...m, channels: m.channels?.length ? m.channels : [team.channel!] }));
-    this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1), authoritative: true, removed: false });
+    this.storeTeam({ team: team.name, host: this.host, channel: team.channel, members, revision: Math.max(Date.now(), (previous?.revision ?? 0) + 1), authoritative: true, removed: false }, undefined, { requireDurable: true });
     for (const record of this.local.values()) {
       if (record.mode !== "tui" || record.team !== team.name || record.teamChannel !== team.channel) continue;
       try { this.checkTuiLaunch(record); } catch { this.agents.get(record.agentId)?.close(); }

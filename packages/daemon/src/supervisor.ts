@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
 import { TeamLaunchSpec, type TeamMember, type TeamSpec } from "@cafe/protocol";
-import { effectiveMemberAccess, validateMemberPath } from "./team-paths.ts";
+import { canonicalPathOrMissing, effectiveMemberAccess, validateMemberPath } from "./team-paths.ts";
 import { openWorkerLog, type CappedLineFile } from "./proc/cappedLog.ts";
 import { probeGroup, readProcessStart, signalGroup } from "./proc/processStart.ts";
 
@@ -109,6 +109,8 @@ export interface SupervisorOptions {
   cliBin?: string;
   /** Lifecycle lines for the daemon log (a worker that keeps failing, or gives up). */
   log?: (msg: string) => void;
+  /** Remove a member from routing after its revocation intent is durable and before signaling its group. */
+  onTeamMemberStopping?: (rosterDir: string, member: string) => void;
   /** Override the isolated Pi/OMP no-model isolation probe (tests only). */
   probeScript?: string;
   /** Give up after this many consecutive failed starts (default 3). */
@@ -138,6 +140,32 @@ function isPiRuntime(value: string): boolean { return /^pi[ @]/i.test(value.trim
 function isOmpRuntime(value: string): boolean { return /^omp\//i.test(value.trim()); }
 type WriteScope = { path: string; ancestors: string[] };
 type RosterWriteScope = { rosterDir: string; member: string; scope: WriteScope; tui?: { reservationId: string; stale: boolean } };
+interface TeamSyncIntent {
+  rosterRootId: string;
+  fromPath: string;
+  toPath?: string;
+  committedHash: string;
+  targetHash: string;
+  phase: "stopping" | "stop-pending" | "committing" | "relocating";
+  affectedGroups: Array<{ member: string; pid: number; startedAt?: string; scope?: WriteScope }>;
+  staleTuiReservationIds: string[];
+}
+interface TeamSyncState {
+  rosterRootId: string;
+  rosterDir: string;
+  committedHash: string;
+  spec: TeamSpec;
+  members: Record<string, { launchHash: string; wanted: boolean; restartWanted?: boolean }>;
+  pendingSpec?: TeamSpec;
+  intent?: TeamSyncIntent;
+}
+interface TeamSyncResult {
+  committedHash: string;
+  restarted: string[];
+  stopped: string[];
+  started: string[];
+  pending: string[];
+}
 
 function captureWriteScope(path: string): WriteScope {
   const ancestors: string[] = [];
@@ -247,6 +275,7 @@ export class Supervisor {
   private readonly file: string;
   private readonly runtimeFile: string;
   private readonly rosterWriteFile: string;
+  private readonly teamSyncFile: string;
   private rosterWriteScopes: RosterWriteScope[];
   private readonly logDir: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -258,6 +287,7 @@ export class Supervisor {
   private readonly log: (msg: string) => void;
   private readonly failAfter: number;
   private readonly quickExitMs: number;
+  private readonly onTeamMemberStopping?: (rosterDir: string, member: string) => void;
   private readonly home: string;
   private readonly probeScript?: string;
 
@@ -265,6 +295,7 @@ export class Supervisor {
     this.file = join(opts.home, "baristas.json");
     this.runtimeFile = join(opts.home, "baristas.runtime.json");
     this.rosterWriteFile = join(opts.home, "team-write-scopes.json");
+    this.teamSyncFile = join(opts.home, "team-sync.json");
     this.rosterWriteScopes = existsSync(this.rosterWriteFile) ? JSON.parse(readFileSync(this.rosterWriteFile, "utf8")) as RosterWriteScope[] : [];
     if (!Array.isArray(this.rosterWriteScopes) || this.rosterWriteScopes.some((entry) =>
       typeof entry?.rosterDir !== "string" || typeof entry.member !== "string" ||
@@ -280,6 +311,7 @@ export class Supervisor {
     this.log = opts.log ?? (() => {});
     this.failAfter = opts.failAfter ?? 3;
     this.quickExitMs = opts.quickExitMs ?? 30_000;
+    this.onTeamMemberStopping = opts.onTeamMemberStopping;
     this.home = opts.home;
     this.probeScript = opts.probeScript;
     this.env = {
@@ -293,11 +325,69 @@ export class Supervisor {
   }
 
   /** Reap worker groups left by a previous daemon, then start the persisted Baristas. */
-  async restore(): Promise<{ reaped: number; skipped: string[] }> {
+  async restore(validateRoster?: (rosterDir: string, team: TeamSpec) => void): Promise<{ reaped: number; skipped: string[] }> {
     const result = await this.reapStale();
+    const states = this.syncStates();
+    for (const [dir, state] of Object.entries(states)) {
+      if (!state.intent) continue;
+      const remaining = state.intent.affectedGroups.filter((group) => probeGroup(group.pid) !== "gone");
+      if (remaining.length) continue;
+      const pendingSpec = state.pendingSpec;
+      if (pendingSpec || state.intent.phase === "committing") {
+        try { validateRoster?.(dir, pendingSpec ?? state.spec); }
+        catch (error) {
+          result.skipped.push(`${dir}: ${String((error as Error).message)}`);
+          continue;
+        }
+      }
+      if (state.intent.phase === "committing") {
+        const target = pendingSpec ?? state.spec;
+        try {
+          this.commitRosterWriteScopes(dir, target);
+          const latest = this.syncStates();
+          const current = latest[dir]!;
+          const wanted = target.members.filter((member) => current.members[member.name]?.wanted);
+          if (wanted.length) this.startTeam(dir, { ...target, members: wanted }, false);
+          this.save();
+          current.intent = undefined;
+          current.pendingSpec = undefined;
+          latest[dir] = current;
+          this.writeSyncStates(latest);
+          states[dir] = current;
+        } catch (error) {
+          result.skipped.push(`${dir}: commit recovery failed: ${(error as Error).message}`);
+          states[dir] = this.syncStates()[dir] ?? state;
+        }
+      } else if (pendingSpec) {
+        const outcome = await this.syncTeam(dir, pendingSpec, () => validateRoster?.(dir, pendingSpec)).catch(() => undefined);
+        if (!outcome || outcome.pending.length) result.skipped.push(`${dir}: team reconciliation still stopping`);
+        states[dir] = this.syncStates()[dir] ?? state;
+      } else {
+        for (const group of state.intent.affectedGroups) if (state.members[group.member]) state.members[group.member]!.wanted = false;
+        state.intent = undefined;
+        state.pendingSpec = undefined;
+        states[dir] = state;
+        this.writeSyncStates(states);
+      }
+    }
+    this.writeSyncStates(states);
     if (existsSync(this.file)) {
       try {
+        const savedStates = this.syncStates();
+        const fenced = new Set(Object.values(savedStates).filter((state) => state.intent).map((state) => state.rosterDir));
         for (const spec of JSON.parse(readFileSync(this.file, "utf8")) as BaristaSpec[]) {
+          if (spec.team && fenced.has(spec.team.rosterDir)) continue;
+          if (spec.team && savedStates[spec.team.rosterDir]) {
+            const state = savedStates[spec.team.rosterDir]!;
+            try { validateRoster?.(spec.team.rosterDir, state.spec); }
+            catch (error) {
+              result.skipped.push(`${spec.team.rosterDir}: ${String((error as Error).message)}`);
+              continue;
+            }
+            const wanted = state.spec.members.filter((member) => state.members[member.name]?.wanted);
+            if (!wanted.length) continue;
+            spec.team.spec = { ...state.spec, members: wanted };
+          }
           try {
             this.start(spec, false);
           } catch {
@@ -392,6 +482,21 @@ export class Supervisor {
       tui?.stale ? [{ reservationId: tui.reservationId, rosterDir, member, path: scope.path }] : []);
   }
 
+  markRosterTuiReservationsStale(rosterDir: string): string[] {
+    const root = canonicalPathOrMissing(rosterDir);
+    const reservations: string[] = [];
+    const next = this.rosterWriteScopes.map((entry) => {
+      if (entry.rosterDir !== root || !entry.tui || entry.tui.stale) return entry;
+      reservations.push(entry.tui.reservationId);
+      return { ...entry, tui: { ...entry.tui, stale: true } };
+    });
+    if (reservations.length) {
+      writeAtomic(this.rosterWriteFile, JSON.stringify(next, null, 2), true);
+      this.rosterWriteScopes = next;
+    }
+    return reservations;
+  }
+
   releaseTuiReservation(reservationId: string): boolean {
     const next = this.rosterWriteScopes.filter((entry) => !(entry.tui?.stale && entry.tui.reservationId === reservationId));
     if (next.length === this.rosterWriteScopes.length) return false;
@@ -433,6 +538,48 @@ export class Supervisor {
     return this.list().filter((w) => w.dir === dir && !w.member);
   }
 
+  private syncStates(): Record<string, TeamSyncState> {
+    if (!existsSync(this.teamSyncFile)) return {};
+    const states = JSON.parse(readFileSync(this.teamSyncFile, "utf8")) as Record<string, TeamSyncState>;
+    if (!states || typeof states !== "object" || Array.isArray(states)) throw new Error(`invalid team sync state in ${this.teamSyncFile}`);
+    return states;
+  }
+
+  private writeSyncStates(states: Record<string, TeamSyncState>): void {
+    writeAtomic(this.teamSyncFile, JSON.stringify(states, null, 2), true);
+  }
+
+  private launchHash(team: TeamSpec, member: TeamMember, canonicalDir: string): string {
+    const identity = statSync(canonicalDir, { bigint: true });
+    return createHash("sha256").update(JSON.stringify({
+      agent: member.agent ?? team.agent ?? "pi",
+      bin: member.bin,
+      model: (member as TeamMember & { model?: string }).model,
+      mode: member.mode,
+      dir: canonicalDir,
+      dev: String(identity.dev),
+      ino: String(identity.ino),
+      access: effectiveMemberAccess(member),
+      environment: (member as TeamMember & { environment?: Record<string, string> }).environment,
+    })).digest("hex");
+  }
+
+  private persistExplicitStarts(rosterDir: string, team: TeamSpec): void {
+    const states = this.syncStates();
+    const prior = states[rosterDir];
+    const merged = new Map((prior?.spec.members ?? []).map((member) => [member.name, member]));
+    for (const member of team.members) merged.set(member.name, member);
+    const members = { ...(prior?.members ?? {}) };
+    for (const member of team.members) {
+      let launchHash = this.launchHash(team, member, validateMemberPath(this.home, rosterDir, member.name, member.dir).realPath);
+      members[member.name] = { launchHash, wanted: member.mode !== "tui", restartWanted: false };
+    }
+    const spec = { ...prior?.spec, ...team, members: [...merged.values()] } as TeamSpec;
+    const committedHash = createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+    states[rosterDir] = { rosterRootId: prior?.rosterRootId ?? createHash("sha256").update(rosterDir).digest("hex"), rosterDir, committedHash, spec, members };
+    this.writeSyncStates(states);
+  }
+
   /**
    * One worker per headless roster member (v4-11). Idempotent per `(rosterDir, member)`: an existing
    * live worker or a worker in restart backoff is left alone, so `team start` can fill gaps.
@@ -441,8 +588,19 @@ export class Supervisor {
   startTeam(rosterDir: string, team: TeamSpec, persist = true): WorkerInfo[] {
     team = TeamLaunchSpec.parse(team);
     const dir = realpathSync(resolve(rosterDir));
+    const syncState = this.syncStates()[dir];
+    if (persist && syncState?.intent) throw new Error(`team ${dir} has a pending reconciliation; retry cafe team sync before starting members`);
     const rosterTag = createHash("sha256").update(dir).digest("hex").slice(0, 8);
     const validatedPaths = new Map(team.members.map((member) => [member.name, validateMemberPath(this.home, dir, member.name, member.dir).realPath]));
+    for (const member of team.members) {
+      const running = this.workers.find((worker) => worker.rosterDir === dir && worker.member === member.name && !worker.failed);
+      if (!running) continue;
+      const previousTeam = running.spec.team?.spec;
+      const previousMember = previousTeam?.members.find((entry) => entry.name === member.name);
+      if (previousTeam && previousMember && this.launchHash(previousTeam, previousMember, running.cwd ?? dir) !== this.launchHash(team, member, validatedPaths.get(member.name)!)) {
+        throw new Error(`${member.name}'s launch settings changed while its worker is running; run cafe team sync`);
+      }
+    }
     const writes = team.members.filter((member) => effectiveMemberAccess(member) === "write");
     const writeScopes = new Map(writes.map((member) => [member.name, captureWriteScope(validatedPaths.get(member.name)!)]));
     for (const [index, member] of writes.entries()) {
@@ -461,6 +619,7 @@ export class Supervisor {
         other.writeScope && writeScopesOverlap(target, other.writeScope));
       if (active) throw new Error(`${member.name} would overlap an existing write-enabled worker in ${active.writeScope!.path}`);
     }
+    if (persist) this.persistExplicitStarts(dir, team);
     // Each worker keeps only its own member definition; save() unions them per roster. A partial
     // `team start` must never overwrite the set that a later restart restores (v4-11 review).
     for (const w of this.workers) {
@@ -504,9 +663,213 @@ export class Supervisor {
     return this.list().filter((w) => w.rosterDir === dir);
   }
 
+  async syncTeam(rosterDir: string, requested: TeamSpec, validateCommit?: () => void): Promise<TeamSyncResult> {
+    const team = TeamLaunchSpec.parse(requested);
+    const dir = realpathSync(resolve(rosterDir));
+    const states = this.syncStates();
+    const prior = states[dir];
+    const oldMembers = new Map((prior?.spec.members ?? []).map((member) => [member.name, member]));
+    const priorWanted = Object.fromEntries(Object.entries(prior?.members ?? {}).map(([name, value]) => [name, value.wanted || value.restartWanted === true]));
+    const desired = new Map(team.members.map((member) => [member.name, member]));
+    const revoked = new Set<string>();
+    const blocked = new Set<string>();
+    if (prior?.intent) {
+      const pending: string[] = [];
+      await Promise.all(prior.intent.affectedGroups.map(async (group) => {
+        if (!(await waitGone(group.pid, this.graceMs + 500))) pending.push(group.member);
+      }));
+      if (pending.length) return { committedHash: prior.committedHash, restarted: [], stopped: [], started: [], pending };
+    }
+    for (const worker of this.workers.filter((entry) => entry.rosterDir === dir)) {
+      const name = worker.member!;
+      const next = desired.get(name);
+      const oldMember = oldMembers.get(name) ?? worker.spec.team?.spec.members.find((member) => member.name === name);
+      if (!next) { revoked.add(name); blocked.add(name); }
+      else if (worker.writeScope && effectiveMemberAccess(next) !== "write") revoked.add(name);
+      try {
+        if (!oldMember) throw new Error("missing committed member");
+        const oldPath = validateMemberPath(this.home, dir, name, oldMember.dir);
+        if (oldPath.realPath !== worker.cwd || (prior?.members[name]?.launchHash && prior.members[name]!.launchHash !== this.launchHash(prior.spec, oldMember, oldPath.realPath))) {
+          revoked.add(name);
+          blocked.add(name);
+        }
+      } catch { revoked.add(name); blocked.add(name); }
+      if (next) {
+        try { validateMemberPath(this.home, dir, next.name, next.dir); }
+        catch { revoked.add(name); blocked.add(name); }
+      }
+    }
+
+    const stopMembers = async (names: Set<string>, targetSpec: TeamSpec, phase: TeamSyncIntent["phase"]): Promise<string[]> => {
+      const selected = this.workers.filter((worker) => worker.rosterDir === dir && names.has(worker.member!));
+      const affectedGroups = selected.flatMap((worker) => worker.child?.pid ? [{
+        member: worker.member!, pid: worker.child.pid, startedAt: worker.startedAt, scope: worker.writeScope,
+      }] : []);
+      const oldHash = prior?.committedHash ?? createHash("sha256").update(JSON.stringify(prior?.spec ?? { members: [] })).digest("hex");
+      const targetHash = createHash("sha256").update(JSON.stringify(targetSpec)).digest("hex");
+      const latestStates = this.syncStates();
+      const state: TeamSyncState = latestStates[dir] ?? prior ?? {
+        rosterRootId: createHash("sha256").update(dir).digest("hex"), rosterDir: dir, committedHash: oldHash,
+        spec: { members: [] }, members: {},
+      };
+      for (const name of names) if (revoked.has(name) && state.members[name]) {
+        state.members[name]!.wanted = false;
+        state.members[name]!.restartWanted = !blocked.has(name) && priorWanted[name] === true;
+      }
+      latestStates[dir] = { ...state, intent: {
+        rosterRootId: state.rosterRootId, fromPath: dir, committedHash: oldHash, targetHash,
+        phase, affectedGroups, staleTuiReservationIds: [],
+      }, pendingSpec: targetSpec };
+      this.writeSyncStates(latestStates);
+      for (const worker of selected) this.onTeamMemberStopping?.(dir, worker.member!);
+      for (const worker of selected) this.kill(worker);
+      this.workers = this.workers.filter((worker) => !selected.includes(worker));
+      this.save();
+      this.saveRuntime();
+      const pending: string[] = [];
+      await Promise.all(affectedGroups.map(async (group) => {
+        if (!(await waitGone(group.pid, this.graceMs + 500))) pending.push(group.member);
+      }));
+      return pending;
+    };
+
+    const safetyStopped: string[] = [];
+    if (revoked.size) {
+      const pending = await stopMembers(revoked, team, "stopping");
+      safetyStopped.push(...revoked);
+      if (pending.length) {
+        const current = this.syncStates();
+        const state = current[dir]!;
+        state.intent!.phase = "stop-pending";
+        current[dir] = state;
+        this.writeSyncStates(current);
+        return { committedHash: prior?.committedHash ?? "", restarted: [], stopped: safetyStopped, started: [], pending };
+      }
+    }
+
+    // Validate the complete target before ordinary stop/restart work. Safety revocations above are
+    // intentionally already durable if an unrelated member fails this preflight.
+    let resolved: Map<string, string>;
+    try {
+      resolved = new Map(team.members.map((member) => [member.name, validateMemberPath(this.home, dir, member.name, member.dir).realPath]));
+      const writers = team.members.filter((member) => member.mode !== "tui" && effectiveMemberAccess(member) === "write");
+      for (const [index, member] of writers.entries()) {
+        const scope = captureWriteScope(resolved.get(member.name)!);
+        const conflict = writers.slice(0, index).find((other) => writeScopesOverlap(scope, captureWriteScope(resolved.get(other.name)!)));
+        if (conflict) throw new Error(`${member.name} and ${conflict.name} would write to overlapping directories`);
+      }
+    } catch (error) {
+      if (revoked.size && this.syncStates()[dir]?.intent) {
+        const latest = this.syncStates();
+        const state = latest[dir]!;
+        state.intent = undefined;
+        state.pendingSpec = undefined;
+        latest[dir] = state;
+        this.writeSyncStates(latest);
+      }
+      throw error;
+    }
+
+    const retiring = [...this.retiringWriters.entries()].filter(([, entry]) => entry.dir === dir);
+    const stoppingPaths: string[] = [];
+    await Promise.all(retiring.map(async ([pid, entry]) => {
+      if (!(await waitGone(pid, this.graceMs + 500))) stoppingPaths.push(entry.writeScope.path);
+      else this.retiringWriters.delete(pid);
+    }));
+    if (stoppingPaths.length) return { committedHash: prior?.committedHash ?? "", restarted: [], stopped: safetyStopped, started: [], pending: stoppingPaths };
+    this.prepareRosterWriteScopes(dir, team, this.rosterWriteScopes);
+    let currentState = this.syncStates()[dir] ?? prior;
+    let oldStateMembers = currentState?.members ?? {};
+    const changedWanted = new Set<string>();
+    const stopped = new Set(safetyStopped);
+    const existingWorkers = this.workers.filter((worker) => worker.rosterDir === dir);
+    for (const member of team.members) {
+      const priorMember = oldMembers.get(member.name);
+      if (priorMember && priorWanted[member.name] && !blocked.has(member.name)) {
+        const previousHash = oldStateMembers[member.name]?.launchHash ?? this.launchHash(prior?.spec ?? team, priorMember, resolved.get(member.name)!);
+        if (previousHash !== this.launchHash(team, member, resolved.get(member.name)!)) changedWanted.add(member.name);
+      }
+    }
+    for (const worker of existingWorkers) {
+      const member = desired.get(worker.member!);
+      const priorMember = oldMembers.get(worker.member!);
+      const previousHash = oldStateMembers[worker.member!]?.launchHash ?? (priorMember ? this.launchHash(prior?.spec ?? team, priorMember, worker.cwd ?? dir) : "");
+      const nextHash = member ? this.launchHash(team, member, resolved.get(member.name)!) : "";
+      if (!member || (member && previousHash !== nextHash)) {
+        if (member && oldStateMembers[worker.member!]?.wanted !== false) changedWanted.add(worker.member!);
+        stopped.add(worker.member!);
+      }
+    }
+    const ordinaryStopNames = new Set([...stopped].filter((name) => !safetyStopped.includes(name)));
+    let pending: string[] = [];
+    if (ordinaryStopNames.size) pending = await stopMembers(ordinaryStopNames, team, "stopping");
+    if (pending.length) {
+      const current = this.syncStates();
+      const state = current[dir]!;
+      state.intent!.phase = "stop-pending";
+      current[dir] = state;
+      this.writeSyncStates(current);
+      return { committedHash: prior?.committedHash ?? "", restarted: [], stopped: [...stopped], started: [], pending };
+    }
+    try { validateCommit?.(); }
+    catch (error) {
+      const latest = this.syncStates();
+      const state = latest[dir];
+      if (state?.intent) {
+        for (const group of state.intent.affectedGroups) if (state.members[group.member]) {
+          state.members[group.member]!.wanted = false;
+          state.members[group.member]!.restartWanted = false;
+        }
+        state.intent.phase = "stop-pending";
+        state.pendingSpec = undefined;
+        latest[dir] = state;
+        this.writeSyncStates(latest);
+      }
+      throw error;
+    }
+
+    currentState = this.syncStates()[dir] ?? currentState;
+    oldStateMembers = currentState?.members ?? {};
+    const members: Record<string, { launchHash: string; wanted: boolean; restartWanted?: boolean }> = {};
+    for (const member of team.members) {
+      const previous = oldStateMembers[member.name];
+      const runningBefore = existingWorkers.some((worker) => worker.member === member.name);
+      members[member.name] = {
+        launchHash: this.launchHash(team, member, resolved.get(member.name)!),
+        wanted: blocked.has(member.name) || (previous?.wanted === false && !previous.restartWanted)
+          ? false
+          : changedWanted.has(member.name) || (runningBefore && previous?.wanted !== false) || (previous?.wanted ?? false) || (previous?.restartWanted ?? false),
+        restartWanted: false,
+      };
+    }
+    const committedHash = createHash("sha256").update(JSON.stringify(team)).digest("hex");
+    const state: TeamSyncState = {
+      rosterRootId: currentState?.rosterRootId ?? createHash("sha256").update(dir).digest("hex"),
+      rosterDir: dir, committedHash, spec: team, members,
+    };
+    const commitStates = this.syncStates();
+    commitStates[dir] = { ...state, intent: {
+      rosterRootId: state.rosterRootId, fromPath: dir, committedHash: currentState?.committedHash ?? "",
+      targetHash: committedHash, phase: "committing", affectedGroups: [], staleTuiReservationIds: [],
+    }, pendingSpec: team };
+    this.writeSyncStates(commitStates);
+    this.commitRosterWriteScopes(dir, team);
+    const wantedNow = this.syncStates()[dir]?.members ?? members;
+    const restart = team.members.filter((member) => changedWanted.has(member.name) && wantedNow[member.name]?.wanted && members[member.name]?.wanted);
+    if (restart.length) this.startTeam(dir, { ...team, members: restart }, false);
+    this.save();
+    const committedStates = this.syncStates();
+    const committedState = committedStates[dir]!;
+    committedState.intent = undefined;
+    committedState.pendingSpec = undefined;
+    committedStates[dir] = committedState;
+    this.writeSyncStates(committedStates);
+    const started = restart.map((member) => member.name);
+    return { committedHash, restarted: started, stopped: [...stopped], started: [], pending: [] };
+  }
+
   async stopUnsafeTeamWorkers(rosterDir: string, team?: TeamSpec): Promise<{ stopped: string[]; pending: string[] }> {
-    let canonical = resolve(rosterDir);
-    try { canonical = realpathSync(canonical); } catch { /* use the recorded path */ }
+    const canonical = canonicalPathOrMissing(rosterDir);
     const unsafe = this.workers.filter((worker) => {
       if (worker.rosterDir !== canonical) return false;
       const member = team?.members.find((entry) => entry.name === worker.member);
@@ -518,10 +881,28 @@ export class Supervisor {
         return !!worker.writeScope && captureWriteScope(path).ancestors[0] !== worker.writeScope.ancestors[0];
       } catch { return true; }
     });
-    const groups = unsafe.flatMap((worker) => worker.child?.pid ? [{ pid: worker.child.pid, member: worker.member! }] : []);
+    const groups = unsafe.flatMap((worker) => worker.child?.pid ? [{ pid: worker.child.pid, member: worker.member!, startedAt: worker.startedAt, scope: worker.writeScope }] : []);
+    const states = this.syncStates();
+    const prior = states[canonical];
+    if (unsafe.length) {
+      const targetHash = team ? createHash("sha256").update(JSON.stringify(team)).digest("hex") : "invalid-roster";
+      const nextState = prior ?? { rosterRootId: createHash("sha256").update(canonical).digest("hex"), rosterDir: canonical, committedHash: "", spec: { members: [] }, members: {} };
+      for (const worker of unsafe) if (worker.member && nextState.members[worker.member]) nextState.members[worker.member]!.wanted = false;
+      states[canonical] = {
+        ...nextState,
+        intent: {
+          rosterRootId: prior?.rosterRootId ?? createHash("sha256").update(canonical).digest("hex"),
+          fromPath: canonical, committedHash: prior?.committedHash ?? "", targetHash, phase: "stopping",
+          affectedGroups: groups, staleTuiReservationIds: [],
+        },
+        pendingSpec: undefined,
+      };
+      this.writeSyncStates(states);
+      for (const worker of unsafe) if (worker.member) this.onTeamMemberStopping?.(canonical, worker.member);
+    }
     for (const worker of unsafe) this.kill(worker);
     this.workers = this.workers.filter((worker) => !unsafe.includes(worker));
-    if (unsafe.length) this.save();
+    if (unsafe.length) { this.save(); this.saveRuntime(); }
     const pending: string[] = [];
     await Promise.all(groups.map(async ({ pid, member }) => {
       if (!(await waitGone(pid, this.graceMs + 500))) pending.push(member);
@@ -529,12 +910,24 @@ export class Supervisor {
     for (const [pid, entry] of this.retiringWriters) {
       if (entry.dir === canonical && probeGroup(pid) !== "gone" && !groups.some((group) => group.pid === pid)) pending.push(entry.writeScope.path);
     }
+    if (unsafe.length) {
+      const updated = this.syncStates();
+      const state = updated[canonical]!;
+      if (pending.length) state.intent!.phase = "stop-pending";
+      else {
+        for (const worker of unsafe) if (worker.member && state.members[worker.member]) state.members[worker.member]!.wanted = false;
+        state.intent = undefined;
+      }
+      updated[canonical] = state;
+      this.writeSyncStates(updated);
+    }
     return { stopped: unsafe.map((worker) => worker.member!), pending };
   }
 
   /** Stop supervised workers of one team, optionally one member. Never touches a TUI or plain Barista. */
   stopTeam(rosterDir: string, member?: string, exactPath?: string): number {
     const target = resolve(rosterDir);
+    let canonical = canonicalPathOrMissing(target);
     const matching = (dir: string) => this.workers.filter((w) => w.rosterDir === dir && (!member || w.member === member) && (!exactPath || w.cwd === exactPath));
     let ws = matching(target);
     // A recorded path still identifies the team if the directory is no longer accessible.
@@ -545,6 +938,18 @@ export class Supervisor {
         const code = (err as NodeJS.ErrnoException).code;
         if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
       }
+    }
+    canonical = ws[0]?.rosterDir ?? canonical;
+    const states = this.syncStates();
+    const state = states[canonical];
+    if (state) {
+      for (const name of Object.keys(state.members)) {
+        if (!member || name === member) {
+          state.members[name]!.wanted = false;
+          state.members[name]!.restartWanted = false;
+        }
+      }
+      this.writeSyncStates(states);
     }
     for (const w of ws) this.kill(w);
     this.workers = this.workers.filter((w) => !ws.includes(w));
@@ -784,6 +1189,13 @@ export class Supervisor {
       if (existsSync(this.runtimeFile)) entries = JSON.parse(readFileSync(this.runtimeFile, "utf8")) as RuntimeEntry[];
     } catch {
       skipped.push(`${this.runtimeFile}: unreadable`);
+    }
+    try {
+      for (const state of Object.values(this.syncStates())) for (const group of state.intent?.affectedGroups ?? []) {
+        if (!entries.some((entry) => entry.pid === group.pid)) entries.push({ dir: state.intent!.fromPath, slot: 1, pid: group.pid, startedAt: group.startedAt, writeScope: group.scope });
+      }
+    } catch {
+      skipped.push(`${this.teamSyncFile}: unreadable`);
     }
     for (const entry of entries) {
       if (Number.isSafeInteger(entry.pid) && entry.pid > 0 && entry.writeScope &&

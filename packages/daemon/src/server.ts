@@ -984,6 +984,36 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
       throw new RpcError("bad_request", (err as Error).message);
     }
   }
+  if (m === "POST" && path === "/api/team-sync") {
+    if (!isLoopback(req)) throw new RpcError("operator_required", "sync a team from its own Host");
+    const input = await readJson(req);
+    if (typeof input?.rosterDir !== "string" || !input.rosterDir) throw new RpcError("bad_request", "rosterDir is required");
+    const sup = daemon.supervisor;
+    if (!sup) throw new RpcError("unavailable", "barista supervisor disabled");
+    const rosterDir = resolve(input.rosterDir);
+    const file = join(rosterDir, ".cafe");
+    let doc;
+    const ignored: string[] = [];
+    try {
+      doc = readCafeFile(file, { onIgnoredTuiAccess: (member) => ignored.push(member) });
+      if (!doc.team) throw new Error(`${file} has no team block`);
+    } catch (error) {
+      daemon.quarantineTeamRoster(rosterDir);
+      const safety = await sup.stopUnsafeTeamWorkers(rosterDir);
+      if (safety.pending.length) throw new RpcError("revocation_pending", `waiting for these workers to stop: ${safety.pending.join(", ")}`);
+      throw new RpcError("bad_request", (error as Error).message);
+    }
+    const team = doc.team!;
+    daemon.assertRosterOwner(rosterDir, team);
+    const result = await sup.syncTeam(rosterDir, team, () => {
+      if (JSON.stringify(readCafeFile(file).team) !== JSON.stringify(team)) throw new RpcError("conflict", "the roster changed during sync; retry with the current file");
+      daemon.assertRosterOwner(rosterDir, team);
+    });
+    if (result.pending.length) throw new RpcError("revocation_pending", `waiting for these workers to stop: ${result.pending.join(", ")}`);
+    daemon.publishRoster(rosterDir, team);
+    const publishPending = daemon.teamPublishPending(rosterDir);
+    return send(res, 200, { published: !publishPending, publishPending, team: team.name, channel: team.channel, ignored, ...result });
+  }
   if (m === "GET" && path === "/api/teams") return send(res, 200, daemon.teams());
   if (m === "DELETE" && path === "/api/teams") {
     // v4-13 (#113): remove a roster, not just its workers. Refuse while a member is online so a
@@ -1024,7 +1054,11 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
           doc = readCafeFile(file);
           if (!doc.team) throw new Error(`${file} has no team block`);
         } catch (err) {
-          if (body.sync === true) await sup.stopUnsafeTeamWorkers(rosterDir);
+          if (body.sync === true) {
+            daemon.quarantineTeamRoster(rosterDir);
+            const safety = await sup.stopUnsafeTeamWorkers(rosterDir);
+            if (safety.pending.length) throw new RpcError("revocation_pending", `waiting for these workers to stop: ${safety.pending.join(", ")}`);
+          }
           throw new RpcError("bad_request", (err as Error).message);
         }
         const selection = TeamSpec.parse(team);
@@ -1032,14 +1066,20 @@ async function api(daemon: Daemon, req: IncomingMessage, res: ServerResponse, ur
         const known = doc.team.members.map((m) => m.name);
         const unknown = names.filter((n) => !known.includes(n));
         if (unknown.length) throw new RpcError("bad_request", `unknown member(s): ${unknown.join(", ")}; roster: ${known.join(", ")}`);
-        let safety: { stopped: string[]; pending: string[] } | undefined;
+        let reconciliation: Awaited<ReturnType<typeof sup.syncTeam>> | undefined;
         if (body.sync === true) {
-          safety = await sup.stopUnsafeTeamWorkers(rosterDir, doc.team);
-          if (safety.pending.length) throw new RpcError("revocation_pending", `waiting for these workers to stop: ${safety.pending.join(", ")}`);
-          if (JSON.stringify(readCafeFile(file).team) !== JSON.stringify(doc.team)) throw new RpcError("conflict", "the roster changed during sync; retry with the current file");
+          daemon.assertRosterOwner(rosterDir, doc.team);
+          reconciliation = await sup.syncTeam(rosterDir, doc.team, () => {
+            if (JSON.stringify(readCafeFile(file).team) !== JSON.stringify(doc.team)) throw new RpcError("conflict", "the roster changed during sync; retry with the current file");
+            daemon.assertRosterOwner(rosterDir, doc.team!);
+          });
+          if (reconciliation.pending.length) throw new RpcError("revocation_pending", `waiting for these workers to stop: ${reconciliation.pending.join(", ")}`);
         }
         daemon.publishRoster(rosterDir, doc.team);
-        if (safety) return send(res, 200, { published: true, team: doc.team.name, stopped: safety.stopped });
+        if (reconciliation) {
+          const publishPending = daemon.teamPublishPending(rosterDir);
+          return send(res, 200, { published: !publishPending, publishPending, team: doc.team.name, ...reconciliation });
+        }
         return send(res, 200, sup.startTeam(rosterDir, { ...doc.team, members: doc.team.members.filter((m) => names.includes(m.name)) }));
       }
       if (member !== undefined) {

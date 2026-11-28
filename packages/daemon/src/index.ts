@@ -1,5 +1,6 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { ulid } from "ulid";
+import { readCafeFile } from "@cafe/protocol/cafe-file";
 import { join } from "node:path";
 import { Daemon, type DaemonOptions } from "./daemon.ts";
 import { cafeHome, loadConfig, saveConfig } from "./config.ts";
@@ -291,9 +292,19 @@ export async function runDaemon(opts: RunOptions = {}): Promise<Running> {
   if (daemon.tlsContext?.enrol && !daemon.tlsContext.network) daemon.startEnrolmentRetry();
   if (!opts.noSupervisor) {
     try {
-      const supervisor = new Supervisor({ home, daemonAddr: `127.0.0.1:${server.port}`, token: config.token, log: (m) => daemon.log(m) });
+      const supervisor = new Supervisor({
+        home,
+        daemonAddr: `127.0.0.1:${server.port}`,
+        token: config.token,
+        log: (m) => daemon.log(m),
+        onTeamMemberStopping: (rosterDir, member) => daemon.quarantineTeamMember(rosterDir, member),
+      });
       daemon.restoreLocalRosterWriteScopes(supervisor);
-      const { reaped, skipped } = await supervisor.restore();
+      const { reaped, skipped } = await supervisor.restore((rosterDir, team) => {
+        const current = readCafeFile(join(rosterDir, ".cafe")).team;
+        if (!current || JSON.stringify(current) !== JSON.stringify(team)) throw new Error("roster changed since the last sync; run cafe team sync");
+        daemon.assertRosterOwner(rosterDir, current);
+      });
       daemon.supervisor = supervisor;
       if (reaped) daemon.log(`reaped ${reaped} barista worker group(s) left by a previous daemon`);
       for (const why of skipped) daemon.log(`barista reap skipped: ${why}`);

@@ -2148,10 +2148,17 @@ team
   .action(async (o) => {
     await ensureDaemon();
     await requireTeamSessions();
-    const { rosterDir, team: spec, ignored } = rosterAt(o.dir, o.teamDir);
-    if (ignored.length) console.error(tuiAccessNotice(ignored));
-    const r = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: spec, sync: true }) });
-    out(`roster ${spec.name} (#${spec.channel}) synced from ${rosterDir}`, r);
+    const rosterDir = resolve(o.teamDir ?? o.dir);
+    try {
+      const { team: spec, ignored } = rosterAt(o.dir, o.teamDir);
+      if (ignored.length) console.error(tuiAccessNotice(ignored));
+      const result = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: spec, sync: true }) }) as { publishPending?: boolean };
+      out(`roster ${spec.name} (#${spec.channel}) synced locally${result.publishPending ? "; Root publication pending" : ""} from ${rosterDir}`, result);
+    } catch (error) {
+      // Let the Daemon safety-stop workers/TUIs even when a local roster cannot be parsed.
+      await api("/api/team-sync", { method: "POST", body: JSON.stringify({ rosterDir }) }).catch(() => undefined);
+      throw error;
+    }
   });
 team
   .command("context")
