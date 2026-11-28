@@ -177,6 +177,9 @@ TUI 成员用 `CAFE_TEAM_MEMBER=<名字> CAFE_TEAM_DIR=<名册目录>` 启动会
 pi/omp 里 `/cafe-team <名字>` 会列出名册并把选择记到下个会话（TUI 无法隔离
 context，所以重启会话才真正生效）。Codex TUI 用 `cafe barista run --agent codex
 --tui --dir <目录> --member <名字> --team-dir <目录>`。
+TUI 成员的权限由终端管理。Cafe 会忽略旧名册中的 TUI `access` 设置，
+并在 `cafe doctor` 和 `cafe team sync` 中指出哪些成员可以移除该字段。
+托管的 headless 成员仍按配置限制权限。Pi/OMP 的只读启动须先通过隔离验证。
 
 **channel 是消息范围，不是权限边界。** Feed 顶部有 channel 切换，composer 会
 显示 `→ #channel`；`cafe ask --channel <名字>` 可以发到别处。成员自己发起的新

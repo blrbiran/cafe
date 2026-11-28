@@ -162,6 +162,11 @@ function describeEvent(env: ThreadEnvelope, addr: (id: string) => string): strin
   }
 }
 
+function finalReplyWasRejected(error: unknown): boolean {
+  const code = (error as { code?: string } | undefined)?.code;
+  return code === "not_registered" || code === "not_a_target" || code === "not_found" || code === "bad_assignment" || code === "bad_request";
+}
+
 interface Working {
   handle: OrderHandle;
   stopHeartbeat: () => void;
@@ -171,6 +176,7 @@ interface Working {
   /** A human message arrived after ours: later assistant text answers the human, not the Order. */
   frozen: boolean;
   lastText?: string;
+  finalSubmission?: Promise<void>;
   /** Inject watchdog (cleared once the message is seen). */
   watchdog?: ReturnType<typeof setTimeout>;
 }
@@ -229,6 +235,34 @@ export default function cafe(pi: ExtensionAPI) {
   /** Events that arrive before order/create returns (the daemon fans out during creation). */
   const early = new Map<string, ThreadEnvelope[]>();
   let registry: AgentRecord[] = [];
+  const observationInterval = 60_000;
+  const failedOrders = new Map<string, ChannelDigest["threads"][number]>();
+  const observedOrders = new Set<string>();
+  let lastObservation = -Infinity;
+  let observationTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function observeFailures(): void {
+    if (!client?.record?.observer || !failedOrders.size || current || queue.length || !isIdle()) return;
+    clearTimeout(observationTimer);
+    observationTimer = undefined;
+    const wait = lastObservation + observationInterval - Date.now();
+    if (wait > 0) {
+      observationTimer = setTimeout(observeFailures, wait);
+      return;
+    }
+    const failures = [...failedOrders.entries()];
+    const lines = failures.map(([orderId, t]) => `- Order ${orderId} in Thread ${t.threadId}: ${t.summary.slice(0, 120)}`);
+    pi.sendMessage({
+      customType: "cafe-observation",
+      content: `Review these failed Cafe Orders. Summarize what needs attention. Open a Thread for more context before drawing conclusions.\n${lines.join("\n")}`,
+      display: true,
+      details: { orders: failures.map(([orderId]) => orderId) },
+    }, { triggerTurn: true, deliverAs: "followUp" });
+    lastObservation = Date.now();
+    failedOrders.clear();
+    for (const [id] of failures) observedOrders.add(id);
+    while (observedOrders.size > 512) observedOrders.delete(observedOrders.values().next().value!);
+  }
 
   const addrOf = (id: string) => registry.find((r) => r.agentId === id)?.address ?? id;
   /** Refresh the Registry cache used to show Addresses instead of agent ids. */
@@ -294,6 +328,7 @@ export default function cafe(pi: ExtensionAPI) {
     const next = queue.shift();
     if (!next) {
       void client.setStatus("idle").catch(() => {});
+      observeFailures();
       return;
     }
     draining = true;
@@ -366,7 +401,7 @@ export default function cafe(pi: ExtensionAPI) {
     const w = current;
     if (!w) return;
     release(w);
-    if (w.declined) return;
+    if (w.declined || await w.finalSubmission?.then(() => true, (error) => !finalReplyWasRejected(error))) return;
     const text = w.lastText;
     if (!text) {
       const reason = aborted
@@ -418,6 +453,13 @@ export default function cafe(pi: ExtensionAPI) {
           },
           { triggerTurn: false },
         );
+        for (const entry of d.threads) {
+          const { orderId } = entry;
+          if (entry.status !== "failed" || entry.closedAt === undefined || !orderId || observedOrders.has(orderId)) continue;
+          failedOrders.set(orderId, entry);
+        }
+        while (failedOrders.size > 64) failedOrders.delete(failedOrders.keys().next().value!);
+        observeFailures();
       });
       c.onTeamContext((tc) => {
         // The playbook is a one-time orientation, not a task: display it without starting a turn.
@@ -477,6 +519,11 @@ export default function cafe(pi: ExtensionAPI) {
     const c = client;
     client = undefined;
     startupError = undefined;
+    clearTimeout(observationTimer);
+    observationTimer = undefined;
+    failedOrders.clear();
+    observedOrders.clear();
+    lastObservation = -Infinity;
     if (current) {
       const w = current;
       release(w);
@@ -520,7 +567,10 @@ export default function cafe(pi: ExtensionAPI) {
     ctxRef = ctx;
     if (current?.seen) await finish(aborted);
     if (queue.length) await drain();
-    else if (client && !current) void client.setStatus("idle").catch(() => {});
+    else if (client && !current) {
+      void client.setStatus("idle").catch(() => {});
+      observeFailures();
+    }
   }
 
   if (isOmp()) {
@@ -809,14 +859,50 @@ export default function cafe(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cafe_reply",
     label: "cafe reply",
-    description: "Send interim progress for the active Cafe Order. To report a result after a human Order closed, provide both reportThreadId and reportOrderId.",
+    description: "Send interim progress for the active Cafe Order. Use finalResult to submit the active human Order's final result. Provide both reportThreadId and reportOrderId to report after a human Order closed.",
     parameters: Type.Object({
       text: Type.String(),
+      finalResult: Type.Optional(Type.Boolean({ description: "Submit the final result for the human Order this Agent is handling." })),
       reportThreadId: Type.Optional(Type.String({ description: "Original human Thread for a result report." })),
       reportOrderId: Type.Optional(Type.String({ description: "Original human Order for a result report." })),
       attachments: Type.Optional(Type.Array(Type.String(), { description: "Local file paths to upload and attach to this interim reply." })),
     }),
     async execute(_id, params) {
+      if (params.finalResult) {
+        const w = current;
+        if (!w?.seen || w.frozen || w.declined) throw new Error("No active human Cafe Order to finalize.");
+        const { threadId, orderId, from, origin } = w.handle.order;
+        if (!from.id.startsWith("cli:") || origin === "agent") throw new Error("Only a human Order can receive a final task result.");
+        if (w.finalSubmission) throw new Error("The final reply was already submitted or is in progress.");
+        if (params.reportThreadId !== undefined || params.reportOrderId !== undefined || params.attachments?.length || !params.text.trim() || params.text.length > 12_000) {
+          throw new Error("A final result uses the active Order's identifiers and requires text only, up to 12000 characters.");
+        }
+        const c = requireClient();
+        w.finalSubmission = w.handle.reply(params.text, true);
+        try {
+          await w.finalSubmission;
+        } catch (error) {
+          if (finalReplyWasRejected(error)) {
+            delete w.finalSubmission;
+            throw error;
+          }
+          return text(`Cafe could not confirm the final reply. Check Thread ${threadId} for Order ${orderId} before retrying. If the reply landed, complete the report with cafe_reply using reportThreadId=${threadId}, reportOrderId=${orderId}, and the same text.`);
+        }
+        try {
+          for (let attempt = 0; ; attempt++) {
+            try {
+              await c.report({ threadId, orderId, text: params.text });
+              return text("Final reply sent. Report added to the original human conversation.");
+            } catch (error) {
+              if ((error as { code?: string }).code !== "order_open" || attempt >= 7) throw error;
+              await new Promise((resolve) => setTimeout(resolve, 250));
+            }
+          }
+        } catch (error) {
+          const pending = (error as { code?: string }).code === "report_pending";
+          return text(`Final reply submitted. ${pending ? "The report is saved locally and waiting to sync." : `Could not confirm the report: ${(error as Error).message}`} To retry the report, use cafe_reply with reportThreadId=${threadId}, reportOrderId=${orderId}, and the same text.`);
+        }
+      }
       if (params.reportThreadId || params.reportOrderId) {
         if (!params.reportThreadId || !params.reportOrderId || params.attachments?.length) throw new Error("A result report requires both original identifiers and text only.");
         await requireClient().report({ threadId: params.reportThreadId, orderId: params.reportOrderId, text: params.text });

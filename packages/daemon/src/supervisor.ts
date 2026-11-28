@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadIdentity } from "@cafe/protocol/cafe-file";
@@ -171,16 +171,26 @@ function compatibleRuntime(binary: string, agent: "pi" | "omp"): boolean {
  * Hold a read-only launch until its exact executable and Cafe-extension hashes have passed an
  * isolated no-model probe. Tests inject probeScript; production uses the sibling helper.
  */
-export async function probeReadonlyRuntime(binary: string, agent: "pi" | "omp", cafeExtension: string, opts: { home: string; probeScript?: string }): Promise<ProbeResult> {
-  let realBinary: string;
-  try { realBinary = realpathSync(resolve(binary)); }
-  catch { return { supported: false, binaryHash: "", reason: `agent executable not found: ${binary}` }; }
+export async function probeReadonlyRuntime(binary: string, agent: "pi" | "omp", cafeExtension: string, opts: { home: string; probeScript?: string; path?: string }): Promise<ProbeResult> {
+  const candidates = isAbsolute(binary) ? [binary] : /[\\/]/.test(binary) ? [] : (opts.path ?? process.env.PATH ?? "").split(delimiter)
+    .filter(isAbsolute).map((dir) => join(dir, binary));
+  let realBinary: string | undefined;
+  for (const candidate of candidates) {
+    try {
+      const actual = realpathSync(candidate);
+      if (!statSync(actual).isFile()) continue;
+      accessSync(actual, constants.X_OK);
+      realBinary = actual;
+      break;
+    } catch { /* keep looking on PATH */ }
+  }
+  if (!realBinary) return { supported: false, binaryHash: "", reason: `executable '${binary}' not found. Install ${agent} and add it to the daemon's PATH, or configure an absolute executable path.` };
   let realExtension: string;
   try { realExtension = realpathSync(resolve(cafeExtension)); }
   catch { return { supported: false, binaryHash: hashFile(realBinary), reason: `Cafe extension not found: ${cafeExtension}` }; }
   if (!existsSync(realExtension)) return { supported: false, binaryHash: hashFile(realBinary), reason: `Cafe extension not found: ${cafeExtension}` };
   const binaryHash = hashFile(realBinary);
-  if (!opts.probeScript) return { supported: false, binaryHash, reason: "Cafe has not yet verified read-only tool isolation for this runtime" };
+  if (!opts.probeScript) return { supported: false, binaryHash, reason: `Cafe found ${agent} at ${realBinary} but cannot verify read-only isolation for this runtime. Use a supported read-only runtime or review this worker's access settings.` };
   const extensionHash = hashFile(realExtension);
   const cacheFile = join(opts.home, "runtime-probes.json");
   mkdirSync(opts.home, { recursive: true, mode: 0o700 });
@@ -593,10 +603,11 @@ export class Supervisor {
         return;
       }
     }
-    const kind = agentKind(w.spec.bin ?? this.piBin);
-    if (!w.spec.agent && w.spec.access !== "workspace-write" && kind) {
-      const agent = kind;
-      w.pendingProbe = probeReadonlyRuntime(w.spec.bin ?? this.piBin, agent, this.extension, { home: this.home, probeScript: this.probeScript }).then((probe) => {
+    const agent = agentKind(w.spec.bin ?? this.piBin);
+    if (!w.spec.agent && w.spec.access !== "workspace-write" && agent) {
+      w.pendingProbe = probeReadonlyRuntime(w.spec.bin ?? this.piBin, agent, this.extension, { home: this.home, probeScript: this.probeScript, path: this.env.PATH }).catch((error: unknown): ProbeResult => ({
+        supported: false, binaryHash: "", reason: `isolation preflight failed: ${(error as Error).message}`,
+      })).then((probe) => {
         if (w.stopping || w.child || w.failed) return;
         if (!probe.supported) {
           w.failed = true;

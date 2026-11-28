@@ -49,7 +49,7 @@ import {
   type Party,
   type RoutingDecision,
   type RoutingHint,
-  type ThreadEnvelope,
+  ThreadEnvelope,
   type ThreadEventBody,
   type ThreadMeta,
   type TeamRecord,
@@ -1210,7 +1210,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         throw new RpcError("bad_request", "threadId, orderId and report text (up to 12000 characters) are required");
       }
       const order = this.findParentOrder(p.orderId, p.threadId);
-      if (order?.threadId !== p.threadId || !order.from.id.startsWith("cli:") || !this.wasDelivered(order, agentId, this.host, true)) {
+      const delivery = order?.threadId === p.threadId && this.findDelivery(order, agentId, this.host, true);
+      if (!order?.from.id.startsWith("cli:") || !delivery) {
         throw new RpcError("not_a_target", "only a recipient of the original human Order can report its result");
       }
       if (!this.closingEvent(p.threadId, p.orderId)) throw new RpcError("order_open", "reply to the open Order instead");
@@ -1221,7 +1222,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         eventId: ulid(), threadId: order.threadId, orderId: order.orderId, host: this.host, at: Date.now(),
         ...(this.tlsContext?.network ? { eventHostId: this.hostId } : {}),
         actor: { kind: "agent", principalId: agentId },
-        event: { type: "order.reported", agentId, text: p.text },
+        event: { type: "order.reported", agentId, ...(this.tlsContext?.network ? { assignmentId: delivery.assignmentId } : {}), text: p.text },
       };
       if (!duplicate) {
         if (!this.isRoot) this.markBackfill(order.threadId, true);
@@ -1363,8 +1364,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (event.type === "order.replied" && event.attachments?.length) {
       accepted = { ...event, attachments: this.commitAttachments(event.attachments, p.threadId) };
     }
-    if (p.assignmentId && (accepted.type === "order.acked" || accepted.type === "order.heartbeat" || accepted.type === "order.replied" || accepted.type === "order.declined")) {
-      accepted = { ...accepted, assignmentId: p.assignmentId };
+    const assignmentId = p.assignmentId ?? (this.tlsContext?.network ? delivery.assignmentId : undefined);
+    if (assignmentId && (accepted.type === "order.acked" || accepted.type === "order.heartbeat" || accepted.type === "order.replied" || accepted.type === "order.declined")) {
+      accepted = { ...accepted, assignmentId };
     }
     if (!closed && ((accepted.type === "order.replied" && accepted.final) || accepted.type === "order.declined")) {
       this.clearActiveOrder(agentId, p.threadId, p.orderId);
@@ -1597,6 +1599,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         since,
         threads: changed.slice(0, 20).map((m) => ({
           threadId: m.threadId,
+          orderId: m.orderId,
           status: m.status,
           from: m.from,
           summary: m.summary,
@@ -3339,15 +3342,24 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (!this.rootOnline) return;
       const meta = this.metas.get(id) ?? this.store.getThread(id);
       try {
+        let rejected = false;
         if (meta) {
           const events = (since ? this.store.readEventsSince(meta.file, since - BACKFILL_SKEW_MS) : this.store.readEvents(meta.file))
             .filter((event) => !this.tlsContext?.network || event.eventHostId === this.hostId);
           for (let i = 0; i < events.length; i += BACKFILL_BATCH) {
-            await this.uplink!.request(Methods.threadBackfill, { events: events.slice(i, i + BACKFILL_BATCH) }, 30_000);
+            try {
+              await this.uplink!.request(Methods.threadBackfill, { events: events.slice(i, i + BACKFILL_BATCH) }, 30_000);
+            } catch (error) {
+              if (!(error instanceof RpcError) || error.code !== "event_rejected") throw error;
+              rejected = true;
+              this.log(`backfill of ${id} retained for review: ${error.message}`);
+            }
           }
         }
-        this.backfill.delete(id);
-        this.saveBackfill();
+        if (!rejected) {
+          this.backfill.delete(id);
+          this.saveBackfill();
+        }
       } catch (err) {
         this.log(`backfill of ${id} failed: ${(err as Error).message}`);
         return;
@@ -3975,7 +3987,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       if (env.eventHostId && event.order.clarificationRecipient) return this.missingClarificationEvidence(env, event.order);
       return;
     }
-    if (event.type !== "order.assigned" && event.type !== "order.replaced" && event.type !== "order.overridden" && event.type !== "order.final-accepted") return;
+    const ownerSkip = event.type === "order.declined" && event.skipped;
+    if (event.type !== "order.assigned" && event.type !== "order.replaced" && event.type !== "order.overridden" && event.type !== "order.final-accepted" && !ownerSkip) return;
     const orderId = event.type === "order.replaced" ? event.previousOrderId : env.orderId;
     const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
     const creation = meta && this.store.findLastEvent(meta.file, (entry) => entry.orderId === orderId &&
@@ -4009,12 +4022,28 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       return this.missingAssignmentEvidence(source);
     }
-    if (!("assignmentId" in event) || !event.assignmentId || !("agentId" in event) || !event.agentId ||
-        event.type === "order.failed") return;
+    if (event.type === "order.declined" && event.skipped) return;
+    if (event.type !== "order.acked" && event.type !== "order.heartbeat" && event.type !== "order.replied" &&
+        event.type !== "order.declined" && event.type !== "order.reported" && event.type !== "order.delivered" &&
+        event.type !== "order.dispatch-failed") return;
+    if (!event.agentId) throw new RpcError("bad_identity", "Agent event requires a nonempty Agent ID");
     const meta = this.metas.get(env.threadId) ?? this.store.getThread(env.threadId);
+    let assignmentId = event.assignmentId;
+    if (!assignmentId) {
+      // An earlier build published reports without an assignment ID. Recover their authority
+      // from the original delivery instead of relying on whether the Agent is still registered.
+      const delivery = event.type === "order.reported" && meta && env.eventHostId &&
+        this.store.findLastEvent(meta.file, (entry) => entry.orderId === env.orderId &&
+          entry.threadId === env.threadId && entry.host === env.host && entry.eventHostId === env.eventHostId &&
+          entry.event.type === "order.delivered" && entry.event.agentId === event.agentId && !!entry.event.assignmentId);
+      if (!delivery || delivery.event.type !== "order.delivered" || !delivery.event.assignmentId) {
+        throw new RpcError("bad_identity", "Agent event requires a recorded assignment from its Host");
+      }
+      assignmentId = delivery.event.assignmentId;
+    }
     if (!meta) return { kind: "order", id: env.orderId };
-    const assignment = this.store.getOrderAssignment(meta.file, env.orderId, event.assignmentId);
-    if (!assignment) return { kind: "assignment", id: event.assignmentId };
+    const assignment = this.store.getOrderAssignment(meta.file, env.orderId, assignmentId);
+    if (!assignment) return { kind: "assignment", id: assignmentId };
     if (assignment.threadId !== env.threadId || assignment.assignment.targetAgentId !== event.agentId ||
         assignment.assignment.targetHostId !== env.eventHostId) {
       throw new RpcError("bad_assignment", "event does not match its assigned Agent and Host");
@@ -4024,9 +4053,10 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       throw new RpcError("bad_assignment", "event actor does not match the assigned Agent");
     }
     const delivered = this.store.findLastEvent(meta.file, (entry) =>
-      entry.orderId === env.orderId && entry.eventHostId === env.eventHostId && entry.event.type === "order.delivered" &&
-      entry.event.assignmentId === event.assignmentId && entry.event.agentId === event.agentId);
-    if (!delivered) return { kind: "delivery", id: event.assignmentId };
+      entry.orderId === env.orderId && entry.threadId === env.threadId && entry.host === env.host &&
+      entry.eventHostId === env.eventHostId && entry.event.type === "order.delivered" &&
+      entry.event.assignmentId === assignmentId && entry.event.agentId === event.agentId);
+    if (!delivered) return { kind: "delivery", id: assignmentId };
   }
 
   private replayAssignmentEvents(threadId: string, opts: { skipTrack?: boolean; from?: Peer } = {}): void {
@@ -4058,6 +4088,9 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   }
 
   recordEvent(env: ThreadEnvelope, opts: { skipTrack?: boolean; from?: Peer; replaying?: boolean } = {}): void {
+    if (opts.from?.hostIdentity && !ThreadEnvelope.safeParse(env).success) {
+      throw new RpcError("bad_request", "invalid authenticated thread event");
+    }
     if (opts.from?.hostIdentity && (this.isRoot || opts.from.meta.kind === "peer")) {
       if (env.eventHostId !== opts.from.hostIdentity.hostId || env.host !== opts.from.meta.host) {
         throw new RpcError("bad_identity", "event source differs from the authenticated Host");
@@ -4786,7 +4819,17 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // Only the Root's events from that window can repeat these (#31): read the tail back to there.
       const from = Math.min(...x.events.map((e) => e.at)) - BACKFILL_SKEW_MS;
       const known = new Set(meta ? this.store.readEventsSince(meta.file, from).map((e) => e.eventId) : []);
-      for (const env of x.events) if (!known.has(env.eventId)) this.recordEvent(env, { from: peer, skipTrack: true });
+      let rejected: RpcError | undefined;
+      for (const env of x.events) {
+        if (known.has(env.eventId)) continue;
+        try {
+          this.recordEvent(env, { from: peer, skipTrack: true });
+        } catch (error) {
+          if (!peer.hostIdentity || !(error instanceof RpcError) || !["bad_identity", "bad_assignment", "bad_request"].includes(error.code)) throw error;
+          rejected ??= error;
+        }
+      }
+      if (rejected) throw new RpcError("event_rejected", rejected.message);
       return {};
     });
     peer.on(Methods.routeDecide, async (x: { order: Order; candidates: string[]; broadcast?: boolean }) => {

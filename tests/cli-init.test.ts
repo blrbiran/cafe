@@ -52,12 +52,25 @@ describe("cafe init", () => {
     expect(readFileSync(join(dir, ".cafe"), "utf8")).toBe("name: keep-me\n");
   });
 
-  it("overwrites with --force", () => {
+  it("keeps a separate byte-identical backup for each explicit replacement", () => {
     const dir = temp();
-    writeFileSync(join(dir, ".cafe"), "name: keep-me\n");
-    const r = cafe(dir, "init", "--yes", "--force", "--name", "new-name");
-    expect(r.status).toBe(0);
-    expect(readCafeFile(join(dir, ".cafe")).name).toBe("new-name");
+    const file = join(dir, ".cafe");
+    const original = "# hand-written identity\nname: keep-me\ndescription: billing\n";
+    writeFileSync(file, original);
+    const replace = (name: string) => {
+      const result = cafe(dir, "init", "--yes", "--force", "--name", name);
+      expect(result.status).toBe(0);
+      expect(readCafeFile(file).name).toBe(name);
+      const backup = result.stdout.match(/^backup: (.+)$/m)?.[1];
+      expect(backup).toBeDefined();
+      return backup!;
+    };
+    const first = replace("new-name");
+    const secondOriginal = readFileSync(file);
+    const second = replace("another-name");
+    expect(first).not.toBe(second);
+    expect(readFileSync(first, "utf8")).toBe(original);
+    expect(readFileSync(second)).toEqual(secondOriginal);
   });
 
   it("preserves a YAML-like name as a string during replacement", () => {
@@ -103,7 +116,7 @@ describe("help", () => {
   it("explains that init --force preserves team rosters", () => {
     const result = cafe(temp(), "init", "--help");
     expect(result.status).toBe(0);
-    expect(result.stdout).toMatch(/--force\s+replace a standalone identity.*preserves team rosters/);
+    expect(result.stdout).toMatch(/--force\s+replace a standalone identity after saving a backup\s+\(preserves team rosters\)/);
   });
 
   it("shows a quick start and the init command", () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +15,7 @@ import { normalizeFingerprint, readTlsConfig } from "../../daemon/src/tls/trust.
 import { discoverTls, enrollHostFromRoot, trustCaForClient, tlsAddressOf } from "../../daemon/src/tls/bootstrap.ts";
 import { daemonHttpUrl } from "@cafe/protocol/urls";
 import { isLoopbackDaemon, pinnedRootRequest, type DaemonRequest } from "./daemon-http.ts";
-import { readCafeFile } from "@cafe/protocol/cafe-file";
+import { readCafeFile, tuiAccessNotice } from "@cafe/protocol/cafe-file";
 import { joinAddresses } from "@cafe/daemon";
 import { joinText } from "./join-text.ts";
 import { tlsLine } from "./tls-line.ts";
@@ -659,10 +659,11 @@ program
   .option("--role <role>", "barista or customer", "barista")
   .option("--concurrency <n>", "headless worker processes", "1")
   .option("-y, --yes", "use the defaults without asking")
-  .option("--force", "replace a standalone identity (preserves team rosters)")
+  .option("--force", "replace a standalone identity after saving a backup (preserves team rosters)")
   .action(async (dir: string | undefined, o) => {
     const res = await runInit({ dir, name: o.name, description: o.description, tags: o.tags, scope: o.scope, role: o.role, concurrency: o.concurrency, yes: o.yes, force: o.force });
-    out(`created ${res.file}\n\nnext:\n${res.next.map((s) => `  ${s}`).join("\n")}`, res);
+    const result = res.backupFile ? `replaced ${res.file}\nbackup: ${res.backupFile}` : `created ${res.file}`;
+    out(`${result}\n\nnext:\n${res.next.map((s) => `  ${s}`).join("\n")}`, res);
   });
 
 program
@@ -959,9 +960,9 @@ program
   .option("--to <address>", "explicit Address (name, name@host, name#n@host); skips routing")
   .option("--broadcast", "ask every eligible Barista (skips routing; only when you mean it)")
   .option("--thread <threadId>", "follow-up in an existing thread (goes to whoever answered there)")
-  .option("--parent <orderId>", "the Order this question is a sub-Order of")
-  .option("--parent-thread <threadId>", "the Thread holding --parent (needed when it is no longer in memory)")
-  .option("--escalate", "with --parent: ask the parent Order's sender (creates a sub-thread; skips routing)")
+  .option("--parent <orderId>", "parent Order reference (links work you own when used with --parent-thread)")
+  .option("--parent-thread <threadId>", "link to the Thread holding your original --parent Order")
+  .option("--escalate", "clarification needs the registered Barista runtime's cafe_ask tool")
   .option("--channel <name>", "message scope (default: this agent's home channel, else default)")
   .option("--collect <mode>", "any (first answer wins) or all (wait for every target)", "any")
   .option("--replace", "with --thread: cancel the thread's still-open question and ask this one instead")
@@ -1934,9 +1935,10 @@ barista
 const rosterAt = (dir: string, teamDir?: string) => {
   const rosterDir = resolve(teamDir ?? dir);
   const file = join(rosterDir, ".cafe");
-  const doc = readCafeFile(file);
+  const ignored: string[] = [];
+  const doc = readCafeFile(file, { onIgnoredTuiAccess: (member) => ignored.push(member) });
   if (!doc.team) throw new Error(`${file} has no team block; add one (see README)`);
-  return { rosterDir, team: doc.team };
+  return { rosterDir, team: doc.team, ignored };
 };
 
 const team = program.command("team").description("agent teams declared in .cafe (v4-11)");
@@ -2001,7 +2003,8 @@ team
   .action(async (names: string[], o) => {
     await ensureDaemon();
     await requireTeamSessions();
-    const { rosterDir, team: spec } = rosterAt(o.dir, o.teamDir);
+    const { rosterDir, team: spec, ignored } = rosterAt(o.dir, o.teamDir);
+    if (ignored.length) console.error(tuiAccessNotice(ignored));
     const unknown = names.filter((n) => !spec.members.some((m) => m.name === n));
     if (unknown.length) throw new Error(`unknown member(s): ${unknown.join(", ")}; roster: ${spec.members.map((m) => m.name).join(", ")}`);
     const selected = names.length ? spec.members.filter((m) => names.includes(m.name)) : spec.members;
@@ -2012,7 +2015,8 @@ team
     const onlineAny = new Set(agents.filter((a) => a.team === spec.name && a.member).map((a) => a.member!));
     const onlineHere = new Set(agents.filter((a) => a.host === health.host && a.team === spec.name && a.member).map((a) => a.member!));
     // A failed worker is not present: `team start` is how the person retries it (v4-11 review).
-    const supervised = new Set(workers.filter((w) => w.rosterDir === rosterDir && w.member && w.state !== "failed").map((w) => w.member!));
+    const canonicalRosterDir = realpathSync(rosterDir);
+    const supervised = new Set(workers.filter((w) => w.rosterDir === canonicalRosterDir && w.member && w.state !== "failed").map((w) => w.member!));
     const missingHeadless = selected.filter((m) => m.mode !== "tui" && (o.force || (!onlineHere.has(m.name) && !supervised.has(m.name))));
     const missingTui = selected.filter((m) => m.mode === "tui" && !onlineHere.has(m.name));
     const plan = {
@@ -2030,9 +2034,15 @@ team
     if (publish.length) {
       await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: { ...spec, members: publish } }) });
     }
+    const requested = new Set(missingHeadless.map((m) => m.name));
+    const launched = requested.size
+      ? await api<Array<{ rosterDir?: string; member?: string; state: string; lastError?: string }>>("/api/baristas").catch(() => [])
+      : [];
+    const states = launched.filter((w) => w.rosterDir === canonicalRosterDir && w.member && requested.has(w.member));
     const lines = [
       `${spec.name} (#${spec.channel}) in ${rosterDir}`,
-      `started ${missingHeadless.length} headless member(s)${missingHeadless.length ? `: ${missingHeadless.map((m) => m.name).join(", ")}` : ""}`,
+      ...(requested.size ? [`requested start for ${requested.size} headless member(s): ${[...requested].join(", ")}`] : []),
+      ...states.map((w) => `${w.member}: ${w.state}${w.lastError ? ` — ${w.lastError}` : ""}`),
       ...missingTui.map((m) => {
         const dir = resolve(rosterDir, m.dir);
         const agent = m.agent ?? spec.agent ?? "pi";
@@ -2101,7 +2111,7 @@ team
       ...(m.observer ? { observer: true } : {}),
       ...(m.currentThread ? { currentThread: m.currentThread } : {}),
     }));
-    const lines = rows.map((r: any) => `${r.status.padEnd(8)} ${r.member.padEnd(16)} ${r.duty.padEnd(14)} ${r.mode.padEnd(8)} ${r.address}${r.observer ? " (observer)" : ""}${r.currentThread ? `  thread ${r.currentThread}` : ""}`);
+    const lines = rows.map((r: any) => `${r.status.padEnd(8)} ${r.member.padEnd(16)} ${r.duty.padEnd(14)} ${r.mode.padEnd(8)} ${r.address}${r.mode === "tui" ? " (permissions managed by terminal)" : ""}${r.observer ? " (observer)" : ""}${r.currentThread ? `  thread ${r.currentThread}` : ""}`);
     out(
       [
         heading(t),
@@ -2138,7 +2148,8 @@ team
   .action(async (o) => {
     await ensureDaemon();
     await requireTeamSessions();
-    const { rosterDir, team: spec } = rosterAt(o.dir, o.teamDir);
+    const { rosterDir, team: spec, ignored } = rosterAt(o.dir, o.teamDir);
+    if (ignored.length) console.error(tuiAccessNotice(ignored));
     const r = await api("/api/baristas", { method: "POST", body: JSON.stringify({ dir: rosterDir, team: spec, sync: true }) });
     out(`roster ${spec.name} (#${spec.channel}) synced from ${rosterDir}`, r);
   });

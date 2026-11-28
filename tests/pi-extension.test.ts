@@ -1,7 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Methods } from "@cafe/protocol";
+import { Peer, RpcError } from "@cafe/protocol/peer";
 import cafe, { formatHistory, isOrderMessage, lastAssistantText, orderPrompt } from "@cafe/pi-extension";
 import { barista, customer, identity, startDaemon, untilClosed, waitFor } from "./helpers.ts";
 
@@ -154,6 +156,50 @@ describe("pi extension", () => {
     expect(events.find((e) => e.event.type === "order.replied")?.event).toMatchObject({ text: "42 widgets", final: true });
   });
 
+  it("submits one final result for the exact active human Order", async () => {
+    const { pi, root } = await setup();
+    const res = await root.daemon.createOrder({ kind: "order", body: "report on billing", to: "widgets" }, undefined, "e".repeat(64));
+    await waitFor(() => orders(pi).length === 1);
+    await pi.fire("agent_start", { type: "agent_start" }, dir);
+    await pi.fire("message_end", { type: "message_end", message: asCustom(orders(pi).at(-1)!) }, dir);
+    const submit = (value: string) => pi.tools.get("cafe_reply").execute("result", { text: value, finalResult: true });
+    const result = await submit("Billing checked.");
+    expect(result.content[0].text).toContain("Report added");
+    await expect(submit("A second result")).rejects.toThrow(/already submitted/i);
+    await pi.fire("message_end", { type: "message_end", message: assistant("Tool submitted the report.") }, dir);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    const thread = root.daemon.thread(res.threadId)!;
+    expect(thread.events.filter(({ event }) => event.type === "order.replied").map(({ event }) => event)).toMatchObject([
+      { final: true, text: "Billing checked." },
+    ]);
+    expect(await root.daemon.orderResult(res.threadId, res.orderId)).toMatchObject({ reports: [{ text: "Billing checked." }] });
+  });
+
+  it("does not submit a second final reply after the first receipt is lost", async () => {
+    const { pi, root } = await setup();
+    const res = await root.daemon.createOrder({ kind: "order", body: "check billing", to: "widgets" }, undefined, "e".repeat(64));
+    await waitFor(() => orders(pi).length === 1);
+    await pi.fire("agent_start", { type: "agent_start" }, dir);
+    await pi.fire("message_end", { type: "message_end", message: asCustom(orders(pi).at(-1)!) }, dir);
+    const request = Peer.prototype.request;
+    const dropReceipt = vi.spyOn(Peer.prototype, "request").mockImplementation(async function (this: Peer, method, params, timeoutMs) {
+      const response = await request.call(this, method, params, timeoutMs);
+      if (method === Methods.orderReply) throw new RpcError("closed", "connection closed");
+      return response;
+    });
+    const submit = () => pi.tools.get("cafe_reply").execute("result", { text: "Billing checked.", finalResult: true });
+    try {
+      const result = await submit();
+      expect(result.content[0].text).toContain("could not confirm the final reply");
+    } finally {
+      dropReceipt.mockRestore();
+    }
+    await expect(submit()).rejects.toThrow(/already submitted/i);
+    await pi.fire("message_end", { type: "message_end", message: assistant("The reply may have arrived.") }, dir);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    expect(root.daemon.thread(res.threadId)?.events.filter(({ event }) => event.type === "order.replied")).toHaveLength(1);
+  });
+
   it("queues Orders while busy and drains on agent_settled", async () => {
     const { pi, c } = await setup();
     pi.setIdle(false);
@@ -194,6 +240,25 @@ describe("pi extension", () => {
     await c.ask({ body: "status check", to: "worker", channel: "demo" });
     await waitFor(() => pi.sent.some((s) => s.message.customType === "cafe-digest"));
     expect(pi.sent.find((s) => s.message.customType === "cafe-digest")?.options.triggerTurn).toBe(false);
+  });
+
+  it("coalesces failed Orders while the observer is busy", async () => {
+    writeFileSync(join(dir, ".cafe"), "name: demo\nteam:\n  members:\n    - { name: orch, duty: orchestrator }\n    - { name: widgets, observer: true }\n");
+    process.env.CAFE_TEAM_DIR = dir;
+    process.env.CAFE_TEAM_MEMBER = "widgets";
+    const { pi, c, root } = await setup(35);
+    pi.setIdle(false);
+    const failures = await Promise.all(["first failure", "second failure"].map((body) => c.ask({ body, to: "offline-worker", channel: "demo" })));
+    await waitFor(() => pi.sent.filter((s) => s.message.customType === "cafe-digest").flatMap((s) => s.message.details.digest.threads).length >= 2);
+    expect(pi.sent.filter((s) => s.options.triggerTurn)).toHaveLength(0);
+    pi.setIdle(true);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    const wakes = pi.sent.filter((s) => s.options.triggerTurn);
+    expect(wakes).toHaveLength(1);
+    for (const failure of failures) expect(wakes[0]?.message.content).toContain(failure.orderId);
+    await pi.fire("agent_settled", { type: "agent_settled", aborted: false }, dir);
+    expect(pi.sent.filter((s) => s.options.triggerTurn)).toHaveLength(1);
+    expect(root.daemon.thread(failures[0]!.threadId)?.meta.status).toBe("failed");
   });
 
   it("passes explicit broadcast through to every eligible Barista", async () => {

@@ -1,8 +1,9 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CafeFile } from "@cafe/protocol";
-import { readCafeFile } from "@cafe/protocol/cafe-file";
+import { parseCafeFile, readCafeFile } from "@cafe/protocol/cafe-file";
 
 export interface InitOptions {
   dir?: string;
@@ -22,6 +23,7 @@ export interface InitResult {
   file: string;
   identity: CafeFile;
   next: string[];
+  backupFile?: string;
 }
 
 function list(value: string | undefined): string[] {
@@ -30,6 +32,10 @@ function list(value: string | undefined): string[] {
 
 function yamlString(value: string): string {
   return JSON.stringify(value);
+}
+
+function sameIdentityFile(current: Stats, original: Stats): boolean {
+  return current.isFile() && current.dev === original.dev && current.ino === original.ino && current.ctimeMs === original.ctimeMs;
 }
 
 export async function runInit(opts: InitOptions = {}): Promise<InitResult> {
@@ -88,11 +94,19 @@ scope: [${id.scope.map(yamlString).join(", ")}]
 role: ${id.role}
 concurrency: ${id.concurrency}
 `;
+  let original: Buffer | undefined;
   if (existing) {
     if (!existsSync(file)) throw new Error(`${file} disappeared while preparing the replacement`);
     let current: ReturnType<typeof readCafeFile>;
     try {
-      current = readCafeFile(file);
+      const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        if (!sameIdentityFile(fstatSync(fd), existing)) throw new Error(`${file} changed while preparing the replacement`);
+        original = readFileSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      current = parseCafeFile(original.toString("utf8"), file);
     } catch (err) {
       throw new Error(`Repair ${file} in place before running init again. Original kept. ${(err as Error).message}`);
     }
@@ -101,26 +115,41 @@ concurrency: ${id.concurrency}
   // Validate the serialized document before it can replace the old file.
   const scratch = mkdtempSync(join(dir, ".cafe-init-"));
   const candidate = join(scratch, ".cafe");
+  const stagedBackup = join(scratch, "original");
+  let backupFile: string | undefined;
   try {
     writeFileSync(candidate, content, { mode: existing ? existing.mode & 0o777 : 0o644, flag: "wx" });
     readCafeFile(candidate);
-    if (existing) {
-      const current = lstatSync(file);
-      if (!current.isFile() || current.dev !== existing.dev || current.ino !== existing.ino || current.ctimeMs !== existing.ctimeMs) {
-        throw new Error(`${file} changed while preparing the replacement; edit it in place`);
-      }
+    if (existing && original) {
+      const checkOriginal = () => {
+        if (!sameIdentityFile(lstatSync(file), existing)) {
+          throw new Error(`${file} changed while preparing the replacement; edit it in place`);
+        }
+      };
+      checkOriginal();
+      const backup = `${file}.bak.${randomUUID()}`;
+      writeFileSync(stagedBackup, original, { mode: 0o600, flag: "wx", flush: true });
+      linkSync(stagedBackup, backup);
+      backupFile = backup;
+      checkOriginal();
       renameSync(candidate, file);
     } else {
       writeFileSync(file, content, { mode: 0o644, flag: "wx" });
     }
+  } catch (err) {
+    if (backupFile) throw new Error(`${(err as Error).message}\nbackup: ${backupFile}`, { cause: err });
+    throw err;
   } finally {
-    if (existsSync(candidate)) unlinkSync(candidate);
-    rmdirSync(scratch);
+    try {
+      if (existsSync(candidate)) unlinkSync(candidate);
+      if (existsSync(stagedBackup)) unlinkSync(stagedBackup);
+      rmdirSync(scratch);
+    } catch { /* a scratch cleanup failure must not mask the replacement outcome */ }
   }
 
   const next =
     id.role === "barista"
       ? [`cafe barista start --dir ${dir}`, `pi -e "$(cafe pi-extension-path)"`, `cafe daemon status`]
       : [`cafe mcp install`, `cafe ask "your first question"`, `cafe daemon status`];
-  return { file, identity: id, next };
+  return { file, identity: id, next, ...(backupFile ? { backupFile } : {}) };
 }

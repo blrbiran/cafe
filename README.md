@@ -186,6 +186,10 @@ For a TUI member, follow the launch command printed by `cafe team start`.
 Install the integration first with `cafe extension install` for pi/omp or
 `cafe claude install` for Claude Code. The launch command sets the working
 directory and the member identity. Codex uses `cafe barista run --agent codex --tui`.
+Your terminal controls TUI member permissions. Cafe ignores legacy TUI `access`
+settings and identifies them in `cafe doctor` and `cafe team sync`. You can remove
+those settings from `.cafe`. Managed headless members still use their configured
+access. Cafe blocks read-only Pi/OMP launches until it can verify isolation.
 
 **Channels are message scopes, not permissions.** The Feed has channel chips
 and the composer shows `→ #channel`; `cafe ask --channel <name>` posts

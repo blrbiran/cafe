@@ -96,12 +96,24 @@ export function findCafeFile(start: string): string | undefined {
 
 const MINIMAL = "minimal file:\nname: my-agent\ndescription: what this agent can answer\n";
 
-export function readCafeFile(path: string): CafeDocument {
-  let raw: unknown;
+type CafeFileReadOptions = { onIgnoredTuiAccess?: (member: string) => void };
+
+export function readCafeFile(path: string, options?: CafeFileReadOptions): CafeDocument {
+  let source: string;
   try {
     const st = statSync(path, { throwIfNoEntry: false });
     if (!st?.isFile()) throw new Error(st?.isDirectory() ? "expected a YAML file, but this path is a directory" : "file not found");
-    raw = parse(readFileSync(path, "utf8")) ?? {};
+    source = readFileSync(path, "utf8");
+  } catch (err) {
+    throw new Error(`invalid .cafe at ${path}: ${(err as Error).message}`);
+  }
+  return parseCafeFile(source, path, options);
+}
+
+export function parseCafeFile(source: string, path: string, options?: CafeFileReadOptions): CafeDocument {
+  let raw: unknown;
+  try {
+    raw = parse(source) ?? {};
   } catch (err) {
     throw new Error(`invalid .cafe at ${path}: ${(err as Error).message}`);
   }
@@ -110,7 +122,8 @@ export function readCafeFile(path: string): CafeDocument {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ");
     throw new Error(`invalid .cafe at ${path}: ${issues}\n${MINIMAL}`);
   }
-  validateTeam(parsed.data, path);
+  const ignored = validateTeam(parsed.data, path);
+  for (const member of ignored) options?.onIgnoredTuiAccess?.(member);
   return parsed.data;
 }
 
@@ -127,9 +140,10 @@ export function sanitizeChannel(name: string): string {
  * Cross-field team rules that zod cannot express. Mutates the parsed team so callers see the
  * concrete channel and each member's effective channel list.
  */
-function validateTeam(doc: CafeDocument, path: string): void {
+function validateTeam(doc: CafeDocument, path: string): string[] {
   const team = doc.team;
-  if (!team) return;
+  const ignored: string[] = [];
+  if (!team) return ignored;
   const fail = (msg: string): never => {
     throw new Error(`invalid .cafe at ${path}: ${msg}`);
   };
@@ -145,7 +159,10 @@ function validateTeam(doc: CafeDocument, path: string): void {
   for (const m of team.members) {
     if (seen.has(m.name)) fail(`team member '${m.name}' is listed twice`);
     seen.add(m.name);
-    if (m.mode === "tui" && m.access !== undefined) fail(`TUI member '${m.name}' cannot declare access; Cafe cannot restrict tools inside a user-owned terminal`);
+    if (m.mode === "tui" && m.access !== undefined) {
+      ignored.push(m.name);
+      delete m.access;
+    }
     if (m.name === teamName) fail(`team member '${m.name}' may not have the same name as the team; \`to: ${m.name}\` would be ambiguous`);
     m.channels = m.channels?.length ? m.channels : [channel];
     if (!m.channels.includes(channel)) fail(`team member '${m.name}' must include the team channel '${channel}' in channels`);
@@ -161,6 +178,7 @@ function validateTeam(doc: CafeDocument, path: string): void {
   if (orchestrators !== 1) {
     fail(`team '${teamName}' must list exactly one member with duty: orchestrator (found ${orchestrators}); the orchestrator is the team's front door (v4-13)`);
   }
+  return ignored;
 }
 
 /** Load a team roster member by name. `teamDir` is the directory holding the roster `.cafe`. */
@@ -228,10 +246,14 @@ export function loadAgentIdentity(cwd: string): { file?: string; cafe: CafeDocum
     identity: { name: cafe.name, description: cafe.description, tags: cafe.tags, scope: cafe.scope, role: cafe.role, concurrency: cafe.concurrency },
   };
 }
-export function loadIdentity(cwd: string): { file?: string; cafe: CafeFile; document: CafeDocument } {
+export function tuiAccessNotice(members: string[]): string {
+  return `Ignored TUI access settings for ${members.join(", ")}. Your terminal controls their permissions. You can remove these access settings.`;
+}
+
+export function loadIdentity(cwd: string, options?: CafeFileReadOptions): { file?: string; cafe: CafeFile; document: CafeDocument } {
   const file = findCafeFile(cwd);
   if (file) {
-    const document = readCafeFile(file);
+    const document = readCafeFile(file, options);
     // `cafe` keeps the pre-v4-11 shape (no team block), so spreading it into an AgentIdentity stays valid.
     return { file, cafe: document, document };
   }

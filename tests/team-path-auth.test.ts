@@ -20,13 +20,25 @@ function roster(root: string, memberDir: string, mode = "headless", access = "")
 }
 
 describe("team path authorization", () => {
-  it("rejects unsafe roster directory declarations and TUI access", () => {
+  it("rejects unsafe roster directory declarations", () => {
     const root = dir();
     expect(() => readCafeFile(roster(root, "../outside"))).not.toThrow();
     roster(root, "../outside");
     expect(TeamMember.safeParse({ name: "worker", dir: "/tmp/outside" }).success).toBe(false);
     expect(TeamMember.safeParse({ name: "worker", dir: "bad\u0000dir" }).success).toBe(false);
-    expect(() => readCafeFile(roster(root, ".", "tui", "write"))).toThrow(/TUI.*access|access.*TUI/i);
+  });
+
+  it.each(["read-only", "write"])("ignores legacy TUI %s without changing YAML or headless access", (access) => {
+    const root = dir();
+    const file = roster(root, ".", "tui", access);
+    const source = readFileSync(file, "utf8").replace("      duty: orchestrator", "      duty: orchestrator\n      access: read-only");
+    writeFileSync(file, source);
+    const ignored: string[] = [];
+    const doc = readCafeFile(file, { onIgnoredTuiAccess: (member: string) => ignored.push(member) });
+    expect(ignored).toEqual(["worker"]);
+    expect(doc.team!.members[0]?.access).toBe("read-only");
+    expect(doc.team!.members[1]).not.toHaveProperty("access");
+    expect(readFileSync(file, "utf8")).toBe(source);
   });
 
   it("resolves internal paths canonically and rejects unsafe or missing targets", () => {

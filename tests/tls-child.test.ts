@@ -138,6 +138,16 @@ describe("a TLS child daemon reaches a TLS Root", () => {
     const answer = child.daemon.answerClarification(parent.threadId, question.threadId, { clarificationOrderId: question.orderId, text: "yes" }, owner);
     await waitFor(() => root.daemon.thread(question.threadId)?.events.some((env) => env.orderId === answer.orderId && env.event.type === "order.delivered") ?? false);
     const publication = root.daemon.thread(question.threadId)?.events.find((env) => env.orderId === answer.orderId && env.event.type === "order.created");
+    await manual!.reply("syntax checked");
+    await waitFor(() => !!root.daemon.closingEvent(parent.threadId, parent.orderId));
+    await held.client.report({ threadId: parent.threadId, orderId: parent.orderId, text: "Syntax review complete." });
+    const parentEvents = child.daemon.thread(parent.threadId)?.events ?? [];
+    const delivery = parentEvents.find(({ event }) => event.type === "order.delivered" && event.agentId === held.rec.agentId)?.event;
+    expect(delivery?.type).toBe("order.delivered");
+    expect(parentEvents.find(({ event }) => event.type === "order.reported")?.event).toMatchObject({
+      agentId: held.rec.agentId,
+      assignmentId: delivery?.type === "order.delivered" ? delivery.assignmentId : undefined,
+    });
     expect(publication).toMatchObject({
       eventHostId: child.daemon.hostId,
       actor: { kind: "human" },

@@ -429,11 +429,10 @@ directory, and not a plain `cafe barista start` in the same dir.
   - At most once per `timing.digestIntervalMs` (default 60 s) per channel while
     there is new activity. Thread-close events are folded into the next interval;
     there is no per-close send.
-  - **A digest wakes the observer: one summarized turn per digest per channel.**
-    It is queued behind any in-flight Order (the same single-`current` rule as
-    an Order), so it never interrupts an answer in progress. The turn has no
-    ack/reply: it is a notification, not an Order, and it is not recorded in the
-    Thread.
+  - Pi/OMP display ordinary activity. They group newly closed failed Orders with an
+    exact Order ID into an observation turn. Each observer session starts at most
+    one automatic observation turn per 60 seconds and handles explicit Orders first.
+    An observation has no ack or reply and does not create a Thread.
   - If the Root is offline, a child assembles a local digest and sets
     `partial: true` (honest boundary: it sees only its own Threads).
   - The extension turns one digest into one summarized message; it does not

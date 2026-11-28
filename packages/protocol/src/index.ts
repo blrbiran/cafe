@@ -160,8 +160,8 @@ export function renderTeamPlaybook(input: { team: string; channel: string; self:
       "Your job as orchestrator:",
       "- Split the task. Assign each part to one member at a time with to: \"<member>\".",
       ...roster.flatMap((m) => m.duty && m.dutyAliases?.length ? [`- Job phrases for ${m.duty}: ${m.dutyAliases.join(", ")}.`] : []),
-      "- In pi or omp, set delegate: true when assigning from the current Order. With other clients, pass its parent Order and Thread identifiers.",
-      "- Send interim progress while delegated work is pending. Use the final reply to report the outcome.",
+      "- In Pi/OMP, use the registered cafe_ask tool with delegate: true to link the assignment to the active Order. Use the registered runtime for Agent delegation.",
+      "- Send interim progress while delegated work is pending. In Pi/OMP, use cafe_reply with finalResult: true to submit the result of the active human Order. If you already answered the original Order, use cafe_reply with reportThreadId and reportOrderId.",
       "- Do not do the work yourself unless it is small; keep your context for the task and the reports.",
       "- Report to the person who asked you with a normal reply. Say what was done, where, and what is still open.",
     );
@@ -646,6 +646,7 @@ export const ChannelDigest = z.object({
   threads: z.array(
     z.object({
       threadId: z.string(),
+      orderId: z.string().optional(),
       status: z.string(),
       from: z.object({ id: z.string(), address: z.string(), host: z.string() }),
       summary: z.string(),

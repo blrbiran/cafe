@@ -85,6 +85,19 @@ describe("read-only worker launch", () => {
     expect(result.supported).toBe(false);
   });
 
+  it("finds a bare runtime on the worker PATH while keeping an unverified launch blocked", async () => {
+    compliantRuntime("runtime-path", "omp");
+    const extension = join(root, "path-extension.mjs");
+    writeFileSync(extension, "export default () => {};");
+    const options = { home: join(root, "path-home"), path: join(root, "runtime-path") };
+    await expect(probeReadonlyRuntime("omp", "omp", extension, options)).resolves.toMatchObject({
+      supported: false, binaryHash: expect.stringMatching(/^[a-f0-9]{64}$/), reason: expect.stringMatching(/found.*cannot verify/i),
+    });
+    await expect(probeReadonlyRuntime("absent", "omp", extension, options)).resolves.toMatchObject({
+      supported: false, binaryHash: "", reason: expect.stringMatching(/daemon.*PATH/i),
+    });
+  });
+
   it("builds the Pi allowlist and disables MCP and extension discovery", () => {
     expect(readonlyToolArgs("pi", "/cafe/ext.ts")).toEqual([
       "--tools", "read,grep,find,ls,cafe_ask,cafe_agents,cafe_reply,cafe_decline",
