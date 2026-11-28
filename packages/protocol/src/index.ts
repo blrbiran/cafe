@@ -483,10 +483,12 @@ export const OrderAssignment = z.object({
   body: z.string(),
   history: z.array(z.object({ from: z.string(), agentId: z.string().optional(), role: z.enum(["customer", "barista"]), text: z.string() })).default([]),
   bodyHash: z.string().optional(),
+  /** Owner-computed absolute hard deadline; absent only on legacy assignments. */
+  deadlineAt: z.number().int().positive().optional(),
 });
 export type OrderAssignment = z.infer<typeof OrderAssignment>;
 
-export const OrderAssignmentReference = OrderAssignment.pick({ assignmentId: true, targetAgentId: true, targetHostId: true }).extend({
+export const OrderAssignmentReference = OrderAssignment.pick({ assignmentId: true, targetAgentId: true, targetHostId: true, deadlineAt: true }).extend({
   bodyHash: z.string().regex(/^[a-f0-9]{64}$/),
   /** Canonical transport choice, fixed when the assignment is journaled. Missing means legacy. */
   relayMode: z.enum(["compat", "strict"]).optional(),
@@ -494,11 +496,11 @@ export const OrderAssignmentReference = OrderAssignment.pick({ assignmentId: tru
 export type OrderAssignmentReference = z.infer<typeof OrderAssignmentReference>;
 const JournalAssignment = z.union([OrderAssignmentReference, OrderAssignment]);
 
-export const OrderReplacement = z.object({ type: z.literal("order.replaced"), previousOrderId: z.string(), order: Order, decision: RoutingDecision, assignments: z.array(JournalAssignment) });
+export const OrderReplacement = z.object({ type: z.literal("order.replaced"), previousOrderId: z.string(), order: Order, decision: RoutingDecision, assignments: z.array(JournalAssignment), deadlineAt: z.number().int().positive().optional() });
 
 export const ThreadEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("order.created"), order: Order }),
-  z.object({ type: z.literal("order.routed"), decision: RoutingDecision }),
+  z.object({ type: z.literal("order.routed"), decision: RoutingDecision, deadlineAt: z.number().int().positive().optional() }),
   z.object({ type: z.literal("order.assigned"), assignment: JournalAssignment }),
   z.object({ type: z.literal("order.delivered"), agentId: z.string(), assignmentId: z.string().optional(), protectedIdentity: z.literal(true).optional() }),
   z.object({ type: z.literal("order.acked"), agentId: z.string(), assignmentId: z.string().optional() }),

@@ -23,6 +23,7 @@ const recipientRecord: RecipientAssignmentRecord = {
   orderId: "order-1",
   threadId: "thread-1",
   receivedAt: 100,
+  deadlineAt: Date.now() + 60_000,
 };
 
 const receipt: RecipientAssignmentReceipt = {
@@ -72,6 +73,7 @@ describe("Store recipient assignment inbox", () => {
       body: recipientRecord.body,
       history: recipientRecord.history,
       receivedAt: recipientRecord.receivedAt,
+      deadlineAt: recipientRecord.deadlineAt,
     };
     expect(store.putRecipientAssignment(reorderedAssignment)).toEqual(recipientRecord);
     expect(store.putRecipientAssignmentReceipt({ acceptedAt: receipt.acceptedAt, agentId: receipt.agentId, assignmentId: receipt.assignmentId })).toEqual(receipt);
@@ -87,15 +89,39 @@ describe("Store recipient assignment inbox", () => {
     expect(() => store.putRecipientAssignmentReceipt({ ...receipt, agentId: "agent-2" })).toThrow(/target Agent/i);
   });
 
+  it("reclaims only expired recipient assignments and their receipts", () => {
+    const store = new Store(home());
+    const expired: RecipientAssignmentRecord = { ...recipientRecord, assignmentId: "expired", deadlineAt: 99 };
+    const live: RecipientAssignmentRecord = { ...recipientRecord, assignmentId: "live", deadlineAt: 101 };
+    store.putRecipientAssignment(expired);
+    store.putRecipientAssignmentReceipt({ ...receipt, assignmentId: "expired" });
+
+    expect(store.reclaimExpiredRecipientAssignments(99 + 5 * 60_000 - 1)).toBe(0);
+    expect(store.reclaimExpiredRecipientAssignments(99 + 5 * 60_000)).toBe(1);
+    store.putRecipientAssignment(live);
+    store.putRecipientAssignmentReceipt({ ...receipt, assignmentId: "live" });
+    expect(store.getRecipientAssignment("expired")).toBeUndefined();
+    expect(store.getRecipientAssignmentReceipt("expired")).toBeUndefined();
+    expect(store.getRecipientAssignment("live")).toEqual(live);
+    expect(store.getRecipientAssignmentReceipt("live")).toEqual({ ...receipt, assignmentId: "live" });
+  });
+
   it("keeps the recipient inbox below its fixed capacity", () => {
     const store = new Store(home());
-    for (let i = 0; i < 5000; i++) {
+    for (let i = 0; i < 4999; i++) {
       store.putRecipientAssignment({
         ...recipientRecord,
         assignmentId: `assignment-${i}`,
         receivedAt: i,
       });
     }
+    const expired = { ...recipientRecord, assignmentId: "assignment-expired", deadlineAt: Date.now() - 10 * 60_000 };
+    store.putRecipientAssignment(expired);
+    store.putRecipientAssignmentReceipt({ ...receipt, assignmentId: expired.assignmentId });
+
+    store.putRecipientAssignment({ ...recipientRecord, assignmentId: "assignment-at-capacity" });
+    expect(store.getRecipientAssignment(expired.assignmentId)).toBeUndefined();
+    expect(store.getRecipientAssignmentReceipt(expired.assignmentId)).toBeUndefined();
     expect(() => store.putRecipientAssignment({
       ...recipientRecord,
       assignmentId: "assignment-over-capacity",

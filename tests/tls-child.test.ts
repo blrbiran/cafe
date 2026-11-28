@@ -119,7 +119,12 @@ describe("a TLS child daemon reaches a TLS Root", () => {
     });
     await durable.connect(identity("receipt-worker"));
     const ownerStatus = child.daemon as unknown as { answerAssignmentStatus(...args: unknown[]): Promise<{ active: boolean }> };
-    const status = vi.spyOn(ownerStatus, "answerAssignmentStatus").mockRejectedValueOnce(new RpcError("assignment_pending", "simulated temporary owner status failure"));
+    const answerStatus = ownerStatus.answerAssignmentStatus.bind(ownerStatus);
+    let statusChecks = 0;
+    const status = vi.spyOn(ownerStatus, "answerAssignmentStatus").mockImplementation(async (...args) => {
+      if (++statusChecks === 2) throw new RpcError("assignment_pending", "simulated temporary owner status failure");
+      return answerStatus(...args);
+    });
     try {
       const queued = await c.ask({ body: "check the receipt", to: "receipt-worker", deadlineMs: 3000 });
       const result = await untilClosed(c, queued.threadId, queued.orderId);

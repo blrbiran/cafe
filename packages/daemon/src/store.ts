@@ -26,6 +26,8 @@ export interface RecipientAssignmentRecord extends OrderAssignment {
   orderId: string;
   threadId: string;
   receivedAt: number;
+  /** Absolute owner-issued deadline; legacy rows without one are retained safely. */
+  deadlineAt?: number;
 }
 
 export interface RecipientAssignmentReceipt {
@@ -106,6 +108,8 @@ export interface CallerPrincipalRecord {
 const PENDING_EVENTS_MAX = 5000;
 // Fail closed at capacity; evicting a receipt could let a replay inject accepted work twice.
 const RECIPIENT_ASSIGNMENTS_MAX = 5000;
+/** Wait conservatively past owner time so clock skew cannot erase a live acceptance receipt. */
+const RECIPIENT_ASSIGNMENT_CLOCK_SKEW_MS = 5 * 60_000;
 
 /**
  * Thread content lives in append-only JSONL files; SQLite keeps only metadata
@@ -229,7 +233,8 @@ export class Store {
         target_agent_id TEXT NOT NULL,
         target_host_id TEXT NOT NULL,
         record_json TEXT NOT NULL,
-        received_at INTEGER NOT NULL
+        received_at INTEGER NOT NULL,
+        expires_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS recipient_assignments_received ON recipient_assignments(received_at, assignment_id);
       CREATE TABLE IF NOT EXISTS recipient_assignment_receipts (
@@ -239,6 +244,9 @@ export class Store {
         record_json TEXT NOT NULL
       );
     `);
+    const assignmentCols = new Set((this.db.prepare("PRAGMA table_info(recipient_assignments)").all() as { name: string }[]).map((c) => c.name));
+    if (!assignmentCols.has("expires_at")) this.db.exec("ALTER TABLE recipient_assignments ADD COLUMN expires_at INTEGER");
+    this.db.exec("CREATE INDEX IF NOT EXISTS recipient_assignments_expiry ON recipient_assignments(expires_at, assignment_id)");
     // v2: identity (`name@host`, survives restarts) and the Order's keywords, for routing hints.
     const cols = new Set((this.db.prepare("PRAGMA table_info(agent_events)").all() as { name: string }[]).map((c) => c.name));
     if (!cols.has("identity")) this.db.exec("ALTER TABLE agent_events ADD COLUMN identity TEXT");
@@ -513,6 +521,33 @@ export class Store {
     return row ? JSON.parse(row.value) as T : undefined;
   }
 
+  /** Remove only rows whose owner-issued deadline is safely in the past. Legacy rows have no expiry. */
+  private deleteExpiredRecipientAssignments(expiredBy: number): number {
+    const rows = this.db.prepare("SELECT assignment_id FROM recipient_assignments WHERE expires_at IS NOT NULL AND expires_at <= ?")
+      .all(expiredBy) as { assignment_id: string }[];
+    if (!rows.length) return 0;
+    const delReceipt = this.db.prepare("DELETE FROM recipient_assignment_receipts WHERE assignment_id = ?");
+    const delAssignment = this.db.prepare("DELETE FROM recipient_assignments WHERE assignment_id = ?");
+    for (const { assignment_id } of rows) {
+      delReceipt.run(assignment_id);
+      delAssignment.run(assignment_id);
+    }
+    return rows.length;
+  }
+
+  /** Reclaim rows only after the owner deadline plus the cross-Host clock-skew allowance. */
+  reclaimExpiredRecipientAssignments(now = Date.now()): number {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const removed = this.deleteExpiredRecipientAssignments(now - RECIPIENT_ASSIGNMENT_CLOCK_SKEW_MS);
+      this.db.exec("COMMIT");
+      return removed;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   putRecipientAssignment(record: RecipientAssignmentRecord): RecipientAssignmentRecord {
     if (!record.assignmentId || !record.orderId || !record.threadId || !record.targetAgentId || !record.targetHostId || !record.bodyHash) {
       throw new Error("recipient assignment requires exact IDs and body hash");
@@ -531,12 +566,13 @@ export class Store {
         this.db.exec("COMMIT");
         return raced;
       }
+      this.deleteExpiredRecipientAssignments(Date.now() - RECIPIENT_ASSIGNMENT_CLOCK_SKEW_MS);
       const count = (this.db.prepare("SELECT COUNT(*) AS n FROM recipient_assignments").get() as { n: number }).n;
       if (count >= RECIPIENT_ASSIGNMENTS_MAX) throw new Error(`recipient assignment inbox is full (${RECIPIENT_ASSIGNMENTS_MAX})`);
       this.db.prepare(`
-        INSERT INTO recipient_assignments(assignment_id, order_id, thread_id, target_agent_id, target_host_id, record_json, received_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(record.assignmentId, record.orderId, record.threadId, record.targetAgentId, record.targetHostId, JSON.stringify(record), record.receivedAt);
+        INSERT INTO recipient_assignments(assignment_id, order_id, thread_id, target_agent_id, target_host_id, record_json, received_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(record.assignmentId, record.orderId, record.threadId, record.targetAgentId, record.targetHostId, JSON.stringify(record), record.receivedAt, record.deadlineAt ?? null);
       this.db.exec("COMMIT");
       return record;
     } catch (error) {

@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Peer } from "@cafe/protocol/peer";
-import type { OrderAssignment, ThreadEnvelope } from "@cafe/protocol";
+import { Methods, type OrderAssignment, type ThreadEnvelope } from "@cafe/protocol";
+import { Peer, RpcError } from "@cafe/protocol/peer";
 import { Store } from "../packages/daemon/src/store.ts";
 import { barista, customer, identity, startDaemon } from "./helpers.ts";
 
@@ -55,6 +55,87 @@ describe("canonical Order assignments", () => {
     expect(receiver.daemon.thread("thread-1")?.events.at(-1)?.event).toMatchObject({ type: "order.failed", agentId: "worker" });
   });
 
+  it("does not install a relay proof when the owner cannot prove the assignment is active", async () => {
+    const daemon = await startDaemon("assignment-relay-status", { mode: "root" });
+    cleanup.push(daemon.stop);
+    const order: any = {
+      orderId: "order-stale",
+      threadId: "thread-stale",
+      kind: "order",
+      from: { id: "cli:owner", address: "owner", host: "remote-owner" },
+      body: "stale task",
+      createdAt: 100,
+      chain: [],
+      depth: 0,
+      turn: 1,
+      history: [],
+    };
+    const assignment = {
+      assignmentId: "assignment-stale",
+      targetAgentId: "agent-local",
+      targetHostId: daemon.daemon.hostId,
+      bodyHash: "a".repeat(64),
+      deadlineAt: 1000,
+    };
+    const creation: any = {
+      eventId: "event-created",
+      threadId: order.threadId,
+      orderId: order.orderId,
+      host: "remote-owner",
+      eventHostId: "owner-host-id",
+      at: 100,
+      event: { type: "order.created", order },
+    };
+    const assignmentEvent: any = {
+      eventId: "event-assigned",
+      threadId: order.threadId,
+      orderId: order.orderId,
+      host: "remote-owner",
+      eventHostId: "owner-host-id",
+      at: 101,
+      event: { type: "order.assigned", assignment },
+    };
+    const request = vi.fn().mockResolvedValue({ active: false });
+    const from: any = { request, hostIdentity: { hostId: "owner-host-id" }, meta: { host: "remote-owner" } };
+    const recordRelayProof = (daemon.daemon as any).recordRelayProof.bind(daemon.daemon);
+
+    const result = recordRelayProof({ assignment, ownerHostId: "owner-host-id", creation, assignmentEvent }, from);
+    expect(result).toBeInstanceOf(Promise);
+    await expect(result).rejects.toMatchObject({ code: "stale_order" });
+    expect(request).toHaveBeenCalledWith(Methods.assignmentStatus, {
+      threadId: order.threadId,
+      orderId: order.orderId,
+      assignmentId: assignment.assignmentId,
+      targetHostId: assignment.targetHostId,
+      deadlineAt: assignment.deadlineAt,
+    }, 1500);
+    expect(daemon.daemon.store.getThread(order.threadId)).toBeUndefined();
+  });
+
+  it("keeps relayed proof pending when owner authority is unavailable", async () => {
+    const daemon = await startDaemon("assignment-relay-pending", { mode: "root" });
+    cleanup.push(daemon.stop);
+    const assignment = {
+      assignmentId: "assignment-pending",
+      targetAgentId: "agent-local",
+      targetHostId: daemon.daemon.hostId,
+      bodyHash: "b".repeat(64),
+      deadlineAt: 1000,
+    };
+    const order = {
+      orderId: "order-pending", threadId: "thread-pending", kind: "order",
+      from: { id: "cli:owner", address: "owner", host: "remote-owner" }, body: "pending task",
+      createdAt: 100, chain: [], depth: 0, turn: 1, history: [],
+    };
+    const creation: any = { eventId: "created-pending", threadId: order.threadId, orderId: order.orderId, host: "remote-owner", at: 100, event: { type: "order.created", order } };
+    const assignmentEvent: any = { eventId: "assigned-pending", threadId: order.threadId, orderId: order.orderId, host: "remote-owner", at: 101, event: { type: "order.assigned", assignment } };
+    const from: any = { request: vi.fn().mockRejectedValue(new RpcError("assignment_pending", "owner proof unavailable")) };
+
+    await expect(Promise.resolve((daemon.daemon as any).recordRelayProof({ assignment, ownerHostId: "owner-host-id", creation, assignmentEvent }, from)))
+      .rejects.toMatchObject({ code: "assignment_pending" });
+    expect(daemon.daemon.store.getThread(order.threadId)).toBeUndefined();
+  });
+
   it("journals the target assignment before handing it to delivery with canonical event references", async () => {
     const daemon = await startDaemon("assignment-owner", { mode: "root" });
     cleanup.push(daemon.stop);
@@ -81,6 +162,10 @@ describe("canonical Order assignments", () => {
       });
       expect(assigned!.event).not.toHaveProperty("assignment.body");
       expect(assigned!.event).not.toHaveProperty("assignment.history");
+      const routed = events.find((env) => env.orderId === order.orderId && env.event.type === "order.routed");
+      expect((routed?.event as any)?.deadlineAt).toBe(order.createdAt + 60_000);
+      expect((assigned!.event as any).assignment.deadlineAt).toBe(order.createdAt + 60_000);
+      expect((proof.assignment as any).deadlineAt).toBe(order.createdAt + 60_000);
       expect(assigned!.eventId).toBe(proof.assignmentEventId);
       expect(proof).toMatchObject({
         assignment: (assigned!.event as Extract<ThreadEnvelope["event"], { type: "order.assigned" }>).assignment,
@@ -91,7 +176,7 @@ describe("canonical Order assignments", () => {
       delivered = true;
     });
 
-    const result = await caller.ask({ body: "write the parser", to: "worker" });
+    const result = await caller.ask({ body: "write the parser", to: "worker", deadlineMs: 60_000 });
     expect(result.decision.targets).toEqual([worker.rec.agentId]);
     expect(delivered).toBe(true);
   });

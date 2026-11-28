@@ -187,6 +187,7 @@ interface Tracking {
   targets: Map<string, "pending" | "acked" | "done" | "failed">;
   candidates: string[];
   timers: Map<string, ReturnType<typeof setTimeout>>;
+  deadlineAt?: number;
   deadline?: ReturnType<typeof setTimeout>;
   /** Multicast/broadcast: after the first final answer, when to skip silent targets. */
   grace?: ReturnType<typeof setTimeout>;
@@ -1292,27 +1293,28 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
   }
 
-  private assignmentIsActive(order: Order, assignmentId: string, targetHostId: string): boolean {
+  private assignmentIsActive(order: Order, assignmentId: string, targetHostId: string, deadlineAt?: number): boolean {
     const tracking = this.tracking.get(order.orderId);
-    if (order.from.host !== this.host || tracking?.status !== "open") return false;
+    if (order.from.host !== this.host || tracking?.status !== "open" || (tracking.deadlineAt !== undefined && Date.now() >= tracking.deadlineAt)) return false;
     const assignment = [...tracking.assignments.values()].find(({ assignment }) => assignment.assignmentId === assignmentId)?.assignment;
-    if (!assignment || assignment.targetHostId !== targetHostId) return false;
+    if (!assignment || assignment.targetHostId !== targetHostId ||
+        (deadlineAt !== undefined && assignment.deadlineAt !== deadlineAt)) return false;
     const state = tracking.targets.get(assignment.targetAgentId);
     return state === "pending" || state === "acked";
   }
 
-  private async remoteAssignmentStatus(order: Order, assignmentId: string): Promise<boolean> {
+  private async remoteAssignmentStatus(order: Order, assignmentId: string, deadlineAt?: number): Promise<boolean> {
     const direct = [...(this.threadLinks.get(order.threadId) ?? [])].find((peer) => !peer.isClosed && peer.meta.host === order.from.host);
     const route = direct ?? (this.isRoot ? this.children.get(order.from.host) : this.uplink);
     if (!route || route.isClosed) throw new RpcError("assignment_pending", "waiting for the assignment's owner Host");
     const result = await route.request<{ active: boolean }>(Methods.assignmentStatus, {
-      threadId: order.threadId, orderId: order.orderId, assignmentId,
+      threadId: order.threadId, orderId: order.orderId, assignmentId, deadlineAt,
       ...(this.isRoot ? { targetHostId: this.assignmentTargetHostId(this.host) } : {}),
     }, 2000);
     return result.active === true;
   }
 
-  private async answerAssignmentStatus(peer: Peer, p: { threadId: string; orderId: string; assignmentId: string; targetHostId?: string }): Promise<{ active: boolean }> {
+  private async answerAssignmentStatus(peer: Peer, p: { threadId: string; orderId: string; assignmentId: string; targetHostId?: string; deadlineAt?: number }): Promise<{ active: boolean }> {
     const allowedRootRelay = !this.isRoot && peer === this.uplink;
     const targetHostId = allowedRootRelay ? p.targetHostId ?? peer.hostIdentity?.hostId ?? this.rootHost
       : peer.hostIdentity?.hostId ?? peer.meta.host;
@@ -1320,11 +1322,11 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (typeof p.assignmentId !== "string" || !targetHostId) return { active: false };
     if (!order) throw new RpcError("assignment_pending", "waiting for the Order's assignment evidence");
     if (order.threadId !== p.threadId) return { active: false };
-    if (order.from.host === this.host) return { active: this.assignmentIsActive(order, p.assignmentId, targetHostId) };
+    if (order.from.host === this.host) return { active: this.assignmentIsActive(order, p.assignmentId, targetHostId, p.deadlineAt) };
     if (!this.isRoot) return { active: false };
     const owner = this.children.get(order.from.host);
     if (!owner || owner.isClosed) throw new RpcError("assignment_pending", "waiting for the assignment's owner Host");
-    return owner.request(Methods.assignmentStatus, { threadId: p.threadId, orderId: p.orderId, assignmentId: p.assignmentId, targetHostId }, 1500);
+    return owner.request(Methods.assignmentStatus, { threadId: p.threadId, orderId: p.orderId, assignmentId: p.assignmentId, targetHostId, deadlineAt: p.deadlineAt }, 1500);
   }
 
   private async acceptRecipientAssignment(peer: Peer, p: { orderId: string; threadId: string; assignmentId: string }): Promise<{ active: boolean }> {
@@ -1339,8 +1341,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const order = this.findParentOrder(p.orderId, p.threadId);
     if (!order || order.threadId !== p.threadId || !this.canDeliverLocal(order, agentId, peer)) return { active: false };
     const active = order.from.host === this.host
-      ? this.assignmentIsActive(order, p.assignmentId, assignment.targetHostId)
-      : await this.remoteAssignmentStatus(order, p.assignmentId);
+      ? this.assignmentIsActive(order, p.assignmentId, assignment.targetHostId, assignment.deadlineAt)
+      : await this.remoteAssignmentStatus(order, p.assignmentId, assignment.deadlineAt);
     if (!active || !this.canDeliverLocal(order, agentId, peer)) return { active: false };
     this.subscribe(order.threadId, peer);
     if (!this.store.getRecipientAssignmentReceipt(p.assignmentId)) {
@@ -2620,12 +2622,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     const priorTargets = prior ? (prior.targetStates?.length ? prior.targetStates.map((s) => s.agentId) : prior.targets) : [];
     const routeNew = () => this.route(order, { isFollowUp: !!prior, responders: answeredBefore, priorTargets }, p.broadcast ?? false);
     let acceptedReplacement: RoutingDecision | undefined;
+    let replacementDeadlineAt: number | undefined;
     if (replacing) {
       acceptedReplacement = await routeNew();
       if (replacing.status !== "open" || (this.metas.get(threadId) ?? this.store.getThread(threadId))?.orderId !== replacing.order.orderId) {
         throw new RpcError("stale_order", "the previous Order changed while routing the replacement");
       }
-      if (!acceptedReplacement.targets.length || Date.now() >= order.createdAt + (order.deadlineMs ?? this.timing.unicastDeadlineMs)) {
+      const defaultMs = order.kind === "notice" || acceptedReplacement.mode !== "unicast" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
+      replacementDeadlineAt = order.createdAt + (order.deadlineMs ?? defaultMs);
+      if (!acceptedReplacement.targets.length || Date.now() >= replacementDeadlineAt) {
         throw new RpcError("replacement_unroutable", acceptedReplacement.reason || "no eligible target for the replacement");
       }
     }
@@ -2637,7 +2642,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (replacing && acceptedReplacement) {
       const { variants, ...decision } = acceptedReplacement;
       if (variants) this.store.putOwnerDeliveryData("variants", order.orderId, order.threadId, variants);
-      const references = decision.targets.map((agentId) => this.prepareAssignment(order, agentId, variants));
+      const references = decision.targets.map((agentId) => this.prepareAssignment(order, agentId, variants, replacementDeadlineAt!));
       for (const assignment of references) {
         if (assignment.relayMode === "strict") {
           await this.preflightAssignmentRoute({ threadId: order.threadId, orderId: order.orderId, assignmentId: assignment.assignmentId,
@@ -2651,7 +2656,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       }
       const predecessors = this.replacementPredecessors(order.threadId, replacing.order.orderId);
       const replacement = this.emitEvent(order, {
-        type: "order.replaced", previousOrderId: replacing.order.orderId, order, decision, assignments: references,
+        type: "order.replaced", previousOrderId: replacing.order.orderId, order, decision, assignments: references, deadlineAt: replacementDeadlineAt,
       }, { actor });
       created = replacement;
       for (const assignment of references) {
@@ -2664,6 +2669,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       order,
       creation: created,
       assignments,
+      deadlineAt: replacementDeadlineAt,
       customerPeer,
       status: "open",
       replied: false,
@@ -2681,9 +2687,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     if (t.status !== "open") return result;
     t.decision = decision;
     t.candidates = [...decision.candidates];
+    const defaultMs = order.kind === "notice" || decision.mode !== "unicast" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
+    const deadlineAt = t.deadlineAt ?? order.createdAt + (order.deadlineMs ?? defaultMs);
+    t.deadlineAt = deadlineAt;
     if (!acceptedReplacement) {
       if (variants) this.store.putOwnerDeliveryData("variants", order.orderId, order.threadId, variants);
-      this.emitEvent(order, { type: "order.routed", decision: publicDecision });
+      this.emitEvent(order, { type: "order.routed", decision: publicDecision, deadlineAt });
     }
     if (needsHuman) {
       this.close(t, "done");
@@ -2694,8 +2703,6 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       this.close(t, "failed");
       return result;
     }
-    const defaultMs = order.kind === "notice" || decision.mode !== "unicast" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
-    const deadlineAt = order.createdAt + (order.deadlineMs ?? defaultMs);
     if (Date.now() >= deadlineAt) {
       for (const id of decision.targets) t.targets.set(id, "pending");
       this.finishOnDeadline(t);
@@ -2781,14 +2788,15 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       targets: new Map(),
       candidates: [],
       timers: new Map(),
+      deadlineAt: order.createdAt + this.timing.unicastDeadlineMs,
       decision,
     };
     this.tracking.set(order.orderId, tracking);
-    const remainingMs = Math.max(0, order.createdAt + this.timing.unicastDeadlineMs - Date.now());
+    const remainingMs = Math.max(0, tracking.deadlineAt! - Date.now());
     tracking.deadline = setTimeout(() => this.finishOnDeadline(tracking), remainingMs);
     tracking.targets.set(meta.from.id, "pending");
     this.armAck(tracking, meta.from.id);
-    this.emitEvent(order, { type: "order.routed", decision });
+    this.emitEvent(order, { type: "order.routed", decision, deadlineAt: tracking.deadlineAt });
     this.dispatch(tracking, meta.from.id);
     return { orderId: order.orderId, threadId, decision };
   }
@@ -3063,7 +3071,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     return this.assignmentRelayFixture && this.tlsContext?.network ? "strict" : "compat";
   }
 
-  private prepareAssignment(order: Order, agentId: string, variants?: Record<string, string>): OrderAssignmentReference {
+  private prepareAssignment(order: Order, agentId: string, variants: Record<string, string> | undefined, deadlineAt: number): OrderAssignmentReference {
     const recipient = this.registry.get(agentId);
     const targetHostId = recipient && this.assignmentTargetHostId(recipient.host);
     if (!targetHostId || !recipient) throw new RpcError("assignment_unavailable", "no Host binding for the assignment target");
@@ -3072,6 +3080,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       assignmentId: ulid(), targetAgentId: agentId, targetHostId,
       bodyHash: assignmentHash(targetOrder, agentId, targetHostId),
       relayMode: this.assignmentRelayMode(recipient.host),
+      deadlineAt,
     };
     this.store.putOwnerDeliveryData("assignment", assignment.assignmentId, order.threadId, targetOrder);
     return assignment;
@@ -3102,7 +3111,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
 
   private dispatch(t: Tracking, agentId: string): void {
     t.targets.set(agentId, "pending");
-    if (t.order.clarificationRecipient && Date.now() >= t.order.createdAt + (t.order.deadlineMs ?? this.timing.unicastDeadlineMs)) {
+    if (t.deadlineAt !== undefined && Date.now() >= t.deadlineAt) {
       this.finishOnDeadline(t);
       return;
     }
@@ -3125,6 +3134,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       assignmentId: ulid(), targetAgentId: agentId, targetHostId,
       bodyHash: assignmentHash(order, agentId, targetHostId),
       relayMode: this.assignmentRelayMode(rec.host),
+      ...(t.deadlineAt ? { deadlineAt: t.deadlineAt } : {}),
     };
     if (assignment.relayMode === "strict") {
       void this.preflightAssignmentRoute({ threadId: order.threadId, orderId: order.orderId, assignmentId: assignment.assignmentId,
@@ -3233,7 +3243,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         this.joinThread(x.order.threadId, peer);
         this.markBackfill(x.order.threadId, true);
       }
-      this.recordRelayProof(proof, peer);
+      await this.recordRelayProof(proof, peer);
       await this.performStrictTransfer(x.order, x.agentId, proof);
       return { accepted: true, assignmentId: proof.assignment.assignmentId };
     });
@@ -3431,16 +3441,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
   private bindLink(peer: Peer): void {
     peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
     this.bindAssignmentHostMethods(peer);
-    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
+    peer.on(Methods.orderRelay, async (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
       if (proof.assignment.relayMode === "strict") throw new RpcError("strict_relay_required", "strict assignments cannot use the compatibility relay method");
       if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host) ||
           (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== peer.meta.host))) {
         throw new RpcError("bad_assignment", "direct relay does not match the sending and receiving Hosts");
       }
+      await this.recordRelayProof(proof, peer);
       this.joinThread(x.order.threadId, peer);
       this.markBackfill(x.order.threadId, true);
-      this.recordRelayProof(proof, peer);
       this.deliverLocal(x.order, x.agentId, proof);
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => {
@@ -3567,7 +3577,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
     // The pull is async: the peer may have disconnected or the Order closed meanwhile. Recording
     // `order.delivered` for a peer that never received it would grant a later connection its authority.
-    if (!this.canDeliverLocal(order, agentId, peer)) return;
+    if (!this.canDeliverLocal(order, agentId, peer, assignment.assignment.deadlineAt)) return;
     try {
       this.notifyLocal(order, agentId, peer, assignment);
       const tracking = this.tracking.get(order.orderId);
@@ -3577,16 +3587,18 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  private canDeliverLocal(order: Order, agentId: string, peer: Peer): boolean {
+  private canDeliverLocal(order: Order, agentId: string, peer: Peer, deadlineAt?: number): boolean {
     if (peer.isClosed || this.agents.get(agentId) !== peer) return false;
-    if (order.deadlineMs !== undefined && Date.now() >= order.createdAt + order.deadlineMs) return false;
+    const hardDeadline = deadlineAt ?? (order.deadlineMs === undefined ? undefined : order.createdAt + order.deadlineMs);
+    if (hardDeadline !== undefined && Date.now() >= hardDeadline) return false;
     const tracking = this.tracking.get(order.orderId);
     return tracking ? tracking.status === "open" : !this.closingEvent(order.threadId, order.orderId);
   }
 
   private notifyLocal(order: Order, agentId: string, peer: Peer, assignment: OrderAssignmentDelivery): void {
-    if (!this.canDeliverLocal(order, agentId, peer)) return;
+    if (!this.canDeliverLocal(order, agentId, peer, assignment.assignment.deadlineAt)) return;
     const durable = this.local.get(agentId)?.durableAssignments === true;
+    if (assignment.assignment.relayMode === "strict" && !durable) return;
     if (this.tlsContext?.network || durable) {
       const reference = assignment.assignment;
       const existing = this.store.getRecipientAssignment(reference.assignmentId);
@@ -4612,8 +4624,16 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     }
   }
 
-  private recordRelayProof(proof: OrderAssignmentDelivery, from: Peer): void {
-    const { creation, assignmentEvent } = proof;
+  private async recordRelayProof(proof: OrderAssignmentDelivery, from: Peer): Promise<void> {
+    const { creation, assignmentEvent, assignment } = proof;
+    const status = await from.request<{ active: boolean }>(Methods.assignmentStatus, {
+      threadId: creation.threadId,
+      orderId: creation.orderId,
+      assignmentId: assignment.assignmentId,
+      targetHostId: assignment.targetHostId,
+      deadlineAt: assignment.deadlineAt,
+    }, 1500);
+    if (status.active !== true) throw new RpcError("stale_order", "the Order owner no longer authorizes this assignment for delivery");
     const meta = this.metas.get(creation.threadId) ?? this.store.getThread(creation.threadId);
     if (this.closingEvent(creation.threadId, creation.orderId)) {
       throw new RpcError("stale_order", "the relayed Order has already closed");
@@ -4865,10 +4885,12 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       n++;
       const savedRoute = events.find((e) => e.event.type === "order.routed")?.event;
       const routed = savedRoute ?? (created.type === "order.replaced"
-        ? { type: "order.routed" as const, decision: created.decision }
+        ? { type: "order.routed" as const, decision: created.decision, deadlineAt: created.deadlineAt }
         : order.clarificationRecipient
           ? { type: "order.routed" as const, decision: this.clarificationAnswerRoute(order.clarificationRecipient) }
           : undefined);
+      const routedDeadlineAt = routed?.type === "order.routed" ? routed.deadlineAt : undefined;
+      t.deadlineAt = routedDeadlineAt ?? [...assignments.values()].find(({ assignment }) => assignment.deadlineAt !== undefined)?.assignment.deadlineAt;
       if (order.needsHuman) {
         this.close(t, "done");
         continue;
@@ -4901,7 +4923,8 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       // A recovered Order gets the same upper bound as a fresh one: a barista that acked before the
 // restart and keeps heartbeating must not hold a unicast `collect: all` open forever.
       const defaultMs = routed.decision.mode !== "unicast" || order.kind === "notice" ? this.timing.broadcastDeadlineMs : this.timing.unicastDeadlineMs;
-      const remaining = order.createdAt + (order.deadlineMs ?? defaultMs) - Date.now();
+      t.deadlineAt ??= order.createdAt + (order.deadlineMs ?? defaultMs);
+      const remaining = t.deadlineAt - Date.now();
       t.deadline = setTimeout(() => this.finishOnDeadline(t), Math.max(0, remaining));
       for (const env of events) {
         if (env.event.type === "order.replied" && env.event.awaitingOwner) this.acceptAgentFinal(t, env);
@@ -4989,13 +5012,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
     this.bindAssignmentHostMethods(peer);
-    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
+    peer.on(Methods.orderRelay, async (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
       if (proof.assignment.relayMode === "strict") throw new RpcError("strict_relay_required", "strict assignments cannot use the compatibility relay method");
       if (peer.hostIdentity && (proof.ownerHostId !== peer.hostIdentity.hostId || x.order.from.host !== host || proof.creation.eventHostId !== peer.hostIdentity.hostId)) {
         throw new RpcError("bad_assignment", "relay owner does not match the authenticated Host");
       }
-      this.recordRelayProof(proof, peer);
+      await this.recordRelayProof(proof, peer);
       this.deliver(x.order, x.agentId, proof);
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
@@ -5457,13 +5480,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
     });
     peer.on(Methods.assignmentStatus, (p) => this.answerAssignmentStatus(peer, p));
     this.bindAssignmentHostMethods(peer);
-    peer.on(Methods.orderRelay, (x: { order: Order; agentId: string; assignment?: unknown }) => {
+    peer.on(Methods.orderRelay, async (x: { order: Order; agentId: string; assignment?: unknown }) => {
       const proof = this.verifyRelay(x.order, x.agentId, x.assignment);
       if (proof.assignment.relayMode === "strict") throw new RpcError("strict_relay_required", "strict assignments cannot use the compatibility relay method");
       if (proof.assignment.targetHostId !== this.assignmentTargetHostId(this.host)) {
         throw new RpcError("bad_assignment", "relay targets a different Host");
       }
-      this.recordRelayProof(proof, peer);
+      await this.recordRelayProof(proof, peer);
       this.deliverLocal(x.order, x.agentId, proof);
     });
     peer.on(Methods.threadEvent, (env: ThreadEnvelope) => this.recordEvent(env, { from: peer }));
