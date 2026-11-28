@@ -141,7 +141,7 @@ Real checks done so far: Network-page version banner checked in a browser (Root 
 
 ## 5. Waiting on the user (start the next session here)
 
-**Dogfooding issue handoff.** At the end of each session, include recommendations for the external dogfooding ledger in this handoff and in the user-facing summary. For each issue, give its ID, the suggested status or revised acceptance criteria, and the evidence from the current code, tests, or reproduction. Name any acceptance checks still pending. The user forwards these recommendations to the tester, who can verify them and update the ledger. Treat the external ledger as read-only unless the user separately requests an edit.
+**Dogfooding issue handoff.** At the end of each session, include recommendations for the external dogfooding ledger in this handoff and in the user-facing summary. For each issue, give its ID, the suggested status or revised acceptance criteria, and the evidence from the current code, tests, or reproduction. Name any acceptance checks still pending. Format retest recommendations as a plain-text list that is easy to copy. Avoid Markdown tables for these recommendations in both the handoff and the user-facing summary. The user forwards these recommendations to the tester, who can verify them and update the ledger. Treat the external ledger as read-only unless the user separately requests an edit.
 
 ### 2026-11-28 — Dogfooding upgrade fixes and Team result checkpoint
 
