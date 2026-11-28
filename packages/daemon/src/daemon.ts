@@ -4178,9 +4178,13 @@ export class Daemon extends EventEmitter<DaemonEvents> {
       env = { ...env, event: { ...event, auditOnly: true } };
     }
     const closed = this.closingEvent(env.threadId, env.orderId);
+    const authenticatedReplay = !!opts.from?.hostIdentity || opts.replaying === true;
     const priorFinalDecision = event.type === "order.final-accepted" && closed?.eventHostId === env.eventHostId &&
-      env.eventHostId !== undefined && closed !== undefined && env.at <= closed.at && (opts.from?.hostIdentity || opts.replaying);
-    if (closed && !(event.type === "order.replied" && event.final) && event.type !== "order.reported" && !priorFinalDecision) return;
+      env.eventHostId !== undefined && closed !== undefined && env.at <= closed.at && authenticatedReplay;
+    // A recipient can reconnect after the owner has already backfilled closure.
+    // The validated delivery can supply proof for a historical receipt or result.
+    const delayedDelivery = event.type === "order.delivered" && !!event.assignmentId && authenticatedReplay;
+    if (closed && !(event.type === "order.replied" && event.final) && event.type !== "order.reported" && !priorFinalDecision && !delayedDelivery) return;
     const tracking = this.tracking.get(env.orderId);
     if (!opts.skipTrack && tracking?.status === "open" && "agentId" in event && typeof event.agentId === "string" && tracking.targets.get(event.agentId) === "failed" &&
       (event.type === "order.acked" || event.type === "order.heartbeat" || event.type === "order.declined" || event.type === "order.failed")) return;
@@ -4584,6 +4588,7 @@ export class Daemon extends EventEmitter<DaemonEvents> {
         meta.status = "delivering";
         break;
       case "order.delivered":
+        if (meta.closedAt !== undefined) break;
         if (!meta.targets.includes(ev.agentId)) meta.targets.push(ev.agentId);
         setTargetState(ev.agentId, "pending");
         break;
